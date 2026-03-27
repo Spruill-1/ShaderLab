@@ -1,0 +1,83 @@
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+ARM/
+ARM64/
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+
+# Visual Studio files
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.ncb
+*.opendb
+*.opensdf
+*.sdf
+*.cachefile
+*.VC.db
+*.VC.VC.opendb
+*.ipch
+*.aps
+*.log
+
+# NuGet packages (restored on build)
+packages/
+
+# Generated files
+Generated Files/
+*.g.h
+*.g.cpp
+*.g.idl
+
+# Precompiled headers
+*.pch
+*.ipch
+
+# Compiled objects
+*.obj
+*.o
+*.lo
+*.ilk
+*.pdb
+*.lib
+*.dll
+*.exe
+*.exp
+*.map
+
+# MSIX packaging
+AppPackages/
+BundleArtifacts/
+*.appx
+*.appxbundle
+*.appxupload
+*.msix
+*.msixbundle
+*.msixupload
+
+# IntelliSense
+*.VC.db-shm
+*.VC.db-wal
+Browse.VC.db
+
+# Compiled shader bytecode
+*.cso
+*.fxc
+
+# Crash dumps
+*.dmp
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store

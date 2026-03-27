@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="ShaderLab.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:ShaderLab"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Title="ShaderLab">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="2*" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <!-- Left: Node Graph Editor area -->
+        <Grid Grid.Row="0" Grid.Column="0"
+              Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+              BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+              BorderThickness="0,0,1,0">
+            <TextBlock Text="Node Graph Editor"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center"
+                       Style="{StaticResource SubtitleTextBlockStyle}"
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+        </Grid>
+
+        <!-- Column divider -->
+        <Border Grid.Row="0" Grid.Column="1"
+                Width="4"
+                Background="{ThemeResource CardStrokeColorDefaultBrush}" />
+
+        <!-- Right: Preview + property tabs -->
+        <Grid Grid.Row="0" Grid.Column="2">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <!-- Preview surface -->
+            <SwapChainPanel x:Name="PreviewPanel" Grid.Row="0" />
+
+            <!-- Row divider -->
+            <Border Grid.Row="1"
+                    Height="4"
+                    Background="{ThemeResource CardStrokeColorDefaultBrush}" />
+
+            <!-- Tab control for properties/editor/inspector -->
+            <TabView Grid.Row="2"
+                     IsAddTabButtonVisible="False"
+                     TabWidthMode="SizeToContent">
+                <TabViewItem Header="Properties" IsClosable="False">
+                    <ScrollViewer>
+                        <StackPanel Padding="12" Spacing="8">
+                            <TextBlock Text="Select a node to view its properties."
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                    </ScrollViewer>
+                </TabViewItem>
+                <TabViewItem Header="Shader Editor" IsClosable="False">
+                    <Grid Padding="12">
+                        <TextBox x:Name="ShaderEditorBox"
+                                 AcceptsReturn="True"
+                                 TextWrapping="NoWrap"
+                                 FontFamily="Cascadia Mono, Consolas, Courier New"
+                                 FontSize="13"
+                                 PlaceholderText="// Enter HLSL shader code here..."
+                                 IsSpellCheckEnabled="False" />
+                    </Grid>
+                </TabViewItem>
+                <TabViewItem Header="Pixel Inspector" IsClosable="False">
+                    <ScrollViewer>
+                        <StackPanel Padding="12" Spacing="8">
+                            <TextBlock Text="Click on the preview to inspect pixel values."
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                    </ScrollViewer>
+                </TabViewItem>
+            </TabView>
+        </Grid>
+
+        <!-- Status bar -->
+        <Grid Grid.Row="1" Grid.ColumnSpan="3"
+              Padding="12,4"
+              Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+              BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+              BorderThickness="0,1,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <TextBlock x:Name="PipelineFormatText" Grid.Column="0"
+                       Text="Pipeline: scRGB FP16"
+                       Margin="0,0,24,0"
+                       Style="{StaticResource CaptionTextBlockStyle}" />
+            <TextBlock x:Name="DisplayModeText" Grid.Column="1"
+                       Text="Display: SDR"
+                       Margin="0,0,24,0"
+                       Style="{StaticResource CaptionTextBlockStyle}" />
+            <TextBlock x:Name="DisplayLuminanceText" Grid.Column="2"
+                       Text="Max Luminance: --"
+                       Margin="0,0,24,0"
+                       Style="{StaticResource CaptionTextBlockStyle}" />
+            <TextBlock x:Name="FpsText" Grid.Column="4"
+                       Text="FPS: --"
+                       Style="{StaticResource CaptionTextBlockStyle}" />
+        </Grid>
+    </Grid>
+</Window>
