@@ -114,6 +114,7 @@
   <ItemGroup>
     <ClInclude Include="Controls\NodeGraphController.h" />
     <ClInclude Include="Controls\PixelInspectorController.h" />
+    <ClInclude Include="Controls\PixelTraceController.h" />
     <ClInclude Include="Controls\ShaderEditorController.h" />
     <ClInclude Include="Effects\CustomComputeShaderEffect.h" />
     <ClInclude Include="Effects\CustomPixelShaderEffect.h" />
@@ -139,6 +140,7 @@
     <ClInclude Include="Rendering\PipelineFormat.h" />
     <ClInclude Include="Rendering\RenderEngine.h" />
     <ClInclude Include="Rendering\ToneMapper.h" />
+    <ClInclude Include="Rendering\FalseColorOverlay.h" />
   </ItemGroup>
   <ItemGroup>
     <ApplicationDefinition Include="App.xaml" />
@@ -147,6 +149,7 @@
   <ItemGroup>
     <ClCompile Include="Controls\NodeGraphController.cpp" />
     <ClCompile Include="Controls\PixelInspectorController.cpp" />
+    <ClCompile Include="Controls\PixelTraceController.cpp" />
     <ClCompile Include="Controls\ShaderEditorController.cpp" />
     <ClCompile Include="Effects\CustomComputeShaderEffect.cpp" />
     <ClCompile Include="Effects\CustomPixelShaderEffect.cpp" />
@@ -169,6 +172,7 @@
     <ClCompile Include="Rendering\GraphEvaluator.cpp" />
     <ClCompile Include="Rendering\RenderEngine.cpp" />
     <ClCompile Include="Rendering\ToneMapper.cpp" />
+    <ClCompile Include="Rendering\FalseColorOverlay.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Midl Include="MainWindow.idl">

@@ -58,6 +58,9 @@
     <ClInclude Include="Rendering\ToneMapper.h">
       <Filter>Rendering</Filter>
     </ClInclude>
+    <ClInclude Include="Rendering\FalseColorOverlay.h">
+      <Filter>Rendering</Filter>
+    </ClInclude>
 
     <ClInclude Include="Effects\ImageLoader.h">
       <Filter>Effects</Filter>
@@ -87,6 +90,9 @@
     <ClInclude Include="Controls\PixelInspectorController.h">
       <Filter>Controls</Filter>
     </ClInclude>
+    <ClInclude Include="Controls\PixelTraceController.h">
+      <Filter>Controls</Filter>
+    </ClInclude>
   </ItemGroup>
 
   <!-- Source Files -->
@@ -110,6 +116,9 @@
       <Filter>Rendering</Filter>
     </ClCompile>
     <ClCompile Include="Rendering\ToneMapper.cpp">
+      <Filter>Rendering</Filter>
+    </ClCompile>
+    <ClCompile Include="Rendering\FalseColorOverlay.cpp">
       <Filter>Rendering</Filter>
     </ClCompile>
 
@@ -139,6 +148,9 @@
       <Filter>Controls</Filter>
     </ClCompile>
     <ClCompile Include="Controls\PixelInspectorController.cpp">
+      <Filter>Controls</Filter>
+    </ClCompile>
+    <ClCompile Include="Controls\PixelTraceController.cpp">
       <Filter>Controls</Filter>
     </ClCompile>
   </ItemGroup>
