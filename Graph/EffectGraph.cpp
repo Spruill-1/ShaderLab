@@ -277,6 +277,22 @@ namespace ShaderLab::Graph
                     arr.Append(WDJ::JsonValue::CreateNumberValue(v.w));
                     obj.SetNamedValue(L"value", arr);
                 }
+                else if constexpr (std::is_same_v<T, D2D1_MATRIX_5X4_F>)
+                {
+                    // Serialize as flat 20-element array (row-major: 5 rows × 4 cols).
+                    WDJ::JsonArray arr;
+                    const float* p = &v._11;
+                    for (int i = 0; i < 20; ++i)
+                        arr.Append(WDJ::JsonValue::CreateNumberValue(p[i]));
+                    obj.SetNamedValue(L"value", arr);
+                }
+                else if constexpr (std::is_same_v<T, std::vector<float>>)
+                {
+                    WDJ::JsonArray arr;
+                    for (float f : v)
+                        arr.Append(WDJ::JsonValue::CreateNumberValue(f));
+                    obj.SetNamedValue(L"value", arr);
+                }
             }, value);
 
             return obj;
@@ -322,6 +338,23 @@ namespace ShaderLab::Graph
                     static_cast<float>(arr.GetNumberAt(3))
                 };
             }
+            if (type == L"matrix5x4")
+            {
+                D2D1_MATRIX_5X4_F m{};
+                float* p = &m._11;
+                uint32_t count = (std::min)(arr.Size(), 20u);
+                for (uint32_t i = 0; i < count; ++i)
+                    p[i] = static_cast<float>(arr.GetNumberAt(i));
+                return m;
+            }
+            if (type == L"floatarray")
+            {
+                std::vector<float> v;
+                v.reserve(arr.Size());
+                for (uint32_t i = 0; i < arr.Size(); ++i)
+                    v.push_back(static_cast<float>(arr.GetNumberAt(i)));
+                return v;
+            }
 
             throw std::invalid_argument("Unknown property type in JSON");
         }
@@ -361,6 +394,27 @@ namespace ShaderLab::Graph
                 obj.SetNamedValue(L"shaderPath", WDJ::JsonValue::CreateStringValue(node.shaderPath.value()));
             }
 
+            // Pins
+            WDJ::JsonArray inPins;
+            for (const auto& pin : node.inputPins)
+            {
+                WDJ::JsonObject p;
+                p.SetNamedValue(L"name", WDJ::JsonValue::CreateStringValue(pin.name));
+                p.SetNamedValue(L"index", WDJ::JsonValue::CreateNumberValue(pin.index));
+                inPins.Append(p);
+            }
+            obj.SetNamedValue(L"inputPins", inPins);
+
+            WDJ::JsonArray outPins;
+            for (const auto& pin : node.outputPins)
+            {
+                WDJ::JsonObject p;
+                p.SetNamedValue(L"name", WDJ::JsonValue::CreateStringValue(pin.name));
+                p.SetNamedValue(L"index", WDJ::JsonValue::CreateNumberValue(pin.index));
+                outPins.Append(p);
+            }
+            obj.SetNamedValue(L"outputPins", outPins);
+
             return obj;
         }
 
@@ -395,6 +449,30 @@ namespace ShaderLab::Graph
             if (obj.HasKey(L"shaderPath"))
             {
                 node.shaderPath = std::wstring(obj.GetNamedString(L"shaderPath"));
+            }
+
+            // Pins
+            {
+                auto arr = obj.GetNamedArray(L"inputPins");
+                for (uint32_t i = 0; i < arr.Size(); ++i)
+                {
+                    auto p = arr.GetObjectAt(i);
+                    node.inputPins.push_back({
+                        std::wstring(p.GetNamedString(L"name")),
+                        static_cast<uint32_t>(p.GetNamedNumber(L"index"))
+                    });
+                }
+            }
+            {
+                auto arr = obj.GetNamedArray(L"outputPins");
+                for (uint32_t i = 0; i < arr.Size(); ++i)
+                {
+                    auto p = arr.GetObjectAt(i);
+                    node.outputPins.push_back({
+                        std::wstring(p.GetNamedString(L"name")),
+                        static_cast<uint32_t>(p.GetNamedNumber(L"index"))
+                    });
+                }
             }
 
             node.dirty = true;

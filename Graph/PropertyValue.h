@@ -5,7 +5,8 @@
 namespace ShaderLab::Graph
 {
     // Variant type for node property values.
-    // Covers common D2D effect property types: scalars, vectors, colors, strings, enums.
+    // Covers common D2D effect property types: scalars, vectors, colors, strings,
+    // enums, 5×4 color matrices, and variable-length float arrays (LUTs).
     using PropertyValue = std::variant<
         float,
         int32_t,
@@ -14,7 +15,9 @@ namespace ShaderLab::Graph
         std::wstring,
         winrt::Windows::Foundation::Numerics::float2,
         winrt::Windows::Foundation::Numerics::float3,
-        winrt::Windows::Foundation::Numerics::float4
+        winrt::Windows::Foundation::Numerics::float4,
+        D2D1_MATRIX_5X4_F,
+        std::vector<float>
     >;
 
     // Human-readable tag for property type (used in JSON and UI).
@@ -31,6 +34,8 @@ namespace ShaderLab::Graph
             else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>) return L"float2";
             else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>) return L"float3";
             else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>) return L"float4";
+            else if constexpr (std::is_same_v<T, D2D1_MATRIX_5X4_F>) return L"matrix5x4";
+            else if constexpr (std::is_same_v<T, std::vector<float>>) return L"floatarray";
             else { static_assert(sizeof(T) == 0, "Unhandled PropertyValue type"); return L"unknown"; }
         }, value);
     }

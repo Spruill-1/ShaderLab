@@ -23,6 +23,17 @@ namespace winrt::ShaderLab::implementation
         MainWindow();
         ~MainWindow();
 
+        // XAML-bound event handlers (must be public for generated code).
+        void OnColumnSplitterPointerPressed(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnColumnSplitterPointerMoved(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnColumnSplitterPointerReleased(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+
     private:
         HWND GetWindowHandle();
         void InitializeRendering();
@@ -34,6 +45,9 @@ namespace winrt::ShaderLab::implementation
         void PopulateCompareNodeSelector();
         ID2D1Image* GetPreviewImage();
         ID2D1Image* ResolveDisplayImage(uint32_t nodeId);
+
+        // Returns the preview viewport size in DIPs (not physical pixels).
+        D2D1_SIZE_F PreviewViewportDips() const;
         void ApplyDisplayProfile(const ::ShaderLab::Rendering::DisplayProfile& profile);
         void RevertToLiveDisplay();
         void ResetAfterGraphLoad();
@@ -184,6 +198,8 @@ namespace winrt::ShaderLab::implementation
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
         void UpdatePropertiesPanel();
+        void ShowCurveEditorDialog(uint32_t nodeId, const std::wstring& propertyKey, std::function<void()> markDirty);
+        winrt::fire_and_forget BrowseImageForSourceNode(uint32_t nodeId);
         void OnSaveImageClicked(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
@@ -192,6 +208,37 @@ namespace winrt::ShaderLab::implementation
         uint32_t m_selectedNodeId{ 0 };
         bool m_isDraggingNode{ false };
         bool m_isDraggingConnection{ false };
+
+        // Column splitter drag state.
+        bool m_isDraggingSplitter{ false };
+        double m_splitterDragStartX{ 0 };
+        double m_splitterStartCol0Width{ 0 };
+        double m_splitterStartCol2Width{ 0 };
+
+        // Preview pan/zoom.
+        float m_previewPanX{ 0.0f };
+        float m_previewPanY{ 0.0f };
+        float m_previewZoom{ 1.0f };
+        bool m_isPreviewPanning{ false };
+        float m_previewPanStartX{ 0.0f };
+        float m_previewPanStartY{ 0.0f };
+        float m_previewPanOriginX{ 0.0f };
+        float m_previewPanOriginY{ 0.0f };
+        bool m_previewDragMoved{ false };
+        float m_traceClickDipX{ 0.0f };
+        float m_traceClickDipY{ 0.0f };
+        float m_traceClickPanX{ 0.0f };
+        float m_traceClickPanY{ 0.0f };
+        float m_traceClickZoom{ 1.0f };
+        void UpdateCrosshairOverlay();
+        void FitPreviewToView();
+
+        // Trace swatch HDR swap chain.
+        winrt::com_ptr<IDXGISwapChain1>   m_traceSwapChain;
+        winrt::com_ptr<ID2D1Bitmap1>      m_traceSwatchTarget;
+        uint32_t m_traceSwatchHeight{ 0 };
+        void InitializeTraceSwatchPanel();
+        void RenderTraceSwatches();
     };
 }
 

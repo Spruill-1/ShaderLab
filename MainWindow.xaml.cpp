@@ -36,14 +36,27 @@ namespace winrt::ShaderLab::implementation
 
         PreviewPanel().PointerPressed({ this, &MainWindow::OnPreviewPointerPressed });
         PreviewPanel().PointerReleased({ this, &MainWindow::OnPreviewPointerReleased });
+        PreviewPanel().PointerWheelChanged([this](auto&&, winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
+        {
+            auto point = args.GetCurrentPoint(PreviewPanel());
+            int delta = point.Properties().MouseWheelDelta();
+            float cursorX = static_cast<float>(point.Position().X);
+            float cursorY = static_cast<float>(point.Position().Y);
+
+            float zoomFactor = (delta > 0) ? 1.1f : (1.0f / 1.1f);
+            float newZoom = std::clamp(m_previewZoom * zoomFactor, 0.01f, 100.0f);
+
+            // Zoom centered on cursor position (DIP coordinates).
+            m_previewPanX = cursorX - (cursorX - m_previewPanX) * (newZoom / m_previewZoom);
+            m_previewPanY = cursorY - (cursorY - m_previewPanY) * (newZoom / m_previewZoom);
+            m_previewZoom = newZoom;
+            args.Handled(true);
+        });
         TraceUnitSelector().SelectedIndex(0);
         TraceUnitSelector().SelectionChanged({ this, &MainWindow::OnTraceUnitSelectionChanged });
 
         SaveGraphButton().Click({ this, &MainWindow::OnSaveGraphClicked });
         LoadGraphButton().Click({ this, &MainWindow::OnLoadGraphClicked });
-        AddImageSourceButton().Click({ this, &MainWindow::OnAddImageSourceClicked });
-        AddFloodSourceButton().Click({ this, &MainWindow::OnAddFloodSourceClicked });
-
         // Populate the Add Node flyout with effects from the registry.
         PopulateAddNodeFlyout();
 
@@ -77,6 +90,17 @@ namespace winrt::ShaderLab::implementation
                 m_nodeGraphController.RebuildLayout();
                 PopulatePreviewNodeSelector();
                 UpdatePropertiesPanel();
+
+                // Reset preview to Output node.
+                for (const auto& n : m_graph.Nodes())
+                {
+                    if (n.type == ::ShaderLab::Graph::NodeType::Output)
+                    {
+                        m_previewNodeId = n.id;
+                        break;
+                    }
+                }
+                PreviewOverlayBorder().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
                 args.Handled(true);
             }
         });
@@ -317,6 +341,7 @@ namespace winrt::ShaderLab::implementation
         if (idx >= 0 && static_cast<uint32_t>(idx) < m_topoOrder.size())
         {
             m_previewNodeId = m_topoOrder[static_cast<uint32_t>(idx)];
+            FitPreviewToView();
         }
 
         // Update overlay text.
@@ -645,6 +670,7 @@ namespace winrt::ShaderLab::implementation
         PixelTracePanel().Children().Clear();
         TracePositionText().Text(L"Click preview to trace a pixel");
 
+        FitPreviewToView();
         UpdateStatusBar();
     }
 
@@ -659,6 +685,8 @@ namespace winrt::ShaderLab::implementation
 
         auto& registry = ::ShaderLab::Effects::EffectRegistry::Instance();
         auto categories = registry.Categories();
+
+        winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutSubItem sourceSubItem{ nullptr };
 
         for (const auto& cat : categories)
         {
@@ -682,7 +710,36 @@ namespace winrt::ShaderLab::implementation
             }
 
             flyout.Items().Append(subItem);
+
+            if (cat == L"Source")
+                sourceSubItem = subItem;
         }
+
+        // Append Image and Flood sources to the Source category.
+        if (!sourceSubItem)
+        {
+            sourceSubItem = winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutSubItem();
+            sourceSubItem.Text(L"Source");
+            flyout.Items().Append(sourceSubItem);
+        }
+
+        auto imageSourceItem = winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutItem();
+        imageSourceItem.Text(L"Image Source");
+        imageSourceItem.Click([this](auto&&, auto&&)
+        {
+            auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateImageSourceNode(L"", L"Image Source");
+            auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
+            OnNodeAdded(nodeId);
+        });
+        sourceSubItem.Items().Append(imageSourceItem);
+
+        auto floodSourceItem = winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutItem();
+        floodSourceItem.Text(L"Flood Fill (Solid Color)");
+        floodSourceItem.Click([this](auto&&, auto&&)
+        {
+            OnAddFloodSourceClicked(nullptr, nullptr);
+        });
+        sourceSubItem.Items().Append(floodSourceItem);
     }
 
     void MainWindow::OnAddEffectNode(const ::ShaderLab::Effects::EffectDescriptor& desc)
@@ -796,6 +853,14 @@ namespace winrt::ShaderLab::implementation
         const auto* node = m_graph.FindNode(nodeId);
         if (!node || !node->cachedOutput) return nullptr;
 
+        // Don't render effects that have required inputs but none connected.
+        if (!node->inputPins.empty())
+        {
+            auto inputs = m_graph.GetInputEdges(nodeId);
+            if (inputs.empty())
+                return nullptr;
+        }
+
         ID2D1Image* image = node->cachedOutput;
 
         // Apply tone mapping only for the Output node.
@@ -821,6 +886,11 @@ namespace winrt::ShaderLab::implementation
             PopulateCompareNodeSelector();
             CompareToolbar().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
             m_splitPosition = 0.5f;
+
+            // Set compare node from the selector (event was suppressed during populate).
+            auto idx = CompareNodeSelector().SelectedIndex();
+            if (idx >= 0 && static_cast<uint32_t>(idx) < m_topoOrder.size())
+                m_compareNodeId = m_topoOrder[static_cast<uint32_t>(idx)];
         }
         else
         {
@@ -846,13 +916,11 @@ namespace winrt::ShaderLab::implementation
         if (!m_isDraggingSplit || !m_compareActive) return;
 
         auto point = args.GetCurrentPoint(PreviewPanel());
-        auto scale = PreviewPanel().CompositionScaleX();
-        float px = static_cast<float>(point.Position().X) * scale;
+        float px = static_cast<float>(point.Position().X);
 
-        auto bounds = GetPreviewImageBounds();
-        float imgW = bounds.right - bounds.left;
-        if (imgW > 0.0f)
-            m_splitPosition = std::clamp((px - bounds.left) / imgW, 0.0f, 1.0f);
+        float vpW = PreviewViewportDips().width;
+        if (vpW > 0.0f)
+            m_splitPosition = std::clamp(px / vpW, 0.0f, 1.0f);
 
         args.Handled(true);
     }
@@ -861,6 +929,47 @@ namespace winrt::ShaderLab::implementation
         winrt::Windows::Foundation::IInspectable const& /*sender*/,
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
+        if (m_isPreviewPanning)
+        {
+            bool wasClick = !m_previewDragMoved;
+            m_isPreviewPanning = false;
+            PreviewPanel().ReleasePointerCapture(args.Pointer());
+
+            // If it was a click (no drag), trigger pixel trace.
+            if (wasClick)
+            {
+                auto point = args.GetCurrentPoint(PreviewPanel());
+                m_traceClickDipX = static_cast<float>(point.Position().X);
+                m_traceClickDipY = static_cast<float>(point.Position().Y);
+                m_traceClickPanX = m_previewPanX;
+                m_traceClickPanY = m_previewPanY;
+                m_traceClickZoom = m_previewZoom;
+
+                float normX = 0, normY = 0;
+                if (PointerToImageCoords(args, normX, normY))
+                {
+                    m_pixelTrace.SetTrackPosition(normX, normY);
+                    m_traceActive = true;
+                    m_lastTraceTopologyHash = 0;
+
+                    auto imgBounds = GetPreviewImageBounds();
+                    float dpiScale = (std::max)(1.0f, PreviewPanel().CompositionScaleX());
+                    float imgDipX = (m_traceClickDipX - m_previewPanX) / m_previewZoom;
+                    float imgDipY = (m_traceClickDipY - m_previewPanY) / m_previewZoom;
+                    float iW = imgBounds.right - imgBounds.left;
+                    float iH = imgBounds.bottom - imgBounds.top;
+                    if (iW <= 0 || iW > 100000.0f) { auto vp = PreviewViewportDips(); iW = vp.width; }
+                    if (iH <= 0 || iH > 100000.0f) { auto vp = PreviewViewportDips(); iH = vp.height; }
+                    // Display position in actual image pixels (context DIPs * DPI scale).
+                    uint32_t px = static_cast<uint32_t>(normX * iW * dpiScale);
+                    uint32_t py = static_cast<uint32_t>(normY * iH * dpiScale);
+                    TracePositionText().Text(std::format(L"Position: ({}, {})", px, py));
+
+                    PopulatePixelTraceTree();
+                    UpdateCrosshairOverlay();
+                }
+            }
+        }
         if (m_isDraggingSplit)
         {
             m_isDraggingSplit = false;
@@ -872,6 +981,18 @@ namespace winrt::ShaderLab::implementation
     // Pixel trace
     // -----------------------------------------------------------------------
 
+    D2D1_SIZE_F MainWindow::PreviewViewportDips() const
+    {
+        // The preview renders at 96 DPI, so the D2D viewport matches WinUI DIPs.
+        // Use the panel's actual size (which is in WinUI DIPs).
+        auto panel = const_cast<MainWindow*>(this)->PreviewPanel();
+        float w = static_cast<float>(panel.ActualWidth());
+        float h = static_cast<float>(panel.ActualHeight());
+        if (w <= 0) w = static_cast<float>(m_renderEngine.BackBufferWidth());
+        if (h <= 0) h = static_cast<float>(m_renderEngine.BackBufferHeight());
+        return { w, h };
+    }
+
     D2D1_RECT_F MainWindow::GetPreviewImageBounds()
     {
         auto* previewImage = GetPreviewImage();
@@ -880,8 +1001,15 @@ namespace winrt::ShaderLab::implementation
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) return {};
 
+        // Get bounds at 96 DPI to match the preview rendering DPI.
+        float oldDpiX, oldDpiY;
+        dc->GetDpi(&oldDpiX, &oldDpiY);
+        dc->SetDpi(96.0f, 96.0f);
+
         D2D1_RECT_F bounds{};
         HRESULT hr = dc->GetImageLocalBounds(previewImage, &bounds);
+
+        dc->SetDpi(oldDpiX, oldDpiY);
         if (FAILED(hr)) return {};
         return bounds;
     }
@@ -891,17 +1019,34 @@ namespace winrt::ShaderLab::implementation
         float& outNormX, float& outNormY)
     {
         auto point = args.GetCurrentPoint(PreviewPanel());
-        auto scale = PreviewPanel().CompositionScaleX();
-        float px = static_cast<float>(point.Position().X) * scale;
-        float py = static_cast<float>(point.Position().Y) * scale;
+        float px = static_cast<float>(point.Position().X);
+        float py = static_cast<float>(point.Position().Y);
 
+        // Invert the preview pan/zoom to get D2D image-space coordinates (context DIPs).
+        float imgDipX = (px - m_previewPanX) / m_previewZoom;
+        float imgDipY = (py - m_previewPanY) / m_previewZoom;
+
+        // The image is drawn at identity in D2D's DIP space via the preview transform.
+        // GetImageLocalBounds returns bounds in context DIPs (accounting for image DPI
+        // vs context DPI). The source rect in ReadPixel also operates in context DIPs.
+        // So we normalize by context DIP bounds.
         auto bounds = GetPreviewImageBounds();
         float imgW = bounds.right - bounds.left;
         float imgH = bounds.bottom - bounds.top;
-        if (imgW <= 0.0f || imgH <= 0.0f) return false;
 
-        outNormX = std::clamp((px - bounds.left) / imgW, 0.0f, 1.0f);
-        outNormY = std::clamp((py - bounds.top) / imgH, 0.0f, 1.0f);
+        // For infinite/huge images, fall back to viewport dimensions.
+        if (imgW <= 0 || imgH <= 0 || imgW > 100000.0f || imgH > 100000.0f)
+        {
+            auto vp = PreviewViewportDips();
+            imgW = vp.width;
+            imgH = vp.height;
+            bounds = { 0, 0, imgW, imgH };
+        }
+
+        if (imgW <= 0 || imgH <= 0) return false;
+
+        outNormX = std::clamp((imgDipX - bounds.left) / imgW, 0.0f, 1.0f);
+        outNormY = std::clamp((imgDipY - bounds.top) / imgH, 0.0f, 1.0f);
         return true;
     }
 
@@ -909,31 +1054,20 @@ namespace winrt::ShaderLab::implementation
         winrt::Windows::Foundation::IInspectable const& /*sender*/,
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
-        float normX = 0, normY = 0;
-        if (!PointerToImageCoords(args, normX, normY))
-            return;
+        auto point = args.GetCurrentPoint(PreviewPanel());
 
-        // Check if clicking near the split line (within 2% of image width).
-        if (m_compareActive && std::abs(normX - m_splitPosition) < 0.02f)
+        // Left or middle button → start pan (click without drag triggers pixel trace on release).
+        if (point.Properties().IsMiddleButtonPressed() || point.Properties().IsLeftButtonPressed())
         {
-            m_isDraggingSplit = true;
+            m_isPreviewPanning = true;
+            m_previewPanStartX = static_cast<float>(point.Position().X);
+            m_previewPanStartY = static_cast<float>(point.Position().Y);
+            m_previewPanOriginX = m_previewPanX;
+            m_previewPanOriginY = m_previewPanY;
+            m_previewDragMoved = false;
             PreviewPanel().CapturePointer(args.Pointer());
             args.Handled(true);
-            return;
         }
-
-        m_pixelTrace.SetTrackPosition(normX, normY);
-        m_traceActive = true;
-        m_lastTraceTopologyHash = 0;  // force full rebuild
-
-        auto bounds = GetPreviewImageBounds();
-        uint32_t imgW = static_cast<uint32_t>(bounds.right - bounds.left);
-        uint32_t imgH = static_cast<uint32_t>(bounds.bottom - bounds.top);
-        uint32_t px = static_cast<uint32_t>(normX * imgW);
-        uint32_t py = static_cast<uint32_t>(normY * imgH);
-
-        TracePositionText().Text(std::format(L"Position: ({}, {})", px, py));
-        PopulatePixelTraceTree();
     }
 
     void MainWindow::OnTraceUnitSelectionChanged(
@@ -1005,17 +1139,61 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(label, 0);
         row.Children().Append(label);
 
-        // Luminance column (always visible).
+        // Luminance column.
         auto lumText = winrt::Microsoft::UI::Xaml::Controls::TextBlock();
         lumText.Text(std::format(L"{:.1f} cd/m\u00B2", traceNode.pixel.luminanceNits));
         lumText.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Cascadia Mono, Consolas, Courier New"));
         lumText.FontSize(12);
-        lumText.Margin({ 12, 0, 0, 0 });
+        lumText.Margin({ 8, 0, 0, 0 });
         lumText.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Top);
         winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(lumText, 1);
         row.Children().Append(lumText);
 
         return row;
+    }
+
+    void MainWindow::UpdateCrosshairOverlay()
+    {
+        auto canvas = CrosshairCanvas();
+        canvas.Children().Clear();
+
+        // Only show crosshair when Pixel Trace tab is active.
+        if (!m_traceActive || BottomTabView().SelectedIndex() != 2)
+            return;
+
+        // Compute the image-space point from the click position and the transform at click time,
+        // then project it back to screen space using the CURRENT transform.
+        // This makes the crosshair track 1:1 with the image during pan/zoom.
+        float imgSpaceX = (m_traceClickDipX - m_traceClickPanX) / m_traceClickZoom;
+        float imgSpaceY = (m_traceClickDipY - m_traceClickPanY) / m_traceClickZoom;
+        float cx = imgSpaceX * m_previewZoom + m_previewPanX;
+        float cy = imgSpaceY * m_previewZoom + m_previewPanY;
+        float arm = 16.0;
+        float gap = 4.0;
+
+        auto makeLine = [&](float x1, float y1, float x2, float y2,
+            winrt::Windows::UI::Color color, double thickness)
+        {
+            auto line = winrt::Microsoft::UI::Xaml::Shapes::Line();
+            line.X1(x1); line.Y1(y1); line.X2(x2); line.Y2(y2);
+            line.Stroke(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(color));
+            line.StrokeThickness(thickness);
+            canvas.Children().Append(line);
+        };
+
+        winrt::Windows::UI::Color black{ 230, 0, 0, 0 };
+        winrt::Windows::UI::Color white{ 230, 255, 255, 255 };
+
+        // Black outline.
+        makeLine(cx - arm, cy, cx - gap, cy, black, 3.0);
+        makeLine(cx + gap, cy, cx + arm, cy, black, 3.0);
+        makeLine(cx, cy - arm, cx, cy - gap, black, 3.0);
+        makeLine(cx, cy + gap, cx, cy + arm, black, 3.0);
+        // White fill.
+        makeLine(cx - arm, cy, cx - gap, cy, white, 1.5);
+        makeLine(cx + gap, cy, cx + arm, cy, white, 1.5);
+        makeLine(cx, cy - arm, cx, cy - gap, white, 1.5);
+        makeLine(cx, cy + gap, cx, cy + arm, white, 1.5);
     }
 
     void MainWindow::PopulatePixelTraceTree()
@@ -1025,12 +1203,22 @@ namespace winrt::ShaderLab::implementation
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) return;
 
+        // Use actual image dimensions in context DIPs for pixel coordinate mapping.
+        // DrawImage's sourceRectangle is in the same coordinate space as the D2D context.
         auto bounds = GetPreviewImageBounds();
-        uint32_t imgW = static_cast<uint32_t>(bounds.right - bounds.left);
-        uint32_t imgH = static_cast<uint32_t>(bounds.bottom - bounds.top);
-        if (imgW == 0 || imgH == 0) return;
+        float imgW = bounds.right - bounds.left;
+        float imgH = bounds.bottom - bounds.top;
+        if (imgW <= 0 || imgH <= 0 || imgW > 100000.0f || imgH > 100000.0f)
+        {
+            auto vp = PreviewViewportDips();
+            imgW = vp.width;
+            imgH = vp.height;
+        }
+        uint32_t traceW = static_cast<uint32_t>(imgW);
+        uint32_t traceH = static_cast<uint32_t>(imgH);
+        if (traceW == 0 || traceH == 0) return;
 
-        if (!m_pixelTrace.ReTrace(dc, m_graph, m_previewNodeId, imgW, imgH))
+        if (!m_pixelTrace.ReTrace(dc, m_graph, m_previewNodeId, traceW, traceH))
             return;
 
         auto topoHash = HashTraceTopology(m_pixelTrace.Root());
@@ -1104,6 +1292,22 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
         if (!m_renderEngine.IsInitialized()) return;
+
+        // Handle preview pan.
+        if (m_isPreviewPanning)
+        {
+            auto point = args.GetCurrentPoint(PreviewPanel());
+            float px = static_cast<float>(point.Position().X);
+            float py = static_cast<float>(point.Position().Y);
+            float dx = px - m_previewPanStartX;
+            float dy = py - m_previewPanStartY;
+            if (std::abs(dx) > 5.0f || std::abs(dy) > 5.0f)
+                m_previewDragMoved = true;
+            m_previewPanX = m_previewPanOriginX + dx;
+            m_previewPanY = m_previewPanOriginY + dy;
+            args.Handled(true);
+            return;
+        }
 
         // Handle split-line dragging.
         if (m_isDraggingSplit && m_compareActive)
@@ -1212,6 +1416,111 @@ namespace winrt::ShaderLab::implementation
         dc->CreateBitmapFromDxgiSurface(surface.get(), bmpProps, m_graphRenderTarget.put());
     }
 
+    void MainWindow::InitializeTraceSwatchPanel()
+    {
+        if (m_traceSwapChain || !m_renderEngine.DXGIFactory() || !m_renderEngine.D3DDevice())
+            return;
+
+        DXGI_SWAP_CHAIN_DESC1 desc{};
+        desc.Width = 28;
+        desc.Height = 600;
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc.SampleDesc.Count = 1;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.BufferCount = 2;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+
+        winrt::com_ptr<IDXGIDevice1> dxgiDevice;
+        m_renderEngine.D3DDevice()->QueryInterface(IID_PPV_ARGS(dxgiDevice.put()));
+
+        HRESULT hr = m_renderEngine.DXGIFactory()->CreateSwapChainForComposition(
+            dxgiDevice.get(), &desc, nullptr, m_traceSwapChain.put());
+        if (FAILED(hr)) return;
+
+        auto panelNative = TraceSwatchPanel().as<ISwapChainPanelNative>();
+        panelNative->SetSwapChain(m_traceSwapChain.get());
+
+        // Set scRGB color space for HDR rendering.
+        winrt::com_ptr<IDXGISwapChain3> sc3;
+        m_traceSwapChain.as(sc3);
+        if (sc3)
+            sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+
+        m_traceSwatchHeight = 600;
+
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        winrt::com_ptr<IDXGISurface> surface;
+        m_traceSwapChain->GetBuffer(0, IID_PPV_ARGS(surface.put()));
+
+        D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(DXGI_FORMAT_R16G16B16A16_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        dc->CreateBitmapFromDxgiSurface(surface.get(), bmpProps, m_traceSwatchTarget.put());
+    }
+
+    void MainWindow::RenderTraceSwatches()
+    {
+        if (!m_traceActive || !m_pixelTrace.HasTrace())
+            return;
+
+        if (!m_traceSwapChain)
+            InitializeTraceSwatchPanel();
+        if (!m_traceSwapChain || !m_traceSwatchTarget)
+            return;
+
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (!dc) return;
+
+        winrt::com_ptr<ID2D1Image> oldTarget;
+        dc->GetTarget(oldTarget.put());
+
+        float oldDpiX, oldDpiY;
+        dc->GetDpi(&oldDpiX, &oldDpiY);
+        dc->SetDpi(96.0f, 96.0f);
+
+        dc->SetTarget(m_traceSwatchTarget.get());
+        dc->BeginDraw();
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+        // Walk the trace tree and render swatches at approximate row positions.
+        float y = 4.0f;
+        constexpr float swatchSize = 20.0f;
+        constexpr float rowHeight = 40.0f;
+
+        std::function<void(const ::ShaderLab::Controls::PixelTraceNode&, int)> drawSwatches;
+        drawSwatches = [&](const ::ShaderLab::Controls::PixelTraceNode& node, int depth)
+        {
+            // scRGB color: 1.0 = 80 nits SDR white. Values > 1.0 = HDR.
+            D2D1_COLOR_F color = {
+                node.pixel.scR, node.pixel.scG, node.pixel.scB, 1.0f
+            };
+
+            winrt::com_ptr<ID2D1SolidColorBrush> brush;
+            dc->CreateSolidColorBrush(color, brush.put());
+            if (brush)
+            {
+                D2D1_ROUNDED_RECT rr = {
+                    { 4.0f, y, 4.0f + swatchSize, y + swatchSize },
+                    3.0f, 3.0f
+                };
+                dc->FillRoundedRectangle(rr, brush.get());
+            }
+            y += rowHeight;
+
+            for (const auto& child : node.inputs)
+                drawSwatches(child, depth + 1);
+        };
+
+        drawSwatches(m_pixelTrace.Root(), 0);
+
+        dc->EndDraw();
+        dc->SetTarget(oldTarget.get());
+        dc->SetDpi(oldDpiX, oldDpiY);
+
+        m_traceSwapChain->Present(0, 0);
+    }
+
     void MainWindow::RenderNodeGraph()
     {
         if (!m_graphSwapChain || !m_graphRenderTarget)
@@ -1223,6 +1532,13 @@ namespace winrt::ShaderLab::implementation
         winrt::com_ptr<ID2D1Image> oldTarget;
         dc->GetTarget(oldTarget.put());
 
+        // The graph swap chain is sized in DIPs (not physical pixels), so
+        // render at 96 DPI so D2D coordinates match the DIP-based pointer
+        // input.  The XAML compositor handles scaling to physical pixels.
+        float oldDpiX, oldDpiY;
+        dc->GetDpi(&oldDpiX, &oldDpiY);
+        dc->SetDpi(96.0f, 96.0f);
+
         dc->SetTarget(m_graphRenderTarget.get());
         dc->BeginDraw();
         dc->Clear(D2D1::ColorF(0x1e1e1e));
@@ -1233,6 +1549,9 @@ namespace winrt::ShaderLab::implementation
 
         dc->EndDraw();
         dc->SetTarget(oldTarget.get());
+
+        dc->SetDpi(oldDpiX, oldDpiY);
+
         m_graphSwapChain->Present(0, 0);
     }
 
@@ -1289,6 +1608,7 @@ namespace winrt::ShaderLab::implementation
 
             // Preview follows selection.
             m_previewNodeId = hitNodeId;
+            FitPreviewToView();
             m_suppressSelectorEvent = true;
             for (uint32_t i = 0; i < m_topoOrder.size(); ++i)
             {
@@ -1314,10 +1634,36 @@ namespace winrt::ShaderLab::implementation
         }
         else
         {
-            // Clicked empty space — deselect.
+            // Clicked empty space — deselect and reset preview to Output node.
             m_nodeGraphController.DeselectAll();
             m_selectedNodeId = 0;
             UpdatePropertiesPanel();
+
+            // Find the Output node and preview it.
+            uint32_t outputId = 0;
+            for (const auto& n : m_graph.Nodes())
+            {
+                if (n.type == ::ShaderLab::Graph::NodeType::Output)
+                {
+                    outputId = n.id;
+                    break;
+                }
+            }
+            if (outputId != 0)
+            {
+                m_previewNodeId = outputId;
+                m_suppressSelectorEvent = true;
+                for (uint32_t i = 0; i < m_topoOrder.size(); ++i)
+                {
+                    if (m_topoOrder[i] == outputId)
+                    {
+                        PreviewNodeSelector().SelectedIndex(static_cast<int32_t>(i));
+                        break;
+                    }
+                }
+                m_suppressSelectorEvent = false;
+            }
+            PreviewOverlayBorder().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
         }
         args.Handled(true);
     }
@@ -1367,15 +1713,19 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::UpdatePropertiesPanel()
     {
+        namespace Controls = winrt::Microsoft::UI::Xaml::Controls;
+        namespace Media = winrt::Microsoft::UI::Xaml::Media;
+        using ::ShaderLab::Effects::PropertyUIHint;
+        using ::ShaderLab::Effects::PropertyMetadata;
+
         auto panel = PropertiesPanel();
         panel.Children().Clear();
 
         if (m_selectedNodeId == 0)
         {
-            auto placeholder = winrt::Microsoft::UI::Xaml::Controls::TextBlock();
+            auto placeholder = Controls::TextBlock();
             placeholder.Text(L"Select a node to view its properties.");
-            placeholder.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(
-                winrt::Microsoft::UI::Colors::Gray()));
+            placeholder.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::Gray()));
             panel.Children().Append(placeholder);
             return;
         }
@@ -1383,22 +1733,21 @@ namespace winrt::ShaderLab::implementation
         auto* node = m_graph.FindNode(m_selectedNodeId);
         if (!node) return;
 
-        // Editable node name.
-        auto nameLabel = winrt::Microsoft::UI::Xaml::Controls::TextBlock();
+        uint32_t capturedId = m_selectedNodeId;
+
+        // ---- Node name (editable) ----
+        auto nameLabel = Controls::TextBlock();
         nameLabel.Text(L"Name");
         nameLabel.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
         panel.Children().Append(nameLabel);
 
-        auto nameBox = winrt::Microsoft::UI::Xaml::Controls::TextBox();
+        auto nameBox = Controls::TextBox();
         nameBox.Text(winrt::hstring(node->name));
         nameBox.Margin({ 0, 2, 0, 8 });
-        uint32_t capturedId = m_selectedNodeId;
         nameBox.LostFocus([this, capturedId](auto&&, auto&&)
         {
-            // Find the TextBox that lost focus by looking up the node.
             auto* n = m_graph.FindNode(capturedId);
             if (!n) return;
-            // The name was already updated in TextChanged, just rebuild selectors.
             PopulatePreviewNodeSelector();
             m_nodeGraphController.RebuildLayout();
         });
@@ -1406,19 +1755,17 @@ namespace winrt::ShaderLab::implementation
         {
             auto* n = m_graph.FindNode(capturedId);
             if (!n) return;
-            // Read the current text from the sender — find our TextBox in the panel.
-            auto panel2 = PropertiesPanel();
-            if (panel2.Children().Size() > 1)
+            auto p = PropertiesPanel();
+            if (p.Children().Size() > 1)
             {
-                auto tb = panel2.Children().GetAt(1).try_as<winrt::Microsoft::UI::Xaml::Controls::TextBox>();
-                if (tb)
-                    n->name = std::wstring(tb.Text().c_str());
+                auto tb = p.Children().GetAt(1).try_as<Controls::TextBox>();
+                if (tb) n->name = std::wstring(tb.Text().c_str());
             }
         });
         panel.Children().Append(nameBox);
 
-        // Node type (read-only).
-        auto typeText = winrt::Microsoft::UI::Xaml::Controls::TextBlock();
+        // ---- Node type (read-only) ----
+        auto typeText = Controls::TextBlock();
         std::wstring typeStr;
         switch (node->type)
         {
@@ -1429,15 +1776,63 @@ namespace winrt::ShaderLab::implementation
         case ::ShaderLab::Graph::NodeType::Output:         typeStr = L"Output"; break;
         }
         typeText.Text(L"Type: " + typeStr);
-        typeText.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(
-            winrt::Microsoft::UI::Colors::Gray()));
+        typeText.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::Gray()));
         typeText.Margin({ 0, 0, 0, 8 });
         panel.Children().Append(typeText);
 
-        // Editable properties.
-        if (!node->properties.empty())
+        // ---- Image source: file path + Browse button ----
+        if (node->type == ::ShaderLab::Graph::NodeType::Source &&
+            !(node->effectClsid.has_value()))
         {
-            auto propsHeader = winrt::Microsoft::UI::Xaml::Controls::TextBlock();
+            auto pathLabel = Controls::TextBlock();
+            pathLabel.Text(L"Image Path");
+            pathLabel.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            pathLabel.Margin({ 0, 4, 0, 2 });
+            panel.Children().Append(pathLabel);
+
+            auto pathText = Controls::TextBlock();
+            pathText.Text(node->shaderPath.has_value() && !node->shaderPath.value().empty()
+                ? winrt::hstring(node->shaderPath.value())
+                : L"(no file selected)");
+            pathText.FontSize(12);
+            pathText.IsTextSelectionEnabled(true);
+            pathText.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::WrapWholeWords);
+            pathText.Foreground(Media::SolidColorBrush(
+                node->shaderPath.has_value() && !node->shaderPath.value().empty()
+                    ? winrt::Microsoft::UI::Colors::White()
+                    : winrt::Microsoft::UI::Colors::Gray()));
+            pathText.Margin({ 0, 0, 0, 4 });
+            panel.Children().Append(pathText);
+
+            auto browseBtn = Controls::Button();
+            browseBtn.Content(winrt::box_value(L"Browse..."));
+            browseBtn.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+            browseBtn.Margin({ 0, 0, 0, 8 });
+            browseBtn.Click([this, capturedId](auto&&, auto&&)
+            {
+                BrowseImageForSourceNode(capturedId);
+            });
+            panel.Children().Append(browseBtn);
+        }
+
+        // ---- Look up metadata from registry ----
+        const ::ShaderLab::Effects::EffectDescriptor* desc = nullptr;
+        if (node->type == ::ShaderLab::Graph::NodeType::BuiltInEffect && node->effectClsid.has_value())
+            desc = ::ShaderLab::Effects::EffectRegistry::Instance().FindByClsid(node->effectClsid.value());
+
+        // ---- Editable properties ----
+        if (node->properties.empty())
+        {
+            auto noProps = Controls::TextBlock();
+            noProps.Text(L"No editable properties.");
+            noProps.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::Gray()));
+            noProps.FontStyle(winrt::Windows::UI::Text::FontStyle::Italic);
+            noProps.Margin({ 0, 4, 0, 0 });
+            panel.Children().Append(noProps);
+        }
+        else
+        {
+            auto propsHeader = Controls::TextBlock();
             propsHeader.Text(L"Properties");
             propsHeader.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
             propsHeader.Margin({ 0, 4, 0, 4 });
@@ -1445,107 +1840,869 @@ namespace winrt::ShaderLab::implementation
 
             for (const auto& [key, value] : node->properties)
             {
-                auto propLabel = winrt::Microsoft::UI::Xaml::Controls::TextBlock();
+                // Resolve metadata for this property.
+                const PropertyMetadata* meta = nullptr;
+                if (desc)
+                {
+                    auto it = desc->propertyMetadata.find(key);
+                    if (it != desc->propertyMetadata.end())
+                        meta = &it->second;
+                }
+
+                auto propLabel = Controls::TextBlock();
                 propLabel.Text(winrt::hstring(key));
                 propLabel.FontSize(12);
-                propLabel.Margin({ 0, 4, 0, 2 });
+                propLabel.Margin({ 0, 6, 0, 2 });
                 panel.Children().Append(propLabel);
 
-                std::wstring valStr = std::visit([](const auto& v) -> std::wstring
-                {
-                    using T = std::decay_t<decltype(v)>;
-                    if constexpr (std::is_same_v<T, float>)
-                        return std::format(L"{:.4f}", v);
-                    else if constexpr (std::is_same_v<T, int32_t>)
-                        return std::to_wstring(v);
-                    else if constexpr (std::is_same_v<T, uint32_t>)
-                        return std::to_wstring(v);
-                    else if constexpr (std::is_same_v<T, bool>)
-                        return v ? L"true" : L"false";
-                    else if constexpr (std::is_same_v<T, std::wstring>)
-                        return v;
-                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
-                        return std::format(L"{:.3f}, {:.3f}", v.x, v.y);
-                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
-                        return std::format(L"{:.3f}, {:.3f}, {:.3f}", v.x, v.y, v.z);
-                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
-                        return std::format(L"{:.3f}, {:.3f}, {:.3f}, {:.3f}", v.x, v.y, v.z, v.w);
-                    else
-                        return L"<unknown>";
-                }, value);
-
-                auto propBox = winrt::Microsoft::UI::Xaml::Controls::TextBox();
-                propBox.Text(winrt::hstring(valStr));
-                propBox.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(
-                    L"Cascadia Mono, Consolas, Courier New"));
-                propBox.FontSize(12);
-                propBox.Margin({ 0, 0, 0, 4 });
-
                 auto capturedKey = key;
-                propBox.LostFocus([this, capturedId, capturedKey](auto&& sender, auto&&)
+
+                // Lambda to mark the node dirty after a property change.
+                auto markDirty = [this, capturedId]()
                 {
                     auto* n = m_graph.FindNode(capturedId);
-                    if (!n) return;
-                    auto it = n->properties.find(capturedKey);
-                    if (it == n->properties.end()) return;
+                    if (n) { n->dirty = true; m_graph.MarkAllDirty(); }
+                };
 
-                    auto tb = sender.as<winrt::Microsoft::UI::Xaml::Controls::TextBox>();
-                    auto text = std::wstring(tb.Text().c_str());
+                // ---- Dispatch by variant type + metadata hint ----
+                std::visit([&](const auto& v)
+                {
+                    using T = std::decay_t<decltype(v)>;
 
-                    try
+                    if constexpr (std::is_same_v<T, bool>)
                     {
-                        std::visit([&text](auto& v)
+                        // Checkbox / ToggleSwitch
+                        auto toggle = Controls::ToggleSwitch();
+                        toggle.IsOn(v);
+                        toggle.OnContent(winrt::box_value(L"True"));
+                        toggle.OffContent(winrt::box_value(L"False"));
+                        toggle.Margin({ 0, 0, 0, 4 });
+                        toggle.Toggled([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
                         {
-                            using T = std::decay_t<decltype(v)>;
-                            if constexpr (std::is_same_v<T, float>)
-                                v = std::stof(text);
-                            else if constexpr (std::is_same_v<T, int32_t>)
-                                v = std::stoi(text);
-                            else if constexpr (std::is_same_v<T, uint32_t>)
-                                v = static_cast<uint32_t>(std::stoul(text));
-                            else if constexpr (std::is_same_v<T, bool>)
-                                v = (text == L"true" || text == L"1");
-                            else if constexpr (std::is_same_v<T, std::wstring>)
-                                v = text;
-                            else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
-                            {
-                                float a, b, c, d;
-                                if (swscanf_s(text.c_str(), L"%f, %f, %f, %f", &a, &b, &c, &d) == 4)
-                                    v = { a, b, c, d };
-                            }
-                            else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
-                            {
-                                float a, b, c;
-                                if (swscanf_s(text.c_str(), L"%f, %f, %f", &a, &b, &c) == 3)
-                                    v = { a, b, c };
-                            }
-                            else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
-                            {
-                                float a, b;
-                                if (swscanf_s(text.c_str(), L"%f, %f", &a, &b) == 2)
-                                    v = { a, b };
-                            }
-                        }, it->second);
-
-                        n->dirty = true;
-                        m_graph.MarkAllDirty();
+                            auto* n = m_graph.FindNode(capturedId);
+                            if (!n) return;
+                            auto it = n->properties.find(capturedKey);
+                            if (it == n->properties.end()) return;
+                            auto ts = sender.template as<Controls::ToggleSwitch>();
+                            it->second = ts.IsOn();
+                            markDirty();
+                        });
+                        panel.Children().Append(toggle);
                     }
-                    catch (...) { /* invalid input, ignore */ }
-                });
+                    else if constexpr (std::is_same_v<T, uint32_t>)
+                    {
+                        if (meta && meta->uiHint == PropertyUIHint::ComboBox && !meta->enumLabels.empty())
+                        {
+                            // ComboBox for enum values.
+                            auto combo = Controls::ComboBox();
+                            for (const auto& label : meta->enumLabels)
+                                combo.Items().Append(winrt::box_value(winrt::hstring(label)));
+                            if (v < meta->enumLabels.size())
+                                combo.SelectedIndex(static_cast<int32_t>(v));
+                            combo.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+                            combo.Margin({ 0, 0, 0, 4 });
+                            combo.SelectionChanged([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                            {
+                                auto* n = m_graph.FindNode(capturedId);
+                                if (!n) return;
+                                auto it = n->properties.find(capturedKey);
+                                if (it == n->properties.end()) return;
+                                auto cb = sender.template as<Controls::ComboBox>();
+                                int32_t idx = cb.SelectedIndex();
+                                if (idx >= 0)
+                                {
+                                    it->second = static_cast<uint32_t>(idx);
+                                    markDirty();
+                                }
+                            });
+                            panel.Children().Append(combo);
+                        }
+                        else
+                        {
+                            // Slider for uint32 with range, or NumberBox fallback.
+                            float minV = meta ? meta->minValue : 0.0f;
+                            float maxV = meta ? meta->maxValue : 100.0f;
+                            float stepV = meta ? meta->step : 1.0f;
+                            auto nb = Controls::NumberBox();
+                            nb.Value(static_cast<double>(v));
+                            nb.Minimum(minV);
+                            nb.Maximum(maxV);
+                            nb.SmallChange(stepV);
+                            nb.LargeChange(stepV * 10.0);
+                            nb.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Inline);
+                            nb.Margin({ 0, 0, 0, 4 });
+                            nb.ValueChanged([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                            {
+                                auto* n = m_graph.FindNode(capturedId);
+                                if (!n) return;
+                                auto it = n->properties.find(capturedKey);
+                                if (it == n->properties.end()) return;
+                                auto box = sender.template as<Controls::NumberBox>();
+                                double val = box.Value();
+                                if (!std::isnan(val))
+                                {
+                                    it->second = static_cast<uint32_t>(val);
+                                    markDirty();
+                                }
+                            });
+                            panel.Children().Append(nb);
+                        }
+                    }
+                    else if constexpr (std::is_same_v<T, float>)
+                    {
+                        bool useSlider = meta && meta->uiHint == PropertyUIHint::Slider;
+                        float minV = meta ? meta->minValue : -FLT_MAX;
+                        float maxV = meta ? meta->maxValue : FLT_MAX;
+                        float stepV = meta ? meta->step : 0.01f;
 
-                panel.Children().Append(propBox);
+                        if (useSlider)
+                        {
+                            // Slider + NumberBox pair for ranged floats.
+                            // Shared flag prevents re-entrant sync loops.
+                            auto syncing = std::make_shared<bool>(false);
+
+                            auto slider = Controls::Slider();
+                            slider.Minimum(minV);
+                            slider.Maximum(maxV);
+                            slider.StepFrequency(stepV);
+                            slider.Value(static_cast<double>(v));
+                            slider.Margin({ 0, 0, 0, 0 });
+
+                            auto nb = Controls::NumberBox();
+                            nb.Value(static_cast<double>(v));
+                            nb.Minimum(minV);
+                            nb.Maximum(maxV);
+                            nb.SmallChange(stepV);
+                            nb.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
+                            nb.Margin({ 0, 0, 0, 4 });
+
+                            // Slider → NumberBox sync.
+                            slider.ValueChanged([nb, syncing, this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                            {
+                                if (*syncing) return;
+                                *syncing = true;
+                                auto sl = sender.template as<Controls::Slider>();
+                                nb.Value(sl.Value());
+                                auto* n = m_graph.FindNode(capturedId);
+                                if (n)
+                                {
+                                    auto it = n->properties.find(capturedKey);
+                                    if (it != n->properties.end())
+                                    {
+                                        it->second = static_cast<float>(sl.Value());
+                                        markDirty();
+                                    }
+                                }
+                                *syncing = false;
+                            });
+
+                            // NumberBox → Slider sync.
+                            nb.ValueChanged([slider, syncing, this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                            {
+                                if (*syncing) return;
+                                *syncing = true;
+                                auto box = sender.template as<Controls::NumberBox>();
+                                double val = box.Value();
+                                if (!std::isnan(val))
+                                {
+                                    slider.Value(val);
+                                    auto* n = m_graph.FindNode(capturedId);
+                                    if (n)
+                                    {
+                                        auto it = n->properties.find(capturedKey);
+                                        if (it != n->properties.end())
+                                        {
+                                            it->second = static_cast<float>(val);
+                                            markDirty();
+                                        }
+                                    }
+                                }
+                                *syncing = false;
+                            });
+
+                            panel.Children().Append(slider);
+                            panel.Children().Append(nb);
+                        }
+                        else
+                        {
+                            // NumberBox only.
+                            auto nb = Controls::NumberBox();
+                            nb.Value(static_cast<double>(v));
+                            nb.SmallChange(stepV);
+                            nb.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Inline);
+                            nb.Margin({ 0, 0, 0, 4 });
+                            nb.ValueChanged([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                            {
+                                auto* n = m_graph.FindNode(capturedId);
+                                if (!n) return;
+                                auto it = n->properties.find(capturedKey);
+                                if (it == n->properties.end()) return;
+                                auto box = sender.template as<Controls::NumberBox>();
+                                double val = box.Value();
+                                if (!std::isnan(val))
+                                {
+                                    it->second = static_cast<float>(val);
+                                    markDirty();
+                                }
+                            });
+                            panel.Children().Append(nb);
+                        }
+                    }
+                    else if constexpr (std::is_same_v<T, int32_t>)
+                    {
+                        float minV = meta ? meta->minValue : static_cast<float>(INT_MIN);
+                        float maxV = meta ? meta->maxValue : static_cast<float>(INT_MAX);
+                        float stepV = meta ? meta->step : 1.0f;
+                        auto nb = Controls::NumberBox();
+                        nb.Value(static_cast<double>(v));
+                        nb.Minimum(minV);
+                        nb.Maximum(maxV);
+                        nb.SmallChange(stepV);
+                        nb.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Inline);
+                        nb.Margin({ 0, 0, 0, 4 });
+                        nb.ValueChanged([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                        {
+                            auto* n = m_graph.FindNode(capturedId);
+                            if (!n) return;
+                            auto it = n->properties.find(capturedKey);
+                            if (it == n->properties.end()) return;
+                            auto box = sender.template as<Controls::NumberBox>();
+                            double val = box.Value();
+                            if (!std::isnan(val))
+                            {
+                                it->second = static_cast<int32_t>(val);
+                                markDirty();
+                            }
+                        });
+                        panel.Children().Append(nb);
+                    }
+                    else if constexpr (std::is_same_v<T, std::wstring>)
+                    {
+                        auto tb = Controls::TextBox();
+                        tb.Text(winrt::hstring(v));
+                        tb.Margin({ 0, 0, 0, 4 });
+                        tb.LostFocus([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                        {
+                            auto* n = m_graph.FindNode(capturedId);
+                            if (!n) return;
+                            auto it = n->properties.find(capturedKey);
+                            if (it == n->properties.end()) return;
+                            auto box = sender.template as<Controls::TextBox>();
+                            it->second = std::wstring(box.Text().c_str());
+                            markDirty();
+                        });
+                        panel.Children().Append(tb);
+                    }
+                    else if constexpr (std::is_same_v<T, D2D1_MATRIX_5X4_F>)
+                    {
+                        // 5×4 grid of NumberBoxes for the color matrix.
+                        static const std::wstring rowLabels[] = { L"R", L"G", L"B", L"A", L"Ofs" };
+                        static const std::wstring colLabels[] = { L"R", L"G", L"B", L"A" };
+
+                        auto grid = Controls::StackPanel();
+                        grid.Orientation(Controls::Orientation::Vertical);
+                        grid.Margin({ 0, 0, 0, 4 });
+
+                        // Column header row.
+                        auto headerRow = Controls::StackPanel();
+                        headerRow.Orientation(Controls::Orientation::Horizontal);
+                        auto spacer = Controls::TextBlock();
+                        spacer.Width(32);
+                        headerRow.Children().Append(spacer);
+                        for (int c = 0; c < 4; ++c)
+                        {
+                            auto colHdr = Controls::TextBlock();
+                            colHdr.Text(winrt::hstring(colLabels[c]));
+                            colHdr.Width(70);
+                            colHdr.FontSize(11);
+                            colHdr.HorizontalTextAlignment(winrt::Microsoft::UI::Xaml::TextAlignment::Center);
+                            headerRow.Children().Append(colHdr);
+                        }
+                        grid.Children().Append(headerRow);
+
+                        for (int r = 0; r < 5; ++r)
+                        {
+                            auto row = Controls::StackPanel();
+                            row.Orientation(Controls::Orientation::Horizontal);
+                            row.Margin({ 0, 1, 0, 1 });
+
+                            auto rowLbl = Controls::TextBlock();
+                            rowLbl.Text(winrt::hstring(rowLabels[r]));
+                            rowLbl.Width(32);
+                            rowLbl.FontSize(11);
+                            rowLbl.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
+                            row.Children().Append(rowLbl);
+
+                            for (int c = 0; c < 4; ++c)
+                            {
+                                int cellIdx = r * 4 + c;
+                                const float* p = &v._11;
+                                auto nb = Controls::NumberBox();
+                                nb.Value(static_cast<double>(p[cellIdx]));
+                                nb.SmallChange(meta ? meta->step : 0.01);
+                                nb.Width(70);
+                                nb.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
+
+                                nb.ValueChanged([this, capturedId, capturedKey, cellIdx, markDirty](auto&& sender, auto&&)
+                                {
+                                    auto* n = m_graph.FindNode(capturedId);
+                                    if (!n) return;
+                                    auto it = n->properties.find(capturedKey);
+                                    if (it == n->properties.end()) return;
+                                    auto box = sender.template as<Controls::NumberBox>();
+                                    double val = box.Value();
+                                    if (std::isnan(val)) return;
+                                    auto* mat = std::get_if<D2D1_MATRIX_5X4_F>(&it->second);
+                                    if (mat)
+                                    {
+                                        float* mp = &mat->_11;
+                                        mp[cellIdx] = static_cast<float>(val);
+                                        markDirty();
+                                    }
+                                });
+                                row.Children().Append(nb);
+                            }
+                            grid.Children().Append(row);
+                        }
+                        panel.Children().Append(grid);
+                    }
+                    else if constexpr (std::is_same_v<T, std::vector<float>>)
+                    {
+                        // Curve editor: show a button to open a flyout, plus a small preview.
+                        auto curveContainer = Controls::StackPanel();
+                        curveContainer.Orientation(Controls::Orientation::Vertical);
+                        curveContainer.Margin({ 0, 0, 0, 4 });
+
+                        // Miniature curve preview using a Polyline.
+                        auto previewCanvas = winrt::Microsoft::UI::Xaml::Controls::Canvas();
+                        previewCanvas.Width(200);
+                        previewCanvas.Height(60);
+                        previewCanvas.Background(Media::SolidColorBrush(
+                            winrt::Microsoft::UI::ColorHelper::FromArgb(255, 30, 30, 30)));
+
+                        // Draw curve preview as a Polyline.
+                        auto polyline = winrt::Microsoft::UI::Xaml::Shapes::Polyline();
+                        polyline.Stroke(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::CornflowerBlue()));
+                        polyline.StrokeThickness(1.5);
+                        auto points = winrt::Microsoft::UI::Xaml::Media::PointCollection();
+                        if (!v.empty())
+                        {
+                            uint32_t step = (std::max)(1u, static_cast<uint32_t>(v.size()) / 50u);
+                            for (uint32_t i = 0; i < v.size(); i += step)
+                            {
+                                float x = static_cast<float>(i) / static_cast<float>(v.size() - 1) * 200.0f;
+                                float y = 60.0f - std::clamp(v[i], 0.0f, 1.0f) * 60.0f;
+                                points.Append(winrt::Windows::Foundation::Point(x, y));
+                            }
+                        }
+                        polyline.Points(points);
+                        previewCanvas.Children().Append(polyline);
+                        curveContainer.Children().Append(previewCanvas);
+
+                        // "Edit Curve" button opens a ContentDialog with full curve editor.
+                        auto editBtn = Controls::Button();
+                        editBtn.Content(winrt::box_value(L"Edit Curve..."));
+                        editBtn.Margin({ 0, 4, 0, 0 });
+                        editBtn.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+                        editBtn.Click([this, capturedId, capturedKey, markDirty](auto&&, auto&&)
+                        {
+                            ShowCurveEditorDialog(capturedId, capturedKey, markDirty);
+                        });
+                        curveContainer.Children().Append(editBtn);
+                        panel.Children().Append(curveContainer);
+                    }
+                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>
+                                    || std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>
+                                    || std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
+                    {
+                        // Vector editor: horizontal row of labeled NumberBoxes.
+                        constexpr int N = std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2> ? 2
+                                        : std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3> ? 3 : 4;
+
+                        std::vector<std::wstring> labels;
+                        if (meta && meta->componentLabels.size() >= static_cast<size_t>(N))
+                            labels = { meta->componentLabels.begin(), meta->componentLabels.begin() + N };
+                        else
+                        {
+                            // Heuristic: if the property name contains "Color", use R/G/B/A labels.
+                            bool isColor = (capturedKey.find(L"Color") != std::wstring::npos)
+                                        || (capturedKey.find(L"color") != std::wstring::npos);
+                            if (isColor)
+                            {
+                                if constexpr (N == 2) labels = { L"R", L"G" };
+                                else if constexpr (N == 3) labels = { L"R", L"G", L"B" };
+                                else                       labels = { L"R", L"G", L"B", L"A" };
+                            }
+                            else
+                            {
+                                if constexpr (N == 2) labels = { L"X", L"Y" };
+                                else if constexpr (N == 3) labels = { L"X", L"Y", L"Z" };
+                                else                       labels = { L"X", L"Y", L"Z", L"W" };
+                            }
+                        }
+
+                        float components[4] = {};
+                        if constexpr (N >= 2) { components[0] = v.x; components[1] = v.y; }
+                        if constexpr (N >= 3) { components[2] = v.z; }
+                        if constexpr (N >= 4) { components[3] = v.w; }
+
+                        float minV = meta ? meta->minValue : -FLT_MAX;
+                        float maxV = meta ? meta->maxValue : FLT_MAX;
+                        float stepV = meta ? meta->step : 0.01f;
+
+                        auto row = Controls::StackPanel();
+                        row.Orientation(Controls::Orientation::Vertical);
+                        row.Margin({ 0, 0, 0, 4 });
+
+                        for (int i = 0; i < N; ++i)
+                        {
+                            auto compRow = Controls::StackPanel();
+                            compRow.Orientation(Controls::Orientation::Horizontal);
+                            compRow.Margin({ 0, 1, 0, 1 });
+
+                            auto lbl = Controls::TextBlock();
+                            lbl.Text(winrt::hstring(labels[i]));
+                            lbl.FontSize(11);
+                            lbl.Width(20);
+                            lbl.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
+                            compRow.Children().Append(lbl);
+
+                            float compMin = (meta && static_cast<int>(meta->componentMin.size()) > i)
+                                ? meta->componentMin[i] : minV;
+                            float compMax = (meta && static_cast<int>(meta->componentMax.size()) > i)
+                                ? meta->componentMax[i] : maxV;
+
+                            auto nb = Controls::NumberBox();
+                            nb.Value(static_cast<double>(components[i]));
+                            nb.Minimum(compMin);
+                            nb.Maximum(compMax);
+                            nb.SmallChange(stepV);
+                            nb.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
+                            nb.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+
+                            int compIdx = i;
+                            nb.ValueChanged([this, capturedId, capturedKey, compIdx, markDirty](auto&& sender, auto&&)
+                            {
+                                auto* n = m_graph.FindNode(capturedId);
+                                if (!n) return;
+                                auto it = n->properties.find(capturedKey);
+                                if (it == n->properties.end()) return;
+                                auto box = sender.template as<Controls::NumberBox>();
+                                double val = box.Value();
+                                if (std::isnan(val)) return;
+                                float fval = static_cast<float>(val);
+
+                                std::visit([compIdx, fval](auto& vec)
+                                {
+                                    using VT = std::decay_t<decltype(vec)>;
+                                    if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float2>)
+                                    {
+                                        if (compIdx == 0) vec.x = fval;
+                                        else if (compIdx == 1) vec.y = fval;
+                                    }
+                                    else if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float3>)
+                                    {
+                                        if (compIdx == 0) vec.x = fval;
+                                        else if (compIdx == 1) vec.y = fval;
+                                        else if (compIdx == 2) vec.z = fval;
+                                    }
+                                    else if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float4>)
+                                    {
+                                        if (compIdx == 0) vec.x = fval;
+                                        else if (compIdx == 1) vec.y = fval;
+                                        else if (compIdx == 2) vec.z = fval;
+                                        else if (compIdx == 3) vec.w = fval;
+                                    }
+                                }, it->second);
+                                markDirty();
+                            });
+                            compRow.Children().Append(nb);
+                            row.Children().Append(compRow);
+                        }
+                        panel.Children().Append(row);
+                    }
+                }, value);
             }
         }
 
-        // Input pins.
+        // ---- Gamma Transfer curve preview ----
+        if (node->type == ::ShaderLab::Graph::NodeType::BuiltInEffect &&
+            node->effectClsid.has_value() && IsEqualGUID(node->effectClsid.value(), CLSID_D2D1GammaTransfer))
+        {
+            auto previewLabel = Controls::TextBlock();
+            previewLabel.Text(L"Curve Preview");
+            previewLabel.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            previewLabel.Margin({ 0, 8, 0, 4 });
+            panel.Children().Append(previewLabel);
+
+            auto canvas = Controls::Canvas();
+            canvas.Width(200);
+            canvas.Height(80);
+            canvas.Background(Media::SolidColorBrush(
+                winrt::Microsoft::UI::ColorHelper::FromArgb(255, 30, 30, 30)));
+
+            // Draw per-channel gamma curves: output = amplitude * input^exponent + offset
+            struct ChannelInfo { std::wstring prefix; winrt::Windows::UI::Color lineColor; };
+            ChannelInfo channels[] = {
+                { L"Red",   { 200, 255, 80, 80 } },
+                { L"Green", { 200, 80, 255, 80 } },
+                { L"Blue",  { 200, 80, 80, 255 } },
+            };
+
+            for (const auto& ch : channels)
+            {
+                float amp = 1.0f, exp = 1.0f, ofs = 0.0f;
+                bool disabled = false;
+                auto ampIt = node->properties.find(ch.prefix + L"Amplitude");
+                auto expIt = node->properties.find(ch.prefix + L"Exponent");
+                auto ofsIt = node->properties.find(ch.prefix + L"Offset");
+                auto disIt = node->properties.find(ch.prefix + L"Disable");
+                if (ampIt != node->properties.end()) if (auto* pf = std::get_if<float>(&ampIt->second)) amp = *pf;
+                if (expIt != node->properties.end()) if (auto* pf = std::get_if<float>(&expIt->second)) exp = *pf;
+                if (ofsIt != node->properties.end()) if (auto* pf = std::get_if<float>(&ofsIt->second)) ofs = *pf;
+                if (disIt != node->properties.end()) if (auto* pb = std::get_if<bool>(&disIt->second)) disabled = *pb;
+
+                if (disabled) continue;
+
+                auto poly = winrt::Microsoft::UI::Xaml::Shapes::Polyline();
+                poly.Stroke(Media::SolidColorBrush(ch.lineColor));
+                poly.StrokeThickness(1.5);
+                auto pts = winrt::Microsoft::UI::Xaml::Media::PointCollection();
+                for (int i = 0; i <= 50; ++i)
+                {
+                    float input = static_cast<float>(i) / 50.0f;
+                    float output = amp * std::pow(input, exp) + ofs;
+                    output = std::clamp(output, 0.0f, 1.0f);
+                    pts.Append({ input * 200.0f, 80.0f - output * 80.0f });
+                }
+                poly.Points(pts);
+                canvas.Children().Append(poly);
+            }
+            panel.Children().Append(canvas);
+        }
+
+        // ---- Input pins info ----
         if (!node->inputPins.empty())
         {
-            auto pinsHeader = winrt::Microsoft::UI::Xaml::Controls::TextBlock();
+            auto pinsHeader = Controls::TextBlock();
             pinsHeader.Text(L"Inputs: " + std::to_wstring(node->inputPins.size()));
-            pinsHeader.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(
-                winrt::Microsoft::UI::Colors::Gray()));
+            pinsHeader.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::Gray()));
             pinsHeader.Margin({ 0, 8, 0, 0 });
             panel.Children().Append(pinsHeader);
+        }
+    }
+
+    void MainWindow::ShowCurveEditorDialog(
+        uint32_t nodeId, const std::wstring& propertyKey, std::function<void()> markDirty)
+    {
+        namespace Controls = winrt::Microsoft::UI::Xaml::Controls;
+        namespace Media = winrt::Microsoft::UI::Xaml::Media;
+
+        auto* node = m_graph.FindNode(nodeId);
+        if (!node) return;
+        auto propIt = node->properties.find(propertyKey);
+        if (propIt == node->properties.end()) return;
+        auto* lutPtr = std::get_if<std::vector<float>>(&propIt->second);
+        if (!lutPtr) return;
+
+        constexpr float canvasW = 400.0f;
+        constexpr float canvasH = 300.0f;
+        constexpr float pointRadius = 6.0f;
+
+        // Build a set of editable control points from the LUT.
+        // Sample ~16 evenly-spaced points for dragging; the full LUT is interpolated from them.
+        auto controlPoints = std::make_shared<std::vector<winrt::Windows::Foundation::Point>>();
+        uint32_t lutSize = static_cast<uint32_t>(lutPtr->size());
+        uint32_t numCtrlPts = (std::min)(16u, lutSize);
+        if (numCtrlPts < 2) numCtrlPts = 2;
+        for (uint32_t i = 0; i < numCtrlPts; ++i)
+        {
+            float t = static_cast<float>(i) / static_cast<float>(numCtrlPts - 1);
+            uint32_t idx = (std::min)(static_cast<uint32_t>(t * (lutSize - 1)), lutSize - 1);
+            float x = t * canvasW;
+            float y = canvasH - std::clamp((*lutPtr)[idx], 0.0f, 1.0f) * canvasH;
+            controlPoints->push_back({ x, y });
+        }
+
+        // Canvas for the curve.
+        auto canvas = Controls::Canvas();
+        canvas.Width(canvasW);
+        canvas.Height(canvasH);
+        canvas.Background(Media::SolidColorBrush(
+            winrt::Microsoft::UI::ColorHelper::FromArgb(255, 30, 30, 30)));
+
+        // Draw grid lines.
+        for (int i = 1; i < 4; ++i)
+        {
+            float pos = canvasH * i / 4.0f;
+            auto hline = winrt::Microsoft::UI::Xaml::Shapes::Line();
+            hline.X1(0); hline.X2(canvasW); hline.Y1(pos); hline.Y2(pos);
+            hline.Stroke(Media::SolidColorBrush(winrt::Microsoft::UI::ColorHelper::FromArgb(255, 60, 60, 60)));
+            hline.StrokeThickness(0.5);
+            canvas.Children().Append(hline);
+
+            float posX = canvasW * i / 4.0f;
+            auto vline = winrt::Microsoft::UI::Xaml::Shapes::Line();
+            vline.X1(posX); vline.X2(posX); vline.Y1(0); vline.Y2(canvasH);
+            vline.Stroke(Media::SolidColorBrush(winrt::Microsoft::UI::ColorHelper::FromArgb(255, 60, 60, 60)));
+            vline.StrokeThickness(0.5);
+            canvas.Children().Append(vline);
+        }
+
+        // Curve polyline.
+        auto polyline = winrt::Microsoft::UI::Xaml::Shapes::Polyline();
+        polyline.Stroke(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::CornflowerBlue()));
+        polyline.StrokeThickness(2.0);
+        canvas.Children().Append(polyline);
+
+        // Helper to rebuild the polyline from control points.
+        auto rebuildCurve = [polyline, controlPoints, canvasW, canvasH]()
+        {
+            auto pts = winrt::Microsoft::UI::Xaml::Media::PointCollection();
+            for (const auto& cp : *controlPoints)
+                pts.Append(cp);
+            polyline.Points(pts);
+        };
+        rebuildCurve();
+
+        // Add draggable point ellipses.
+        auto draggingIdx = std::make_shared<int>(-1);
+        std::vector<winrt::Microsoft::UI::Xaml::Shapes::Ellipse> pointEllipses;
+
+        for (uint32_t i = 0; i < controlPoints->size(); ++i)
+        {
+            auto ellipse = winrt::Microsoft::UI::Xaml::Shapes::Ellipse();
+            ellipse.Width(pointRadius * 2);
+            ellipse.Height(pointRadius * 2);
+            ellipse.Fill(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::White()));
+            Controls::Canvas::SetLeft(ellipse, (*controlPoints)[i].X - pointRadius);
+            Controls::Canvas::SetTop(ellipse, (*controlPoints)[i].Y - pointRadius);
+            canvas.Children().Append(ellipse);
+            pointEllipses.push_back(ellipse);
+        }
+
+        // Pointer handlers for dragging control points.
+        canvas.PointerPressed([draggingIdx, controlPoints, pointRadius](auto&&,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
+        {
+            auto pos = args.GetCurrentPoint(nullptr).Position();
+            for (int i = static_cast<int>(controlPoints->size()) - 1; i >= 0; --i)
+            {
+                float dx = pos.X - (*controlPoints)[i].X;
+                float dy = pos.Y - (*controlPoints)[i].Y;
+                if (dx * dx + dy * dy < (pointRadius * 3) * (pointRadius * 3))
+                {
+                    *draggingIdx = i;
+                    break;
+                }
+            }
+        });
+
+        canvas.PointerMoved([draggingIdx, controlPoints, &pointEllipses, rebuildCurve,
+            canvasW, canvasH, pointRadius](auto&&,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
+        {
+            if (*draggingIdx < 0) return;
+            auto pos = args.GetCurrentPoint(nullptr).Position();
+            int idx = *draggingIdx;
+
+            // Clamp X to maintain ordering (first/last points locked to edges).
+            float x = pos.X;
+            float y = std::clamp(pos.Y, 0.0f, canvasH);
+            if (idx == 0)
+                x = 0.0f;
+            else if (idx == static_cast<int>(controlPoints->size()) - 1)
+                x = canvasW;
+            else
+            {
+                float minX = (*controlPoints)[idx - 1].X + 1.0f;
+                float maxX = (*controlPoints)[idx + 1].X - 1.0f;
+                x = std::clamp(x, minX, maxX);
+            }
+
+            (*controlPoints)[idx] = { x, y };
+            Controls::Canvas::SetLeft(pointEllipses[idx], x - pointRadius);
+            Controls::Canvas::SetTop(pointEllipses[idx], y - pointRadius);
+            rebuildCurve();
+        });
+
+        canvas.PointerReleased([draggingIdx](auto&&, auto&&) { *draggingIdx = -1; });
+
+        // Build dialog.
+        auto dialog = Controls::ContentDialog();
+        dialog.Title(winrt::box_value(L"Curve Editor — " + propertyKey));
+        dialog.PrimaryButtonText(L"Apply");
+        dialog.CloseButtonText(L"Cancel");
+        dialog.XamlRoot(this->Content().XamlRoot());
+
+        auto dialogContent = Controls::StackPanel();
+        dialogContent.Children().Append(canvas);
+
+        // "Reset to Identity" button.
+        auto resetBtn = Controls::Button();
+        resetBtn.Content(winrt::box_value(L"Reset to Identity"));
+        resetBtn.Margin({ 0, 8, 0, 0 });
+        resetBtn.Click([controlPoints, &pointEllipses, rebuildCurve, canvasW, canvasH, pointRadius](auto&&, auto&&)
+        {
+            for (uint32_t i = 0; i < controlPoints->size(); ++i)
+            {
+                float t = static_cast<float>(i) / static_cast<float>(controlPoints->size() - 1);
+                (*controlPoints)[i] = { t * canvasW, canvasH - t * canvasH };
+                Controls::Canvas::SetLeft(pointEllipses[i], t * canvasW - pointRadius);
+                Controls::Canvas::SetTop(pointEllipses[i], (canvasH - t * canvasH) - pointRadius);
+            }
+            rebuildCurve();
+        });
+        dialogContent.Children().Append(resetBtn);
+        dialog.Content(dialogContent);
+
+        // Show dialog and apply result.
+        auto capturedNodeId = nodeId;
+        auto capturedKey = propertyKey;
+        auto capturedMarkDirty = markDirty;
+        auto capturedCtrlPts = controlPoints;
+
+        dialog.PrimaryButtonClick([this, capturedNodeId, capturedKey, capturedMarkDirty,
+            capturedCtrlPts, canvasW, canvasH](auto&&, auto&&)
+        {
+            auto* n = m_graph.FindNode(capturedNodeId);
+            if (!n) return;
+            auto it = n->properties.find(capturedKey);
+            if (it == n->properties.end()) return;
+            auto* lut = std::get_if<std::vector<float>>(&it->second);
+            if (!lut) return;
+
+            // Interpolate control points into the full LUT array.
+            uint32_t lutSize = static_cast<uint32_t>(lut->size());
+            for (uint32_t i = 0; i < lutSize; ++i)
+            {
+                float x = static_cast<float>(i) / static_cast<float>(lutSize - 1) * canvasW;
+
+                // Find the two surrounding control points.
+                int cpIdx = 0;
+                for (int j = 1; j < static_cast<int>(capturedCtrlPts->size()); ++j)
+                {
+                    if ((*capturedCtrlPts)[j].X >= x)
+                    {
+                        cpIdx = j - 1;
+                        break;
+                    }
+                    cpIdx = j;
+                }
+
+                float val;
+                if (cpIdx >= static_cast<int>(capturedCtrlPts->size()) - 1)
+                {
+                    val = 1.0f - (*capturedCtrlPts).back().Y / canvasH;
+                }
+                else
+                {
+                    float x0 = (*capturedCtrlPts)[cpIdx].X;
+                    float x1 = (*capturedCtrlPts)[cpIdx + 1].X;
+                    float y0 = (*capturedCtrlPts)[cpIdx].Y;
+                    float y1 = (*capturedCtrlPts)[cpIdx + 1].Y;
+                    float t = (x1 > x0) ? (x - x0) / (x1 - x0) : 0.0f;
+                    float yInterp = y0 + t * (y1 - y0);
+                    val = 1.0f - yInterp / canvasH;
+                }
+                (*lut)[i] = std::clamp(val, 0.0f, 1.0f);
+            }
+            capturedMarkDirty();
+            UpdatePropertiesPanel();
+        });
+
+        dialog.ShowAsync();
+    }
+
+    winrt::fire_and_forget MainWindow::BrowseImageForSourceNode(uint32_t nodeId)
+    {
+        auto strong = get_strong();
+
+        winrt::Windows::Storage::Pickers::FileOpenPicker picker;
+        picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
+        picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::PicturesLibrary);
+        picker.FileTypeFilter().Append(L".png");
+        picker.FileTypeFilter().Append(L".jpg");
+        picker.FileTypeFilter().Append(L".jpeg");
+        picker.FileTypeFilter().Append(L".bmp");
+        picker.FileTypeFilter().Append(L".tif");
+        picker.FileTypeFilter().Append(L".tiff");
+        picker.FileTypeFilter().Append(L".hdr");
+        picker.FileTypeFilter().Append(L".exr");
+        picker.FileTypeFilter().Append(L".jxr");
+
+        auto file = co_await picker.PickSingleFileAsync();
+        if (!file) co_return;
+
+        auto* node = m_graph.FindNode(nodeId);
+        if (!node) co_return;
+
+        node->shaderPath = std::wstring(file.Path().c_str());
+        node->name = std::wstring(file.Name().c_str());
+        node->dirty = true;
+
+        // Prepare the source (load the image bitmap).
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (dc)
+            m_sourceFactory.PrepareSourceNode(*node, dc);
+
+        m_graph.MarkAllDirty();
+        m_nodeGraphController.RebuildLayout();
+        PopulatePreviewNodeSelector();
+        FitPreviewToView();
+        UpdatePropertiesPanel();
+    }
+
+    // -----------------------------------------------------------------------
+    // Column splitter
+    // -----------------------------------------------------------------------
+
+    void MainWindow::OnColumnSplitterPointerPressed(
+        winrt::Windows::Foundation::IInspectable const& sender,
+        winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
+    {
+        m_isDraggingSplitter = true;
+        auto point = args.GetCurrentPoint(this->Content());
+        m_splitterDragStartX = point.Position().X;
+
+        auto col0 = Content().as<winrt::Microsoft::UI::Xaml::Controls::Grid>().ColumnDefinitions().GetAt(0);
+        auto col2 = Content().as<winrt::Microsoft::UI::Xaml::Controls::Grid>().ColumnDefinitions().GetAt(2);
+        m_splitterStartCol0Width = col0.ActualWidth();
+        m_splitterStartCol2Width = col2.ActualWidth();
+
+        sender.as<winrt::Microsoft::UI::Xaml::UIElement>().CapturePointer(args.Pointer());
+        args.Handled(true);
+    }
+
+    void MainWindow::OnColumnSplitterPointerMoved(
+        winrt::Windows::Foundation::IInspectable const& /*sender*/,
+        winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
+    {
+        if (!m_isDraggingSplitter) return;
+
+        auto point = args.GetCurrentPoint(this->Content());
+        double delta = point.Position().X - m_splitterDragStartX;
+
+        double newCol0 = (std::max)(100.0, m_splitterStartCol0Width + delta);
+        double newCol2 = (std::max)(100.0, m_splitterStartCol2Width - delta);
+
+        auto grid = Content().as<winrt::Microsoft::UI::Xaml::Controls::Grid>();
+        grid.ColumnDefinitions().GetAt(0).Width(
+            winrt::Microsoft::UI::Xaml::GridLengthHelper::FromPixels(newCol0));
+        grid.ColumnDefinitions().GetAt(2).Width(
+            winrt::Microsoft::UI::Xaml::GridLengthHelper::FromPixels(newCol2));
+
+        args.Handled(true);
+    }
+
+    void MainWindow::OnColumnSplitterPointerReleased(
+        winrt::Windows::Foundation::IInspectable const& sender,
+        winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
+    {
+        if (m_isDraggingSplitter)
+        {
+            m_isDraggingSplitter = false;
+            sender.as<winrt::Microsoft::UI::Xaml::UIElement>().ReleasePointerCapture(args.Pointer());
         }
     }
 
@@ -1661,6 +2818,46 @@ namespace winrt::ShaderLab::implementation
     }
 
     // -----------------------------------------------------------------------
+    // Preview pan/zoom
+    // -----------------------------------------------------------------------
+
+    void MainWindow::FitPreviewToView()
+    {
+        auto vp = PreviewViewportDips();
+        float vpW = vp.width;
+        float vpH = vp.height;
+        if (vpW <= 0 || vpH <= 0)
+        {
+            m_previewZoom = 1.0f;
+            m_previewPanX = 0.0f;
+            m_previewPanY = 0.0f;
+            return;
+        }
+
+        auto bounds = GetPreviewImageBounds();
+        float imgW = bounds.right - bounds.left;
+        float imgH = bounds.bottom - bounds.top;
+
+        // For infinite or very large images (e.g., Flood), use a default view.
+        if (imgW <= 0 || imgH <= 0 || imgW > 100000.0f || imgH > 100000.0f)
+        {
+            m_previewZoom = 1.0f;
+            m_previewPanX = 0.0f;
+            m_previewPanY = 0.0f;
+            return;
+        }
+
+        // Scale to fit with some padding.
+        float scaleX = vpW / imgW;
+        float scaleY = vpH / imgH;
+        m_previewZoom = (std::min)(scaleX, scaleY) * 0.95f;
+
+        // Center the image.
+        m_previewPanX = (vpW - imgW * m_previewZoom) * 0.5f - bounds.left * m_previewZoom;
+        m_previewPanY = (vpH - imgH * m_previewZoom) * 0.5f - bounds.top * m_previewZoom;
+    }
+
+    // -----------------------------------------------------------------------
     // Render loop
     // -----------------------------------------------------------------------
 
@@ -1692,6 +2889,13 @@ namespace winrt::ShaderLab::implementation
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) return;
 
+        // Re-prepare dirty source nodes (e.g., Flood color changed in properties panel).
+        for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+        {
+            if (node.type == ::ShaderLab::Graph::NodeType::Source && node.dirty)
+                m_sourceFactory.PrepareSourceNode(node, dc);
+        }
+
         // Evaluate the effect graph.
         m_graphEvaluator.Evaluate(m_graph, dc);
 
@@ -1700,7 +2904,21 @@ namespace winrt::ShaderLab::implementation
         if (!drawDc)
             return;
 
+        // Set DPI to 96 so D2D coordinates match WinUI DIPs exactly.
+        // The XAML compositor handles physical pixel scaling.
+        // This ensures the preview transform, crosshair overlay, and pixel
+        // trace coordinates all use the same coordinate space.
+        float oldDpiX, oldDpiY;
+        drawDc->GetDpi(&oldDpiX, &oldDpiY);
+        drawDc->SetDpi(96.0f, 96.0f);
+
         drawDc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
+
+        // Apply preview pan/zoom transform.
+        D2D1_MATRIX_3X2_F previewTransform =
+            D2D1::Matrix3x2F::Scale(m_previewZoom, m_previewZoom) *
+            D2D1::Matrix3x2F::Translation(m_previewPanX, m_previewPanY);
+        drawDc->SetTransform(previewTransform);
 
         if (m_compareActive && m_compareNodeId != 0)
         {
@@ -1708,34 +2926,41 @@ namespace winrt::ShaderLab::implementation
             auto* imageA = ResolveDisplayImage(m_previewNodeId);
             auto* imageB = ResolveDisplayImage(m_compareNodeId);
 
-            auto bounds = GetPreviewImageBounds();
-            float imgW = bounds.right - bounds.left;
-            float splitX = bounds.left + imgW * m_splitPosition;
+            // Split line in viewport coordinates (pre-transform).
+            drawDc->SetTransform(D2D1::Matrix3x2F::Identity());
+            auto vp = PreviewViewportDips();
+            float vpW = vp.width;
+            float vpH = vp.height;
+            float splitX = vpW * m_splitPosition;
 
             if (imageA)
             {
-                D2D1_RECT_F clipA = { bounds.left, bounds.top, splitX, bounds.bottom };
+                D2D1_RECT_F clipA = { 0, 0, splitX, vpH };
                 drawDc->PushAxisAlignedClip(clipA, D2D1_ANTIALIAS_MODE_ALIASED);
+                drawDc->SetTransform(previewTransform);
                 drawDc->DrawImage(imageA);
+                drawDc->SetTransform(D2D1::Matrix3x2F::Identity());
                 drawDc->PopAxisAlignedClip();
             }
 
             if (imageB)
             {
-                D2D1_RECT_F clipB = { splitX, bounds.top, bounds.right, bounds.bottom };
+                D2D1_RECT_F clipB = { splitX, 0, vpW, vpH };
                 drawDc->PushAxisAlignedClip(clipB, D2D1_ANTIALIAS_MODE_ALIASED);
+                drawDc->SetTransform(previewTransform);
                 drawDc->DrawImage(imageB);
+                drawDc->SetTransform(D2D1::Matrix3x2F::Identity());
                 drawDc->PopAxisAlignedClip();
             }
 
-            // Draw split line.
+            // Draw split line (no transform — viewport coords).
             winrt::com_ptr<ID2D1SolidColorBrush> lineBrush;
             drawDc->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White, 0.8f), lineBrush.put());
             if (lineBrush)
             {
                 drawDc->DrawLine(
-                    D2D1::Point2F(splitX, bounds.top),
-                    D2D1::Point2F(splitX, bounds.bottom),
+                    D2D1::Point2F(splitX, 0),
+                    D2D1::Point2F(splitX, vpH),
                     lineBrush.get(), 2.0f);
             }
         }
@@ -1747,6 +2972,9 @@ namespace winrt::ShaderLab::implementation
                 drawDc->DrawImage(previewImage);
         }
 
+        drawDc->SetTransform(D2D1::Matrix3x2F::Identity());
+        drawDc->SetDpi(oldDpiX, oldDpiY);
+
         m_renderEngine.EndDraw();
         m_renderEngine.Present();
 
@@ -1754,6 +2982,9 @@ namespace winrt::ShaderLab::implementation
         if (m_traceActive)
         {
             PopulatePixelTraceTree();
+            RenderTraceSwatches();
         }
+        // Update crosshair position each frame (tracks with pan/zoom).
+        UpdateCrosshairOverlay();
     }
 }

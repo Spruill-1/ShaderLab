@@ -226,6 +226,17 @@ namespace ShaderLab::Rendering
                     D2D1_VECTOR_4F vec{ v.x, v.y, v.z, v.w };
                     effect->SetValue(index, vec);
                 }
+                else if constexpr (std::is_same_v<T, D2D1_MATRIX_5X4_F>)
+                {
+                    effect->SetValue(index, D2D1_PROPERTY_TYPE_MATRIX_5X4,
+                        reinterpret_cast<const BYTE*>(&v), sizeof(v));
+                }
+                else if constexpr (std::is_same_v<T, std::vector<float>>)
+                {
+                    effect->SetValue(index,
+                        reinterpret_cast<const BYTE*>(v.data()),
+                        static_cast<UINT32>(v.size() * sizeof(float)));
+                }
             }, value);
         }
     }

@@ -2,6 +2,7 @@
 
 #include "pch.h"
 #include "../Graph/EffectNode.h"
+#include "PropertyMetadata.h"
 
 namespace ShaderLab::Effects
 {
@@ -20,6 +21,9 @@ namespace ShaderLab::Effects
 
         // Default property values (key = property name or index string).
         std::map<std::wstring, Graph::PropertyValue> defaultProperties;
+
+        // UI metadata for the properties panel (key must match defaultProperties key).
+        std::map<std::wstring, PropertyMetadata> propertyMetadata;
     };
 
     // Singleton catalog of all registered built-in D2D effects.

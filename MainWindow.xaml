@@ -17,9 +17,9 @@
         </Grid.RowDefinitions>
 
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="2*" />
+            <ColumnDefinition Width="3*" />
             <ColumnDefinition Width="Auto" />
-            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="2*" />
         </Grid.ColumnDefinitions>
 
         <!-- File toolbar -->
@@ -37,8 +37,6 @@
                         <MenuFlyout x:Name="AddNodeFlyout" />
                     </DropDownButton.Flyout>
                 </DropDownButton>
-                <Button x:Name="AddImageSourceButton" Content="Add Image Source" />
-                <Button x:Name="AddFloodSourceButton" Content="Add Color Source" />
                 <AppBarSeparator />
                 <Button x:Name="SaveImageButton" Content="Save Image" />
             </StackPanel>
@@ -54,17 +52,20 @@
             </Grid>
         </Grid>
 
-        <!-- Column divider -->
-        <Border Grid.Row="1" Grid.Column="1"
-                Width="4"
-                Background="{ThemeResource CardStrokeColorDefaultBrush}" />
+        <!-- Column splitter (draggable) -->
+        <Border x:Name="ColumnSplitter" Grid.Row="1" Grid.Column="1"
+                Width="6"
+                Background="{ThemeResource CardStrokeColorDefaultBrush}"
+                PointerPressed="OnColumnSplitterPointerPressed"
+                PointerMoved="OnColumnSplitterPointerMoved"
+                PointerReleased="OnColumnSplitterPointerReleased" />
 
         <!-- Right: Preview + property tabs -->
         <Grid Grid.Row="1" Grid.Column="2">
             <Grid.RowDefinitions>
-                <RowDefinition Height="*" />
+                <RowDefinition Height="2*" />
                 <RowDefinition Height="Auto" />
-                <RowDefinition Height="*" />
+                <RowDefinition Height="*" MinHeight="180" />
             </Grid.RowDefinitions>
 
             <!-- Preview surface with toolbar and overlay -->
@@ -148,6 +149,10 @@
                 <!-- Swap chain panel -->
                 <SwapChainPanel x:Name="PreviewPanel" Grid.Row="2" />
 
+                <!-- Pixel trace crosshair overlay -->
+                <Canvas x:Name="CrosshairCanvas" Grid.Row="2"
+                        IsHitTestVisible="False" />
+
                 <!-- Preview overlay (node name when not on Output) -->
                 <Border Grid.Row="2"
                         HorizontalAlignment="Left"
@@ -170,7 +175,7 @@
                     Background="{ThemeResource CardStrokeColorDefaultBrush}" />
 
             <!-- Tab control for properties/editor/inspector -->
-            <TabView Grid.Row="2"
+            <TabView x:Name="BottomTabView" Grid.Row="2"
                      IsAddTabButtonVisible="False"
                      TabWidthMode="SizeToContent">
                 <TabViewItem Header="Properties" IsClosable="False">
@@ -230,10 +235,17 @@
                             </ComboBox>
                         </Grid>
 
-                        <!-- Trace tree (placeholder until TreeView is confirmed working) -->
-                        <ScrollViewer Grid.Row="1" Padding="4">
-                            <StackPanel x:Name="PixelTracePanel" Spacing="2" />
-                        </ScrollViewer>
+                        <!-- Trace tree with HDR swatch strip -->
+                        <Grid Grid.Row="1">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="28" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <SwapChainPanel x:Name="TraceSwatchPanel" Grid.Column="0" />
+                            <ScrollViewer Grid.Column="1" Padding="4">
+                                <StackPanel x:Name="PixelTracePanel" Spacing="2" />
+                            </ScrollViewer>
+                        </Grid>
                     </Grid>
                 </TabViewItem>
             </TabView>

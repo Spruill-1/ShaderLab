@@ -77,6 +77,9 @@
     <ClInclude Include="Effects\EffectRegistry.h">
       <Filter>Effects</Filter>
     </ClInclude>
+    <ClInclude Include="Effects\PropertyMetadata.h">
+      <Filter>Effects</Filter>
+    </ClInclude>
     <ClInclude Include="Effects\ShaderCompiler.h">
       <Filter>Effects</Filter>
     </ClInclude>

@@ -80,6 +80,11 @@ namespace ShaderLab::Controls
         winrt::com_ptr<ID2D1Image> prevTarget;
         dc->GetTarget(prevTarget.put());
 
+        // Set DPI to 96 so 1 DIP = 1 pixel in the source rect.
+        float oldDpiX, oldDpiY;
+        dc->GetDpi(&oldDpiX, &oldDpiY);
+        dc->SetDpi(96.0f, 96.0f);
+
         dc->SetTarget(targetBitmap.get());
         dc->BeginDraw();
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
@@ -95,6 +100,7 @@ namespace ShaderLab::Controls
             D2D1_COMPOSITE_MODE_SOURCE_COPY);
         dc->EndDraw();
         dc->SetTarget(prevTarget.get());
+        dc->SetDpi(oldDpiX, oldDpiY);
 
         // Create a CPU-readable bitmap and copy from the target.
         winrt::com_ptr<ID2D1Bitmap1> readbackBitmap;

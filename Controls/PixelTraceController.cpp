@@ -66,6 +66,15 @@ namespace ShaderLab::Controls
         if (!dc || !image) return false;
         if (!EnsureBitmaps(dc)) return false;
 
+        // Save and set DPI to 96 so that 1 DIP = 1 pixel in the source rect,
+        // and the 1×1 pixel target bitmap covers exactly 1×1 DIPs.
+        float oldDpiX, oldDpiY;
+        dc->GetDpi(&oldDpiX, &oldDpiY);
+        dc->SetDpi(96.0f, 96.0f);
+
+        float srcX = static_cast<float>(pixelX);
+        float srcY = static_cast<float>(pixelY);
+
         // Draw the source image so the desired pixel lands at (0,0).
         winrt::com_ptr<ID2D1Image> prevTarget;
         dc->GetTarget(prevTarget.put());
@@ -76,15 +85,12 @@ namespace ShaderLab::Controls
         dc->DrawImage(
             image,
             D2D1::Point2F(0, 0),
-            D2D1::RectF(
-                static_cast<float>(pixelX),
-                static_cast<float>(pixelY),
-                static_cast<float>(pixelX + 1),
-                static_cast<float>(pixelY + 1)),
+            D2D1::RectF(srcX, srcY, srcX + 1.0f, srcY + 1.0f),
             D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
             D2D1_COMPOSITE_MODE_SOURCE_COPY);
         dc->EndDraw();
         dc->SetTarget(prevTarget.get());
+        dc->SetDpi(oldDpiX, oldDpiY);
 
         // Copy to CPU-readable bitmap.
         D2D1_POINT_2U destPoint = { 0, 0 };

@@ -119,6 +119,7 @@
     <ClInclude Include="Effects\CustomComputeShaderEffect.h" />
     <ClInclude Include="Effects\CustomPixelShaderEffect.h" />
     <ClInclude Include="Effects\EffectRegistry.h" />
+    <ClInclude Include="Effects\PropertyMetadata.h" />
     <ClInclude Include="Effects\ImageLoader.h" />
     <ClInclude Include="Effects\ShaderCompiler.h" />
     <ClInclude Include="Effects\SourceNodeFactory.h" />

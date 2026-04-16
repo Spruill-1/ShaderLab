@@ -274,7 +274,14 @@ namespace ShaderLab::Rendering
 
     void RenderEngine::EndDraw()
     {
-        winrt::check_hresult(m_d2dDeviceContext->EndDraw());
+        HRESULT hr = m_d2dDeviceContext->EndDraw();
+        if (hr == D2DERR_RECREATE_TARGET)
+        {
+            // Device lost — caller should recreate resources.
+            ReleaseRenderTarget();
+        }
+        // Other errors (e.g., deferred effect errors from missing inputs)
+        // are silently ignored to avoid crashing the render loop.
     }
 
     void RenderEngine::Present(bool vsync)
