@@ -325,6 +325,10 @@ namespace ShaderLab::Effects
             if (it == properties.end())
                 continue;
 
+            // Guard against out-of-range offsets.
+            if (var.offset >= cbSizeBytes)
+                continue;
+
             BYTE* dest = m_constantBuffer.data() + var.offset;
             uint32_t remaining = cbSizeBytes - var.offset;
 

@@ -24,13 +24,14 @@ namespace ShaderLab::Graph
         {
             using T = std::decay_t<decltype(v)>;
             if constexpr (std::is_same_v<T, float>)      return L"float";
-            if constexpr (std::is_same_v<T, int32_t>)    return L"int";
-            if constexpr (std::is_same_v<T, uint32_t>)   return L"uint";
-            if constexpr (std::is_same_v<T, bool>)       return L"bool";
-            if constexpr (std::is_same_v<T, std::wstring>) return L"string";
-            if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>) return L"float2";
-            if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>) return L"float3";
-            if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>) return L"float4";
+            else if constexpr (std::is_same_v<T, int32_t>)    return L"int";
+            else if constexpr (std::is_same_v<T, uint32_t>)   return L"uint";
+            else if constexpr (std::is_same_v<T, bool>)       return L"bool";
+            else if constexpr (std::is_same_v<T, std::wstring>) return L"string";
+            else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>) return L"float2";
+            else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>) return L"float3";
+            else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>) return L"float4";
+            else { static_assert(sizeof(T) == 0, "Unhandled PropertyValue type"); return L"unknown"; }
         }, value);
     }
 }

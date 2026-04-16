@@ -26,6 +26,18 @@
 // WinRT JSON
 #include <winrt/Windows.Data.Json.h>
 
+// Storage / Pickers
+#include <winrt/Windows.Storage.h>
+#include <winrt/Windows.Storage.Pickers.h>
+
+// Input (PointerPoint)
+#include <winrt/Microsoft.UI.Input.h>
+#include <winrt/Microsoft.UI.h>
+
+// System (VirtualKey)
+#include <winrt/Windows.System.h>
+#include <winrt/Windows.UI.Text.h>
+
 // Win2D
 #include <winrt/Microsoft.Graphics.Canvas.h>
 #include <winrt/Microsoft.Graphics.Canvas.Effects.h>

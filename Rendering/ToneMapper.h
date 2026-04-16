@@ -32,8 +32,8 @@ namespace ShaderLab::Rendering
     //
     // Uses D2D built-in effects where possible:
     //   - CLSID_D2D1WhiteLevelAdjustment for SDR→HDR white level scaling
-    //   - CLSID_D2D1HdrToneMap for HDR→SDR tone mapping
-    //   - Custom implementations for Reinhard, ACES, Hable
+    //   - CLSID_D2D1ColorMatrix for per-channel Reinhard, ACES, Hable via LUT
+    //   - Custom pixel shader effects for advanced operators
     //
     // The tone mapper sits between the graph evaluator output and the
     // swap chain render target. It can be bypassed (None mode) or
@@ -75,10 +75,15 @@ namespace ShaderLab::Rendering
         // Create or update D2D effects for the current mode.
         void UpdateEffects();
 
-        // Tone mapping math (used for custom modes).
+        // Build a LUT from the tone curve and apply it to the table transfer effect.
+        void BuildToneMappingLUT(ToneMapMode mode);
+
+        // Tone mapping math (used to build LUTs).
         static float ReinhardToneMap(float x);
         static float ACESFilmicToneMap(float x);
         static float HableToneMap(float x);
+
+        static constexpr uint32_t kLutSize = 256;
 
         winrt::com_ptr<ID2D1DeviceContext> m_dc;
         bool m_initialized{ false };
@@ -88,10 +93,12 @@ namespace ShaderLab::Rendering
         float m_displayMaxNits{ 300.0f };
         float m_exposureStops{ 0.0f };
 
-        // D2D built-in tone mapping effects.
+        // D2D effects.
         winrt::com_ptr<ID2D1Effect> m_whiteLevelEffect;
         winrt::com_ptr<ID2D1Effect> m_hdrToneMapEffect;
-        winrt::com_ptr<ID2D1Effect> m_exposureEffect;      // Brightness + exposure
+        winrt::com_ptr<ID2D1Effect> m_exposureEffect;
+        winrt::com_ptr<ID2D1Effect> m_preScaleEffect;         // ColorMatrix to normalize to [0,1]
+        winrt::com_ptr<ID2D1Effect> m_tableTransferEffect;    // Per-channel tone curve LUT
 
         // Output image (from the last Apply call).
         winrt::com_ptr<ID2D1Image> m_output;

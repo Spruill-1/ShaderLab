@@ -136,7 +136,9 @@
     </ClInclude>
     <ClInclude Include="Rendering\DisplayInfo.h" />
     <ClInclude Include="Rendering\DisplayMonitor.h" />
+    <ClInclude Include="Rendering\DisplayProfile.h" />
     <ClInclude Include="Rendering\GraphEvaluator.h" />
+    <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
     <ClInclude Include="Rendering\RenderEngine.h" />
     <ClInclude Include="Rendering\ToneMapper.h" />
@@ -170,6 +172,7 @@
     <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
     <ClCompile Include="Rendering\DisplayMonitor.cpp" />
     <ClCompile Include="Rendering\GraphEvaluator.cpp" />
+    <ClCompile Include="Rendering\IccProfileParser.cpp" />
     <ClCompile Include="Rendering\RenderEngine.cpp" />
     <ClCompile Include="Rendering\ToneMapper.cpp" />
     <ClCompile Include="Rendering\FalseColorOverlay.cpp" />

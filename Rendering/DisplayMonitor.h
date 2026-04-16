@@ -2,6 +2,7 @@
 
 #include "pch.h"
 #include "DisplayInfo.h"
+#include "DisplayProfile.h"
 
 namespace ShaderLab::Rendering
 {
@@ -35,10 +36,30 @@ namespace ShaderLab::Rendering
         DisplayCapabilities QueryCurrentCapabilities() const;
 
         // Returns the most recently cached capabilities (no DXGI call).
-        const DisplayCapabilities& CachedCapabilities() const { return m_caps; }
+        // When a simulated profile is active, returns the simulated caps.
+        DisplayCapabilities CachedCapabilities() const
+        {
+            std::lock_guard lock(m_capsMutex);
+            if (m_simulatedProfile.has_value())
+                return m_simulatedProfile->caps;
+            return m_caps;
+        }
 
         // Register / clear the change callback.
         void SetCallback(DisplayChangeCallback callback);
+
+        // Simulated profile support — override live display with a preset or ICC profile.
+        void SetSimulatedProfile(const DisplayProfile& profile);
+        void ClearSimulatedProfile();
+
+        bool IsSimulated() const
+        {
+            std::lock_guard lock(m_capsMutex);
+            return m_simulatedProfile.has_value();
+        }
+
+        // Returns the simulated profile if active, otherwise constructs one from live caps.
+        DisplayProfile ActiveProfile() const;
 
     private:
         // Hidden message-only window for WM_DISPLAYCHANGE.
@@ -66,7 +87,13 @@ namespace ShaderLab::Rendering
         std::jthread                    m_adapterThread;
 
         DisplayCapabilities             m_caps{};
+        std::optional<DisplayProfile>   m_simulatedProfile;
+        mutable std::mutex              m_capsMutex;
         DisplayChangeCallback           m_callback;
         std::mutex                      m_callbackMutex;
+
+        // Periodic monitor-change polling (WM_DISPLAYCHANGE doesn't fire on window move).
+        HMONITOR                        m_lastMonitor{ nullptr };
+        std::jthread                    m_monitorPollThread;
     };
 }

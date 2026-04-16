@@ -18,6 +18,7 @@ namespace ShaderLab::Rendering
 
         // Take a fresh snapshot before anything else.
         m_caps = QueryCurrentCapabilities();
+        m_lastMonitor = MonitorFromWindow(m_appHwnd, MONITOR_DEFAULTTOPRIMARY);
 
         // Create a hidden message-only window to receive WM_DISPLAYCHANGE.
         CreateMessageWindow();
@@ -27,10 +28,32 @@ namespace ShaderLab::Rendering
         {
             RegisterAdapterChangeEvent(dxgiFactory);
         }
+
+        // Poll for monitor changes (moving the window between displays).
+        m_monitorPollThread = std::jthread([this](std::stop_token stop)
+        {
+            while (!stop.stop_requested())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                if (stop.stop_requested()) break;
+
+                HMONITOR current = MonitorFromWindow(m_appHwnd, MONITOR_DEFAULTTOPRIMARY);
+                if (current != m_lastMonitor)
+                {
+                    m_lastMonitor = current;
+                    OnDisplayChanged();
+                }
+            }
+        });
     }
 
     void DisplayMonitor::Shutdown()
     {
+        if (m_monitorPollThread.joinable())
+        {
+            m_monitorPollThread.request_stop();
+            m_monitorPollThread.join();
+        }
         UnregisterAdapterChangeEvent();
         DestroyMessageWindow();
         m_appHwnd = nullptr;
@@ -237,18 +260,21 @@ namespace ShaderLab::Rendering
         auto newCaps = QueryCurrentCapabilities();
 
         // Only fire the callback if something meaningful changed.
-        bool changed = (newCaps.hdrEnabled != m_caps.hdrEnabled)
-            || (newCaps.colorSpace != m_caps.colorSpace)
-            || (newCaps.bitsPerColor != m_caps.bitsPerColor)
-            || (std::abs(newCaps.maxLuminanceNits - m_caps.maxLuminanceNits) > 0.5f);
-
-        m_caps = newCaps;
+        bool changed = false;
+        {
+            std::lock_guard lock(m_capsMutex);
+            changed = (newCaps.hdrEnabled != m_caps.hdrEnabled)
+                || (newCaps.colorSpace != m_caps.colorSpace)
+                || (newCaps.bitsPerColor != m_caps.bitsPerColor)
+                || (std::abs(newCaps.maxLuminanceNits - m_caps.maxLuminanceNits) > 0.5f);
+            m_caps = newCaps;
+        }
 
         if (changed)
         {
             std::lock_guard lock(m_callbackMutex);
             if (m_callback)
-                m_callback(m_caps);
+                m_callback(newCaps);
         }
     }
 
@@ -256,5 +282,53 @@ namespace ShaderLab::Rendering
     {
         std::lock_guard lock(m_callbackMutex);
         m_callback = std::move(callback);
+    }
+
+    // -----------------------------------------------------------------------
+    // Simulated profile support
+    // -----------------------------------------------------------------------
+
+    void DisplayMonitor::SetSimulatedProfile(const DisplayProfile& profile)
+    {
+        {
+            std::lock_guard lock(m_capsMutex);
+            m_simulatedProfile = profile;
+            m_simulatedProfile->isSimulated = true;
+        }
+
+        // Notify subscribers with the simulated capabilities.
+        std::lock_guard lock(m_callbackMutex);
+        if (m_callback)
+            m_callback(profile.caps);
+    }
+
+    void DisplayMonitor::ClearSimulatedProfile()
+    {
+        DisplayCapabilities liveCaps{};
+        {
+            std::lock_guard lock(m_capsMutex);
+            m_simulatedProfile.reset();
+            // Re-query live display to get current state.
+            m_caps = QueryCurrentCapabilities();
+            liveCaps = m_caps;
+        }
+
+        std::lock_guard lock(m_callbackMutex);
+        if (m_callback)
+            m_callback(liveCaps);
+    }
+
+    DisplayProfile DisplayMonitor::ActiveProfile() const
+    {
+        std::lock_guard lock(m_capsMutex);
+        if (m_simulatedProfile.has_value())
+            return *m_simulatedProfile;
+
+        // Construct a basic profile from live capabilities.
+        DisplayProfile p{};
+        p.caps = m_caps;
+        p.isSimulated = false;
+        p.profileName = L"Live Display";
+        return p;
     }
 }

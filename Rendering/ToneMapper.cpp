@@ -12,17 +12,23 @@ namespace ShaderLab::Rendering
         if (!dc) return;
         m_dc.copy_from(dc);
 
-        // Create the white level adjustment effect (D2D1_EFFECT_WHITE_LEVEL_ADJUSTMENT).
-        dc->CreateEffect(CLSID_D2D1WhiteLevelAdjustment, m_whiteLevelEffect.put());
+        // Create the white level adjustment effect.
+        HRESULT hr1 = dc->CreateEffect(CLSID_D2D1WhiteLevelAdjustment, m_whiteLevelEffect.put());
 
-        // Create the HDR tone map effect.
-        dc->CreateEffect(CLSID_D2D1HdrToneMap, m_hdrToneMapEffect.put());
+        // Create the HDR tone map effect (D2D built-in operator).
+        HRESULT hr2 = dc->CreateEffect(CLSID_D2D1HdrToneMap, m_hdrToneMapEffect.put());
 
         // Create a color matrix effect for exposure adjustment.
-        dc->CreateEffect(CLSID_D2D1ColorMatrix, m_exposureEffect.put());
+        HRESULT hr3 = dc->CreateEffect(CLSID_D2D1ColorMatrix, m_exposureEffect.put());
 
-        m_initialized = true;
-        UpdateEffects();
+        // Create effects for per-channel LUT-based tone mapping (Reinhard/ACES/Hable).
+        HRESULT hr4 = dc->CreateEffect(CLSID_D2D1ColorMatrix, m_preScaleEffect.put());
+        HRESULT hr5 = dc->CreateEffect(CLSID_D2D1TableTransfer, m_tableTransferEffect.put());
+
+        m_initialized = SUCCEEDED(hr1) && SUCCEEDED(hr2) && SUCCEEDED(hr3)
+            && SUCCEEDED(hr4) && SUCCEEDED(hr5);
+        if (m_initialized)
+            UpdateEffects();
     }
 
     void ToneMapper::Release()
@@ -30,6 +36,8 @@ namespace ShaderLab::Rendering
         m_whiteLevelEffect = nullptr;
         m_hdrToneMapEffect = nullptr;
         m_exposureEffect = nullptr;
+        m_preScaleEffect = nullptr;
+        m_tableTransferEffect = nullptr;
         m_output = nullptr;
         m_dc = nullptr;
         m_initialized = false;
@@ -87,7 +95,7 @@ namespace ShaderLab::Rendering
             m_exposureEffect->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, matrix);
         }
 
-        // Configure white level adjustment.
+        // Configure white level adjustment (for SDRClamp mode).
         if (m_whiteLevelEffect)
         {
             m_whiteLevelEffect->SetValue(
@@ -96,7 +104,7 @@ namespace ShaderLab::Rendering
                 D2D1_WHITELEVELADJUSTMENT_PROP_OUTPUT_WHITE_LEVEL, m_displayMaxNits);
         }
 
-        // Configure HDR tone map.
+        // Configure HDR tone map (D2D built-in, not used for Reinhard/ACES/Hable).
         if (m_hdrToneMapEffect)
         {
             m_hdrToneMapEffect->SetValue(
@@ -104,6 +112,14 @@ namespace ShaderLab::Rendering
             m_hdrToneMapEffect->SetValue(
                 D2D1_HDRTONEMAP_PROP_DISPLAY_MODE,
                 D2D1_HDRTONEMAP_DISPLAY_MODE_SDR);
+        }
+
+        // Build per-channel LUT for Reinhard / ACES / Hable.
+        if (m_mode == ToneMapMode::Reinhard
+            || m_mode == ToneMapMode::ACESFilmic
+            || m_mode == ToneMapMode::Hable)
+        {
+            BuildToneMappingLUT(m_mode);
         }
     }
 
@@ -133,7 +149,6 @@ namespace ShaderLab::Rendering
         {
         case ToneMapMode::SDRClamp:
         {
-            // Use white level adjustment to scale HDR → SDR range.
             if (m_whiteLevelEffect)
             {
                 m_whiteLevelEffect->SetInput(0, current);
@@ -149,14 +164,16 @@ namespace ShaderLab::Rendering
         case ToneMapMode::ACESFilmic:
         case ToneMapMode::Hable:
         {
-            // Use D2D's built-in HDR tone map effect.
-            // The D2D1_HDRTONEMAP effect implements a sophisticated tone curve
-            // that approximates these operators when configured appropriately.
-            if (m_hdrToneMapEffect)
+            // Per-channel tone mapping: pre-scale to [0,1] then apply LUT.
+            if (m_preScaleEffect && m_tableTransferEffect)
             {
-                m_hdrToneMapEffect->SetInput(0, current);
+                m_preScaleEffect->SetInput(0, current);
+                winrt::com_ptr<ID2D1Image> preScaled;
+                m_preScaleEffect->GetOutput(preScaled.put());
+
+                m_tableTransferEffect->SetInput(0, preScaled.get());
                 winrt::com_ptr<ID2D1Image> out;
-                m_hdrToneMapEffect->GetOutput(out.put());
+                m_tableTransferEffect->GetOutput(out.put());
                 m_output = out;
                 return m_output.get();
             }
@@ -171,7 +188,67 @@ namespace ShaderLab::Rendering
     }
 
     // -----------------------------------------------------------------------
-    // Tone mapping math (for reference / future custom shader use)
+    // LUT generation for per-channel tone mapping
+    // -----------------------------------------------------------------------
+
+    void ToneMapper::BuildToneMappingLUT(ToneMapMode mode)
+    {
+        if (!m_preScaleEffect || !m_tableTransferEffect)
+            return;
+
+        // Max expected input in scRGB linear (1.0 = 80 nits).
+        float maxInput = (std::max)(1.0f, m_displayMaxNits / 80.0f);
+
+        // Pre-scale matrix: normalize RGB from [0, maxInput] to [0, 1] for table lookup.
+        float scale = 1.0f / maxInput;
+        D2D1_MATRIX_5X4_F preMatrix = D2D1::Matrix5x4F(
+            scale, 0, 0, 0,
+            0, scale, 0, 0,
+            0, 0, scale, 0,
+            0, 0, 0, 1,
+            0, 0, 0, 0);
+        m_preScaleEffect->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, preMatrix);
+
+        // Hable requires white point normalization.
+        float hableWhiteScale = 1.0f;
+        if (mode == ToneMapMode::Hable)
+        {
+            constexpr float W = 11.2f;
+            float hableW = HableToneMap(W);
+            if (hableW > 0.0f)
+                hableWhiteScale = 1.0f / hableW;
+        }
+
+        // Sample the tone curve into the LUT.
+        std::vector<float> lut(kLutSize);
+        for (uint32_t i = 0; i < kLutSize; ++i)
+        {
+            float t = static_cast<float>(i) / static_cast<float>(kLutSize - 1);
+            float x = t * maxInput;
+
+            float y = 0.0f;
+            switch (mode)
+            {
+            case ToneMapMode::Reinhard:   y = ReinhardToneMap(x); break;
+            case ToneMapMode::ACESFilmic: y = ACESFilmicToneMap(x); break;
+            case ToneMapMode::Hable:      y = HableToneMap(x) * hableWhiteScale; break;
+            default:                      y = t; break;
+            }
+            lut[i] = (std::max)(0.0f, (std::min)(1.0f, y));
+        }
+
+        // Apply the same LUT to R, G, B channels; leave alpha untouched.
+        auto lutBytes = reinterpret_cast<const BYTE*>(lut.data());
+        UINT32 lutByteSize = static_cast<UINT32>(lut.size() * sizeof(float));
+        m_tableTransferEffect->SetValue(D2D1_TABLETRANSFER_PROP_RED_TABLE, lutBytes, lutByteSize);
+        m_tableTransferEffect->SetValue(D2D1_TABLETRANSFER_PROP_GREEN_TABLE, lutBytes, lutByteSize);
+        m_tableTransferEffect->SetValue(D2D1_TABLETRANSFER_PROP_BLUE_TABLE, lutBytes, lutByteSize);
+        m_tableTransferEffect->SetValue(D2D1_TABLETRANSFER_PROP_ALPHA_DISABLE, TRUE);
+        m_tableTransferEffect->SetValue(D2D1_TABLETRANSFER_PROP_CLAMP_OUTPUT, TRUE);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tone mapping math (for LUT generation and reference)
     // -----------------------------------------------------------------------
 
     float ToneMapper::ReinhardToneMap(float x)

@@ -11,6 +11,7 @@
 
     <Grid>
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
@@ -21,33 +22,147 @@
             <ColumnDefinition Width="*" />
         </Grid.ColumnDefinitions>
 
+        <!-- File toolbar -->
+        <Grid Grid.Row="0" Grid.ColumnSpan="3"
+              Padding="8,4"
+              Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+              BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+              BorderThickness="0,0,0,1">
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button x:Name="SaveGraphButton" Content="Save Graph" />
+                <Button x:Name="LoadGraphButton" Content="Load Graph" />
+                <AppBarSeparator />
+                <DropDownButton x:Name="AddNodeButton" Content="Add Node">
+                    <DropDownButton.Flyout>
+                        <MenuFlyout x:Name="AddNodeFlyout" />
+                    </DropDownButton.Flyout>
+                </DropDownButton>
+                <Button x:Name="AddImageSourceButton" Content="Add Image Source" />
+                <Button x:Name="AddFloodSourceButton" Content="Add Color Source" />
+                <AppBarSeparator />
+                <Button x:Name="SaveImageButton" Content="Save Image" />
+            </StackPanel>
+        </Grid>
+
         <!-- Left: Node Graph Editor area -->
-        <Grid Grid.Row="0" Grid.Column="0"
+        <Grid Grid.Row="1" Grid.Column="0"
               Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
               BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
               BorderThickness="0,0,1,0">
-            <TextBlock Text="Node Graph Editor"
-                       HorizontalAlignment="Center"
-                       VerticalAlignment="Center"
-                       Style="{StaticResource SubtitleTextBlockStyle}"
-                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            <Grid x:Name="NodeGraphContainer" Background="Transparent">
+                <SwapChainPanel x:Name="NodeGraphPanel" />
+            </Grid>
         </Grid>
 
         <!-- Column divider -->
-        <Border Grid.Row="0" Grid.Column="1"
+        <Border Grid.Row="1" Grid.Column="1"
                 Width="4"
                 Background="{ThemeResource CardStrokeColorDefaultBrush}" />
 
         <!-- Right: Preview + property tabs -->
-        <Grid Grid.Row="0" Grid.Column="2">
+        <Grid Grid.Row="1" Grid.Column="2">
             <Grid.RowDefinitions>
                 <RowDefinition Height="*" />
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
             </Grid.RowDefinitions>
 
-            <!-- Preview surface -->
-            <SwapChainPanel x:Name="PreviewPanel" Grid.Row="0" />
+            <!-- Preview surface with toolbar and overlay -->
+            <Grid Grid.Row="0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <!-- Preview toolbar: node selector -->
+                <Grid Grid.Row="0" Padding="6,4"
+                      Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                      BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                      BorderThickness="0,0,0,1">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Preview:"
+                               VerticalAlignment="Center"
+                               Margin="0,0,8,0"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+                    <ComboBox x:Name="PreviewNodeSelector" Grid.Column="1"
+                              MinWidth="100" />
+                    <TextBlock Text="Analysis:"
+                               Grid.Column="2"
+                               VerticalAlignment="Center"
+                               Margin="12,0,8,0"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+                    <ComboBox x:Name="FalseColorSelector" Grid.Column="3"
+                              MinWidth="120">
+                        <x:String>None</x:String>
+                        <x:String>Clipping</x:String>
+                        <x:String>Luminance Zones</x:String>
+                        <x:String>Out of Gamut</x:String>
+                    </ComboBox>
+                    <TextBlock Text="Display:"
+                               Grid.Column="4"
+                               VerticalAlignment="Center"
+                               Margin="12,0,8,0"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+                    <ComboBox x:Name="DisplayProfileSelector" Grid.Column="5"
+                              MinWidth="180" />
+                    <CheckBox x:Name="CompareToggle" Grid.Column="6"
+                              Content="Compare"
+                              Margin="12,0,0,0" />
+                </Grid>
+
+                <!-- Compare toolbar (visible only when compare is active) -->
+                <Grid x:Name="CompareToolbar" Grid.Row="1" Padding="6,4"
+                      Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                      BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                      BorderThickness="0,0,0,1"
+                      Visibility="Collapsed">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Compare with:"
+                               VerticalAlignment="Center"
+                               Margin="0,0,8,0"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+                    <ComboBox x:Name="CompareNodeSelector" Grid.Column="1"
+                              HorizontalAlignment="Stretch"
+                              MinWidth="120" />
+                    <TextBlock x:Name="SplitPositionText" Grid.Column="2"
+                               VerticalAlignment="Center"
+                               Margin="12,0,0,0"
+                               Text="Drag the split line on the preview"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                </Grid>
+
+                <!-- Swap chain panel -->
+                <SwapChainPanel x:Name="PreviewPanel" Grid.Row="2" />
+
+                <!-- Preview overlay (node name when not on Output) -->
+                <Border Grid.Row="2"
+                        HorizontalAlignment="Left"
+                        VerticalAlignment="Top"
+                        Margin="8,8,0,0"
+                        Padding="6,2"
+                        Background="#99000000"
+                        CornerRadius="2"
+                        Visibility="Collapsed"
+                        x:Name="PreviewOverlayBorder">
+                    <TextBlock x:Name="PreviewOverlayText"
+                               FontSize="12"
+                               Foreground="White" />
+                </Border>
+            </Grid>
 
             <!-- Row divider -->
             <Border Grid.Row="1"
@@ -60,8 +175,9 @@
                      TabWidthMode="SizeToContent">
                 <TabViewItem Header="Properties" IsClosable="False">
                     <ScrollViewer>
-                        <StackPanel Padding="12" Spacing="8">
-                            <TextBlock Text="Select a node to view its properties."
+                        <StackPanel x:Name="PropertiesPanel" Padding="12" Spacing="8">
+                            <TextBlock x:Name="PropertiesPlaceholder"
+                                       Text="Select a node to view its properties."
                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                         </StackPanel>
                     </ScrollViewer>
@@ -77,24 +193,60 @@
                                  IsSpellCheckEnabled="False" />
                     </Grid>
                 </TabViewItem>
-                <TabViewItem Header="Pixel Inspector" IsClosable="False">
-                    <ScrollViewer>
-                        <StackPanel Padding="12" Spacing="8">
-                            <TextBlock Text="Click on the preview to inspect pixel values."
-                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                        </StackPanel>
-                    </ScrollViewer>
+                <TabViewItem Header="Pixel Trace" IsClosable="False">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+
+                        <!-- Trace toolbar -->
+                        <Grid Grid.Row="0" Padding="8,4"
+                              Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                              BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                              BorderThickness="0,0,0,1">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock x:Name="TracePositionText"
+                                       Text="Click preview to trace a pixel"
+                                       VerticalAlignment="Center"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       FontFamily="Cascadia Mono, Consolas, Courier New" />
+                            <TextBlock Text="Unit:"
+                                       Grid.Column="2"
+                                       VerticalAlignment="Center"
+                                       Margin="8,0,6,0"
+                                       Style="{StaticResource CaptionTextBlockStyle}" />
+                            <ComboBox x:Name="TraceUnitSelector" Grid.Column="3"
+                                      MinWidth="100">
+                                <x:String>scRGB</x:String>
+                                <x:String>sRGB</x:String>
+                                <x:String>Nits</x:String>
+                                <x:String>PQ</x:String>
+                            </ComboBox>
+                        </Grid>
+
+                        <!-- Trace tree (placeholder until TreeView is confirmed working) -->
+                        <ScrollViewer Grid.Row="1" Padding="4">
+                            <StackPanel x:Name="PixelTracePanel" Spacing="2" />
+                        </ScrollViewer>
+                    </Grid>
                 </TabViewItem>
             </TabView>
         </Grid>
 
         <!-- Status bar -->
-        <Grid Grid.Row="1" Grid.ColumnSpan="3"
+        <Grid Grid.Row="2" Grid.ColumnSpan="3"
               Padding="12,4"
               Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
               BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
               BorderThickness="0,1,0,0">
             <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
@@ -114,7 +266,12 @@
                        Text="Max Luminance: --"
                        Margin="0,0,24,0"
                        Style="{StaticResource CaptionTextBlockStyle}" />
-            <TextBlock x:Name="FpsText" Grid.Column="4"
+            <TextBlock x:Name="CursorReadoutText" Grid.Column="3"
+                       Text=""
+                       Margin="0,0,24,0"
+                       Style="{StaticResource CaptionTextBlockStyle}"
+                       FontFamily="Cascadia Mono, Consolas, Courier New" />
+            <TextBlock x:Name="FpsText" Grid.Column="5"
                        Text="FPS: --"
                        Style="{StaticResource CaptionTextBlockStyle}" />
         </Grid>

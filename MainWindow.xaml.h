@@ -5,6 +5,7 @@
 #include "Rendering/DisplayMonitor.h"
 #include "Rendering/GraphEvaluator.h"
 #include "Rendering/ToneMapper.h"
+#include "Rendering/FalseColorOverlay.h"
 #include "Graph/EffectGraph.h"
 #include "Effects/EffectRegistry.h"
 #include "Effects/SourceNodeFactory.h"
@@ -13,6 +14,7 @@
 #include "Controls/ShaderEditorController.h"
 #include "Controls/NodeGraphController.h"
 #include "Controls/PixelInspectorController.h"
+#include "Controls/PixelTraceController.h"
 
 namespace winrt::ShaderLab::implementation
 {
@@ -24,8 +26,27 @@ namespace winrt::ShaderLab::implementation
     private:
         HWND GetWindowHandle();
         void InitializeRendering();
+        void OnPreviewPanelLoaded();
         void RegisterCustomEffects();
         void UpdateStatusBar();
+        void PopulatePreviewNodeSelector();
+        void PopulateDisplayProfileSelector();
+        void PopulateCompareNodeSelector();
+        ID2D1Image* GetPreviewImage();
+        ID2D1Image* ResolveDisplayImage(uint32_t nodeId);
+        void ApplyDisplayProfile(const ::ShaderLab::Rendering::DisplayProfile& profile);
+        void RevertToLiveDisplay();
+        void ResetAfterGraphLoad();
+
+        // Pixel trace helpers.
+        D2D1_RECT_F GetPreviewImageBounds();
+        bool PointerToImageCoords(
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args,
+            float& outNormX, float& outNormY);
+        void PopulatePixelTraceTree();
+        void UpdatePixelTraceValues();
+        winrt::Microsoft::UI::Xaml::Controls::Grid CreateTraceRow(
+            const ::ShaderLab::Controls::PixelTraceNode& traceNode);
 
         // Event handlers.
         void OnPreviewSizeChanged(
@@ -34,6 +55,58 @@ namespace winrt::ShaderLab::implementation
         void OnShaderEditorKeyDown(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const& args);
+        void OnPreviewNodeSelectionChanged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
+        void OnPreviewPointerMoved(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnPreviewKeyDown(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const& args);
+        void OnFalseColorSelectionChanged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
+        void OnDisplayProfileSelectionChanged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
+        winrt::fire_and_forget LoadIccProfileAsync();
+        void OnPreviewPointerPressed(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnTraceUnitSelectionChanged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
+        void OnSaveGraphClicked(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnLoadGraphClicked(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        winrt::fire_and_forget SaveGraphAsync();
+        winrt::fire_and_forget LoadGraphAsync();
+        void PopulateAddNodeFlyout();
+        void OnAddEffectNode(const ::ShaderLab::Effects::EffectDescriptor& desc);
+        void OnAddImageSourceClicked(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        winrt::fire_and_forget AddImageSourceAsync();
+        void OnAddFloodSourceClicked(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnNodeAdded(uint32_t nodeId);
+        void OnCompareToggled(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnCompareNodeSelectionChanged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
+        void OnPreviewPointerDragged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnPreviewPointerReleased(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
 
         // Render loop.
         void OnRenderTick(
@@ -42,10 +115,11 @@ namespace winrt::ShaderLab::implementation
         void RenderFrame();
 
         // Device stack.
-        ::ShaderLab::Rendering::RenderEngine    m_renderEngine;
-        ::ShaderLab::Rendering::DisplayMonitor  m_displayMonitor;
-        ::ShaderLab::Rendering::GraphEvaluator  m_graphEvaluator;
-        ::ShaderLab::Rendering::ToneMapper      m_toneMapper;
+        ::ShaderLab::Rendering::RenderEngine       m_renderEngine;
+        ::ShaderLab::Rendering::DisplayMonitor     m_displayMonitor;
+        ::ShaderLab::Rendering::GraphEvaluator     m_graphEvaluator;
+        ::ShaderLab::Rendering::ToneMapper         m_toneMapper;
+        ::ShaderLab::Rendering::FalseColorOverlay  m_falseColor;
 
         // Effect graph.
         ::ShaderLab::Graph::EffectGraph         m_graph;
@@ -55,6 +129,7 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Controls::ShaderEditorController    m_shaderEditor;
         ::ShaderLab::Controls::NodeGraphController       m_nodeGraphController;
         ::ShaderLab::Controls::PixelInspectorController  m_pixelInspector;
+        ::ShaderLab::Controls::PixelTraceController      m_pixelTrace;
 
         // Render loop timer.
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer m_renderTimer{ nullptr };
@@ -63,6 +138,60 @@ namespace winrt::ShaderLab::implementation
 
         HWND m_hwnd{ nullptr };
         bool m_customEffectsRegistered{ false };
+
+        // Per-node preview.
+        uint32_t m_previewNodeId{ 0 };       // 0 = Output node (default)
+        std::vector<uint32_t> m_topoOrder;   // cached for [ ] navigation
+        bool m_suppressSelectorEvent{ false };
+
+        // Display profile selection.
+        std::vector<::ShaderLab::Rendering::DisplayProfile> m_displayPresets;
+        std::optional<::ShaderLab::Rendering::DisplayProfile> m_loadedIccProfile;
+        int32_t m_committedProfileIndex{ 0 };
+        bool m_suppressProfileEvent{ false };
+
+        // Pixel trace.
+        bool m_traceActive{ false };
+        uint32_t m_traceUnit{ 0 };          // 0=scRGB, 1=sRGB, 2=Nits, 3=PQ
+        uint32_t m_lastTraceTopologyHash{ 0 };
+        std::vector<winrt::Microsoft::UI::Xaml::Controls::Grid> m_traceRowCache;
+
+        // Split comparison.
+        bool m_compareActive{ false };
+        uint32_t m_compareNodeId{ 0 };
+        float m_splitPosition{ 0.5f };  // 0.0–1.0 within image bounds
+        bool m_isDraggingSplit{ false };
+        bool m_suppressCompareEvent{ false };
+
+        // Node graph editor rendering.
+        winrt::com_ptr<IDXGISwapChain1>     m_graphSwapChain;
+        winrt::com_ptr<ID2D1Bitmap1>        m_graphRenderTarget;
+        uint32_t m_graphPanelWidth{ 0 };
+        uint32_t m_graphPanelHeight{ 0 };
+
+        void InitializeGraphPanel();
+        void ResizeGraphPanel(uint32_t w, uint32_t h);
+        void RenderNodeGraph();
+        D2D1_POINT_2F GraphPanelPointerToCanvas(
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnGraphPanelPointerPressed(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnGraphPanelPointerMoved(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnGraphPanelPointerReleased(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void UpdatePropertiesPanel();
+        void OnSaveImageClicked(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        winrt::fire_and_forget SaveImageAsync();
+
+        uint32_t m_selectedNodeId{ 0 };
+        bool m_isDraggingNode{ false };
+        bool m_isDraggingConnection{ false };
     };
 }
 

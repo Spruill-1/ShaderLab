@@ -43,6 +43,8 @@ graph TB
         DM[Display Change Monitor]
         HDR[HDR/SDR Detection]
         LUM[Max Luminance Query]
+        DP[Display Profile<br/>Simulated / Live]
+        ICC[ICC Profile Parser]
     end
 
     MW --> NGE
@@ -64,7 +66,9 @@ graph TB
     CS --> EG
     DM --> HDR
     DM --> LUM
-    DM --> PF
+    DM --> DP
+    ICC --> DP
+    DP --> PF
     SE -.->|Hot Reload| PS
     SE -.->|Hot Reload| CS
     PI -.->|Read Back| EVAL
@@ -163,6 +167,104 @@ sequenceDiagram
     DM->>App: Update status bar
 ```
 
+## Display Profile Mocking
+
+Allows overriding the live display's characteristics with values from a preset or ICC profile, enabling tone mapping development targeting arbitrary displays without physical hardware.
+
+```mermaid
+classDiagram
+    class DisplayCapabilities {
+        +bool hdrEnabled
+        +uint32_t bitsPerColor
+        +DXGI_COLOR_SPACE_TYPE colorSpace
+        +float sdrWhiteLevelNits
+        +float maxLuminanceNits
+        +float minLuminanceNits
+        +float maxFullFrameLuminanceNits
+    }
+
+    class ChromaticityXY {
+        +float x
+        +float y
+    }
+
+    class DisplayProfile {
+        +DisplayCapabilities caps
+        +ChromaticityXY primaryRed
+        +ChromaticityXY primaryGreen
+        +ChromaticityXY primaryBlue
+        +ChromaticityXY whitePoint
+        +GamutId gamut
+        +wstring profileName
+        +bool isSimulated
+    }
+
+    class GamutId {
+        <<enumeration>>
+        sRGB
+        DCI_P3
+        BT2020
+        Custom
+    }
+
+    class IccProfileParser {
+        +LoadFromFile(path) IccProfileData?
+    }
+
+    class IccProfileData {
+        +wstring description
+        +ChromaticityXY primaryRed/Green/Blue
+        +ChromaticityXY whitePoint
+        +float luminanceNits
+        +bool valid
+    }
+
+    class DisplayMonitor {
+        +SetSimulatedProfile(profile)
+        +ClearSimulatedProfile()
+        +IsSimulated() bool
+        +ActiveProfile() DisplayProfile
+        +CachedCapabilities() DisplayCapabilities
+    }
+
+    DisplayProfile *-- DisplayCapabilities
+    DisplayProfile *-- ChromaticityXY
+    DisplayProfile --> GamutId
+    IccProfileParser ..> IccProfileData : parses
+    IccProfileData ..> DisplayProfile : DisplayProfileFromIcc()
+    DisplayMonitor --> DisplayProfile : m_simulatedProfile
+```
+
+```mermaid
+sequenceDiagram
+    participant UI as User / UI
+    participant DM as DisplayMonitor
+    participant ICC as IccProfileParser
+    participant CB as Callback (ToneMapper)
+
+    alt Preset selection
+        UI->>DM: SetSimulatedProfile(PresetP3_1000())
+        DM->>DM: Store simulated profile
+        DM->>CB: callback(profile.caps)
+        CB->>CB: Re-configure tone mapping
+    end
+
+    alt ICC file load
+        UI->>ICC: LoadFromFile("display.icc")
+        ICC-->>UI: IccProfileData
+        UI->>UI: DisplayProfileFromIcc(iccData)
+        UI->>DM: SetSimulatedProfile(profile)
+        DM->>DM: Store simulated profile
+        DM->>CB: callback(profile.caps)
+    end
+
+    alt Clear simulation
+        UI->>DM: ClearSimulatedProfile()
+        DM->>DM: Re-query live DXGI output
+        DM->>CB: callback(liveCaps)
+    end
+```
+
 ## Topological Evaluation
 
 ```mermaid
@@ -215,6 +317,7 @@ flowchart TD
 | 23 | GPU readback via D2D1Bitmap1 for pixel inspection | Renders 1×1 target bitmap at pixel coordinates, copies to CPU_READ bitmap, maps for float4 read. Converts scRGB linear → sRGB gamma, PQ (ST.2084), BT.709 luminance (80 nit ref white). Tracked position persists across re-evaluations. | Day 3 |
 | 24 | D2D built-in effects for tone mapping | WhiteLevelAdjustment for SDR↔HDR white scaling, HdrToneMap for HDR→SDR, ColorMatrix for exposure (2^stops). Five modes: None, Reinhard, ACES Filmic, Hable, SDR Clamp. Reference math implementations for custom shader fallback. | Day 3 |
 | 25 | DispatcherQueueTimer at 16ms for render loop | ~60 FPS render tick drives graph evaluation → tone mapping → swap chain present. FPS counter updated every second in status bar. Ctrl+Enter compiles shader from TextBox. Custom effects (pixel + compute) registered with D2D factory at startup. | Day 3 |
+| 26 | Display profile mocking with ICC parser | DisplayProfile wraps DisplayCapabilities with CIE xy chromaticities and gamut ID. Six presets cover sRGB→BT.2020 at various luminances. IccProfileParser reads binary ICC files (v2/v4) extracting rXYZ/gXYZ/bXYZ/wtpt/lumi/desc tags. DisplayMonitor.SetSimulatedProfile overrides live caps and fires existing callback, so the entire downstream pipeline (tone mapper, pipeline format) adapts without changes. | Day 4 |
 
 ---
 
@@ -268,8 +371,11 @@ ShaderLab/
 │   └── EffectGraph.cpp         # EffectGraph implementation
 ├── Rendering/                  # D3D/D2D device management, swap chain, pipeline
 │   ├── DisplayInfo.h           # DisplayCapabilities struct (HDR flag, luminance, color space, SDR white level)
-│   ├── DisplayMonitor.h        # DisplayMonitor class (WM_DISPLAYCHANGE + adapter-changed event)
+│   ├── DisplayMonitor.h        # DisplayMonitor class (WM_DISPLAYCHANGE + adapter-changed event + simulated profile)
 │   ├── DisplayMonitor.cpp      # DisplayMonitor implementation
+│   ├── DisplayProfile.h        # DisplayProfile struct, ChromaticityXY, GamutId, preset factory functions
+│   ├── IccProfileParser.h      # IccProfileParser class + IccProfileData struct
+│   ├── IccProfileParser.cpp    # ICC binary format parsing (v2/v4), XYZ→xy conversion, gamut detection
 │   ├── PipelineFormat.h        # PipelineFormat struct + 4 predefined formats (scRGB FP16, sRGB 8-bit, HDR10, Linear FP32)
 │   ├── RenderEngine.h          # RenderEngine class (D3D11 + D2D1 + swap chain lifecycle)
 │   ├── RenderEngine.cpp        # RenderEngine implementation (device creation, resize, format switch, draw cycle)

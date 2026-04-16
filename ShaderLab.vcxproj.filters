@@ -46,6 +46,9 @@
     <ClInclude Include="Rendering\DisplayMonitor.h">
       <Filter>Rendering</Filter>
     </ClInclude>
+    <ClInclude Include="Rendering\DisplayProfile.h">
+      <Filter>Rendering</Filter>
+    </ClInclude>
     <ClInclude Include="Rendering\PipelineFormat.h">
       <Filter>Rendering</Filter>
     </ClInclude>
@@ -56,6 +59,9 @@
       <Filter>Rendering</Filter>
     </ClInclude>
     <ClInclude Include="Rendering\ToneMapper.h">
+      <Filter>Rendering</Filter>
+    </ClInclude>
+    <ClInclude Include="Rendering\IccProfileParser.h">
       <Filter>Rendering</Filter>
     </ClInclude>
     <ClInclude Include="Rendering\FalseColorOverlay.h">
@@ -107,6 +113,9 @@
     </ClCompile>
 
     <ClCompile Include="Rendering\DisplayMonitor.cpp">
+      <Filter>Rendering</Filter>
+    </ClCompile>
+    <ClCompile Include="Rendering\IccProfileParser.cpp">
       <Filter>Rendering</Filter>
     </ClCompile>
     <ClCompile Include="Rendering\RenderEngine.cpp">

@@ -1,7 +1,7 @@
 #include "pch.h"
 #include "RenderEngine.h"
 
-#include <windows.ui.xaml.media.dxinterop.h>
+#include <microsoft.ui.xaml.media.dxinterop.h>
 
 namespace ShaderLab::Rendering
 {
@@ -45,17 +45,11 @@ namespace ShaderLab::Rendering
     {
         // --- DXGI Factory ---
         UINT factoryFlags = 0;
-#ifdef _DEBUG
-        factoryFlags = DXGI_CREATE_FACTORY_DEBUG;
-#endif
         winrt::check_hresult(
             CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(m_dxgiFactory.put())));
 
         // --- D3D11 Device ---
         UINT d3dFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT; // required for D2D interop
-#ifdef _DEBUG
-        d3dFlags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif
         D3D_FEATURE_LEVEL featureLevels[] = {
             D3D_FEATURE_LEVEL_11_1,
             D3D_FEATURE_LEVEL_11_0,
