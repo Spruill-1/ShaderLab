@@ -223,26 +223,23 @@ namespace ShaderLab::Effects
         {
             m_inputRect = inputRects[0];
 
-            if (m_hasRequestedRect)
+            // Compute union of input rects.
+            *outputRect = inputRects[0];
+            for (UINT32 i = 1; i < inputRectCount; ++i)
             {
-                // During rendering: D2D called MapOutputRectToInputRects first,
-                // so we know the actual region needed. Use it to prevent infinite
-                // inputs from blowing up the UV coordinate space.
-                *outputRect = m_lastRequestedRect;
-                m_hasRequestedRect = false;
+                outputRect->left   = (std::min)(outputRect->left,   inputRects[i].left);
+                outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
+                outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
+                outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
             }
-            else
+
+            // If the result is unreasonably large (infinite-extent input), constrain
+            // to the host-supplied desired rect (render target size).
+            LONG w = outputRect->right - outputRect->left;
+            LONG h = outputRect->bottom - outputRect->top;
+            if ((w > 8192 || h > 8192 || w < 0 || h < 0) && m_hasDesiredRect)
             {
-                // During setup: no requested rect yet. Pass through input rects.
-                // This runs during SetSingleTransformNode / initial effect creation.
-                *outputRect = inputRects[0];
-                for (UINT32 i = 1; i < inputRectCount; ++i)
-                {
-                    outputRect->left   = (std::min)(outputRect->left,   inputRects[i].left);
-                    outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
-                    outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
-                    outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
-                }
+                *outputRect = m_desiredOutputRect;
             }
         }
         else
@@ -259,11 +256,6 @@ namespace ShaderLab::Effects
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const
     {
-        // Store for MapInputRectsToOutputRect to use.
-        auto* mutableThis = const_cast<CustomPixelShaderEffect*>(this);
-        mutableThis->m_lastRequestedRect = *outputRect;
-        mutableThis->m_hasRequestedRect = true;
-
         for (UINT32 i = 0; i < inputRectCount; ++i)
         {
             inputRects[i] = *outputRect;

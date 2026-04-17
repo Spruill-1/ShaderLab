@@ -218,21 +218,19 @@ namespace ShaderLab::Effects
     {
         if (inputRectCount > 0 && inputRects)
         {
-            if (m_hasRequestedRect)
+            *outputRect = inputRects[0];
+            for (UINT32 i = 1; i < inputRectCount; ++i)
             {
-                *outputRect = m_lastRequestedRect;
-                m_hasRequestedRect = false;
+                outputRect->left   = (std::min)(outputRect->left,   inputRects[i].left);
+                outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
+                outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
+                outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
             }
-            else
+            LONG w = outputRect->right - outputRect->left;
+            LONG h = outputRect->bottom - outputRect->top;
+            if ((w > 8192 || h > 8192 || w < 0 || h < 0) && m_hasDesiredRect)
             {
-                *outputRect = inputRects[0];
-                for (UINT32 i = 1; i < inputRectCount; ++i)
-                {
-                    outputRect->left   = (std::min)(outputRect->left,   inputRects[i].left);
-                    outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
-                    outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
-                    outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
-                }
+                *outputRect = m_desiredOutputRect;
             }
         }
         else
@@ -249,10 +247,6 @@ namespace ShaderLab::Effects
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const
     {
-        auto* mutableThis = const_cast<CustomComputeShaderEffect*>(this);
-        mutableThis->m_lastRequestedRect = *outputRect;
-        mutableThis->m_hasRequestedRect = true;
-
         for (UINT32 i = 0; i < inputRectCount; ++i)
         {
             inputRects[i] = *outputRect;
