@@ -219,27 +219,22 @@ namespace ShaderLab::Effects
         D2D1_RECT_L* outputRect,
         D2D1_RECT_L* outputOpaqueSubRect)
     {
-        // Default behavior: output rect = union of all input rects.
         if (inputRectCount > 0 && inputRects)
         {
             m_inputRect = inputRects[0];
-            *outputRect = inputRects[0];
 
-            for (UINT32 i = 1; i < inputRectCount; ++i)
-            {
-                outputRect->left   = (std::min)(outputRect->left,   inputRects[i].left);
-                outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
-                outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
-                outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
-            }
+            // Use the intersection of input rects with the previously requested
+            // output rect. This prevents infinite-extent inputs (e.g., Turbulence)
+            // from creating a huge output rect that causes D2D to map texture
+            // coordinates across an enormous area, resulting in constant UVs
+            // and a solid-color output.
+            *outputRect = m_requestedOutputRect;
         }
         else
         {
-            // No inputs — the shader generates content (unlikely for pixel shaders).
             *outputRect = D2D1_RECT_L{ 0, 0, 0, 0 };
         }
 
-        // No opaque sub-rect (conservative).
         *outputOpaqueSubRect = D2D1_RECT_L{ 0, 0, 0, 0 };
         return S_OK;
     }
@@ -249,7 +244,10 @@ namespace ShaderLab::Effects
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const
     {
-        // Default 1:1 mapping — each input needs the same rect as the output.
+        // Store the requested output rect for use in MapInputRectsToOutputRect.
+        const_cast<CustomPixelShaderEffect*>(this)->m_requestedOutputRect = *outputRect;
+
+        // Each input needs the same rect as the output (1:1 passthrough).
         for (UINT32 i = 0; i < inputRectCount; ++i)
         {
             inputRects[i] = *outputRect;
