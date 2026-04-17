@@ -130,6 +130,12 @@ namespace ShaderLab::Effects
         UINT32            m_inputCount{ 1 };
         D2D1_RECT_L       m_inputRect{};
 
+        // Stored from the most recent MapOutputRectToInputRects call.
+        // Used to constrain infinite-extent inputs in MapInputRectsToOutputRect.
+        // Reset after each use so setup calls (before rendering) use the fallback.
+        D2D1_RECT_L       m_lastRequestedRect{};
+        bool              m_hasRequestedRect{ false };
+
         // Whether we need to re-upload the constant buffer.
         bool m_cbDirty{ false };
         // Whether we need to re-set the pixel shader.
