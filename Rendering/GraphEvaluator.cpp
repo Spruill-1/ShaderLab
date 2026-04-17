@@ -22,7 +22,7 @@ namespace ShaderLab::Rendering
         }
         catch (const std::logic_error&)
         {
-            // Graph has a cycle — cannot evaluate.
+            // Graph has a cycle -- cannot evaluate.
             return nullptr;
         }
 
@@ -40,7 +40,7 @@ namespace ShaderLab::Rendering
             {
                 // Source nodes have their cachedOutput set externally
                 // (by WIC image loading or Flood effect in Step 8).
-                // Nothing to do here — just ensure it's marked clean.
+                // Nothing to do here -- just ensure it's marked clean.
                 node->dirty = false;
                 break;
             }
@@ -87,14 +87,25 @@ namespace ShaderLab::Rendering
                         node->dirty = false;
                     }
 
+                    // Log external input count before wiring.
+                    UINT32 extInputs = effect->GetInputCount();
+                    OutputDebugStringW(std::format(L"[CustomFX] node {} '{}' -- wiring, D2D inputCount={}\n",
+                        node->id, node->name, extInputs).c_str());
+
                     WireInputs(effect, *node, graph);
 
                     winrt::com_ptr<ID2D1Image> output;
                     effect->GetOutput(output.put());
                     node->cachedOutput = output.get();
+                    OutputDebugStringW(std::format(L"[CustomFX] node {} -- cachedOutput={}\n",
+                        node->id, (node->cachedOutput ? L"valid" : L"NULL")).c_str());
                 }
                 else if (effect)
                 {
+                    OutputDebugStringW(std::format(L"[CustomFX] node {} -- fallback branch (hasCustom={}, compiled={})\n",
+                        node->id,
+                        node->customEffect.has_value(),
+                        node->customEffect.has_value() ? node->customEffect->isCompiled() : false).c_str());
                     WireInputs(effect, *node, graph);
                     if (node->dirty)
                     {
@@ -104,6 +115,11 @@ namespace ShaderLab::Rendering
                     winrt::com_ptr<ID2D1Image> output;
                     effect->GetOutput(output.put());
                     node->cachedOutput = output.get();
+                }
+                else
+                {
+                    OutputDebugStringW(std::format(L"[CustomFX] node {} -- GetOrCreateEffect returned NULL\n",
+                        node->id).c_str());
                 }
                 break;
             }
@@ -161,7 +177,10 @@ namespace ShaderLab::Rendering
 
         // Need a CLSID to create the effect.
         if (!node.effectClsid.has_value())
+        {
+            OutputDebugStringW(std::format(L"[CustomFX] GetOrCreateEffect node {} -- no CLSID\n", node.id).c_str());
             return nullptr;
+        }
 
         // Clear thread-local impl pointers before CreateEffect.
         Effects::CustomPixelShaderEffect::s_lastCreated = nullptr;
@@ -169,8 +188,37 @@ namespace ShaderLab::Rendering
 
         winrt::com_ptr<ID2D1Effect> effect;
         HRESULT hr = dc->CreateEffect(node.effectClsid.value(), effect.put());
+
+        // If the custom effect isn't registered yet, register it now and retry.
+        if (FAILED(hr) && (node.type == NodeType::PixelShader || node.type == NodeType::ComputeShader))
+        {
+            winrt::com_ptr<ID2D1Factory> factory;
+            dc->GetFactory(factory.put());
+            auto factory1 = factory.as<ID2D1Factory1>();
+            if (factory1)
+            {
+                HRESULT regHr = S_OK;
+                if (node.type == NodeType::PixelShader)
+                    regHr = Effects::CustomPixelShaderEffect::RegisterEffect(factory1.get());
+                else
+                    regHr = Effects::CustomComputeShaderEffect::RegisterEffect(factory1.get());
+
+                OutputDebugStringW(std::format(L"[CustomFX] Late-register node {} regHr=0x{:08X}\n",
+                    node.id, static_cast<uint32_t>(regHr)).c_str());
+
+                if (SUCCEEDED(regHr))
+                    hr = dc->CreateEffect(node.effectClsid.value(), effect.put());
+            }
+        }
+
         if (FAILED(hr))
+        {
+            wchar_t guidStr[64]{};
+            StringFromGUID2(node.effectClsid.value(), guidStr, 64);
+            OutputDebugStringW(std::format(L"[CustomFX] GetOrCreateEffect node {} -- CreateEffect({}) FAILED hr=0x{:08X}\n",
+                node.id, guidStr, static_cast<uint32_t>(hr)).c_str());
             return nullptr;
+        }
 
         // Capture custom effect impl for host-side API.
         if (node.type == NodeType::PixelShader && Effects::CustomPixelShaderEffect::s_lastCreated)
@@ -324,24 +372,35 @@ namespace ShaderLab::Rendering
         auto& def = node.customEffect.value();
 
         auto implIt = m_customImplCache.find(node.id);
-        if (implIt == m_customImplCache.end()) return;
+        if (implIt == m_customImplCache.end())
+        {
+            OutputDebugStringW(std::format(L"[CustomFX] node {} -- no impl in cache!\n", node.id).c_str());
+            return;
+        }
 
-        // Set the D2D effect's external input count (ID2D1Effect::SetInputCount).
-        // This is required because our XML declares <Inputs minimum='0' maximum='8'/>,
-        // so D2D defaults to 0 inputs. Without this call, SetInput() fails with E_INVALIDARG.
         UINT32 inputCount = static_cast<UINT32>(def.inputNames.size());
-        effect->SetInputCount(inputCount);
 
-        // Also update our transform node's internal input count via the custom property.
-        effect->SetValue(0, inputCount);
+        // Update our transform node's internal input count directly so
+        // GetInputCount() returns the correct value when D2D rebuilds.
+        if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
+            implIt->second.pixelImpl->SetInputCountDirect(inputCount);
+        else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
+            implIt->second.computeImpl->SetInputCountDirect(inputCount);
+
+        // Set the D2D effect's external input count.
+        HRESULT hr = effect->SetInputCount(inputCount);
+        OutputDebugStringW(std::format(L"[CustomFX] node {} -- SetInputCount({}) hr=0x{:08X}\n",
+            node.id, inputCount, static_cast<uint32_t>(hr)).c_str());
 
         // Load bytecode into the concrete impl with per-instance GUID.
         if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
         {
             implIt->second.pixelImpl->SetShaderGuid(def.shaderGuid);
-            implIt->second.pixelImpl->LoadShaderBytecode(
+            HRESULT loadHr = implIt->second.pixelImpl->LoadShaderBytecode(
                 def.compiledBytecode.data(),
                 static_cast<UINT32>(def.compiledBytecode.size()));
+            OutputDebugStringW(std::format(L"[CustomFX] node {} -- LoadShaderBytecode({} bytes) hr=0x{:08X}\n",
+                node.id, def.compiledBytecode.size(), static_cast<uint32_t>(loadHr)).c_str());
         }
         else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
         {

@@ -553,9 +553,14 @@ namespace ShaderLab::Graph
                 CoCreateGuid(&def.shaderGuid);
                 std::string target = (def.shaderType == CustomShaderType::PixelShader)
                     ? "ps_5_0" : "cs_5_0";
+                // WinUI TextBox stores \r as line separator; D3DCompile needs \n.
+                std::string hlslUtf8(def.hlslSource.begin(), def.hlslSource.end());
+                for (auto& ch : hlslUtf8)
+                {
+                    if (ch == '\r') ch = '\n';
+                }
                 auto compileResult = ::ShaderLab::Effects::ShaderCompiler::CompileFromString(
-                    std::string(def.hlslSource.begin(), def.hlslSource.end()),
-                    "GraphLoad", "main", target);
+                    hlslUtf8, "GraphLoad", "main", target);
                 if (compileResult.succeeded && compileResult.bytecode)
                 {
                     auto* blob = compileResult.bytecode.get();

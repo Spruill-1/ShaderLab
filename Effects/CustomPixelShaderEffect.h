@@ -101,6 +101,9 @@ namespace ShaderLab::Effects
         // Set per-instance shader GUID (must be set before loading bytecode).
         void SetShaderGuid(const GUID& guid) { m_shaderGuid = guid; }
 
+        // Set input count directly (bypasses D2D property system).
+        void SetInputCountDirect(UINT32 count) { m_inputCount = count; }
+
         // Set raw constant buffer data (will be uploaded on next PrepareForRender).
         void SetConstantBufferData(const BYTE* data, UINT32 dataSize);
 

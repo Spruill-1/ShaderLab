@@ -128,7 +128,7 @@ namespace winrt::ShaderLab::implementation
         typeCombo.MinWidth(90);
         row.Children().Append(typeCombo);
 
-        // Default value container — rebuilds when type changes.
+        // Default value container -- rebuilds when type changes.
         auto defContainer = Controls::StackPanel();
         defContainer.Orientation(Controls::Orientation::Horizontal);
         defContainer.Spacing(2);
@@ -359,7 +359,7 @@ namespace winrt::ShaderLab::implementation
                     hlsl += std::format(L"    float4 color{} = {}.Sample(Sampler0, uv{}.xy);\n",
                         i, def.inputNames[i], i);
                 }
-                hlsl += L"\n    // Your code here — blend, combine, or process the inputs\n\n";
+                hlsl += L"\n    // Your code here -- blend, combine, or process the inputs\n\n";
                 hlsl += L"    return color0;\n";
             }
             else
@@ -411,15 +411,22 @@ namespace winrt::ShaderLab::implementation
         auto hlsl = std::wstring(HlslEditorBox().Text());
         def.hlslSource = hlsl;
 
+        // WinUI TextBox uses \r as line separator. D3DCompile needs \n.
+        std::string hlslUtf8 = winrt::to_string(hlsl);
+        for (auto& ch : hlslUtf8)
+        {
+            if (ch == '\r') ch = '\n';
+        }
+
         std::wstring target = (def.shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader)
             ? L"ps_5_0" : L"cs_5_0";
         std::wstring entryPoint = L"main";
 
         auto result = ::ShaderLab::Effects::ShaderCompiler::CompileFromString(
-            winrt::to_string(hlsl), "EffectDesigner", winrt::to_string(entryPoint), winrt::to_string(target));
+            hlslUtf8, "EffectDesigner", winrt::to_string(entryPoint), winrt::to_string(target));
         if (!result.succeeded)
         {
-            CompileStatusText().Text(L"❌ " + winrt::hstring(result.ErrorMessage()));
+            CompileStatusText().Text(L"X " + winrt::hstring(result.ErrorMessage()));
             def.compiledBytecode.clear();
             return false;
         }
@@ -432,7 +439,7 @@ namespace winrt::ShaderLab::implementation
         if (def.shaderGuid == GUID{})
             CoCreateGuid(&def.shaderGuid);
 
-        CompileStatusText().Text(L"✓ Compiled successfully (" +
+        CompileStatusText().Text(L"V Compiled successfully (" +
             winrt::to_hstring(def.compiledBytecode.size()) + L" bytes)");
         return true;
     }
@@ -502,7 +509,7 @@ namespace winrt::ShaderLab::implementation
             m_editingNodeId = m_addToGraph(std::move(node));
             UpdateInGraphButton().Visibility(Visibility::Visible);
             UpdateInGraphButton().IsEnabled(true);
-            CompileStatusText().Text(L"✓ Added to graph as node " + winrt::to_hstring(m_editingNodeId));
+            CompileStatusText().Text(L"V Added to graph as node " + winrt::to_hstring(m_editingNodeId));
         }
     }
 
@@ -519,7 +526,7 @@ namespace winrt::ShaderLab::implementation
             CoCreateGuid(&def.shaderGuid);
 
         m_updateInGraph(m_editingNodeId, std::move(def));
-        CompileStatusText().Text(L"✓ Updated node " + winrt::to_hstring(m_editingNodeId) + L" in graph");
+        CompileStatusText().Text(L"V Updated node " + winrt::to_hstring(m_editingNodeId) + L" in graph");
     }
 
     void EffectDesignerWindow::LoadDefinition(uint32_t nodeId, const ::ShaderLab::Graph::CustomEffectDefinition& def,
@@ -637,7 +644,7 @@ namespace winrt::ShaderLab::implementation
         AddToGraphButton().IsEnabled(!def.compiledBytecode.empty());
 
         CompileStatusText().Text(def.compiledBytecode.empty()
-            ? L"Loaded — not yet compiled"
-            : L"✓ Loaded — compiled and ready");
+            ? L"Loaded -- not yet compiled"
+            : L"V Loaded -- compiled and ready");
     }
 }

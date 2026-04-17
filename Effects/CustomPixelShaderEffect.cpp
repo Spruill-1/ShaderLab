@@ -24,10 +24,10 @@ namespace ShaderLab::Effects
         if (!factory)
             return E_INVALIDARG;
 
-        // Property XML schema for D2D.
-        // Only InputCount is registered as a D2D property.
-        // Shader bytecode and constant buffer are managed outside the
-        // D2D property system for simplicity and performance.
+        // Use 8 fixed named inputs in the XML. At runtime, the host calls
+        // ID2D1Effect::SetInputCount() to set the actual number of inputs.
+        // Variable-input XML (<Inputs minimum/maximum>) fails on some D2D
+        // runtimes, so we use fixed inputs instead.
         static const PCWSTR pszXml =
             L"<?xml version='1.0'?>\r\n"
             L"<Effect>\r\n"
@@ -35,26 +35,16 @@ namespace ShaderLab::Effects
             L"  <Property name='Author'      type='string' value='ShaderLab'/>\r\n"
             L"  <Property name='Category'    type='string' value='Custom'/>\r\n"
             L"  <Property name='Description' type='string' value='Runs a user-supplied pixel shader.'/>\r\n"
-            L"  <Inputs minimum='0' maximum='8'/>\r\n"
-            L"  <Property name='InputCount' type='uint32'>\r\n"
-            L"    <Property name='DisplayName' type='string' value='Input Count'/>\r\n"
-            L"  </Property>\r\n"
+            L"  <Inputs>\r\n"
+            L"    <Input name='Source'/>\r\n"
+            L"  </Inputs>\r\n"
             L"</Effect>\r\n";
-
-        // Property binding table — maps D2D property indices to get/set methods.
-        const D2D1_PROPERTY_BINDING bindings[] =
-        {
-            D2D1_VALUE_TYPE_BINDING(
-                L"InputCount",
-                &CustomPixelShaderEffect::SetInputCount,
-                &CustomPixelShaderEffect::GetInputCountProp),
-        };
 
         return factory->RegisterEffectFromString(
             CLSID_CustomPixelShader,
             pszXml,
-            bindings,
-            ARRAYSIZE(bindings),
+            nullptr,
+            0,
             &CustomPixelShaderEffect::CreateFactory);
     }
 
@@ -130,6 +120,8 @@ namespace ShaderLab::Effects
         m_effectContext.copy_from(effectContext);
         m_transformGraph.copy_from(transformGraph);
 
+        OutputDebugStringW(std::format(L"[CustomPS] Initialize — inputCount={}\n", m_inputCount).c_str());
+
         // Set ourselves as the single transform node in the graph.
         return transformGraph->SetSingleTransformNode(static_cast<ID2D1DrawTransform*>(this));
     }
@@ -137,7 +129,10 @@ namespace ShaderLab::Effects
     IFACEMETHODIMP CustomPixelShaderEffect::PrepareForRender(D2D1_CHANGE_TYPE /*changeType*/)
     {
         if (!m_drawInfo)
+        {
+            OutputDebugStringW(L"[CustomPS] PrepareForRender — m_drawInfo is null!\n");
             return E_FAIL;
+        }
 
         // If the shader bytecode changed, load it into D2D.
         if (m_shaderDirty && !m_shaderBytecode.empty())
@@ -151,9 +146,14 @@ namespace ShaderLab::Effects
                 m_shaderBytecode.data(),
                 static_cast<UINT32>(m_shaderBytecode.size()));
 
+            OutputDebugStringW(std::format(L"[CustomPS] LoadPixelShader hr=0x{:08X} size={}\n",
+                static_cast<uint32_t>(hr), m_shaderBytecode.size()).c_str());
+
             if (SUCCEEDED(hr))
             {
                 hr = m_drawInfo->SetPixelShader(m_shaderGuid);
+                OutputDebugStringW(std::format(L"[CustomPS] SetPixelShader hr=0x{:08X}\n",
+                    static_cast<uint32_t>(hr)).c_str());
             }
 
             if (FAILED(hr))
@@ -169,6 +169,9 @@ namespace ShaderLab::Effects
                 m_constantBuffer.data(),
                 static_cast<UINT32>(m_constantBuffer.size()));
 
+            OutputDebugStringW(std::format(L"[CustomPS] SetCBuffer hr=0x{:08X} size={}\n",
+                static_cast<uint32_t>(hr), m_constantBuffer.size()).c_str());
+
             if (FAILED(hr))
                 return hr;
 
@@ -180,6 +183,7 @@ namespace ShaderLab::Effects
 
     IFACEMETHODIMP CustomPixelShaderEffect::SetGraph(ID2D1TransformGraph* transformGraph)
     {
+        OutputDebugStringW(std::format(L"[CustomPS] SetGraph called — inputCount={}\n", m_inputCount).c_str());
         // Called when the number of inputs changes.
         m_transformGraph.copy_from(transformGraph);
         return transformGraph->SetSingleTransformNode(static_cast<ID2D1DrawTransform*>(this));
@@ -192,6 +196,8 @@ namespace ShaderLab::Effects
     IFACEMETHODIMP CustomPixelShaderEffect::SetDrawInfo(ID2D1DrawInfo* drawInfo)
     {
         m_drawInfo.copy_from(drawInfo);
+        OutputDebugStringW(std::format(L"[CustomPS] SetDrawInfo called — hasShader={}, inputCount={}\n",
+            !m_shaderBytecode.empty(), m_inputCount).c_str());
 
         // If we already have bytecode loaded, set the shader immediately.
         if (!m_shaderBytecode.empty())
@@ -276,6 +282,8 @@ namespace ShaderLab::Effects
 
     HRESULT CustomPixelShaderEffect::SetInputCount(UINT32 count)
     {
+        OutputDebugStringW(std::format(L"[CustomPS] SetInputCount({}) — current={}\n",
+            count, m_inputCount).c_str());
         if (count == m_inputCount)
             return S_OK;
 

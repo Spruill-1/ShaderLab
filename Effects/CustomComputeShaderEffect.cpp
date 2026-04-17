@@ -19,25 +19,16 @@ namespace ShaderLab::Effects
             L"  <Property name='Author'      type='string' value='ShaderLab'/>\r\n"
             L"  <Property name='Category'    type='string' value='Custom'/>\r\n"
             L"  <Property name='Description' type='string' value='Runs a user-supplied compute shader.'/>\r\n"
-            L"  <Inputs minimum='0' maximum='8'/>\r\n"
-            L"  <Property name='InputCount' type='uint32'>\r\n"
-            L"    <Property name='DisplayName' type='string' value='Input Count'/>\r\n"
-            L"  </Property>\r\n"
+            L"  <Inputs>\r\n"
+            L"    <Input name='Source'/>\r\n"
+            L"  </Inputs>\r\n"
             L"</Effect>\r\n";
-
-        const D2D1_PROPERTY_BINDING bindings[] =
-        {
-            D2D1_VALUE_TYPE_BINDING(
-                L"InputCount",
-                &CustomComputeShaderEffect::SetInputCount,
-                &CustomComputeShaderEffect::GetInputCountProp),
-        };
 
         return factory->RegisterEffectFromString(
             CLSID_CustomComputeShader,
             pszXml,
-            bindings,
-            ARRAYSIZE(bindings),
+            nullptr,
+            0,
             &CustomComputeShaderEffect::CreateFactory);
     }
 
