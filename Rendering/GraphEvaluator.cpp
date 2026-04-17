@@ -326,8 +326,14 @@ namespace ShaderLab::Rendering
         auto implIt = m_customImplCache.find(node.id);
         if (implIt == m_customImplCache.end()) return;
 
-        // Set input count via D2D property (index 0).
-        effect->SetValue(0, static_cast<UINT32>(def.inputNames.size()));
+        // Set the D2D effect's external input count (ID2D1Effect::SetInputCount).
+        // This is required because our XML declares <Inputs minimum='0' maximum='8'/>,
+        // so D2D defaults to 0 inputs. Without this call, SetInput() fails with E_INVALIDARG.
+        UINT32 inputCount = static_cast<UINT32>(def.inputNames.size());
+        effect->SetInputCount(inputCount);
+
+        // Also update our transform node's internal input count via the custom property.
+        effect->SetValue(0, inputCount);
 
         // Load bytecode into the concrete impl with per-instance GUID.
         if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
