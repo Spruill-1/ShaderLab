@@ -62,6 +62,14 @@ namespace ShaderLab::Rendering
                     winrt::com_ptr<ID2D1Image> output;
                     effect->GetOutput(output.put());
                     node->cachedOutput = output.get();
+
+                    // For analysis effects (e.g., Histogram), force computation
+                    // by drawing the output, then read back the result property.
+                    if (node->effectClsid.has_value() &&
+                        IsEqualGUID(node->effectClsid.value(), CLSID_D2D1Histogram))
+                    {
+                        ReadHistogramOutput(dc, effect, *node);
+                    }
                 }
                 break;
             }
@@ -261,6 +269,99 @@ namespace ShaderLab::Rendering
             {
                 effect->SetInput(edge->destPin, srcNode->cachedOutput);
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Analysis effect readback
+    // -----------------------------------------------------------------------
+
+    void GraphEvaluator::ReadHistogramOutput(
+        ID2D1DeviceContext5* dc,
+        ID2D1Effect* effect,
+        EffectNode& node)
+    {
+        if (!node.cachedOutput) return;
+
+        // Force D2D to compute the histogram by drawing the effect output.
+        // The histogram processes the entire input, so we need a target large
+        // enough and must actually draw the image (not just a 1x1 region).
+        winrt::com_ptr<ID2D1Image> prevTarget;
+        dc->GetTarget(prevTarget.put());
+
+        // Get the input image bounds to size the temp target appropriately.
+        D2D1_RECT_F bounds{};
+        dc->GetImageLocalBounds(node.cachedOutput, &bounds);
+        uint32_t w = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 4096.0f));
+        uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 4096.0f));
+        if (w == 0) w = 1;
+        if (h == 0) h = 1;
+
+        // Recreate temp target if size changed.
+        if (!m_analysisTarget || m_analysisTargetW != w || m_analysisTargetH != h)
+        {
+            m_analysisTarget = nullptr;
+            D2D1_BITMAP_PROPERTIES1 props = {};
+            props.pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED };
+            props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+            HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, props, m_analysisTarget.put());
+            if (FAILED(hr)) { dc->SetTarget(prevTarget.get()); return; }
+            m_analysisTargetW = w;
+            m_analysisTargetH = h;
+        }
+
+        dc->SetTarget(m_analysisTarget.get());
+        dc->BeginDraw();
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        dc->DrawImage(node.cachedOutput, D2D1::Point2F(-bounds.left, -bounds.top));
+        dc->EndDraw();
+        dc->SetTarget(prevTarget.get());
+
+        // Read the channel selector for labeling.
+        uint32_t channelIdx = 0;
+        auto chanIt = node.properties.find(L"ChannelSelect");
+        if (chanIt != node.properties.end())
+        {
+            if (auto* pv = std::get_if<uint32_t>(&chanIt->second))
+                channelIdx = *pv;
+        }
+        static const std::wstring channelNames[] = { L"Red", L"Green", L"Blue", L"Alpha" };
+
+        // Query the actual output data size.
+        UINT32 dataSize = effect->GetValueSize(D2D1_HISTOGRAM_PROP_HISTOGRAM_OUTPUT);
+
+        OutputDebugStringW(std::format(L"[Histogram] channelIdx={} dataSize={} bounds=({:.0f},{:.0f},{:.0f},{:.0f})\n",
+            channelIdx, dataSize, bounds.left, bounds.top, bounds.right, bounds.bottom).c_str());
+
+        if (dataSize == 0) return;
+
+        uint32_t numBins = dataSize / sizeof(float);
+        std::vector<float> histData(numBins, 0.0f);
+
+        HRESULT hr = effect->GetValue(
+            D2D1_HISTOGRAM_PROP_HISTOGRAM_OUTPUT,
+            reinterpret_cast<BYTE*>(histData.data()),
+            dataSize);
+
+        if (SUCCEEDED(hr))
+        {
+            float maxVal = *std::max_element(histData.begin(), histData.end());
+            float sumVal = 0.0f;
+            for (float f : histData) sumVal += f;
+            OutputDebugStringW(std::format(L"[Histogram] OK bins={} max={:.4f} sum={:.4f}\n",
+                numBins, maxVal, sumVal).c_str());
+
+            node.analysisOutput.type = AnalysisOutputType::Histogram;
+            node.analysisOutput.data = std::move(histData);
+            node.analysisOutput.channelIndex = channelIdx;
+            node.analysisOutput.label = (channelIdx < 4)
+                ? channelNames[channelIdx] + L" Histogram"
+                : L"Histogram";
+        }
+        else
+        {
+            node.analysisOutput.type = AnalysisOutputType::None;
+            node.analysisOutput.data.clear();
         }
     }
 }

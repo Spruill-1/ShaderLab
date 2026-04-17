@@ -152,6 +152,7 @@ namespace winrt::ShaderLab::implementation
 
         HWND m_hwnd{ nullptr };
         bool m_customEffectsRegistered{ false };
+        bool m_isShuttingDown{ false };
 
         // Per-node preview.
         uint32_t m_previewNodeId{ 0 };       // 0 = Output node (default)
@@ -230,6 +231,7 @@ namespace winrt::ShaderLab::implementation
         float m_traceClickPanX{ 0.0f };
         float m_traceClickPanY{ 0.0f };
         float m_traceClickZoom{ 1.0f };
+        bool m_traceOutOfBounds{ false };
         void UpdateCrosshairOverlay();
         void FitPreviewToView();
 

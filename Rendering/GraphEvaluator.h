@@ -50,5 +50,16 @@ namespace ShaderLab::Rendering
         // Per-node effect cache: nodeId → D2D effect.
         // Effects are reused across frames; only properties are updated.
         std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Effect>> m_effectCache;
+
+        // Force D2D to compute the histogram and read output data.
+        void ReadHistogramOutput(
+            ID2D1DeviceContext5* dc,
+            ID2D1Effect* effect,
+            Graph::EffectNode& node);
+
+        // Temp target for forcing effect computation.
+        winrt::com_ptr<ID2D1Bitmap1> m_analysisTarget;
+        uint32_t m_analysisTargetW{ 0 };
+        uint32_t m_analysisTargetH{ 0 };
     };
 }

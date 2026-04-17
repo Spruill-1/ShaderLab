@@ -13,6 +13,24 @@ namespace ShaderLab::Graph
         uint32_t     index{ 0 };
     };
 
+    // Identifies the type of non-image data produced by analysis/compute effects.
+    enum class AnalysisOutputType
+    {
+        None,           // No analysis output (default for image-producing effects).
+        Histogram,      // Float array of histogram bin values.
+        FloatBuffer,    // Generic float array (custom compute effects).
+    };
+
+    // Stores non-image output data from analysis/compute effects.
+    // Read back from the GPU after the effect graph is evaluated.
+    struct AnalysisOutput
+    {
+        AnalysisOutputType type{ AnalysisOutputType::None };
+        std::vector<float> data;         // Bin values, buffer contents, etc.
+        std::wstring       label;        // Human-readable description (e.g., "Red channel histogram").
+        uint32_t           channelIndex{ 0 }; // For per-channel data (R=0, G=1, B=2, A=3).
+    };
+
     // A node in the effect graph DAG.
     // Each node represents a D2D image source, a built-in D2D effect,
     // a custom pixel/compute shader, or the final output.
@@ -41,6 +59,9 @@ namespace ShaderLab::Graph
         // Cached output after evaluation (non-owning, managed by the render engine).
         // Not serialized.
         ID2D1Image* cachedOutput{ nullptr };
+
+        // Analysis/compute output data (read back after evaluation). Not serialized.
+        AnalysisOutput analysisOutput;
 
         // Dirty flag — set when properties change, cleared after evaluation.
         bool dirty{ true };

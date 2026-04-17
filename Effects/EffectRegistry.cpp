@@ -721,7 +721,7 @@ namespace ShaderLab::Effects
             .category = L"Analysis",
             .inputPins = SINGLE_INPUT,
             .defaultProperties = {
-                { L"ChannelSelect", static_cast<uint32_t>(3) },
+                { L"ChannelSelect", static_cast<uint32_t>(0) },
                 { L"NumBins", static_cast<uint32_t>(256) },
             },
             .propertyMetadata = {

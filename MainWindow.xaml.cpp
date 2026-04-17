@@ -63,6 +63,20 @@ namespace winrt::ShaderLab::implementation
         CompareToggle().Click({ this, &MainWindow::OnCompareToggled });
         CompareNodeSelector().SelectionChanged({ this, &MainWindow::OnCompareNodeSelectionChanged });
 
+        // Compare and Pixel Trace are mutually exclusive.
+        BottomTabView().SelectionChanged([this](auto&&, auto&&)
+        {
+            if (m_isShuttingDown) return;
+            if (BottomTabView().SelectedIndex() == 2 && m_compareActive)
+            {
+                // Switching to Pixel Trace → disable compare.
+                m_compareActive = false;
+                CompareToggle().IsChecked(false);
+                CompareToolbar().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
+            }
+            UpdateCrosshairOverlay();
+        });
+
         // Defer GPU initialization until the SwapChainPanel is in the visual tree.
         PreviewPanel().Loaded([this](auto&&, auto&&) { OnPreviewPanelLoaded(); });
         NodeGraphPanel().SizeChanged([this](auto&&, winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& e)
@@ -111,9 +125,16 @@ namespace winrt::ShaderLab::implementation
 
     MainWindow::~MainWindow()
     {
-        if (m_renderTimer)
-            m_renderTimer.Stop();
+        m_isShuttingDown = true;
 
+        if (m_renderTimer)
+        {
+            m_renderTimer.Stop();
+            m_renderTimer = nullptr;
+        }
+
+        m_traceSwapChain = nullptr;
+        m_traceSwatchTarget = nullptr;
         m_falseColor.Release();
         m_toneMapper.Release();
         m_graphEvaluator.ReleaseCache();
@@ -891,6 +912,13 @@ namespace winrt::ShaderLab::implementation
             auto idx = CompareNodeSelector().SelectedIndex();
             if (idx >= 0 && static_cast<uint32_t>(idx) < m_topoOrder.size())
                 m_compareNodeId = m_topoOrder[static_cast<uint32_t>(idx)];
+
+            // Switch away from Pixel Trace tab (mutually exclusive).
+            if (BottomTabView().SelectedIndex() == 2)
+                BottomTabView().SelectedIndex(0);
+
+            m_traceActive = false;
+            UpdateCrosshairOverlay();
         }
         else
         {
@@ -1045,8 +1073,14 @@ namespace winrt::ShaderLab::implementation
 
         if (imgW <= 0 || imgH <= 0) return false;
 
-        outNormX = std::clamp((imgDipX - bounds.left) / imgW, 0.0f, 1.0f);
-        outNormY = std::clamp((imgDipY - bounds.top) / imgH, 0.0f, 1.0f);
+        // Check if the click is outside the image bounds before clamping.
+        float rawNormX = (imgDipX - bounds.left) / imgW;
+        float rawNormY = (imgDipY - bounds.top) / imgH;
+        m_traceOutOfBounds = (rawNormX < 0.0f || rawNormX > 1.0f ||
+                              rawNormY < 0.0f || rawNormY > 1.0f);
+
+        outNormX = std::clamp(rawNormX, 0.0f, 1.0f);
+        outNormY = std::clamp(rawNormY, 0.0f, 1.0f);
         return true;
     }
 
@@ -1055,6 +1089,22 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
         auto point = args.GetCurrentPoint(PreviewPanel());
+        bool isPixelTraceTab = (BottomTabView().SelectedIndex() == 2);
+
+        // Check for compare split line drag (only when compare is active and NOT on Pixel Trace tab).
+        if (m_compareActive && !isPixelTraceTab && point.Properties().IsLeftButtonPressed())
+        {
+            float px = static_cast<float>(point.Position().X);
+            auto vp = PreviewViewportDips();
+            float splitScreenX = vp.width * m_splitPosition;
+            if (std::abs(px - splitScreenX) < 10.0f)
+            {
+                m_isDraggingSplit = true;
+                PreviewPanel().CapturePointer(args.Pointer());
+                args.Handled(true);
+                return;
+            }
+        }
 
         // Left or middle button → start pan (click without drag triggers pixel trace on release).
         if (point.Properties().IsMiddleButtonPressed() || point.Properties().IsLeftButtonPressed())
@@ -1157,6 +1207,13 @@ namespace winrt::ShaderLab::implementation
         auto canvas = CrosshairCanvas();
         canvas.Children().Clear();
 
+        // Clip the canvas to the preview panel bounds.
+        auto clipGeom = winrt::Microsoft::UI::Xaml::Media::RectangleGeometry();
+        clipGeom.Rect({ 0, 0,
+            static_cast<float>(canvas.ActualWidth()),
+            static_cast<float>(canvas.ActualHeight()) });
+        canvas.Clip(clipGeom);
+
         // Only show crosshair when Pixel Trace tab is active.
         if (!m_traceActive || BottomTabView().SelectedIndex() != 2)
             return;
@@ -1250,6 +1307,19 @@ namespace winrt::ShaderLab::implementation
         };
 
         buildRows(m_pixelTrace.Root(), 0);
+
+        // Show out-of-bounds warning if the selected pixel is outside the image.
+        if (m_traceOutOfBounds)
+        {
+            auto warning = winrt::Microsoft::UI::Xaml::Controls::InfoBar();
+            warning.IsOpen(true);
+            warning.IsClosable(false);
+            warning.Severity(winrt::Microsoft::UI::Xaml::Controls::InfoBarSeverity::Warning);
+            warning.Title(L"Outside image bounds");
+            warning.Message(L"The selected pixel is outside the image area. Values shown are from the nearest edge pixel.");
+            warning.Margin({ 0, 8, 0, 0 });
+            panel.Children().Append(warning);
+        }
     }
 
     void MainWindow::UpdatePixelTraceValues()
@@ -1292,6 +1362,13 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
         if (!m_renderEngine.IsInitialized()) return;
+
+        // Handle compare split-line dragging (takes priority over pan).
+        if (m_isDraggingSplit && m_compareActive)
+        {
+            OnPreviewPointerDragged(sender, args);
+            return;
+        }
 
         // Handle preview pan.
         if (m_isPreviewPanning)
@@ -1605,14 +1682,36 @@ namespace winrt::ShaderLab::implementation
             m_isDraggingNode = true;
             NodeGraphContainer().CapturePointer(args.Pointer());
             UpdatePropertiesPanel();
+            BottomTabView().SelectedIndex(0);
 
-            // Preview follows selection.
-            m_previewNodeId = hitNodeId;
+            // For analysis effects (e.g., Histogram), keep the preview on the
+            // Output node since analysis effects don't produce viewable images.
+            const auto* clickedNode = m_graph.FindNode(hitNodeId);
+            bool isAnalysisEffect = clickedNode &&
+                clickedNode->effectClsid.has_value() &&
+                IsEqualGUID(clickedNode->effectClsid.value(), CLSID_D2D1Histogram);
+
+            if (isAnalysisEffect)
+            {
+                // Find the Output node for preview.
+                for (const auto& n : m_graph.Nodes())
+                {
+                    if (n.type == ::ShaderLab::Graph::NodeType::Output)
+                    {
+                        m_previewNodeId = n.id;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                m_previewNodeId = hitNodeId;
+            }
             FitPreviewToView();
             m_suppressSelectorEvent = true;
             for (uint32_t i = 0; i < m_topoOrder.size(); ++i)
             {
-                if (m_topoOrder[i] == hitNodeId)
+                if (m_topoOrder[i] == m_previewNodeId)
                 {
                     PreviewNodeSelector().SelectedIndex(static_cast<int32_t>(i));
                     break;
@@ -1620,11 +1719,11 @@ namespace winrt::ShaderLab::implementation
             }
             m_suppressSelectorEvent = false;
 
-            const auto* node = m_graph.FindNode(hitNodeId);
-            bool isOutputNode = node && node->type == ::ShaderLab::Graph::NodeType::Output;
-            if (node && !isOutputNode)
+            const auto* previewNode = m_graph.FindNode(m_previewNodeId);
+            bool isOutputNode = previewNode && previewNode->type == ::ShaderLab::Graph::NodeType::Output;
+            if (previewNode && !isOutputNode)
             {
-                PreviewOverlayText().Text(L"Previewing: " + winrt::hstring(node->name));
+                PreviewOverlayText().Text(L"Previewing: " + winrt::hstring(previewNode->name));
                 PreviewOverlayBorder().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
             }
             else
@@ -1862,6 +1961,16 @@ namespace winrt::ShaderLab::implementation
                 {
                     auto* n = m_graph.FindNode(capturedId);
                     if (n) { n->dirty = true; m_graph.MarkAllDirty(); }
+
+                    // For analysis effects, schedule a properties panel refresh
+                    // after the next evaluation computes new output data.
+                    if (n && n->effectClsid.has_value() &&
+                        IsEqualGUID(n->effectClsid.value(), CLSID_D2D1Histogram))
+                    {
+                        this->DispatcherQueue().TryEnqueue(
+                            winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low,
+                            [this]() { if (!m_isShuttingDown) UpdatePropertiesPanel(); });
+                    }
                 };
 
                 // ---- Dispatch by variant type + metadata hint ----
@@ -2381,6 +2490,63 @@ namespace winrt::ShaderLab::implementation
             panel.Children().Append(canvas);
         }
 
+        // ---- Analysis output visualization ----
+        if (node->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Histogram &&
+            !node->analysisOutput.data.empty())
+        {
+            auto histHeader = Controls::TextBlock();
+            histHeader.Text(winrt::hstring(node->analysisOutput.label));
+            histHeader.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            histHeader.Margin({ 0, 8, 0, 4 });
+            panel.Children().Append(histHeader);
+
+            // Draw histogram as a bar chart using XAML Canvas.
+            constexpr float chartW = 300.0f;
+            constexpr float chartH = 120.0f;
+            auto canvas = Controls::Canvas();
+            canvas.Width(chartW);
+            canvas.Height(chartH);
+            canvas.Background(Media::SolidColorBrush(
+                winrt::Windows::UI::Color{ 255, 30, 30, 30 }));
+
+            const auto& bins = node->analysisOutput.data;
+            uint32_t numBins = static_cast<uint32_t>(bins.size());
+            if (numBins > 0)
+            {
+                // Find max bin value for normalization.
+                float maxVal = *std::max_element(bins.begin(), bins.end());
+                if (maxVal <= 0.0f) maxVal = 1.0f;
+
+                // Choose bar color based on channel.
+                winrt::Windows::UI::Color barColor;
+                switch (node->analysisOutput.channelIndex)
+                {
+                case 0: barColor = { 200, 255, 60, 60 }; break;   // Red
+                case 1: barColor = { 200, 60, 255, 60 }; break;   // Green
+                case 2: barColor = { 200, 60, 100, 255 }; break;  // Blue
+                default: barColor = { 200, 200, 200, 200 }; break; // Alpha / other
+                }
+                auto barBrush = Media::SolidColorBrush(barColor);
+
+                float barWidth = chartW / static_cast<float>(numBins);
+                for (uint32_t i = 0; i < numBins; ++i)
+                {
+                    float normalized = bins[i] / maxVal;
+                    float barH = normalized * chartH;
+                    if (barH < 0.5f) continue; // skip empty bins
+
+                    auto rect = winrt::Microsoft::UI::Xaml::Shapes::Rectangle();
+                    rect.Width((std::max)(1.0, static_cast<double>(barWidth)));
+                    rect.Height(static_cast<double>(barH));
+                    rect.Fill(barBrush);
+                    Controls::Canvas::SetLeft(rect, static_cast<double>(i * barWidth));
+                    Controls::Canvas::SetTop(rect, static_cast<double>(chartH - barH));
+                    canvas.Children().Append(rect);
+                }
+            }
+            panel.Children().Append(canvas);
+        }
+
         // ---- Input pins info ----
         if (!node->inputPins.empty())
         {
@@ -2865,6 +3031,7 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer const& /*sender*/,
         winrt::Windows::Foundation::IInspectable const& /*args*/)
     {
+        if (m_isShuttingDown) return;
         RenderFrame();
         RenderNodeGraph();
 
