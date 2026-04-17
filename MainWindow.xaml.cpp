@@ -1846,6 +1846,29 @@ namespace winrt::ShaderLab::implementation
         typeText.Margin({ 0, 0, 0, 8 });
         panel.Children().Append(typeText);
 
+        // ---- Custom effect: "Edit in Designer" button ----
+        if ((node->type == ::ShaderLab::Graph::NodeType::PixelShader ||
+             node->type == ::ShaderLab::Graph::NodeType::ComputeShader) &&
+            node->customEffect.has_value())
+        {
+            auto editBtn = Controls::Button();
+            editBtn.Content(winrt::box_value(L"\xE70F  Edit in Effect Designer"));
+            editBtn.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+            editBtn.Margin({ 0, 0, 0, 8 });
+            editBtn.Click([this, capturedId](auto&&, auto&&)
+            {
+                auto* n = m_graph.FindNode(capturedId);
+                if (!n || !n->customEffect.has_value()) return;
+
+                OpenEffectDesigner();
+
+                auto designerImpl = winrt::get_self<
+                    winrt::ShaderLab::implementation::EffectDesignerWindow>(m_designerWindow);
+                designerImpl->LoadDefinition(capturedId, n->customEffect.value(), n->name);
+            });
+            panel.Children().Append(editBtn);
+        }
+
         // ---- Image source: file path + Browse button ----
         if (node->type == ::ShaderLab::Graph::NodeType::Source &&
             !(node->effectClsid.has_value()))

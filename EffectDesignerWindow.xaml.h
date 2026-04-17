@@ -20,7 +20,8 @@ namespace winrt::ShaderLab::implementation
         void SetUpdateInGraphCallback(UpdateInGraphCallback cb) { m_updateInGraph = std::move(cb); }
 
         // Load an existing custom effect definition for editing.
-        void LoadDefinition(uint32_t nodeId, const ::ShaderLab::Graph::CustomEffectDefinition& def);
+        void LoadDefinition(uint32_t nodeId, const ::ShaderLab::Graph::CustomEffectDefinition& def,
+                            const std::wstring& nodeName = L"");
 
     private:
         void OnGenerateScaffold(

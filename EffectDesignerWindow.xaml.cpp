@@ -500,11 +500,13 @@ namespace winrt::ShaderLab::implementation
         CompileStatusText().Text(L"✓ Updated node " + winrt::to_hstring(m_editingNodeId) + L" in graph");
     }
 
-    void EffectDesignerWindow::LoadDefinition(uint32_t nodeId, const ::ShaderLab::Graph::CustomEffectDefinition& def)
+    void EffectDesignerWindow::LoadDefinition(uint32_t nodeId, const ::ShaderLab::Graph::CustomEffectDefinition& def,
+                                              const std::wstring& nodeName)
     {
         m_editingNodeId = nodeId;
+        m_lastBytecode = def.compiledBytecode;
 
-        EffectNameBox().Text(L""); // Name comes from the node, not the definition.
+        EffectNameBox().Text(nodeName.empty() ? L"Custom Effect" : winrt::hstring(nodeName));
         ShaderTypeSelector().SelectedIndex(
             def.shaderType == ::ShaderLab::Graph::CustomShaderType::ComputeShader ? 1 : 0);
 
@@ -536,6 +538,64 @@ namespace winrt::ShaderLab::implementation
                     break;
                 }
             }
+
+            // Restore default/min/max values.
+            // Parameter row layout: [NameBox, TypeCombo, DefaultBox, MinBox, MaxBox, DeleteBtn]
+            // or with vector types there are multiple default boxes.
+            // Find NumberBoxes by iterating children.
+            std::vector<Controls::NumberBox> numberBoxes;
+            for (uint32_t ci = 0; ci < lastRow.Children().Size(); ++ci)
+            {
+                auto nb = lastRow.Children().GetAt(ci).try_as<Controls::NumberBox>();
+                if (nb) numberBoxes.push_back(nb);
+            }
+
+            // Set default value from the parameter definition.
+            if (!numberBoxes.empty())
+            {
+                std::visit([&numberBoxes](const auto& v)
+                {
+                    using T = std::decay_t<decltype(v)>;
+                    if constexpr (std::is_same_v<T, float>)
+                    {
+                        if (numberBoxes.size() >= 1) numberBoxes[0].Value(v);
+                    }
+                    else if constexpr (std::is_same_v<T, int32_t>)
+                    {
+                        if (numberBoxes.size() >= 1) numberBoxes[0].Value(static_cast<double>(v));
+                    }
+                    else if constexpr (std::is_same_v<T, uint32_t>)
+                    {
+                        if (numberBoxes.size() >= 1) numberBoxes[0].Value(static_cast<double>(v));
+                    }
+                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
+                    {
+                        if (numberBoxes.size() >= 1) numberBoxes[0].Value(v.x);
+                        if (numberBoxes.size() >= 2) numberBoxes[1].Value(v.y);
+                    }
+                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
+                    {
+                        if (numberBoxes.size() >= 1) numberBoxes[0].Value(v.x);
+                        if (numberBoxes.size() >= 2) numberBoxes[1].Value(v.y);
+                        if (numberBoxes.size() >= 3) numberBoxes[2].Value(v.z);
+                    }
+                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
+                    {
+                        if (numberBoxes.size() >= 1) numberBoxes[0].Value(v.x);
+                        if (numberBoxes.size() >= 2) numberBoxes[1].Value(v.y);
+                        if (numberBoxes.size() >= 3) numberBoxes[2].Value(v.z);
+                        if (numberBoxes.size() >= 4) numberBoxes[3].Value(v.w);
+                    }
+                }, p.defaultValue);
+
+                // Min and max are the last two NumberBoxes in the row.
+                size_t nb_count = numberBoxes.size();
+                if (nb_count >= 3)
+                {
+                    numberBoxes[nb_count - 2].Value(p.minValue);
+                    numberBoxes[nb_count - 1].Value(p.maxValue);
+                }
+            }
         }
 
         // Compute settings.
@@ -549,7 +609,13 @@ namespace winrt::ShaderLab::implementation
         // HLSL source.
         HlslEditorBox().Text(winrt::hstring(def.hlslSource));
 
+        // Update button states.
         UpdateInGraphButton().Visibility(Visibility::Visible);
         UpdateInGraphButton().IsEnabled(!def.compiledBytecode.empty());
+        AddToGraphButton().IsEnabled(!def.compiledBytecode.empty());
+
+        CompileStatusText().Text(def.compiledBytecode.empty()
+            ? L"Loaded — not yet compiled"
+            : L"✓ Loaded — compiled and ready");
     }
 }
