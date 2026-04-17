@@ -329,16 +329,38 @@ namespace winrt::ShaderLab::implementation
                 hlsl += L"SamplerState Sampler0 : register(s0);\n\n";
             }
 
-            // Entry point.
+            // Entry point with per-input TEXCOORD semantics.
             hlsl += L"float4 main(\n";
-            hlsl += L"    float4 pos : SV_POSITION,\n";
-            hlsl += L"    float4 uv  : TEXCOORD0) : SV_TARGET\n";
-            hlsl += L"{\n";
-            if (!def.inputNames.empty())
+            hlsl += L"    float4 pos : SV_POSITION";
+            for (uint32_t i = 0; i < def.inputNames.size(); ++i)
             {
-                hlsl += L"    float4 color = " + def.inputNames[0] + L".Sample(Sampler0, uv.xy);\n";
+                hlsl += std::format(L",\n    float4 uv{} : TEXCOORD{}", i, i);
+            }
+            if (def.inputNames.empty())
+            {
+                hlsl += L") : SV_TARGET\n";
+            }
+            else
+            {
+                hlsl += L") : SV_TARGET\n";
+            }
+            hlsl += L"{\n";
+            if (def.inputNames.size() == 1)
+            {
+                hlsl += L"    float4 color = " + def.inputNames[0] +
+                    L".Sample(Sampler0, uv0.xy);\n";
                 hlsl += L"\n    // Your code here\n\n";
                 hlsl += L"    return color;\n";
+            }
+            else if (def.inputNames.size() >= 2)
+            {
+                for (uint32_t i = 0; i < def.inputNames.size(); ++i)
+                {
+                    hlsl += std::format(L"    float4 color{} = {}.Sample(Sampler0, uv{}.xy);\n",
+                        i, def.inputNames[i], i);
+                }
+                hlsl += L"\n    // Your code here — blend, combine, or process the inputs\n\n";
+                hlsl += L"    return color0;\n";
             }
             else
             {
