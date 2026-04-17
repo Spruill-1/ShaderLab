@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "EffectGraph.h"
+#include "../Effects/ShaderCompiler.h"
 
 #include <winrt/Windows.Data.Json.h>
 
@@ -10,7 +11,7 @@ namespace ShaderLab::Graph
     // -----------------------------------------------------------------------
     // Node management
     // -----------------------------------------------------------------------
-
+     
     uint32_t EffectGraph::AddNode(EffectNode node)
     {
         node.id = m_nextId++;
@@ -415,6 +416,44 @@ namespace ShaderLab::Graph
             }
             obj.SetNamedValue(L"outputPins", outPins);
 
+            // Custom effect definition.
+            if (node.customEffect.has_value())
+            {
+                WDJ::JsonObject ced;
+                auto& def = node.customEffect.value();
+                ced.SetNamedValue(L"shaderType", WDJ::JsonValue::CreateNumberValue(
+                    static_cast<double>(def.shaderType)));
+                ced.SetNamedValue(L"hlslSource", WDJ::JsonValue::CreateStringValue(def.hlslSource));
+
+                WDJ::JsonArray inputs;
+                for (const auto& name : def.inputNames)
+                    inputs.Append(WDJ::JsonValue::CreateStringValue(name));
+                ced.SetNamedValue(L"inputNames", inputs);
+
+                WDJ::JsonArray params;
+                for (const auto& p : def.parameters)
+                {
+                    WDJ::JsonObject po;
+                    po.SetNamedValue(L"name", WDJ::JsonValue::CreateStringValue(p.name));
+                    po.SetNamedValue(L"typeName", WDJ::JsonValue::CreateStringValue(p.typeName));
+                    po.SetNamedValue(L"minValue", WDJ::JsonValue::CreateNumberValue(p.minValue));
+                    po.SetNamedValue(L"maxValue", WDJ::JsonValue::CreateNumberValue(p.maxValue));
+                    po.SetNamedValue(L"step", WDJ::JsonValue::CreateNumberValue(p.step));
+                    po.SetNamedValue(L"default", PropertyValueToJson(p.name, p.defaultValue));
+                    params.Append(po);
+                }
+                ced.SetNamedValue(L"parameters", params);
+
+                ced.SetNamedValue(L"threadGroupX", WDJ::JsonValue::CreateNumberValue(def.threadGroupX));
+                ced.SetNamedValue(L"threadGroupY", WDJ::JsonValue::CreateNumberValue(def.threadGroupY));
+                ced.SetNamedValue(L"threadGroupZ", WDJ::JsonValue::CreateNumberValue(def.threadGroupZ));
+                ced.SetNamedValue(L"analysisOutputType", WDJ::JsonValue::CreateNumberValue(
+                    static_cast<double>(def.analysisOutputType)));
+                ced.SetNamedValue(L"analysisOutputSize", WDJ::JsonValue::CreateNumberValue(def.analysisOutputSize));
+
+                obj.SetNamedValue(L"customEffect", ced);
+            }
+
             return obj;
         }
 
@@ -473,6 +512,58 @@ namespace ShaderLab::Graph
                         static_cast<uint32_t>(p.GetNamedNumber(L"index"))
                     });
                 }
+            }
+
+            // Custom effect definition.
+            if (obj.HasKey(L"customEffect"))
+            {
+                auto ced = obj.GetNamedObject(L"customEffect");
+                CustomEffectDefinition def;
+                def.shaderType = static_cast<CustomShaderType>(
+                    static_cast<int>(ced.GetNamedNumber(L"shaderType")));
+                def.hlslSource = std::wstring(ced.GetNamedString(L"hlslSource"));
+
+                auto inputs = ced.GetNamedArray(L"inputNames");
+                for (uint32_t i = 0; i < inputs.Size(); ++i)
+                    def.inputNames.push_back(std::wstring(inputs.GetStringAt(i)));
+
+                auto params = ced.GetNamedArray(L"parameters");
+                for (uint32_t i = 0; i < params.Size(); ++i)
+                {
+                    auto po = params.GetObjectAt(i);
+                    ParameterDefinition pd;
+                    pd.name = std::wstring(po.GetNamedString(L"name"));
+                    pd.typeName = std::wstring(po.GetNamedString(L"typeName"));
+                    pd.minValue = static_cast<float>(po.GetNamedNumber(L"minValue"));
+                    pd.maxValue = static_cast<float>(po.GetNamedNumber(L"maxValue"));
+                    pd.step = static_cast<float>(po.GetNamedNumber(L"step"));
+                    if (po.HasKey(L"default"))
+                        pd.defaultValue = PropertyValueFromJson(po.GetNamedObject(L"default"));
+                    def.parameters.push_back(std::move(pd));
+                }
+
+                def.threadGroupX = static_cast<uint32_t>(ced.GetNamedNumber(L"threadGroupX"));
+                def.threadGroupY = static_cast<uint32_t>(ced.GetNamedNumber(L"threadGroupY"));
+                def.threadGroupZ = static_cast<uint32_t>(ced.GetNamedNumber(L"threadGroupZ"));
+                def.analysisOutputType = static_cast<AnalysisOutputType>(
+                    static_cast<int>(ced.GetNamedNumber(L"analysisOutputType")));
+                def.analysisOutputSize = static_cast<uint32_t>(ced.GetNamedNumber(L"analysisOutputSize"));
+
+                // Recompile from source on load.
+                CoCreateGuid(&def.shaderGuid);
+                std::string target = (def.shaderType == CustomShaderType::PixelShader)
+                    ? "ps_5_0" : "cs_5_0";
+                auto compileResult = ::ShaderLab::Effects::ShaderCompiler::CompileFromString(
+                    std::string(def.hlslSource.begin(), def.hlslSource.end()),
+                    "GraphLoad", "main", target);
+                if (compileResult.succeeded && compileResult.bytecode)
+                {
+                    auto* blob = compileResult.bytecode.get();
+                    def.compiledBytecode.resize(blob->GetBufferSize());
+                    memcpy(def.compiledBytecode.data(), blob->GetBufferPointer(), blob->GetBufferSize());
+                }
+
+                node.customEffect = std::move(def);
             }
 
             node.dirty = true;

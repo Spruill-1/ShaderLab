@@ -1,0 +1,8 @@
+namespace ShaderLab
+{
+    [default_interface]
+    runtimeclass EffectDesignerWindow : Microsoft.UI.Xaml.Window
+    {
+        EffectDesignerWindow();
+    }
+}

@@ -77,13 +77,23 @@ namespace ShaderLab::Rendering
             case NodeType::PixelShader:
             case NodeType::ComputeShader:
             {
-                // Custom shader effects — placeholder for Steps 10-11.
-                // When implemented, these will use ID2D1EffectImpl +
-                // ID2D1DrawTransform / ID2D1ComputeTransform and follow
-                // the same GetOrCreateEffect / WireInputs / ApplyProperties
-                // pattern as built-in effects.
                 ID2D1Effect* effect = GetOrCreateEffect(dc, *node);
-                if (effect)
+                if (effect && node->customEffect.has_value() && node->customEffect->isCompiled())
+                {
+                    // Apply bytecode/cbuffer BEFORE wiring so input count is correct.
+                    if (node->dirty)
+                    {
+                        ApplyCustomEffect(effect, *node);
+                        node->dirty = false;
+                    }
+
+                    WireInputs(effect, *node, graph);
+
+                    winrt::com_ptr<ID2D1Image> output;
+                    effect->GetOutput(output.put());
+                    node->cachedOutput = output.get();
+                }
+                else if (effect)
                 {
                     WireInputs(effect, *node, graph);
                     if (node->dirty)
@@ -127,11 +137,13 @@ namespace ShaderLab::Rendering
     void GraphEvaluator::ReleaseCache()
     {
         m_effectCache.clear();
+        m_customImplCache.clear();
     }
 
     void GraphEvaluator::InvalidateNode(uint32_t nodeId)
     {
         m_effectCache.erase(nodeId);
+        m_customImplCache.erase(nodeId);
     }
 
     // -----------------------------------------------------------------------
@@ -147,14 +159,28 @@ namespace ShaderLab::Rendering
         if (it != m_effectCache.end())
             return it->second.get();
 
-        // Need a CLSID to create a built-in effect.
+        // Need a CLSID to create the effect.
         if (!node.effectClsid.has_value())
             return nullptr;
+
+        // Clear thread-local impl pointers before CreateEffect.
+        Effects::CustomPixelShaderEffect::s_lastCreated = nullptr;
+        Effects::CustomComputeShaderEffect::s_lastCreated = nullptr;
 
         winrt::com_ptr<ID2D1Effect> effect;
         HRESULT hr = dc->CreateEffect(node.effectClsid.value(), effect.put());
         if (FAILED(hr))
             return nullptr;
+
+        // Capture custom effect impl for host-side API.
+        if (node.type == NodeType::PixelShader && Effects::CustomPixelShaderEffect::s_lastCreated)
+        {
+            m_customImplCache[node.id] = { Effects::CustomPixelShaderEffect::s_lastCreated, nullptr };
+        }
+        else if (node.type == NodeType::ComputeShader && Effects::CustomComputeShaderEffect::s_lastCreated)
+        {
+            m_customImplCache[node.id] = { nullptr, Effects::CustomComputeShaderEffect::s_lastCreated };
+        }
 
         auto* raw = effect.get();
         m_effectCache[node.id] = std::move(effect);
@@ -262,13 +288,111 @@ namespace ShaderLab::Rendering
             return;
 
         auto inputEdges = graph.GetInputEdges(destNode.id);
+
+        // Track which pins are connected so we can clear stale ones.
+        UINT32 totalInputs = effect->GetInputCount();
+        std::vector<bool> connected(totalInputs, false);
+
         for (const auto* edge : inputEdges)
         {
+            if (edge->destPin >= totalInputs)
+                continue;
+
             const EffectNode* srcNode = graph.FindNode(edge->sourceNodeId);
             if (srcNode && srcNode->cachedOutput)
             {
                 effect->SetInput(edge->destPin, srcNode->cachedOutput);
+                connected[edge->destPin] = true;
             }
+        }
+
+        // Clear any inputs that are no longer connected.
+        for (UINT32 i = 0; i < totalInputs; ++i)
+        {
+            if (!connected[i])
+                effect->SetInput(i, nullptr);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom effect application
+    // -----------------------------------------------------------------------
+
+    void GraphEvaluator::ApplyCustomEffect(ID2D1Effect* effect, EffectNode& node)
+    {
+        if (!node.customEffect.has_value()) return;
+        auto& def = node.customEffect.value();
+
+        auto implIt = m_customImplCache.find(node.id);
+        if (implIt == m_customImplCache.end()) return;
+
+        // Set input count via D2D property (index 0).
+        effect->SetValue(0, static_cast<UINT32>(def.inputNames.size()));
+
+        // Load bytecode into the concrete impl with per-instance GUID.
+        if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
+        {
+            implIt->second.pixelImpl->SetShaderGuid(def.shaderGuid);
+            implIt->second.pixelImpl->LoadShaderBytecode(
+                def.compiledBytecode.data(),
+                static_cast<UINT32>(def.compiledBytecode.size()));
+        }
+        else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
+        {
+            implIt->second.computeImpl->SetShaderGuid(def.shaderGuid);
+            implIt->second.computeImpl->LoadShaderBytecode(
+                def.compiledBytecode.data(),
+                static_cast<UINT32>(def.compiledBytecode.size()));
+            implIt->second.computeImpl->SetThreadGroupSize(
+                def.threadGroupX, def.threadGroupY, def.threadGroupZ);
+        }
+
+        // Reflect the bytecode to discover cbuffer layout.
+        auto reflection = Effects::ShaderCompiler::Reflect(def.compiledBytecode);
+        if (!reflection.constantBuffers.empty())
+        {
+            auto& cb = reflection.constantBuffers[0];
+            std::vector<BYTE> cbData(cb.sizeBytes, 0);
+
+            // Pack each property into the cbuffer at the reflected offset.
+            for (const auto& var : cb.variables)
+            {
+                auto propIt = node.properties.find(
+                    std::wstring(var.name.begin(), var.name.end()));
+                if (propIt == node.properties.end()) continue;
+
+                std::visit([&](const auto& v)
+                {
+                    using T = std::decay_t<decltype(v)>;
+                    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, int32_t> ||
+                                  std::is_same_v<T, uint32_t> || std::is_same_v<T, bool>)
+                    {
+                        if (var.offset + sizeof(T) <= cbData.size())
+                            memcpy(cbData.data() + var.offset, &v, sizeof(T));
+                    }
+                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
+                    {
+                        if (var.offset + sizeof(float) * 2 <= cbData.size())
+                            memcpy(cbData.data() + var.offset, &v, sizeof(float) * 2);
+                    }
+                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
+                    {
+                        if (var.offset + sizeof(float) * 3 <= cbData.size())
+                            memcpy(cbData.data() + var.offset, &v, sizeof(float) * 3);
+                    }
+                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
+                    {
+                        if (var.offset + sizeof(float) * 4 <= cbData.size())
+                            memcpy(cbData.data() + var.offset, &v, sizeof(float) * 4);
+                    }
+                }, propIt->second);
+            }
+
+            // Set the packed cbuffer on the concrete impl.
+            if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
+                implIt->second.pixelImpl->SetConstantBufferData(cbData.data(), static_cast<UINT32>(cbData.size()));
+            else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
+                implIt->second.computeImpl->SetConstantBufferData(cbData.data(), static_cast<UINT32>(cbData.size()));
         }
     }
 

@@ -48,9 +48,13 @@ namespace ShaderLab::Effects
         return factory->UnregisterEffect(CLSID_CustomComputeShader);
     }
 
+    thread_local CustomComputeShaderEffect* CustomComputeShaderEffect::s_lastCreated = nullptr;
+
     HRESULT __stdcall CustomComputeShaderEffect::CreateFactory(IUnknown** effect)
     {
-        *effect = static_cast<ID2D1EffectImpl*>(new (std::nothrow) CustomComputeShaderEffect());
+        auto* impl = new (std::nothrow) CustomComputeShaderEffect();
+        *effect = static_cast<ID2D1EffectImpl*>(impl);
+        s_lastCreated = impl;
         return *effect ? S_OK : E_OUTOFMEMORY;
     }
 
@@ -136,14 +140,17 @@ namespace ShaderLab::Effects
         // If the shader bytecode changed, load it into D2D.
         if (m_shaderDirty && !m_shaderBytecode.empty())
         {
+            if (m_shaderGuid == GUID{})
+                CoCreateGuid(&m_shaderGuid);
+
             HRESULT hr = m_effectContext->LoadComputeShader(
-                CLSID_CustomComputeShader,
+                m_shaderGuid,
                 m_shaderBytecode.data(),
                 static_cast<UINT32>(m_shaderBytecode.size()));
 
             if (SUCCEEDED(hr))
             {
-                hr = m_computeInfo->SetComputeShader(CLSID_CustomComputeShader);
+                hr = m_computeInfo->SetComputeShader(m_shaderGuid);
             }
 
             if (FAILED(hr))
@@ -275,6 +282,9 @@ namespace ShaderLab::Effects
 
     HRESULT CustomComputeShaderEffect::SetInputCount(UINT32 count)
     {
+        if (count == m_inputCount)
+            return S_OK;
+
         m_inputCount = count;
 
         if (m_transformGraph)
@@ -298,10 +308,16 @@ namespace ShaderLab::Effects
     {
         if (!bytecode)
             return E_INVALIDARG;
+        return LoadShaderBytecode(
+            static_cast<const BYTE*>(bytecode->GetBufferPointer()),
+            static_cast<UINT32>(bytecode->GetBufferSize()));
+    }
 
-        auto* data = static_cast<const BYTE*>(bytecode->GetBufferPointer());
-        auto  size = static_cast<UINT32>(bytecode->GetBufferSize());
-        m_shaderBytecode.assign(data, data + size);
+    HRESULT CustomComputeShaderEffect::LoadShaderBytecode(const BYTE* data, UINT32 dataSize)
+    {
+        if (!data || dataSize == 0)
+            return E_INVALIDARG;
+        m_shaderBytecode.assign(data, data + dataSize);
         m_shaderDirty = true;
         return S_OK;
     }

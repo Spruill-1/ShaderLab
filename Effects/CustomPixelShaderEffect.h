@@ -49,6 +49,9 @@ namespace ShaderLab::Effects
         // D2D creation callback (invoked by CreateEffect).
         static HRESULT __stdcall CreateFactory(IUnknown** effect);
 
+        // Last-created instance (used to capture impl pointer after CreateEffect).
+        static thread_local CustomPixelShaderEffect* s_lastCreated;
+
         // ---- IUnknown ----
         IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override;
         IFACEMETHODIMP_(ULONG) AddRef() override;
@@ -92,6 +95,12 @@ namespace ShaderLab::Effects
         // Load shader from compiled bytecode blob. Updates the D2D pixel shader.
         HRESULT LoadShaderBytecode(ID3DBlob* bytecode);
 
+        // Load shader from raw bytecode data.
+        HRESULT LoadShaderBytecode(const BYTE* data, UINT32 dataSize);
+
+        // Set per-instance shader GUID (must be set before loading bytecode).
+        void SetShaderGuid(const GUID& guid) { m_shaderGuid = guid; }
+
         // Set raw constant buffer data (will be uploaded on next PrepareForRender).
         void SetConstantBufferData(const BYTE* data, UINT32 dataSize);
 
@@ -113,6 +122,7 @@ namespace ShaderLab::Effects
 
         // Shader state.
         std::vector<BYTE> m_shaderBytecode;
+        GUID m_shaderGuid{};  // Per-instance shader ID for D2D LoadPixelShader.
         std::vector<BYTE> m_constantBuffer;
         UINT32            m_inputCount{ 1 };
         D2D1_RECT_L       m_inputRect{};

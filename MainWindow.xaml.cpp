@@ -26,7 +26,6 @@ namespace winrt::ShaderLab::implementation
         PreviewPanel().PointerMoved({ this, &MainWindow::OnPreviewPointerMoved });
         PreviewPanel().KeyDown({ this, &MainWindow::OnPreviewKeyDown });
         PreviewPanel().IsTabStop(true);
-        ShaderEditorBox().KeyDown({ this, &MainWindow::OnShaderEditorKeyDown });
         PreviewNodeSelector().SelectionChanged({ this, &MainWindow::OnPreviewNodeSelectionChanged });
         FalseColorSelector().SelectedIndex(0);
         FalseColorSelector().SelectionChanged({ this, &MainWindow::OnFalseColorSelectionChanged });
@@ -67,7 +66,7 @@ namespace winrt::ShaderLab::implementation
         BottomTabView().SelectionChanged([this](auto&&, auto&&)
         {
             if (m_isShuttingDown) return;
-            if (BottomTabView().SelectedIndex() == 2 && m_compareActive)
+            if (BottomTabView().SelectedIndex() == 1 && m_compareActive)
             {
                 // Switching to Pixel Trace → disable compare.
                 m_compareActive = false;
@@ -121,6 +120,7 @@ namespace winrt::ShaderLab::implementation
         NodeGraphContainer().IsTabStop(true);
 
         SaveImageButton().Click({ this, &MainWindow::OnSaveImageClicked });
+        EffectDesignerButton().Click([this](auto&&, auto&&) { OpenEffectDesigner(); });
     }
 
     MainWindow::~MainWindow()
@@ -230,9 +230,6 @@ namespace winrt::ShaderLab::implementation
             m_falseColor.SetDisplayMaxLuminance(caps.maxLuminanceNits);
         }
 
-        auto defaultShader = ::ShaderLab::Controls::ShaderEditorController::DefaultPixelShaderTemplate();
-        ShaderEditorBox().Text(winrt::to_hstring(defaultShader));
-
         // Start render loop.
         m_fpsTimePoint = std::chrono::steady_clock::now();
         m_renderTimer = DispatcherQueue().CreateTimer();
@@ -273,37 +270,6 @@ namespace winrt::ShaderLab::implementation
         auto w = static_cast<uint32_t>((std::max)(1.0f, static_cast<float>(args.NewSize().Width) * scale));
         auto h = static_cast<uint32_t>((std::max)(1.0f, static_cast<float>(args.NewSize().Height) * scale));
         m_renderEngine.Resize(w, h);
-    }
-
-    void MainWindow::OnShaderEditorKeyDown(
-        winrt::Windows::Foundation::IInspectable const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const& args)
-    {
-        // Ctrl+Enter triggers shader compilation.
-        if (args.Key() == winrt::Windows::System::VirtualKey::Enter)
-        {
-            bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-
-            if (ctrlDown)
-            {
-                auto hlsl = winrt::to_string(ShaderEditorBox().Text());
-                auto result = m_shaderEditor.Compile(hlsl);
-
-                if (!result.succeeded)
-                {
-                    // Show error in status bar (simplified).
-                    PipelineFormatText().Text(L"Shader Error: " + result.errorText.substr(0, 80));
-                }
-                else
-                {
-                    PipelineFormatText().Text(L"Shader compiled OK (" +
-                        std::to_wstring(result.autoProperties.size()) + L" properties)");
-                    m_graph.MarkAllDirty();
-                }
-
-                args.Handled(true);
-            }
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -914,7 +880,7 @@ namespace winrt::ShaderLab::implementation
                 m_compareNodeId = m_topoOrder[static_cast<uint32_t>(idx)];
 
             // Switch away from Pixel Trace tab (mutually exclusive).
-            if (BottomTabView().SelectedIndex() == 2)
+            if (BottomTabView().SelectedIndex() == 1)
                 BottomTabView().SelectedIndex(0);
 
             m_traceActive = false;
@@ -1089,7 +1055,7 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
         auto point = args.GetCurrentPoint(PreviewPanel());
-        bool isPixelTraceTab = (BottomTabView().SelectedIndex() == 2);
+        bool isPixelTraceTab = (BottomTabView().SelectedIndex() == 1);
 
         // Check for compare split line drag (only when compare is active and NOT on Pixel Trace tab).
         if (m_compareActive && !isPixelTraceTab && point.Properties().IsLeftButtonPressed())
@@ -1215,7 +1181,7 @@ namespace winrt::ShaderLab::implementation
         canvas.Clip(clipGeom);
 
         // Only show crosshair when Pixel Trace tab is active.
-        if (!m_traceActive || BottomTabView().SelectedIndex() != 2)
+        if (!m_traceActive || BottomTabView().SelectedIndex() != 1)
             return;
 
         // Compute the image-space point from the click position and the transform at click time,
@@ -1683,6 +1649,7 @@ namespace winrt::ShaderLab::implementation
             NodeGraphContainer().CapturePointer(args.Pointer());
             UpdatePropertiesPanel();
             BottomTabView().SelectedIndex(0);
+            NodeGraphContainer().Focus(winrt::Microsoft::UI::Xaml::FocusState::Programmatic);
 
             // For analysis effects (e.g., Histogram), keep the preview on the
             // Output node since analysis effects don't produce viewable images.
@@ -2870,6 +2837,39 @@ namespace winrt::ShaderLab::implementation
             m_isDraggingSplitter = false;
             sender.as<winrt::Microsoft::UI::Xaml::UIElement>().ReleasePointerCapture(args.Pointer());
         }
+    }
+
+    void MainWindow::OpenEffectDesigner()
+    {
+        if (!m_designerWindow)
+        {
+            m_designerWindow = winrt::make<winrt::ShaderLab::implementation::EffectDesignerWindow>();
+
+            // Set up callbacks from the designer to the main window.
+            auto designerImpl = winrt::get_self<winrt::ShaderLab::implementation::EffectDesignerWindow>(m_designerWindow);
+            designerImpl->SetAddToGraphCallback([this](::ShaderLab::Graph::EffectNode node) -> uint32_t
+            {
+                auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
+                m_graph.MarkAllDirty();
+                m_nodeGraphController.RebuildLayout();
+                PopulatePreviewNodeSelector();
+                return nodeId;
+            });
+            designerImpl->SetUpdateInGraphCallback([this](uint32_t nodeId, ::ShaderLab::Graph::CustomEffectDefinition def)
+            {
+                auto* node = m_graph.FindNode(nodeId);
+                if (node)
+                {
+                    node->customEffect = std::move(def);
+                    node->dirty = true;
+                    m_graph.MarkAllDirty();
+                    m_graphEvaluator.InvalidateNode(nodeId);
+                }
+            });
+
+            m_designerWindow.Closed([this](auto&&, auto&&) { m_designerWindow = nullptr; });
+        }
+        m_designerWindow.Activate();
     }
 
     void MainWindow::OnSaveImageClicked(

@@ -2,6 +2,9 @@
 
 #include "pch.h"
 #include "../Graph/EffectGraph.h"
+#include "../Effects/CustomPixelShaderEffect.h"
+#include "../Effects/CustomComputeShaderEffect.h"
+#include "../Effects/ShaderCompiler.h"
 
 namespace ShaderLab::Rendering
 {
@@ -50,6 +53,17 @@ namespace ShaderLab::Rendering
         // Per-node effect cache: nodeId → D2D effect.
         // Effects are reused across frames; only properties are updated.
         std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Effect>> m_effectCache;
+
+        // Per-node custom effect impl cache for host-side API access.
+        struct CustomEffectEntry
+        {
+            Effects::CustomPixelShaderEffect* pixelImpl{ nullptr };
+            Effects::CustomComputeShaderEffect* computeImpl{ nullptr };
+        };
+        std::unordered_map<uint32_t, CustomEffectEntry> m_customImplCache;
+
+        // Apply bytecode and cbuffer to a custom effect node.
+        void ApplyCustomEffect(ID2D1Effect* effect, Graph::EffectNode& node);
 
         // Force D2D to compute the histogram and read output data.
         void ReadHistogramOutput(

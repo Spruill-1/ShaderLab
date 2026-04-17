@@ -64,5 +64,6 @@ namespace ShaderLab::Effects
 
         // Reflect a compiled shader to discover constant buffers and bindings.
         static ShaderReflectionResult Reflect(ID3DBlob* bytecode);
+        static ShaderReflectionResult Reflect(const std::vector<uint8_t>& bytecode);
     };
 }

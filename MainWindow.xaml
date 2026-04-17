@@ -39,6 +39,8 @@
                 </DropDownButton>
                 <AppBarSeparator />
                 <Button x:Name="SaveImageButton" Content="Save Image" />
+                <AppBarSeparator />
+                <Button x:Name="EffectDesignerButton" Content="Effect Designer" />
             </StackPanel>
         </Grid>
 
@@ -186,17 +188,6 @@
                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                         </StackPanel>
                     </ScrollViewer>
-                </TabViewItem>
-                <TabViewItem Header="Shader Editor" IsClosable="False">
-                    <Grid Padding="12">
-                        <TextBox x:Name="ShaderEditorBox"
-                                 AcceptsReturn="True"
-                                 TextWrapping="NoWrap"
-                                 FontFamily="Cascadia Mono, Consolas, Courier New"
-                                 FontSize="13"
-                                 PlaceholderText="// Enter HLSL shader code here..."
-                                 IsSpellCheckEnabled="False" />
-                    </Grid>
                 </TabViewItem>
                 <TabViewItem Header="Pixel Trace" IsClosable="False">
                     <Grid>

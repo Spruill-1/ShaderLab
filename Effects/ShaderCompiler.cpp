@@ -162,4 +162,25 @@ namespace ShaderLab::Effects
 
         return result;
     }
+
+    ShaderReflectionResult ShaderCompiler::Reflect(const std::vector<uint8_t>& bytecode)
+    {
+        ShaderReflectionResult result;
+        if (bytecode.empty()) return result;
+
+        winrt::com_ptr<ID3D11ShaderReflection> reflection;
+        HRESULT hr = D3DReflect(bytecode.data(), bytecode.size(),
+            IID_PPV_ARGS(reflection.put()));
+        if (FAILED(hr)) return result;
+
+        // Reuse the blob-based Reflect by creating a temporary blob.
+        winrt::com_ptr<ID3DBlob> blob;
+        D3DCreateBlob(bytecode.size(), blob.put());
+        if (blob)
+        {
+            memcpy(blob->GetBufferPointer(), bytecode.data(), bytecode.size());
+            return Reflect(blob.get());
+        }
+        return result;
+    }
 }

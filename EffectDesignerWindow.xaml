@@ -1,0 +1,115 @@
+<Window
+    x:Class="ShaderLab.EffectDesignerWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Effect Designer">
+
+    <Grid Padding="12" RowSpacing="8">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- Row 0: Name and Type -->
+        <Grid Grid.Row="0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock Text="Effect Name:" VerticalAlignment="Center" Margin="0,0,8,0" />
+            <TextBox x:Name="EffectNameBox" Grid.Column="1" PlaceholderText="My Custom Effect" />
+            <TextBlock Text="Type:" Grid.Column="2" VerticalAlignment="Center" Margin="16,0,8,0" />
+            <ComboBox x:Name="ShaderTypeSelector" Grid.Column="3" MinWidth="140">
+                <x:String>Pixel Shader</x:String>
+                <x:String>Compute Shader</x:String>
+            </ComboBox>
+        </Grid>
+
+        <!-- Row 1: Inputs -->
+        <StackPanel Grid.Row="1">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Inputs" FontWeight="SemiBold" VerticalAlignment="Center" />
+                <Button x:Name="AddInputButton" Grid.Column="1" Content="+ Add Input" />
+            </Grid>
+            <StackPanel x:Name="InputsPanel" Spacing="4" Margin="0,4,0,0" />
+        </StackPanel>
+
+        <!-- Row 2: Parameters -->
+        <StackPanel Grid.Row="2">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Parameters" FontWeight="SemiBold" VerticalAlignment="Center" />
+                <Button x:Name="AddParamButton" Grid.Column="1" Content="+ Add Parameter" />
+            </Grid>
+            <StackPanel x:Name="ParamsPanel" Spacing="4" Margin="0,4,0,0" />
+        </StackPanel>
+
+        <!-- Row 3: Compute Settings (visible only for Compute Shader) -->
+        <StackPanel x:Name="ComputeSettingsPanel" Grid.Row="3" Visibility="Collapsed"
+                    Orientation="Horizontal" Spacing="8">
+            <TextBlock Text="Thread Group:" VerticalAlignment="Center" />
+            <NumberBox x:Name="ThreadGroupX" Value="8" Minimum="1" Maximum="1024"
+                       SpinButtonPlacementMode="Compact" Width="80" />
+            <TextBlock Text="×" VerticalAlignment="Center" />
+            <NumberBox x:Name="ThreadGroupY" Value="8" Minimum="1" Maximum="1024"
+                       SpinButtonPlacementMode="Compact" Width="80" />
+            <TextBlock Text="×" VerticalAlignment="Center" />
+            <NumberBox x:Name="ThreadGroupZ" Value="1" Minimum="1" Maximum="64"
+                       SpinButtonPlacementMode="Compact" Width="80" />
+            <AppBarSeparator />
+            <TextBlock Text="Output:" VerticalAlignment="Center" />
+            <ComboBox x:Name="OutputTypeSelector" MinWidth="100">
+                <x:String>None</x:String>
+                <x:String>Histogram</x:String>
+                <x:String>Float Buffer</x:String>
+            </ComboBox>
+        </StackPanel>
+
+        <!-- Row 4: Action buttons -->
+        <StackPanel Grid.Row="4" Orientation="Horizontal" Spacing="8">
+            <Button x:Name="GenerateScaffoldButton" Content="Generate Scaffold"
+                    Style="{StaticResource AccentButtonStyle}" />
+            <Button x:Name="CompileButton" Content="Compile (Ctrl+Enter)" />
+            <Button x:Name="AddToGraphButton" Content="Add to Graph" IsEnabled="False" />
+            <Button x:Name="UpdateInGraphButton" Content="Update in Graph" IsEnabled="False"
+                    Visibility="Collapsed" />
+        </StackPanel>
+
+        <!-- Row 5: HLSL Editor -->
+        <TextBox x:Name="HlslEditorBox" Grid.Row="5"
+                 AcceptsReturn="True"
+                 TextWrapping="NoWrap"
+                 FontFamily="Cascadia Mono, Consolas, Courier New"
+                 FontSize="13"
+                 PlaceholderText="// Click 'Generate Scaffold' to create HLSL boilerplate..."
+                 IsSpellCheckEnabled="False"
+                 ScrollViewer.VerticalScrollBarVisibility="Auto"
+                 ScrollViewer.HorizontalScrollBarVisibility="Auto" />
+
+        <!-- Row 6: Status bar -->
+        <Grid Grid.Row="6" Padding="4"
+              Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+              CornerRadius="4">
+            <TextBlock x:Name="CompileStatusText"
+                       Text="Ready"
+                       FontFamily="Cascadia Mono, Consolas, Courier New"
+                       FontSize="12"
+                       TextWrapping="Wrap"
+                       MaxLines="5" />
+        </Grid>
+    </Grid>
+</Window>

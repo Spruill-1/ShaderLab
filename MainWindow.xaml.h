@@ -15,6 +15,7 @@
 #include "Controls/NodeGraphController.h"
 #include "Controls/PixelInspectorController.h"
 #include "Controls/PixelTraceController.h"
+#include "EffectDesignerWindow.xaml.h"
 
 namespace winrt::ShaderLab::implementation
 {
@@ -66,9 +67,6 @@ namespace winrt::ShaderLab::implementation
         void OnPreviewSizeChanged(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& args);
-        void OnShaderEditorKeyDown(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const& args);
         void OnPreviewNodeSelectionChanged(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
@@ -205,10 +203,14 @@ namespace winrt::ShaderLab::implementation
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
         winrt::fire_and_forget SaveImageAsync();
+        void OpenEffectDesigner();
 
         uint32_t m_selectedNodeId{ 0 };
         bool m_isDraggingNode{ false };
         bool m_isDraggingConnection{ false };
+
+        // Effect Designer window.
+        winrt::ShaderLab::EffectDesignerWindow m_designerWindow{ nullptr };
 
         // Column splitter drag state.
         bool m_isDraggingSplitter{ false };

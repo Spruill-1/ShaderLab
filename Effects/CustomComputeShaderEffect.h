@@ -49,6 +49,7 @@ namespace ShaderLab::Effects
 
         // D2D creation callback (invoked by CreateEffect).
         static HRESULT __stdcall CreateFactory(IUnknown** effect);
+        static thread_local CustomComputeShaderEffect* s_lastCreated;
 
         // ---- IUnknown ----
         IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override;
@@ -97,6 +98,8 @@ namespace ShaderLab::Effects
 
         // Load shader from compiled bytecode blob. Updates the compute shader.
         HRESULT LoadShaderBytecode(ID3DBlob* bytecode);
+        HRESULT LoadShaderBytecode(const BYTE* data, UINT32 dataSize);
+        void SetShaderGuid(const GUID& guid) { m_shaderGuid = guid; }
 
         // Set raw constant buffer data (will be uploaded on next PrepareForRender).
         void SetConstantBufferData(const BYTE* data, UINT32 dataSize);
@@ -122,6 +125,7 @@ namespace ShaderLab::Effects
 
         // Shader state.
         std::vector<BYTE> m_shaderBytecode;
+        GUID m_shaderGuid{};
         std::vector<BYTE> m_constantBuffer;
         UINT32            m_inputCount{ 1 };
 

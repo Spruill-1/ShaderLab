@@ -135,6 +135,9 @@
     <ClInclude Include="MainWindow.xaml.h">
       <DependentUpon>MainWindow.xaml</DependentUpon>
     </ClInclude>
+    <ClInclude Include="EffectDesignerWindow.xaml.h">
+      <DependentUpon>EffectDesignerWindow.xaml</DependentUpon>
+    </ClInclude>
     <ClInclude Include="Rendering\DisplayInfo.h" />
     <ClInclude Include="Rendering\DisplayMonitor.h" />
     <ClInclude Include="Rendering\DisplayProfile.h" />
@@ -148,6 +151,7 @@
   <ItemGroup>
     <ApplicationDefinition Include="App.xaml" />
     <Page Include="MainWindow.xaml" />
+    <Page Include="EffectDesignerWindow.xaml" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Controls\NodeGraphController.cpp" />
@@ -170,6 +174,9 @@
     <ClCompile Include="MainWindow.xaml.cpp">
       <DependentUpon>MainWindow.xaml</DependentUpon>
     </ClCompile>
+    <ClCompile Include="EffectDesignerWindow.xaml.cpp">
+      <DependentUpon>EffectDesignerWindow.xaml</DependentUpon>
+    </ClCompile>
     <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
     <ClCompile Include="Rendering\DisplayMonitor.cpp" />
     <ClCompile Include="Rendering\GraphEvaluator.cpp" />
@@ -182,6 +189,10 @@
     <Midl Include="MainWindow.idl">
       <SubType>Code</SubType>
       <DependentUpon>MainWindow.xaml</DependentUpon>
+    </Midl>
+    <Midl Include="EffectDesignerWindow.idl">
+      <SubType>Code</SubType>
+      <DependentUpon>EffectDesignerWindow.xaml</DependentUpon>
     </Midl>
   </ItemGroup>
   <ItemGroup>
