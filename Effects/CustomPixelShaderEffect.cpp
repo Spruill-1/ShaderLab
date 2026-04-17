@@ -223,12 +223,32 @@ namespace ShaderLab::Effects
         {
             m_inputRect = inputRects[0];
 
-            // Use the intersection of input rects with the previously requested
-            // output rect. This prevents infinite-extent inputs (e.g., Turbulence)
-            // from creating a huge output rect that causes D2D to map texture
-            // coordinates across an enormous area, resulting in constant UVs
-            // and a solid-color output.
-            *outputRect = m_requestedOutputRect;
+            // If we have a stored requested rect, use it to prevent infinite-extent
+            // inputs from producing a huge output. Otherwise, use input rects directly.
+            bool hasRequestedRect = (m_requestedOutputRect.right > m_requestedOutputRect.left &&
+                                     m_requestedOutputRect.bottom > m_requestedOutputRect.top);
+            if (hasRequestedRect)
+            {
+                *outputRect = m_requestedOutputRect;
+            }
+            else
+            {
+                // Fall back to union of input rects (clamped to prevent infinite extent).
+                *outputRect = inputRects[0];
+                for (UINT32 i = 1; i < inputRectCount; ++i)
+                {
+                    outputRect->left   = (std::min)(outputRect->left,   inputRects[i].left);
+                    outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
+                    outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
+                    outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
+                }
+                // Clamp to reasonable maximum to avoid infinite-extent issues.
+                const LONG maxDim = 16384;
+                outputRect->left   = (std::max)(outputRect->left,   -maxDim);
+                outputRect->top    = (std::max)(outputRect->top,    -maxDim);
+                outputRect->right  = (std::min)(outputRect->right,  maxDim);
+                outputRect->bottom = (std::min)(outputRect->bottom, maxDim);
+            }
         }
         else
         {
