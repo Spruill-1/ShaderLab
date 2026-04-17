@@ -218,28 +218,19 @@ namespace ShaderLab::Effects
     {
         if (inputRectCount > 0 && inputRects)
         {
-            bool hasRequestedRect = (m_requestedOutputRect.right > m_requestedOutputRect.left &&
-                                     m_requestedOutputRect.bottom > m_requestedOutputRect.top);
-            if (hasRequestedRect)
+            *outputRect = inputRects[0];
+            for (UINT32 i = 1; i < inputRectCount; ++i)
             {
-                *outputRect = m_requestedOutputRect;
+                outputRect->left   = (std::min)(outputRect->left,   inputRects[i].left);
+                outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
+                outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
+                outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
             }
-            else
-            {
-                *outputRect = inputRects[0];
-                for (UINT32 i = 1; i < inputRectCount; ++i)
-                {
-                    outputRect->left   = (std::min)(outputRect->left,   inputRects[i].left);
-                    outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
-                    outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
-                    outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
-                }
-                const LONG maxDim = 16384;
-                outputRect->left   = (std::max)(outputRect->left,   -maxDim);
-                outputRect->top    = (std::max)(outputRect->top,    -maxDim);
-                outputRect->right  = (std::min)(outputRect->right,  maxDim);
-                outputRect->bottom = (std::min)(outputRect->bottom, maxDim);
-            }
+            const LONG maxDim = 16384;
+            outputRect->left   = (std::max)(outputRect->left,   -maxDim);
+            outputRect->top    = (std::max)(outputRect->top,    -maxDim);
+            outputRect->right  = (std::min)(outputRect->right,  maxDim);
+            outputRect->bottom = (std::min)(outputRect->bottom, maxDim);
         }
         else
         {
@@ -255,8 +246,6 @@ namespace ShaderLab::Effects
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const
     {
-        const_cast<CustomComputeShaderEffect*>(this)->m_requestedOutputRect = *outputRect;
-
         for (UINT32 i = 0; i < inputRectCount; ++i)
         {
             inputRects[i] = *outputRect;

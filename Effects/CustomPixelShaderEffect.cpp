@@ -222,33 +222,23 @@ namespace ShaderLab::Effects
         if (inputRectCount > 0 && inputRects)
         {
             m_inputRect = inputRects[0];
+            *outputRect = inputRects[0];
 
-            // If we have a stored requested rect, use it to prevent infinite-extent
-            // inputs from producing a huge output. Otherwise, use input rects directly.
-            bool hasRequestedRect = (m_requestedOutputRect.right > m_requestedOutputRect.left &&
-                                     m_requestedOutputRect.bottom > m_requestedOutputRect.top);
-            if (hasRequestedRect)
+            // Union all input rects.
+            for (UINT32 i = 1; i < inputRectCount; ++i)
             {
-                *outputRect = m_requestedOutputRect;
+                outputRect->left   = (std::min)(outputRect->left,   inputRects[i].left);
+                outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
+                outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
+                outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
             }
-            else
-            {
-                // Fall back to union of input rects (clamped to prevent infinite extent).
-                *outputRect = inputRects[0];
-                for (UINT32 i = 1; i < inputRectCount; ++i)
-                {
-                    outputRect->left   = (std::min)(outputRect->left,   inputRects[i].left);
-                    outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
-                    outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
-                    outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
-                }
-                // Clamp to reasonable maximum to avoid infinite-extent issues.
-                const LONG maxDim = 16384;
-                outputRect->left   = (std::max)(outputRect->left,   -maxDim);
-                outputRect->top    = (std::max)(outputRect->top,    -maxDim);
-                outputRect->right  = (std::min)(outputRect->right,  maxDim);
-                outputRect->bottom = (std::min)(outputRect->bottom, maxDim);
-            }
+
+            // Clamp to prevent infinite-extent inputs from blowing up UV mapping.
+            const LONG maxDim = 16384;
+            outputRect->left   = (std::max)(outputRect->left,   -maxDim);
+            outputRect->top    = (std::max)(outputRect->top,    -maxDim);
+            outputRect->right  = (std::min)(outputRect->right,  maxDim);
+            outputRect->bottom = (std::min)(outputRect->bottom, maxDim);
         }
         else
         {
@@ -264,9 +254,6 @@ namespace ShaderLab::Effects
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const
     {
-        // Store the requested output rect for use in MapInputRectsToOutputRect.
-        const_cast<CustomPixelShaderEffect*>(this)->m_requestedOutputRect = *outputRect;
-
         // Each input needs the same rect as the output (1:1 passthrough).
         for (UINT32 i = 0; i < inputRectCount; ++i)
         {
