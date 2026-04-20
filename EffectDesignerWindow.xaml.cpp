@@ -319,16 +319,17 @@ namespace winrt::ShaderLab::implementation
 
         if (def.shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader)
         {
-            // Texture inputs.
+            // Texture inputs + sampler.
             for (uint32_t i = 0; i < def.inputNames.size(); ++i)
             {
                 hlsl += std::format(L"Texture2D {} : register(t{});\n", def.inputNames[i], i);
             }
             if (!def.inputNames.empty())
             {
+                hlsl += L"SamplerState Sampler0 : register(s0);\n";
                 hlsl += L"\n// D2D provides TEXCOORD in pixel/scene space.\n";
-                hlsl += L"// Use Load(int3(uv.xy, 0)) for direct texel access.\n";
-                hlsl += L"// Use Sample() with GetDimensions() normalization for filtered sampling.\n\n";
+                hlsl += L"// Normalize with GetDimensions() before sampling.\n";
+                hlsl += L"// D2D's sampler uses CLAMP addressing (edge color for out-of-bounds).\n\n";
             }
 
             // Entry point with per-input TEXCOORD semantics.
@@ -341,18 +342,16 @@ namespace winrt::ShaderLab::implementation
             hlsl += L") : SV_TARGET\n";
             hlsl += L"{\n";
 
-            // Use Load() with the pixel-space TEXCOORD directly.
-            // D2D provides TEXCOORD in pixel/scene space (not [0,1]).
-            // Load() takes integer texel coords, matching D2D's coordinate space.
             if (def.inputNames.size() >= 1)
             {
                 for (uint32_t i = 0; i < def.inputNames.size(); ++i)
                 {
-                    hlsl += std::format(L"    float4 color{0} = {1}.Load(int3(uv{0}.xy, 0));\n",
+                    hlsl += std::format(L"    float {0}w, {0}h;\n", def.inputNames[i]);
+                    hlsl += std::format(L"    {0}.GetDimensions({0}w, {0}h);\n", def.inputNames[i]);
+                    hlsl += std::format(L"    float4 color{0} = {1}.SampleLevel(Sampler0, uv{0}.xy / float2({1}w, {1}h), 0);\n\n",
                         i, def.inputNames[i]);
                 }
 
-                hlsl += L"\n";
                 if (def.inputNames.size() == 1)
                 {
                     hlsl += L"    // Your code here\n\n";
