@@ -570,61 +570,75 @@ namespace winrt::ShaderLab::implementation
             }
 
             // Restore default/min/max values.
-            // Parameter row layout: [NameBox, TypeCombo, DefaultBox, MinBox, MaxBox, DeleteBtn]
-            // or with vector types there are multiple default boxes.
-            // Find NumberBoxes by iterating children.
-            std::vector<Controls::NumberBox> numberBoxes;
+            // Row layout: [NameBox, TypeCombo, DefContainer(StackPanel), MinBox, MaxBox, DeleteBtn]
+            // Default NumberBoxes are INSIDE DefContainer, not direct row children.
+            
+            // Find DefContainer (the StackPanel child of the row).
+            Controls::StackPanel defContainer{ nullptr };
             for (uint32_t ci = 0; ci < lastRow.Children().Size(); ++ci)
             {
-                auto nb = lastRow.Children().GetAt(ci).try_as<Controls::NumberBox>();
-                if (nb) numberBoxes.push_back(nb);
+                auto sp = lastRow.Children().GetAt(ci).try_as<Controls::StackPanel>();
+                if (sp) { defContainer = sp; break; }
             }
 
-            // Set default value from the parameter definition.
-            if (!numberBoxes.empty())
+            // Set default value in DefContainer's NumberBoxes.
+            if (defContainer)
             {
-                std::visit([&numberBoxes](const auto& v)
+                std::vector<Controls::NumberBox> defBoxes;
+                for (uint32_t ci = 0; ci < defContainer.Children().Size(); ++ci)
+                {
+                    auto nb = defContainer.Children().GetAt(ci).try_as<Controls::NumberBox>();
+                    if (nb) defBoxes.push_back(nb);
+                }
+
+                std::visit([&defBoxes](const auto& v)
                 {
                     using T = std::decay_t<decltype(v)>;
                     if constexpr (std::is_same_v<T, float>)
                     {
-                        if (numberBoxes.size() >= 1) numberBoxes[0].Value(v);
+                        if (defBoxes.size() >= 1) defBoxes[0].Value(v);
                     }
                     else if constexpr (std::is_same_v<T, int32_t>)
                     {
-                        if (numberBoxes.size() >= 1) numberBoxes[0].Value(static_cast<double>(v));
+                        if (defBoxes.size() >= 1) defBoxes[0].Value(static_cast<double>(v));
                     }
                     else if constexpr (std::is_same_v<T, uint32_t>)
                     {
-                        if (numberBoxes.size() >= 1) numberBoxes[0].Value(static_cast<double>(v));
+                        if (defBoxes.size() >= 1) defBoxes[0].Value(static_cast<double>(v));
                     }
                     else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
                     {
-                        if (numberBoxes.size() >= 1) numberBoxes[0].Value(v.x);
-                        if (numberBoxes.size() >= 2) numberBoxes[1].Value(v.y);
+                        if (defBoxes.size() >= 1) defBoxes[0].Value(v.x);
+                        if (defBoxes.size() >= 2) defBoxes[1].Value(v.y);
                     }
                     else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
                     {
-                        if (numberBoxes.size() >= 1) numberBoxes[0].Value(v.x);
-                        if (numberBoxes.size() >= 2) numberBoxes[1].Value(v.y);
-                        if (numberBoxes.size() >= 3) numberBoxes[2].Value(v.z);
+                        if (defBoxes.size() >= 1) defBoxes[0].Value(v.x);
+                        if (defBoxes.size() >= 2) defBoxes[1].Value(v.y);
+                        if (defBoxes.size() >= 3) defBoxes[2].Value(v.z);
                     }
                     else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
                     {
-                        if (numberBoxes.size() >= 1) numberBoxes[0].Value(v.x);
-                        if (numberBoxes.size() >= 2) numberBoxes[1].Value(v.y);
-                        if (numberBoxes.size() >= 3) numberBoxes[2].Value(v.z);
-                        if (numberBoxes.size() >= 4) numberBoxes[3].Value(v.w);
+                        if (defBoxes.size() >= 1) defBoxes[0].Value(v.x);
+                        if (defBoxes.size() >= 2) defBoxes[1].Value(v.y);
+                        if (defBoxes.size() >= 3) defBoxes[2].Value(v.z);
+                        if (defBoxes.size() >= 4) defBoxes[3].Value(v.w);
                     }
                 }, p.defaultValue);
+            }
 
-                // Min and max are the last two NumberBoxes in the row.
-                size_t nb_count = numberBoxes.size();
-                if (nb_count >= 3)
-                {
-                    numberBoxes[nb_count - 2].Value(p.minValue);
-                    numberBoxes[nb_count - 1].Value(p.maxValue);
-                }
+            // Set Min and Max (direct NumberBox children of row, after DefContainer).
+            std::vector<Controls::NumberBox> rowBoxes;
+            for (uint32_t ci = 0; ci < lastRow.Children().Size(); ++ci)
+            {
+                auto nb = lastRow.Children().GetAt(ci).try_as<Controls::NumberBox>();
+                if (nb) rowBoxes.push_back(nb);
+            }
+            // rowBoxes = [MinBox, MaxBox]
+            if (rowBoxes.size() >= 2)
+            {
+                rowBoxes[0].Value(p.minValue);
+                rowBoxes[1].Value(p.maxValue);
             }
         }
 
