@@ -90,10 +90,6 @@ namespace ShaderLab::Rendering
                     if (node->dirty)
                     {
                         ApplyCustomEffect(effect, *node);
-                        // D2D doesn't call PrepareForRender unless it detects a property
-                        // change. We bypass D2D's property system for cbuffer updates, so
-                        // poke the D2D1_PROPERTY_CACHED system property to force re-render.
-                        effect->SetValue(D2D1_PROPERTY_CACHED, FALSE);
                         node->dirty = false;
                     }
 
