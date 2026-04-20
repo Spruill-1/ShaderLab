@@ -101,6 +101,14 @@ namespace ShaderLab::Rendering
                                 implIt->second.pixelImpl->ForceUploadConstantBuffer();
                         }
 
+                        // Force D2D to re-render by toggling input 0.
+                        // D2D caches effect output and skips re-rendering if it sees
+                        // no changes. Briefly nulling input 0 signals a change.
+                        winrt::com_ptr<ID2D1Image> savedInput;
+                        effect->GetInput(0, savedInput.put());
+                        effect->SetInput(0, nullptr);
+                        effect->SetInput(0, savedInput.get());
+
                         node->dirty = false;
                     }
 
