@@ -201,11 +201,12 @@ namespace ShaderLab::Effects
         D2D1_RECT_L* outputRect,
         D2D1_RECT_L* outputOpaqueSubRect)
     {
+        // Pure passthrough: output = union of input rects.
+        // With Load() sampling, the output rect size doesn't affect UV mapping
+        // since Load() uses absolute texel coordinates from the scene-space TEXCOORD.
         if (inputRectCount > 0 && inputRects)
         {
             m_inputRect = inputRects[0];
-
-            // Compute union of input rects.
             *outputRect = inputRects[0];
             for (UINT32 i = 1; i < inputRectCount; ++i)
             {
@@ -213,15 +214,6 @@ namespace ShaderLab::Effects
                 outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
                 outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
                 outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
-            }
-
-            // If the result is unreasonably large (infinite-extent input), constrain
-            // to the host-supplied desired rect (render target size).
-            LONG w = outputRect->right - outputRect->left;
-            LONG h = outputRect->bottom - outputRect->top;
-            if ((w > 8192 || h > 8192 || w < 0 || h < 0) && m_hasDesiredRect)
-            {
-                *outputRect = m_desiredOutputRect;
             }
         }
         else

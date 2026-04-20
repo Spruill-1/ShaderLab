@@ -97,32 +97,6 @@ namespace ShaderLab::Rendering
                         node->dirty = false;
                     }
 
-                    // Tell the transform impl the render target size so it can
-                    // constrain infinite-extent inputs in MapInputRectsToOutputRect.
-                    auto implIt = m_customImplCache.find(node->id);
-                    if (implIt != m_customImplCache.end())
-                    {
-                        D2D1_SIZE_U rtSize{};
-                        winrt::com_ptr<ID2D1Image> target;
-                        dc->GetTarget(target.put());
-                        if (target)
-                        {
-                            auto bitmap = target.try_as<ID2D1Bitmap>();
-                            if (bitmap)
-                                rtSize = bitmap->GetPixelSize();
-                        }
-                        if (rtSize.width == 0) rtSize.width = 1920;
-                        if (rtSize.height == 0) rtSize.height = 1080;
-                        D2D1_RECT_L desired = { 0, 0,
-                            static_cast<LONG>(rtSize.width),
-                            static_cast<LONG>(rtSize.height) };
-
-                        if (node->type == NodeType::PixelShader && implIt->second.pixelImpl)
-                            implIt->second.pixelImpl->SetDesiredOutputRect(desired);
-                        else if (node->type == NodeType::ComputeShader && implIt->second.computeImpl)
-                            implIt->second.computeImpl->SetDesiredOutputRect(desired);
-                    }
-
                     WireInputs(effect, *node, graph);
 
                     winrt::com_ptr<ID2D1Image> output;

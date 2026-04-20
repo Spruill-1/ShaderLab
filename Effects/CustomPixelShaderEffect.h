@@ -116,10 +116,6 @@ namespace ShaderLab::Effects
                 m_transformGraph->SetSingleTransformNode(static_cast<ID2D1DrawTransform*>(this));
         }
 
-        // Set the desired output rect (from the host). Used to constrain
-        // infinite-extent inputs to the actual render target size.
-        void SetDesiredOutputRect(const D2D1_RECT_L& rect) { m_desiredOutputRect = rect; m_hasDesiredRect = true; }
-
         // Set raw constant buffer data (will be uploaded on next PrepareForRender).
         void SetConstantBufferData(const BYTE* data, UINT32 dataSize);
 
@@ -145,10 +141,6 @@ namespace ShaderLab::Effects
         std::vector<BYTE> m_constantBuffer;
         UINT32            m_inputCount{ 1 };
         D2D1_RECT_L       m_inputRect{};
-
-        // Host-supplied output rect to constrain infinite inputs.
-        D2D1_RECT_L       m_desiredOutputRect{};
-        bool              m_hasDesiredRect{ false };
         D2D1_RECT_L       m_lastRequestedRect{};
         bool              m_hasRequestedRect{ false };
 

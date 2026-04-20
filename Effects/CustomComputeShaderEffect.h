@@ -113,8 +113,6 @@ namespace ShaderLab::Effects
                 m_transformGraph->SetSingleTransformNode(static_cast<ID2D1ComputeTransform*>(this));
         }
 
-        void SetDesiredOutputRect(const D2D1_RECT_L& rect) { m_desiredOutputRect = rect; m_hasDesiredRect = true; }
-
         // Set raw constant buffer data (will be uploaded on next PrepareForRender).
         void SetConstantBufferData(const BYTE* data, UINT32 dataSize);
 
@@ -142,8 +140,6 @@ namespace ShaderLab::Effects
         GUID m_shaderGuid{};
         std::vector<BYTE> m_constantBuffer;
         UINT32            m_inputCount{ 1 };
-        D2D1_RECT_L       m_desiredOutputRect{};
-        bool              m_hasDesiredRect{ false };
 
         // Thread group dimensions for compute dispatch.
         UINT32 m_threadGroupX{ 8 };

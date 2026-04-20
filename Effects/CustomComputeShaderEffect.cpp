@@ -233,12 +233,6 @@ namespace ShaderLab::Effects
                 outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
                 outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
             }
-            LONG w = outputRect->right - outputRect->left;
-            LONG h = outputRect->bottom - outputRect->top;
-            if ((w > 8192 || h > 8192 || w < 0 || h < 0) && m_hasDesiredRect)
-            {
-                *outputRect = m_desiredOutputRect;
-            }
         }
         else
         {
