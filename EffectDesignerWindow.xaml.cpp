@@ -326,14 +326,9 @@ namespace winrt::ShaderLab::implementation
             }
             if (!def.inputNames.empty())
             {
-                hlsl += L"SamplerState Sampler0 : register(s0);\n\n";
-            }
-
-            // Helper comment about D2D coordinate space.
-            if (!def.inputNames.empty())
-            {
-                hlsl += L"// D2D provides TEXCOORD in pixel/scene space, not [0,1] UV space.\n";
-                hlsl += L"// Use GetDimensions() to normalize before calling Sample().\n\n";
+                hlsl += L"\n// D2D provides TEXCOORD in pixel/scene space.\n";
+                hlsl += L"// Use Load(int3(uv.xy, 0)) for direct texel access.\n";
+                hlsl += L"// Use Sample() with GetDimensions() normalization for filtered sampling.\n\n";
             }
 
             // Entry point with per-input TEXCOORD semantics.
@@ -346,17 +341,18 @@ namespace winrt::ShaderLab::implementation
             hlsl += L") : SV_TARGET\n";
             hlsl += L"{\n";
 
-            // Generate GetDimensions + normalize + Sample for each input.
+            // Use Load() with the pixel-space TEXCOORD directly.
+            // D2D provides TEXCOORD in pixel/scene space (not [0,1]).
+            // Load() takes integer texel coords, matching D2D's coordinate space.
             if (def.inputNames.size() >= 1)
             {
                 for (uint32_t i = 0; i < def.inputNames.size(); ++i)
                 {
-                    hlsl += std::format(L"    float w{0}, h{0};\n", i);
-                    hlsl += std::format(L"    {}.GetDimensions(w{}, h{});\n", def.inputNames[i], i, i);
-                    hlsl += std::format(L"    float4 color{0} = {1}.Sample(Sampler0, uv{0}.xy / float2(w{0}, h{0}));\n\n",
+                    hlsl += std::format(L"    float4 color{0} = {1}.Load(int3(uv{0}.xy, 0));\n",
                         i, def.inputNames[i]);
                 }
 
+                hlsl += L"\n";
                 if (def.inputNames.size() == 1)
                 {
                     hlsl += L"    // Your code here\n\n";
