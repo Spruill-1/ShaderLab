@@ -241,6 +241,13 @@ namespace ShaderLab::Effects
             {
                 *outputRect = m_desiredOutputRect;
             }
+
+            OutputDebugStringW(std::format(
+                L"[CustomPS] MapInputToOutput: inputs={} in0=({},{},{},{}) out=({},{},{},{}) desired={}\n",
+                inputRectCount,
+                inputRects[0].left, inputRects[0].top, inputRects[0].right, inputRects[0].bottom,
+                outputRect->left, outputRect->top, outputRect->right, outputRect->bottom,
+                m_hasDesiredRect).c_str());
         }
         else
         {
@@ -256,6 +263,11 @@ namespace ShaderLab::Effects
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const
     {
+        OutputDebugStringW(std::format(
+            L"[CustomPS] MapOutputToInput: count={} out=({},{},{},{})\n",
+            inputRectCount,
+            outputRect->left, outputRect->top, outputRect->right, outputRect->bottom).c_str());
+
         for (UINT32 i = 0; i < inputRectCount; ++i)
         {
             inputRects[i] = *outputRect;

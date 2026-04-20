@@ -329,6 +329,13 @@ namespace winrt::ShaderLab::implementation
                 hlsl += L"SamplerState Sampler0 : register(s0);\n\n";
             }
 
+            // Helper comment about D2D coordinate space.
+            if (!def.inputNames.empty())
+            {
+                hlsl += L"// D2D provides TEXCOORD in pixel/scene space, not [0,1] UV space.\n";
+                hlsl += L"// Use GetDimensions() to normalize before calling Sample().\n\n";
+            }
+
             // Entry point with per-input TEXCOORD semantics.
             hlsl += L"float4 main(\n";
             hlsl += L"    float4 pos : SV_POSITION";
@@ -336,35 +343,34 @@ namespace winrt::ShaderLab::implementation
             {
                 hlsl += std::format(L",\n    float4 uv{} : TEXCOORD{}", i, i);
             }
-            if (def.inputNames.empty())
-            {
-                hlsl += L") : SV_TARGET\n";
-            }
-            else
-            {
-                hlsl += L") : SV_TARGET\n";
-            }
+            hlsl += L") : SV_TARGET\n";
             hlsl += L"{\n";
-            if (def.inputNames.size() == 1)
-            {
-                hlsl += L"    float4 color = " + def.inputNames[0] +
-                    L".Sample(Sampler0, uv0.xy);\n";
-                hlsl += L"\n    // Your code here\n\n";
-                hlsl += L"    return color;\n";
-            }
-            else if (def.inputNames.size() >= 2)
+
+            // Generate GetDimensions + normalize + Sample for each input.
+            if (def.inputNames.size() >= 1)
             {
                 for (uint32_t i = 0; i < def.inputNames.size(); ++i)
                 {
-                    hlsl += std::format(L"    float4 color{} = {}.Sample(Sampler0, uv{}.xy);\n",
-                        i, def.inputNames[i], i);
+                    hlsl += std::format(L"    float w{0}, h{0};\n", i);
+                    hlsl += std::format(L"    {}.GetDimensions(w{}, h{});\n", def.inputNames[i], i, i);
+                    hlsl += std::format(L"    float4 color{0} = {1}.Sample(Sampler0, uv{0}.xy / float2(w{0}, h{0}));\n\n",
+                        i, def.inputNames[i]);
                 }
-                hlsl += L"\n    // Your code here -- blend, combine, or process the inputs\n\n";
-                hlsl += L"    return color0;\n";
+
+                if (def.inputNames.size() == 1)
+                {
+                    hlsl += L"    // Your code here\n\n";
+                    hlsl += L"    return color0;\n";
+                }
+                else
+                {
+                    hlsl += L"    // Your code here -- blend, combine, or process the inputs\n\n";
+                    hlsl += L"    return color0;\n";
+                }
             }
             else
             {
-                hlsl += L"    // Your code here\n";
+                hlsl += L"    // Your code here (no inputs)\n";
                 hlsl += L"    return float4(0, 0, 0, 1);\n";
             }
             hlsl += L"}\n";
