@@ -415,26 +415,17 @@ namespace ShaderLab::Rendering
 
         auto implIt = m_customImplCache.find(node.id);
         if (implIt == m_customImplCache.end())
-        {
-            OutputDebugStringW(std::format(L"[CustomFX] node {} -- no impl in cache!\n", node.id).c_str());
             return;
-        }
 
         UINT32 inputCount = static_cast<UINT32>(def.inputNames.size());
-
-        // D2D effect has 8 fixed inputs (matching the XML). No need to call
-        // SetInputCount or SetInputCountDirect -- the count is always 8.
-        // Unused inputs are left null; the shader gets zeros for them.
 
         // Load bytecode into the concrete impl with per-instance GUID.
         if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
         {
             implIt->second.pixelImpl->SetShaderGuid(def.shaderGuid);
-            HRESULT loadHr = implIt->second.pixelImpl->LoadShaderBytecode(
+            implIt->second.pixelImpl->LoadShaderBytecode(
                 def.compiledBytecode.data(),
                 static_cast<UINT32>(def.compiledBytecode.size()));
-            OutputDebugStringW(std::format(L"[CustomFX] node {} -- LoadShaderBytecode({} bytes) hr=0x{:08X}\n",
-                node.id, def.compiledBytecode.size(), static_cast<uint32_t>(loadHr)).c_str());
         }
         else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
         {
@@ -552,10 +543,6 @@ namespace ShaderLab::Rendering
 
         // Query the actual output data size.
         UINT32 dataSize = effect->GetValueSize(D2D1_HISTOGRAM_PROP_HISTOGRAM_OUTPUT);
-
-        OutputDebugStringW(std::format(L"[Histogram] channelIdx={} dataSize={} bounds=({:.0f},{:.0f},{:.0f},{:.0f})\n",
-            channelIdx, dataSize, bounds.left, bounds.top, bounds.right, bounds.bottom).c_str());
-
         if (dataSize == 0) return;
 
         uint32_t numBins = dataSize / sizeof(float);
@@ -568,12 +555,6 @@ namespace ShaderLab::Rendering
 
         if (SUCCEEDED(hr))
         {
-            float maxVal = *std::max_element(histData.begin(), histData.end());
-            float sumVal = 0.0f;
-            for (float f : histData) sumVal += f;
-            OutputDebugStringW(std::format(L"[Histogram] OK bins={} max={:.4f} sum={:.4f}\n",
-                numBins, maxVal, sumVal).c_str());
-
             node.analysisOutput.type = AnalysisOutputType::Histogram;
             node.analysisOutput.data = std::move(histData);
             node.analysisOutput.channelIndex = channelIdx;
