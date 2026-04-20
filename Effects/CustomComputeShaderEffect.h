@@ -105,7 +105,13 @@ namespace ShaderLab::Effects
         void SetShaderGuid(const GUID& guid) { m_shaderGuid = guid; }
 
         // Set input count directly (bypasses D2D property system).
-        void SetInputCountDirect(UINT32 count) { m_inputCount = count; }
+        void SetInputCountDirect(UINT32 count)
+        {
+            if (count == m_inputCount) return;
+            m_inputCount = count;
+            if (m_transformGraph)
+                m_transformGraph->SetSingleTransformNode(static_cast<ID2D1ComputeTransform*>(this));
+        }
 
         void SetDesiredOutputRect(const D2D1_RECT_L& rect) { m_desiredOutputRect = rect; m_hasDesiredRect = true; }
 

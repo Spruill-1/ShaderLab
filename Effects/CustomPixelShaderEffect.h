@@ -104,8 +104,14 @@ namespace ShaderLab::Effects
         // Set per-instance shader GUID (must be set before loading bytecode).
         void SetShaderGuid(const GUID& guid) { m_shaderGuid = guid; }
 
-        // Set input count directly (bypasses D2D property system).
-        void SetInputCountDirect(UINT32 count) { m_inputCount = count; }
+        // Set input count directly and rebuild the D2D transform graph.
+        void SetInputCountDirect(UINT32 count)
+        {
+            if (count == m_inputCount) return;
+            m_inputCount = count;
+            if (m_transformGraph)
+                m_transformGraph->SetSingleTransformNode(static_cast<ID2D1DrawTransform*>(this));
+        }
 
         // Set the desired output rect (from the host). Used to constrain
         // infinite-extent inputs to the actual render target size.
