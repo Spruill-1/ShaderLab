@@ -201,12 +201,11 @@ namespace ShaderLab::Effects
         D2D1_RECT_L* outputRect,
         D2D1_RECT_L* outputOpaqueSubRect)
     {
-        // Pure passthrough: output = union of input rects.
-        // With Load() sampling, the output rect size doesn't affect UV mapping
-        // since Load() uses absolute texel coordinates from the scene-space TEXCOORD.
         if (inputRectCount > 0 && inputRects)
         {
             m_inputRect = inputRects[0];
+
+            // Compute union of input rects.
             *outputRect = inputRects[0];
             for (UINT32 i = 1; i < inputRectCount; ++i)
             {
@@ -215,6 +214,16 @@ namespace ShaderLab::Effects
                 outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
                 outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
             }
+
+            // Clamp to a reasonable origin-at-zero rect. D2D maps TEXCOORD
+            // relative to this output rect — if it's infinite, the viewport
+            // maps to a tiny fraction and all pixels sample the same texel.
+            // With SampleLevel + CLAMP, any viewport within (0,0,4096,4096)
+            // works correctly; out-of-bounds samples get edge color.
+            outputRect->left   = (std::max)(outputRect->left,   0L);
+            outputRect->top    = (std::max)(outputRect->top,    0L);
+            outputRect->right  = (std::min)(outputRect->right,  4096L);
+            outputRect->bottom = (std::min)(outputRect->bottom, 4096L);
         }
         else
         {

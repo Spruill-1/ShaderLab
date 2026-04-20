@@ -233,6 +233,10 @@ namespace ShaderLab::Effects
                 outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
                 outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
             }
+            outputRect->left   = (std::max)(outputRect->left,   0L);
+            outputRect->top    = (std::max)(outputRect->top,    0L);
+            outputRect->right  = (std::min)(outputRect->right,  4096L);
+            outputRect->bottom = (std::min)(outputRect->bottom, 4096L);
         }
         else
         {
