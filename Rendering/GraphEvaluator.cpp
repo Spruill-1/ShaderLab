@@ -90,9 +90,10 @@ namespace ShaderLab::Rendering
                     if (node->dirty)
                     {
                         ApplyCustomEffect(effect, *node);
-                        // D2D doesn't know the cbuffer changed (we bypass its property
-                        // system). Force invalidation by toggling input 0.
-                        effect->SetInput(0, nullptr);
+                        // D2D doesn't call PrepareForRender unless it detects a property
+                        // change. We bypass D2D's property system for cbuffer updates, so
+                        // poke the D2D1_PROPERTY_CACHED system property to force re-render.
+                        effect->SetValue(D2D1_PROPERTY_CACHED, FALSE);
                         node->dirty = false;
                     }
 
@@ -419,15 +420,19 @@ namespace ShaderLab::Rendering
         if (implIt == m_customImplCache.end())
             return;
 
-        UINT32 inputCount = static_cast<UINT32>(def.inputNames.size());
-
-        // Load bytecode into the concrete impl with per-instance GUID.
+        // Load bytecode only if not already loaded (bytecode doesn't change
+        // on property updates, only on recompile/update-in-graph).
+        bool needsShaderLoad = false;
         if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
         {
-            implIt->second.pixelImpl->SetShaderGuid(def.shaderGuid);
-            implIt->second.pixelImpl->LoadShaderBytecode(
-                def.compiledBytecode.data(),
-                static_cast<UINT32>(def.compiledBytecode.size()));
+            if (implIt->second.pixelImpl->NeedsShaderLoad())
+            {
+                implIt->second.pixelImpl->SetShaderGuid(def.shaderGuid);
+                implIt->second.pixelImpl->LoadShaderBytecode(
+                    def.compiledBytecode.data(),
+                    static_cast<UINT32>(def.compiledBytecode.size()));
+                needsShaderLoad = true;
+            }
         }
         else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
         {

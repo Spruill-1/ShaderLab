@@ -104,6 +104,9 @@ namespace ShaderLab::Effects
         // Set per-instance shader GUID (must be set before loading bytecode).
         void SetShaderGuid(const GUID& guid) { m_shaderGuid = guid; }
 
+        // Check if shader bytecode needs initial loading.
+        bool NeedsShaderLoad() const { return m_shaderBytecode.empty(); }
+
         // Set input count directly and rebuild the D2D transform graph.
         void SetInputCountDirect(UINT32 count)
         {
