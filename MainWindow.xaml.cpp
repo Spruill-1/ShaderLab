@@ -1929,6 +1929,21 @@ namespace winrt::ShaderLab::implementation
         if (node->type == ::ShaderLab::Graph::NodeType::BuiltInEffect && node->effectClsid.has_value())
             desc = ::ShaderLab::Effects::EffectRegistry::Instance().FindByClsid(node->effectClsid.value());
 
+        // Build metadata map for custom effect parameters (min/max/step from ParameterDefinition).
+        std::map<std::wstring, PropertyMetadata> customMeta;
+        if (node->customEffect.has_value())
+        {
+            for (const auto& p : node->customEffect->parameters)
+            {
+                PropertyMetadata pm;
+                pm.uiHint = PropertyUIHint::Slider;
+                pm.minValue = p.minValue;
+                pm.maxValue = p.maxValue;
+                pm.step = p.step;
+                customMeta[p.name] = pm;
+            }
+        }
+
         // ---- Editable properties ----
         if (node->properties.empty())
         {
@@ -1956,6 +1971,12 @@ namespace winrt::ShaderLab::implementation
                     auto it = desc->propertyMetadata.find(key);
                     if (it != desc->propertyMetadata.end())
                         meta = &it->second;
+                }
+                if (!meta)
+                {
+                    auto cmIt = customMeta.find(key);
+                    if (cmIt != customMeta.end())
+                        meta = &cmIt->second;
                 }
 
                 auto propLabel = Controls::TextBlock();

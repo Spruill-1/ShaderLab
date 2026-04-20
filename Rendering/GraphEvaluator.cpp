@@ -90,6 +90,9 @@ namespace ShaderLab::Rendering
                     if (node->dirty)
                     {
                         ApplyCustomEffect(effect, *node);
+                        // D2D doesn't know the cbuffer changed (we bypass its property
+                        // system). Force invalidation by toggling input 0.
+                        effect->SetInput(0, nullptr);
                         node->dirty = false;
                     }
 
