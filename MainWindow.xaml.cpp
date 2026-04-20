@@ -1871,6 +1871,24 @@ namespace winrt::ShaderLab::implementation
             panel.Children().Append(editBtn);
         }
 
+        // ---- Runtime error display ----
+        if (!node->runtimeError.empty())
+        {
+            auto errorBorder = Controls::Border();
+            errorBorder.Background(Media::SolidColorBrush(winrt::Windows::UI::Color{ 255, 180, 30, 30 }));
+            errorBorder.CornerRadius({ 4, 4, 4, 4 });
+            errorBorder.Padding({ 8, 6, 8, 6 });
+            errorBorder.Margin({ 0, 0, 0, 8 });
+
+            auto errorText = Controls::TextBlock();
+            errorText.Text(winrt::hstring(node->runtimeError));
+            errorText.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::White()));
+            errorText.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::WrapWholeWords);
+            errorText.FontSize(12);
+            errorBorder.Child(errorText);
+            panel.Children().Append(errorBorder);
+        }
+
         // ---- Image source: file path + Browse button ----
         if (node->type == ::ShaderLab::Graph::NodeType::Source &&
             !(node->effectClsid.has_value()))

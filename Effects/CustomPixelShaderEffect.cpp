@@ -24,10 +24,9 @@ namespace ShaderLab::Effects
         if (!factory)
             return E_INVALIDARG;
 
-        // Use 8 fixed named inputs in the XML. At runtime, the host calls
-        // ID2D1Effect::SetInputCount() to set the actual number of inputs.
+        // 8 fixed inputs. Unused inputs are left null (shader gets zeros).
         // Variable-input XML (<Inputs minimum/maximum>) fails on some D2D
-        // runtimes, so we use fixed inputs instead.
+        // runtimes, so we declare the maximum upfront.
         static const PCWSTR pszXml =
             L"<?xml version='1.0'?>\r\n"
             L"<Effect>\r\n"
@@ -36,7 +35,8 @@ namespace ShaderLab::Effects
             L"  <Property name='Category'    type='string' value='Custom'/>\r\n"
             L"  <Property name='Description' type='string' value='Runs a user-supplied pixel shader.'/>\r\n"
             L"  <Inputs>\r\n"
-            L"    <Input name='Source'/>\r\n"
+            L"    <Input name='I0'/><Input name='I1'/><Input name='I2'/><Input name='I3'/>\r\n"
+            L"    <Input name='I4'/><Input name='I5'/><Input name='I6'/><Input name='I7'/>\r\n"
             L"  </Inputs>\r\n"
             L"</Effect>\r\n";
 

@@ -132,7 +132,7 @@ namespace ShaderLab::Effects
         std::vector<BYTE> m_shaderBytecode;
         GUID m_shaderGuid{};
         std::vector<BYTE> m_constantBuffer;
-        UINT32            m_inputCount{ 1 };
+        UINT32            m_inputCount{ 8 };
         D2D1_RECT_L       m_desiredOutputRect{};
         bool              m_hasDesiredRect{ false };
 

@@ -131,7 +131,7 @@ namespace ShaderLab::Effects
         std::vector<BYTE> m_shaderBytecode;
         GUID m_shaderGuid{};  // Per-instance shader ID for D2D LoadPixelShader.
         std::vector<BYTE> m_constantBuffer;
-        UINT32            m_inputCount{ 1 };
+        UINT32            m_inputCount{ 8 };
         D2D1_RECT_L       m_inputRect{};
 
         // Host-supplied output rect to constrain infinite inputs.

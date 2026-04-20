@@ -78,9 +78,15 @@ namespace ShaderLab::Rendering
             case NodeType::ComputeShader:
             {
                 ID2D1Effect* effect = GetOrCreateEffect(dc, *node);
-                if (effect && node->customEffect.has_value() && node->customEffect->isCompiled())
+                if (!effect)
                 {
-                    // Apply bytecode/cbuffer BEFORE wiring so input count is correct.
+                    node->runtimeError = L"Failed to create D2D effect. Check effect registration.";
+                    break;
+                }
+                node->runtimeError.clear();
+
+                if (node->customEffect.has_value() && node->customEffect->isCompiled())
+                {
                     if (node->dirty)
                     {
                         ApplyCustomEffect(effect, *node);
@@ -101,10 +107,8 @@ namespace ShaderLab::Rendering
                             if (bitmap)
                                 rtSize = bitmap->GetPixelSize();
                         }
-                        // Fallback to a reasonable default.
                         if (rtSize.width == 0) rtSize.width = 1920;
                         if (rtSize.height == 0) rtSize.height = 1080;
-
                         D2D1_RECT_L desired = { 0, 0,
                             static_cast<LONG>(rtSize.width),
                             static_cast<LONG>(rtSize.height) };
@@ -120,15 +124,12 @@ namespace ShaderLab::Rendering
                     winrt::com_ptr<ID2D1Image> output;
                     effect->GetOutput(output.put());
                     node->cachedOutput = output.get();
-                    OutputDebugStringW(std::format(L"[CustomFX] node {} -- cachedOutput={}\n",
-                        node->id, (node->cachedOutput ? L"valid" : L"NULL")).c_str());
                 }
-                else if (effect)
+                else
                 {
-                    OutputDebugStringW(std::format(L"[CustomFX] node {} -- fallback branch (hasCustom={}, compiled={})\n",
-                        node->id,
-                        node->customEffect.has_value(),
-                        node->customEffect.has_value() ? node->customEffect->isCompiled() : false).c_str());
+                    if (node->customEffect.has_value() && !node->customEffect->isCompiled())
+                        node->runtimeError = L"Shader not compiled. Open in Effect Designer and compile.";
+
                     WireInputs(effect, *node, graph);
                     if (node->dirty)
                     {
@@ -138,11 +139,6 @@ namespace ShaderLab::Rendering
                     winrt::com_ptr<ID2D1Image> output;
                     effect->GetOutput(output.put());
                     node->cachedOutput = output.get();
-                }
-                else
-                {
-                    OutputDebugStringW(std::format(L"[CustomFX] node {} -- GetOrCreateEffect returned NULL\n",
-                        node->id).c_str());
                 }
                 break;
             }
@@ -403,17 +399,9 @@ namespace ShaderLab::Rendering
 
         UINT32 inputCount = static_cast<UINT32>(def.inputNames.size());
 
-        // Update our transform node's internal input count directly so
-        // GetInputCount() returns the correct value when D2D rebuilds.
-        if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
-            implIt->second.pixelImpl->SetInputCountDirect(inputCount);
-        else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
-            implIt->second.computeImpl->SetInputCountDirect(inputCount);
-
-        // Set the D2D effect's external input count.
-        HRESULT hr = effect->SetInputCount(inputCount);
-        OutputDebugStringW(std::format(L"[CustomFX] node {} -- SetInputCount({}) hr=0x{:08X}\n",
-            node.id, inputCount, static_cast<uint32_t>(hr)).c_str());
+        // D2D effect has 8 fixed inputs (matching the XML). No need to call
+        // SetInputCount or SetInputCountDirect -- the count is always 8.
+        // Unused inputs are left null; the shader gets zeros for them.
 
         // Load bytecode into the concrete impl with per-instance GUID.
         if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)

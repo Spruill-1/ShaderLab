@@ -20,7 +20,8 @@ namespace ShaderLab::Effects
             L"  <Property name='Category'    type='string' value='Custom'/>\r\n"
             L"  <Property name='Description' type='string' value='Runs a user-supplied compute shader.'/>\r\n"
             L"  <Inputs>\r\n"
-            L"    <Input name='Source'/>\r\n"
+            L"    <Input name='I0'/><Input name='I1'/><Input name='I2'/><Input name='I3'/>\r\n"
+            L"    <Input name='I4'/><Input name='I5'/><Input name='I6'/><Input name='I7'/>\r\n"
             L"  </Inputs>\r\n"
             L"</Effect>\r\n";
 

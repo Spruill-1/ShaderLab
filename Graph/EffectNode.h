@@ -111,6 +111,9 @@ namespace ShaderLab::Graph
         // Analysis/compute output data (read back after evaluation). Not serialized.
         AnalysisOutput analysisOutput;
 
+        // Runtime error message (e.g., effect creation failure). Not serialized.
+        std::wstring runtimeError;
+
         // Dirty flag — set when properties change, cleared after evaluation.
         bool dirty{ true };
     };
