@@ -309,6 +309,16 @@ namespace ShaderLab::Effects
         m_cbDirty = true;
     }
 
+    HRESULT CustomPixelShaderEffect::ForceUploadConstantBuffer()
+    {
+        if (!m_drawInfo || m_constantBuffer.empty())
+            return E_FAIL;
+        m_cbDirty = false;
+        return m_drawInfo->SetPixelShaderConstantBuffer(
+            m_constantBuffer.data(),
+            static_cast<UINT32>(m_constantBuffer.size()));
+    }
+
     // -----------------------------------------------------------------------
     // Convenience: pack PropertyValue map into constant buffer
     // -----------------------------------------------------------------------

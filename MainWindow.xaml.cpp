@@ -1993,14 +1993,6 @@ namespace winrt::ShaderLab::implementation
                     auto* n = m_graph.FindNode(capturedId);
                     if (n) { n->dirty = true; m_graph.MarkAllDirty(); }
 
-                    // Custom effects bypass D2D's property system, so D2D doesn't
-                    // know the cbuffer changed. Force full effect recreation.
-                    if (n && (n->type == ::ShaderLab::Graph::NodeType::PixelShader ||
-                              n->type == ::ShaderLab::Graph::NodeType::ComputeShader))
-                    {
-                        m_graphEvaluator.InvalidateNode(capturedId);
-                    }
-
                     // For analysis effects, schedule a properties panel refresh
                     // after the next evaluation computes new output data.
                     if (n && n->effectClsid.has_value() &&

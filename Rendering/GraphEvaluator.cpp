@@ -90,6 +90,17 @@ namespace ShaderLab::Rendering
                     if (node->dirty)
                     {
                         ApplyCustomEffect(effect, *node);
+
+                        // Force-upload the cbuffer directly to the GPU.
+                        // D2D won't call PrepareForRender for host-side cbuffer changes,
+                        // so we push it via DrawInfo immediately.
+                        auto implIt = m_customImplCache.find(node->id);
+                        if (implIt != m_customImplCache.end())
+                        {
+                            if (node->type == NodeType::PixelShader && implIt->second.pixelImpl)
+                                implIt->second.pixelImpl->ForceUploadConstantBuffer();
+                        }
+
                         node->dirty = false;
                     }
 

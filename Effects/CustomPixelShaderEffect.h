@@ -104,6 +104,11 @@ namespace ShaderLab::Effects
         // Set per-instance shader GUID (must be set before loading bytecode).
         void SetShaderGuid(const GUID& guid) { m_shaderGuid = guid; }
 
+        // Force-upload the constant buffer to the GPU via DrawInfo.
+        // Call this from the evaluator when properties change, bypassing
+        // D2D's PrepareForRender change detection.
+        HRESULT ForceUploadConstantBuffer();
+
         // Check if shader bytecode needs initial loading.
         bool NeedsShaderLoad() const { return m_shaderBytecode.empty(); }
 
