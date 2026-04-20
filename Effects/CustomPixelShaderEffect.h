@@ -55,6 +55,9 @@ namespace ShaderLab::Effects
         // Last-created instance (used to capture impl pointer after CreateEffect).
         static thread_local CustomPixelShaderEffect* s_lastCreated;
 
+        // Set before CreateEffect to initialize m_inputCount in the constructor.
+        static thread_local UINT32 s_pendingInputCount;
+
         // ---- IUnknown ----
         IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override;
         IFACEMETHODIMP_(ULONG) AddRef() override;

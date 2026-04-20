@@ -62,6 +62,7 @@ namespace ShaderLab::Effects
 
     // Thread-local for capturing the last-created impl pointer.
     thread_local CustomPixelShaderEffect* CustomPixelShaderEffect::s_lastCreated = nullptr;
+    thread_local UINT32 CustomPixelShaderEffect::s_pendingInputCount = 0;
 
     HRESULT __stdcall CustomPixelShaderEffect::CreateFactory(IUnknown** effect)
     {
@@ -71,7 +72,14 @@ namespace ShaderLab::Effects
         return *effect ? S_OK : E_OUTOFMEMORY;
     }
 
-    CustomPixelShaderEffect::CustomPixelShaderEffect() = default;
+    CustomPixelShaderEffect::CustomPixelShaderEffect()
+    {
+        // Use the pending input count set before CreateEffect, so that
+        // Initialize → SetSingleTransformNode sees the correct value
+        // from GetInputCount() immediately.
+        if (s_pendingInputCount > 0)
+            m_inputCount = s_pendingInputCount;
+    }
 
     // -----------------------------------------------------------------------
     // IUnknown

@@ -234,7 +234,20 @@ namespace ShaderLab::Rendering
         Effects::CustomComputeShaderEffect::s_lastCreated = nullptr;
 
         winrt::com_ptr<ID2D1Effect> effect;
+        // Set pending input count BEFORE CreateEffect so the constructor
+        // initializes m_inputCount correctly for SetSingleTransformNode.
+        if (node.customEffect.has_value())
+        {
+            UINT32 ic = static_cast<UINT32>(node.customEffect->inputNames.size());
+            if (node.type == NodeType::PixelShader)
+                Effects::CustomPixelShaderEffect::s_pendingInputCount = ic;
+            // TODO: same for compute
+        }
+
         HRESULT hr = dc->CreateEffect(clsid, effect.put());
+
+        // Clear pending counts.
+        Effects::CustomPixelShaderEffect::s_pendingInputCount = 0;
 
         if (FAILED(hr))
         {
@@ -249,20 +262,11 @@ namespace ShaderLab::Rendering
         // Capture custom effect impl for host-side API.
         if (node.type == NodeType::PixelShader && Effects::CustomPixelShaderEffect::s_lastCreated)
         {
-            auto* impl = Effects::CustomPixelShaderEffect::s_lastCreated;
-            // Set input count to match the registration.
-            if (node.customEffect.has_value())
-                impl->SetInputCountDirect(
-                    static_cast<UINT32>(node.customEffect->inputNames.size()));
-            m_customImplCache[node.id] = { impl, nullptr };
+            m_customImplCache[node.id] = { Effects::CustomPixelShaderEffect::s_lastCreated, nullptr };
         }
         else if (node.type == NodeType::ComputeShader && Effects::CustomComputeShaderEffect::s_lastCreated)
         {
-            auto* impl = Effects::CustomComputeShaderEffect::s_lastCreated;
-            if (node.customEffect.has_value())
-                impl->SetInputCountDirect(
-                    static_cast<UINT32>(node.customEffect->inputNames.size()));
-            m_customImplCache[node.id] = { nullptr, impl };
+            m_customImplCache[node.id] = { nullptr, Effects::CustomComputeShaderEffect::s_lastCreated };
         }
 
         auto* raw = effect.get();
