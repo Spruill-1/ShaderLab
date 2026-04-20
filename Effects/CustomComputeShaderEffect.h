@@ -44,6 +44,9 @@ namespace ShaderLab::Effects
         // Register this effect with a D2D factory. Call once at startup.
         static HRESULT RegisterEffect(ID2D1Factory1* factory);
 
+        // Register a per-definition CLSID with the exact number of inputs.
+        static HRESULT RegisterWithInputCount(ID2D1Factory1* factory, REFCLSID clsid, UINT32 inputCount);
+
         // Unregister from the factory (optional cleanup).
         static HRESULT UnregisterEffect(ID2D1Factory1* factory);
 
@@ -132,7 +135,7 @@ namespace ShaderLab::Effects
         std::vector<BYTE> m_shaderBytecode;
         GUID m_shaderGuid{};
         std::vector<BYTE> m_constantBuffer;
-        UINT32            m_inputCount{ 8 };
+        UINT32            m_inputCount{ 1 };
         D2D1_RECT_L       m_desiredOutputRect{};
         bool              m_hasDesiredRect{ false };
 

@@ -194,10 +194,45 @@ namespace ShaderLab::Rendering
         if (it != m_effectCache.end())
             return it->second.get();
 
-        // Need a CLSID to create the effect.
-        if (!node.effectClsid.has_value())
+        // For custom effects, use the per-definition shaderGuid as the CLSID
+        // and register with the exact number of inputs.
+        GUID clsid{};
+        if ((node.type == NodeType::PixelShader || node.type == NodeType::ComputeShader) &&
+            node.customEffect.has_value() && node.customEffect->isCompiled())
         {
-            OutputDebugStringW(std::format(L"[CustomFX] GetOrCreateEffect node {} -- no CLSID\n", node.id).c_str());
+            clsid = node.customEffect->shaderGuid;
+            UINT32 inputCount = static_cast<UINT32>(
+                (std::max)(size_t(1), node.customEffect->inputNames.size()));
+
+            // Register this specific CLSID if not already registered.
+            winrt::com_ptr<ID2D1Factory> factory;
+            dc->GetFactory(factory.put());
+            auto factory1 = factory.as<ID2D1Factory1>();
+            if (factory1)
+            {
+                HRESULT regHr;
+                if (node.type == NodeType::PixelShader)
+                    regHr = Effects::CustomPixelShaderEffect::RegisterWithInputCount(
+                        factory1.get(), clsid, inputCount);
+                else
+                    regHr = Effects::CustomComputeShaderEffect::RegisterWithInputCount(
+                        factory1.get(), clsid, inputCount);
+
+                // S_OK = registered, D2DERR_ALREADY_REGISTERED-style = already done (also fine).
+                if (FAILED(regHr) && regHr != static_cast<HRESULT>(0x88990004L))
+                {
+                    OutputDebugStringW(std::format(
+                        L"[CustomFX] RegisterWithInputCount node {} inputs={} hr=0x{:08X}\n",
+                        node.id, inputCount, static_cast<uint32_t>(regHr)).c_str());
+                }
+            }
+        }
+        else if (node.effectClsid.has_value())
+        {
+            clsid = node.effectClsid.value();
+        }
+        else
+        {
             return nullptr;
         }
 
@@ -206,47 +241,35 @@ namespace ShaderLab::Rendering
         Effects::CustomComputeShaderEffect::s_lastCreated = nullptr;
 
         winrt::com_ptr<ID2D1Effect> effect;
-        HRESULT hr = dc->CreateEffect(node.effectClsid.value(), effect.put());
-
-        // If the custom effect isn't registered yet, register it now and retry.
-        if (FAILED(hr) && (node.type == NodeType::PixelShader || node.type == NodeType::ComputeShader))
-        {
-            winrt::com_ptr<ID2D1Factory> factory;
-            dc->GetFactory(factory.put());
-            auto factory1 = factory.as<ID2D1Factory1>();
-            if (factory1)
-            {
-                HRESULT regHr = S_OK;
-                if (node.type == NodeType::PixelShader)
-                    regHr = Effects::CustomPixelShaderEffect::RegisterEffect(factory1.get());
-                else
-                    regHr = Effects::CustomComputeShaderEffect::RegisterEffect(factory1.get());
-
-                OutputDebugStringW(std::format(L"[CustomFX] Late-register node {} regHr=0x{:08X}\n",
-                    node.id, static_cast<uint32_t>(regHr)).c_str());
-
-                if (SUCCEEDED(regHr))
-                    hr = dc->CreateEffect(node.effectClsid.value(), effect.put());
-            }
-        }
+        HRESULT hr = dc->CreateEffect(clsid, effect.put());
 
         if (FAILED(hr))
         {
             wchar_t guidStr[64]{};
-            StringFromGUID2(node.effectClsid.value(), guidStr, 64);
-            OutputDebugStringW(std::format(L"[CustomFX] GetOrCreateEffect node {} -- CreateEffect({}) FAILED hr=0x{:08X}\n",
-                node.id, guidStr, static_cast<uint32_t>(hr)).c_str());
+            StringFromGUID2(clsid, guidStr, 64);
+            OutputDebugStringW(std::format(
+                L"[CustomFX] CreateEffect({}) FAILED hr=0x{:08X}\n",
+                guidStr, static_cast<uint32_t>(hr)).c_str());
             return nullptr;
         }
 
         // Capture custom effect impl for host-side API.
         if (node.type == NodeType::PixelShader && Effects::CustomPixelShaderEffect::s_lastCreated)
         {
-            m_customImplCache[node.id] = { Effects::CustomPixelShaderEffect::s_lastCreated, nullptr };
+            auto* impl = Effects::CustomPixelShaderEffect::s_lastCreated;
+            // Set input count to match the registration.
+            if (node.customEffect.has_value())
+                impl->SetInputCountDirect(
+                    static_cast<UINT32>(node.customEffect->inputNames.size()));
+            m_customImplCache[node.id] = { impl, nullptr };
         }
         else if (node.type == NodeType::ComputeShader && Effects::CustomComputeShaderEffect::s_lastCreated)
         {
-            m_customImplCache[node.id] = { nullptr, Effects::CustomComputeShaderEffect::s_lastCreated };
+            auto* impl = Effects::CustomComputeShaderEffect::s_lastCreated;
+            if (node.customEffect.has_value())
+                impl->SetInputCountDirect(
+                    static_cast<UINT32>(node.customEffect->inputNames.size()));
+            m_customImplCache[node.id] = { nullptr, impl };
         }
 
         auto* raw = effect.get();

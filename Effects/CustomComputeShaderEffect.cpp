@@ -9,25 +9,31 @@ namespace ShaderLab::Effects
 
     HRESULT CustomComputeShaderEffect::RegisterEffect(ID2D1Factory1* factory)
     {
-        if (!factory)
+        return RegisterWithInputCount(factory, CLSID_CustomComputeShader, 1);
+    }
+
+    HRESULT CustomComputeShaderEffect::RegisterWithInputCount(
+        ID2D1Factory1* factory, REFCLSID clsid, UINT32 inputCount)
+    {
+        if (!factory || inputCount == 0 || inputCount > 8)
             return E_INVALIDARG;
 
-        static const PCWSTR pszXml =
+        std::wstring xml =
             L"<?xml version='1.0'?>\r\n"
             L"<Effect>\r\n"
             L"  <Property name='DisplayName' type='string' value='Custom Compute Shader'/>\r\n"
             L"  <Property name='Author'      type='string' value='ShaderLab'/>\r\n"
             L"  <Property name='Category'    type='string' value='Custom'/>\r\n"
             L"  <Property name='Description' type='string' value='Runs a user-supplied compute shader.'/>\r\n"
-            L"  <Inputs>\r\n"
-            L"    <Input name='I0'/><Input name='I1'/><Input name='I2'/><Input name='I3'/>\r\n"
-            L"    <Input name='I4'/><Input name='I5'/><Input name='I6'/><Input name='I7'/>\r\n"
-            L"  </Inputs>\r\n"
-            L"</Effect>\r\n";
+            L"  <Inputs>\r\n";
+        for (UINT32 i = 0; i < inputCount; ++i)
+            xml += std::format(L"    <Input name='I{}'/>\r\n", i);
+        xml += L"  </Inputs>\r\n"
+               L"</Effect>\r\n";
 
         return factory->RegisterEffectFromString(
-            CLSID_CustomComputeShader,
-            pszXml,
+            clsid,
+            xml.c_str(),
             nullptr,
             0,
             &CustomComputeShaderEffect::CreateFactory);

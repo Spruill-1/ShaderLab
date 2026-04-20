@@ -21,28 +21,33 @@ namespace ShaderLab::Effects
 
     HRESULT CustomPixelShaderEffect::RegisterEffect(ID2D1Factory1* factory)
     {
-        if (!factory)
+        // Default registration with 1 input (used as fallback).
+        return RegisterWithInputCount(factory, CLSID_CustomPixelShader, 1);
+    }
+
+    HRESULT CustomPixelShaderEffect::RegisterWithInputCount(
+        ID2D1Factory1* factory, REFCLSID clsid, UINT32 inputCount)
+    {
+        if (!factory || inputCount == 0 || inputCount > 8)
             return E_INVALIDARG;
 
-        // 8 fixed inputs. Unused inputs are left null (shader gets zeros).
-        // Variable-input XML (<Inputs minimum/maximum>) fails on some D2D
-        // runtimes, so we declare the maximum upfront.
-        static const PCWSTR pszXml =
+        // Build XML with the exact number of fixed inputs.
+        std::wstring xml =
             L"<?xml version='1.0'?>\r\n"
             L"<Effect>\r\n"
             L"  <Property name='DisplayName' type='string' value='Custom Pixel Shader'/>\r\n"
             L"  <Property name='Author'      type='string' value='ShaderLab'/>\r\n"
             L"  <Property name='Category'    type='string' value='Custom'/>\r\n"
             L"  <Property name='Description' type='string' value='Runs a user-supplied pixel shader.'/>\r\n"
-            L"  <Inputs>\r\n"
-            L"    <Input name='I0'/><Input name='I1'/><Input name='I2'/><Input name='I3'/>\r\n"
-            L"    <Input name='I4'/><Input name='I5'/><Input name='I6'/><Input name='I7'/>\r\n"
-            L"  </Inputs>\r\n"
-            L"</Effect>\r\n";
+            L"  <Inputs>\r\n";
+        for (UINT32 i = 0; i < inputCount; ++i)
+            xml += std::format(L"    <Input name='I{}'/>\r\n", i);
+        xml += L"  </Inputs>\r\n"
+               L"</Effect>\r\n";
 
         return factory->RegisterEffectFromString(
-            CLSID_CustomPixelShader,
-            pszXml,
+            clsid,
+            xml.c_str(),
             nullptr,
             0,
             &CustomPixelShaderEffect::CreateFactory);
