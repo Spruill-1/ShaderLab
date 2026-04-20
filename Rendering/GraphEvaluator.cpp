@@ -294,14 +294,13 @@ namespace ShaderLab::Rendering
         {
             // Try to parse the key as a numeric index first.
             uint32_t index = UINT32_MAX;
-            try
+            if (!key.empty() && key[0] >= L'0' && key[0] <= L'9')
             {
                 size_t pos = 0;
                 unsigned long parsed = std::stoul(key, &pos);
                 if (pos == key.size())
                     index = static_cast<uint32_t>(parsed);
             }
-            catch (...) {}
 
             // If not numeric, look up the property by name.
             if (index == UINT32_MAX)
