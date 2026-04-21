@@ -6,6 +6,14 @@
 
 namespace ShaderLab::Rendering
 {
+    // Device creation preference.
+    enum class DevicePreference
+    {
+        Default,    // Hardware, fallback to WARP on failure
+        Hardware,   // Force hardware GPU (fail if unavailable)
+        Warp,       // Force WARP software renderer
+    };
+
     // Core rendering engine: owns D3D11 device, D2D1 device context, and the
     // DXGI swap chain bound to a WinUI 3 SwapChainPanel.
     //
@@ -30,7 +38,8 @@ namespace ShaderLab::Rendering
         // Create D3D11 device, D2D factory/device/context, swap chain on the panel.
         void Initialize(HWND hwnd,
                         winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel const& panel,
-                        const PipelineFormat& format = FormatScRgbFP16);
+                        const PipelineFormat& format = FormatScRgbFP16,
+                        DevicePreference devicePref = DevicePreference::Default);
 
         // Release all GPU resources.
         void Shutdown();
@@ -70,7 +79,7 @@ namespace ShaderLab::Rendering
         uint32_t                BackBufferHeight() const { return m_height; }
 
     private:
-        void CreateDeviceResources();
+        void CreateDeviceResources(DevicePreference devicePref);
         void CreateSwapChain(winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel const& panel);
         void ConfigureSwapChainColorSpace();
         void CreateRenderTarget();

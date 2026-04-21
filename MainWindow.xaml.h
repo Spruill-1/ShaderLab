@@ -25,6 +25,12 @@ namespace winrt::ShaderLab::implementation
         MainWindow();
         ~MainWindow();
 
+        // Auto-start MCP server (set from --mcp command-line flag).
+        void SetAutoStartMcp(bool autoStart) { m_autoStartMcp = autoStart; }
+
+        // Device preference (set from --gpu / --warp command-line flags).
+        void SetDevicePreference(::ShaderLab::Rendering::DevicePreference pref) { m_devicePref = pref; }
+
         // XAML-bound event handlers (must be public for generated code).
         void OnColumnSplitterPointerPressed(
             winrt::Windows::Foundation::IInspectable const& sender,
@@ -219,6 +225,8 @@ namespace winrt::ShaderLab::implementation
 
         // MCP HTTP server for AI agent integration.
         std::unique_ptr<::ShaderLab::McpHttpServer> m_mcpServer;
+        bool m_autoStartMcp{ false };
+        ::ShaderLab::Rendering::DevicePreference m_devicePref{ ::ShaderLab::Rendering::DevicePreference::Default };
         void SetupMcpRoutes();
         template<typename F> auto DispatchSync(F&& fn) -> decltype(fn());
 

@@ -12,13 +12,14 @@ namespace ShaderLab::Rendering
     void RenderEngine::Initialize(
         HWND hwnd,
         winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel const& panel,
-        const PipelineFormat& format)
+        const PipelineFormat& format,
+        DevicePreference devicePref)
     {
         m_hwnd = hwnd;
         m_panel = panel;
         m_format = format;
 
-        CreateDeviceResources();
+        CreateDeviceResources(devicePref);
         CreateSwapChain(panel);
         ConfigureSwapChainColorSpace();
         CreateRenderTarget();
@@ -41,7 +42,7 @@ namespace ShaderLab::Rendering
     // Device creation
     // -----------------------------------------------------------------------
 
-    void RenderEngine::CreateDeviceResources()
+    void RenderEngine::CreateDeviceResources(DevicePreference devicePref)
     {
         // --- DXGI Factory ---
         UINT factoryFlags = 0;
@@ -57,18 +58,27 @@ namespace ShaderLab::Rendering
 
         winrt::com_ptr<ID3D11Device> baseDevice;
         winrt::com_ptr<ID3D11DeviceContext> baseContext;
-        winrt::check_hresult(
-            D3D11CreateDevice(
-                nullptr,                        // default adapter
-                D3D_DRIVER_TYPE_HARDWARE,
-                nullptr,
-                d3dFlags,
-                featureLevels,
-                ARRAYSIZE(featureLevels),
-                D3D11_SDK_VERSION,
-                baseDevice.put(),
-                nullptr,
-                baseContext.put()));
+
+        D3D_DRIVER_TYPE driverType = D3D_DRIVER_TYPE_HARDWARE;
+        if (devicePref == DevicePreference::Warp)
+            driverType = D3D_DRIVER_TYPE_WARP;
+        else if (devicePref == DevicePreference::Hardware)
+            driverType = D3D_DRIVER_TYPE_HARDWARE;
+
+        HRESULT hr = D3D11CreateDevice(
+            nullptr, driverType, nullptr, d3dFlags,
+            featureLevels, ARRAYSIZE(featureLevels),
+            D3D11_SDK_VERSION, baseDevice.put(), nullptr, baseContext.put());
+
+        // Default: fallback to WARP if hardware fails.
+        if (FAILED(hr) && devicePref == DevicePreference::Default)
+        {
+            hr = D3D11CreateDevice(
+                nullptr, D3D_DRIVER_TYPE_WARP, nullptr, d3dFlags,
+                featureLevels, ARRAYSIZE(featureLevels),
+                D3D11_SDK_VERSION, baseDevice.put(), nullptr, baseContext.put());
+        }
+        winrt::check_hresult(hr);
 
         m_d3dDevice = baseDevice.as<ID3D11Device5>();
         m_d3dContext = baseContext.as<ID3D11DeviceContext4>();

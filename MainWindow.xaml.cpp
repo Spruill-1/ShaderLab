@@ -205,7 +205,7 @@ namespace winrt::ShaderLab::implementation
         auto format = ::ShaderLab::Rendering::RecommendedFormat(caps);
 
         // Create D3D11/D2D1 device stack and swap chain on the PreviewPanel.
-        m_renderEngine.Initialize(m_hwnd, PreviewPanel(), format);
+        m_renderEngine.Initialize(m_hwnd, PreviewPanel(), format, m_devicePref);
 
         // Now that we have a DXGI factory, register adapter-change monitoring.
         if (m_renderEngine.DXGIFactory())
@@ -255,8 +255,15 @@ namespace winrt::ShaderLab::implementation
         InitializeRendering();
         RegisterCustomEffects();
 
-        // Pre-setup MCP routes (server starts when user toggles the button).
+        // Pre-setup MCP routes (server starts when user toggles the button or --mcp flag).
         SetupMcpRoutes();
+        if (m_autoStartMcp && m_mcpServer)
+        {
+            m_mcpServer->Start(47808);
+            McpServerToggle().IsChecked(true);
+            McpServerToggle().Content(winrt::box_value(L"MCP Server :47808"));
+            McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
+        }
 
         UpdateStatusBar();
 
