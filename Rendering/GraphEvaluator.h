@@ -71,6 +71,11 @@ namespace ShaderLab::Rendering
             ID2D1Effect* effect,
             Graph::EffectNode& node);
 
+        // Read back key-value analysis data from custom compute effect output pixels.
+        void ReadCustomAnalysisOutput(
+            ID2D1DeviceContext5* dc,
+            Graph::EffectNode& node);
+
         // Temp target for forcing effect computation.
         winrt::com_ptr<ID2D1Bitmap1> m_analysisTarget;
         uint32_t m_analysisTargetW{ 0 };

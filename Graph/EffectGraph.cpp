@@ -451,6 +451,15 @@ namespace ShaderLab::Graph
                     static_cast<double>(def.analysisOutputType)));
                 ced.SetNamedValue(L"analysisOutputSize", WDJ::JsonValue::CreateNumberValue(def.analysisOutputSize));
 
+                // Serialize analysis field names.
+                if (!def.analysisFieldNames.empty())
+                {
+                    WDJ::JsonArray fields;
+                    for (const auto& name : def.analysisFieldNames)
+                        fields.Append(WDJ::JsonValue::CreateStringValue(name));
+                    ced.SetNamedValue(L"analysisFieldNames", fields);
+                }
+
                 obj.SetNamedValue(L"customEffect", ced);
             }
 
@@ -548,6 +557,14 @@ namespace ShaderLab::Graph
                 def.analysisOutputType = static_cast<AnalysisOutputType>(
                     static_cast<int>(ced.GetNamedNumber(L"analysisOutputType")));
                 def.analysisOutputSize = static_cast<uint32_t>(ced.GetNamedNumber(L"analysisOutputSize"));
+
+                // Deserialize analysis field names.
+                if (ced.HasKey(L"analysisFieldNames"))
+                {
+                    auto fields = ced.GetNamedArray(L"analysisFieldNames");
+                    for (uint32_t fi = 0; fi < fields.Size(); ++fi)
+                        def.analysisFieldNames.push_back(std::wstring(fields.GetStringAt(fi)));
+                }
 
                 // Recompile from source on load.
                 CoCreateGuid(&def.shaderGuid);

@@ -119,6 +119,14 @@ namespace ShaderLab::Rendering
                     winrt::com_ptr<ID2D1Image> output;
                     effect->GetOutput(output.put());
                     node->cachedOutput = output.get();
+
+                    // Read back analysis data from custom compute effects.
+                    if (node->customEffect->analysisOutputType == AnalysisOutputType::KeyValue &&
+                        !node->customEffect->analysisFieldNames.empty() &&
+                        node->cachedOutput)
+                    {
+                        ReadCustomAnalysisOutput(dc, *node);
+                    }
                 }
                 else
                 {
@@ -571,5 +579,88 @@ namespace ShaderLab::Rendering
             node.analysisOutput.type = AnalysisOutputType::None;
             node.analysisOutput.data.clear();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom analysis readback
+    // -----------------------------------------------------------------------
+
+    void GraphEvaluator::ReadCustomAnalysisOutput(
+        ID2D1DeviceContext5* dc,
+        EffectNode& node)
+    {
+        if (!node.cachedOutput || !node.customEffect.has_value()) return;
+        auto& def = node.customEffect.value();
+        uint32_t fieldCount = static_cast<uint32_t>(def.analysisFieldNames.size());
+        if (fieldCount == 0) return;
+
+        // Force D2D to evaluate the compute effect by drawing its output.
+        winrt::com_ptr<ID2D1Image> prevTarget;
+        dc->GetTarget(prevTarget.put());
+
+        D2D1_RECT_F bounds{};
+        dc->GetImageLocalBounds(node.cachedOutput, &bounds);
+        uint32_t w = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 4096.0f));
+        uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 4096.0f));
+        if (w == 0) w = 1;
+        if (h == 0) h = 1;
+
+        if (!m_analysisTarget || m_analysisTargetW != w || m_analysisTargetH != h)
+        {
+            m_analysisTarget = nullptr;
+            D2D1_BITMAP_PROPERTIES1 props = {};
+            props.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+            props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+            HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, props, m_analysisTarget.put());
+            if (FAILED(hr)) { dc->SetTarget(prevTarget.get()); return; }
+            m_analysisTargetW = w;
+            m_analysisTargetH = h;
+        }
+
+        dc->SetTarget(m_analysisTarget.get());
+        dc->BeginDraw();
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        dc->DrawImage(node.cachedOutput, D2D1::Point2F(-bounds.left, -bounds.top));
+        dc->EndDraw();
+        dc->SetTarget(prevTarget.get());
+
+        // Create a CPU-readable bitmap to read back the analysis pixels.
+        winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
+        D2D1_BITMAP_PROPERTIES1 cpuProps = {};
+        cpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+        cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+
+        // Only need enough pixels for the field count.
+        uint32_t readW = (std::max)(fieldCount, 1u);
+        HRESULT hr = dc->CreateBitmap(D2D1::SizeU(readW, 1), nullptr, 0, cpuProps, cpuBitmap.put());
+        if (FAILED(hr)) return;
+
+        D2D1_POINT_2U dest = { 0, 0 };
+        D2D1_RECT_U srcRect = { 0, 0, readW, 1 };
+        hr = cpuBitmap->CopyFromBitmap(&dest, m_analysisTarget.get(), &srcRect);
+        if (FAILED(hr)) return;
+
+        D2D1_MAPPED_RECT mapped{};
+        hr = cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped);
+        if (FAILED(hr)) return;
+
+        // Read float4 values from the first row.
+        node.analysisOutput.type = AnalysisOutputType::KeyValue;
+        node.analysisOutput.keyValues.clear();
+        node.analysisOutput.label = L"Analysis";
+
+        const float* pixels = reinterpret_cast<const float*>(mapped.bits);
+        for (uint32_t i = 0; i < fieldCount; ++i)
+        {
+            std::array<float, 4> val = {
+                pixels[i * 4 + 0],
+                pixels[i * 4 + 1],
+                pixels[i * 4 + 2],
+                pixels[i * 4 + 3]
+            };
+            node.analysisOutput.keyValues.push_back({ def.analysisFieldNames[i], val });
+        }
+
+        cpuBitmap->Unmap();
     }
 }

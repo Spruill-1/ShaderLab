@@ -372,31 +372,96 @@ namespace winrt::ShaderLab::implementation
             {
                 hlsl += std::format(L"Texture2D {} : register(t{});\n", def.inputNames[i], i);
             }
-            hlsl += L"RWTexture2D<float4> OutputTexture : register(u0);\n";
+            hlsl += L"RWTexture2D<float4> Output : register(u0);\n";
             if (!def.inputNames.empty())
                 hlsl += L"SamplerState Sampler0 : register(s0);\n";
             hlsl += L"\n";
 
-            hlsl += std::format(L"[numthreads({}, {}, {})]\n",
-                def.threadGroupX, def.threadGroupY, def.threadGroupZ);
-            hlsl += L"void main(uint3 DTid : SV_DispatchThreadID)\n";
-            hlsl += L"{\n";
-            hlsl += L"    uint width, height;\n";
-            hlsl += L"    OutputTexture.GetDimensions(width, height);\n";
-            hlsl += L"    if (DTid.x >= width || DTid.y >= height) return;\n\n";
-            if (!def.inputNames.empty())
+            if (def.analysisOutputType == ::ShaderLab::Graph::AnalysisOutputType::KeyValue)
             {
-                hlsl += L"    float2 uv = float2(DTid.xy) / float2(width, height);\n";
-                hlsl += L"    float4 color = " + def.inputNames[0] + L".SampleLevel(Sampler0, uv, 0);\n";
-                hlsl += L"\n    // Your code here\n\n";
-                hlsl += L"    OutputTexture[DTid.xy] = color;\n";
+                // Analysis compute shader: reads entire input, writes summary stats
+                // to the first N pixels of the output row.
+                hlsl += L"// Analysis compute shader pattern:\n";
+                hlsl += L"// The output texture is used as a data buffer.\n";
+                hlsl += L"// Write float4 results to Output[int2(fieldIndex, 0)].\n";
+                hlsl += L"// The host reads these pixels back after evaluation.\n\n";
+
+                if (!def.parameters.empty())
+                {
+                    hlsl += L"cbuffer Constants : register(b0)\n{\n";
+                    for (const auto& p : def.parameters)
+                        hlsl += L"    " + p.typeName + L" " + p.name + L";\n";
+                    hlsl += L"};\n\n";
+                }
+
+                // Generate field index comments.
+                for (size_t i = 0; i < def.analysisFieldNames.size(); ++i)
+                    hlsl += std::format(L"// Output[int2({}, 0)] = {}\n", i, def.analysisFieldNames[i]);
+                hlsl += L"\n";
+
+                hlsl += std::format(L"[numthreads({}, {}, {})]\n",
+                    def.threadGroupX, def.threadGroupY, def.threadGroupZ);
+                hlsl += L"void main(uint3 DTid : SV_DispatchThreadID)\n";
+                hlsl += L"{\n";
+
+                if (!def.inputNames.empty())
+                {
+                    hlsl += L"    // Get input dimensions.\n";
+                    hlsl += L"    uint inW, inH;\n";
+                    hlsl += std::format(L"    {}.GetDimensions(inW, inH);\n\n", def.inputNames[0]);
+                    hlsl += L"    // Each thread processes one pixel of the input.\n";
+                    hlsl += L"    if (DTid.x >= inW || DTid.y >= inH) return;\n\n";
+                    hlsl += std::format(L"    float4 pixel = {}.Load(int3(DTid.xy, 0));\n\n", def.inputNames[0]);
+                }
+
+                hlsl += L"    // TODO: Accumulate statistics across pixels.\n";
+                hlsl += L"    // Note: Compute shaders cannot easily reduce across threads without\n";
+                hlsl += L"    // shared memory atomics. For now, this scaffold processes per-pixel.\n";
+                hlsl += L"    // For whole-image statistics, use groupshared memory and atomic ops,\n";
+                hlsl += L"    // or output per-pixel data and reduce on the CPU.\n\n";
+
+                hlsl += L"    // Write results to known pixel locations.\n";
+                for (size_t i = 0; i < def.analysisFieldNames.size(); ++i)
+                    hlsl += std::format(L"    // Output[int2({}, 0)] = ...; // {}\n", i, def.analysisFieldNames[i]);
+                if (def.analysisFieldNames.empty())
+                    hlsl += L"    // Output[int2(0, 0)] = float4(result, 0, 0, 0);\n";
+
+                hlsl += L"}\n";
             }
             else
             {
-                hlsl += L"    // Your code here\n";
-                hlsl += L"    OutputTexture[DTid.xy] = float4(0, 0, 0, 1);\n";
+                // Image-processing compute shader (passthrough scaffold).
+                hlsl += L"// Image-processing compute shader:\n";
+                hlsl += L"// Each thread processes one output pixel.\n\n";
+
+                if (!def.parameters.empty())
+                {
+                    hlsl += L"cbuffer Constants : register(b0)\n{\n";
+                    for (const auto& p : def.parameters)
+                        hlsl += L"    " + p.typeName + L" " + p.name + L";\n";
+                    hlsl += L"};\n\n";
+                }
+
+                hlsl += std::format(L"[numthreads({}, {}, {})]\n",
+                    def.threadGroupX, def.threadGroupY, def.threadGroupZ);
+                hlsl += L"void main(uint3 DTid : SV_DispatchThreadID)\n";
+                hlsl += L"{\n";
+                hlsl += L"    uint width, height;\n";
+                hlsl += L"    Output.GetDimensions(width, height);\n";
+                hlsl += L"    if (DTid.x >= width || DTid.y >= height) return;\n\n";
+                if (!def.inputNames.empty())
+                {
+                    hlsl += std::format(L"    float4 color = {}.Load(int3(DTid.xy, 0));\n", def.inputNames[0]);
+                    hlsl += L"\n    // Your code here\n\n";
+                    hlsl += L"    Output[DTid.xy] = color;\n";
+                }
+                else
+                {
+                    hlsl += L"    // Your code here\n";
+                    hlsl += L"    Output[DTid.xy] = float4(0, 0, 0, 1);\n";
+                }
+                hlsl += L"}\n";
             }
-            hlsl += L"}\n";
         }
 
         return hlsl;

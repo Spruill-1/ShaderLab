@@ -200,7 +200,16 @@ namespace winrt::ShaderLab::implementation
     "sampling": "Use Load int3 uv0.xy 0 for direct texel access; all inputs share TEXCOORD0",
     "filteredSampling": "Use SampleLevel with GetDimensions normalization for bilinear",
     "constantBuffer": "register b0, variables packed by D3DReflect offsets",
-    "textures": "register t0..t7, one per input"
+    "textures": "register t0..t7, one per input",
+    "computeOutput": "RWTexture2D<float4> Output : register u0"
+},
+"analysisEffects": {
+    "pattern": "Compute shaders can act as analysis effects that read an entire image and produce summary statistics",
+    "outputConvention": "Write float4 results to Output[int2 fieldIndex 0] for each named field",
+    "readback": "The host reads back the first N pixels of the output to get the analysis results",
+    "fieldNames": "Define analysisFieldNames in the custom effect definition to label each output pixel",
+    "builtInExample": "D2D Histogram effect: processes input, exposes 256-float histogram via GetValue",
+    "customExample": "Gamut analysis: Output[0 0] = maxRGB+luminance, Output[1 0] = minRGB+count, etc."
 },
 "nodeTypes": ["Source", "BuiltInEffect", "PixelShader", "ComputeShader", "Output"],
 "outputNote": "PNG captures are tone-mapped SDR. Use /render/pixel/X/Y for true scRGB float values. Values above 1.0 are HDR.",

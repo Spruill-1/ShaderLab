@@ -35,8 +35,9 @@ namespace ShaderLab::Graph
     enum class AnalysisOutputType
     {
         None,
-        Histogram,
-        FloatBuffer,
+        Histogram,      // Built-in D2D histogram (256 float bins).
+        FloatBuffer,    // Custom compute: array of float4 values read from output pixels.
+        KeyValue,       // Custom compute: named float values (e.g., maxLuminance, gamutCoverage).
     };
 
     // Complete definition of a custom effect authored in the Effect Designer.
@@ -57,6 +58,11 @@ namespace ShaderLab::Graph
         AnalysisOutputType analysisOutputType{ AnalysisOutputType::None };
         uint32_t analysisOutputSize{ 256 };
 
+        // Labels for analysis output pixels. Each entry names the float4 at that pixel index.
+        // E.g., ["Max RGB + Luminance", "Min RGB + Count", "Gamut Coverage"]
+        // The compute shader writes to Output[int2(i, 0)] for each field.
+        std::vector<std::wstring> analysisFieldNames;
+
         // Runtime: compiled bytecode (not serialized — recompiled from hlslSource on load).
         std::vector<uint8_t> compiledBytecode;
 
@@ -72,8 +78,12 @@ namespace ShaderLab::Graph
     {
         AnalysisOutputType type{ AnalysisOutputType::None };
         std::vector<float> data;         // Bin values, buffer contents, etc.
-        std::wstring       label;        // Human-readable description (e.g., "Red channel histogram").
+        std::wstring       label;        // Human-readable description.
         uint32_t           channelIndex{ 0 }; // For per-channel data (R=0, G=1, B=2, A=3).
+
+        // Key-value results from custom analysis compute shaders.
+        // Each entry maps a label to a float4 read from a specific output pixel.
+        std::vector<std::pair<std::wstring, std::array<float, 4>>> keyValues;
     };
 
     // A node in the effect graph DAG.
