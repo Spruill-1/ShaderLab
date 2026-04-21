@@ -740,15 +740,24 @@ namespace winrt::ShaderLab::implementation
                     }
 
                     bool isError = restResp.statusCode >= 400;
+
+                    // MCP requires content[].text to be a STRING, not raw JSON.
+                    // Escape the body for embedding in a JSON string value.
+                    std::string escaped;
+                    for (char c : restResp.body)
+                    {
+                        if (c == '"') escaped += "\\\"";
+                        else if (c == '\\') escaped += "\\\\";
+                        else if (c == '\n') escaped += "\\n";
+                        else if (c == '\r') escaped += "\\r";
+                        else if (c == '\t') escaped += "\\t";
+                        else escaped += c;
+                    }
+
                     std::string content = std::format(
-                        R"JSON({{"content":[{{"type":"text","text":{}}}],"isError":{}}})JSON",
-                        restResp.body.empty() ? "\"\"" : restResp.body,
+                        R"JSON({{"content":[{{"type":"text","text":"{}"}}],"isError":{}}})JSON",
+                        escaped.empty() ? "" : escaped,
                         isError ? "true" : "false");
-                    // Wrap body in quotes if it's not already JSON
-                    if (!restResp.body.empty() && restResp.body[0] != '{' && restResp.body[0] != '[')
-                        content = std::format(
-                            R"JSON({{"content":[{{"type":"text","text":"{}"}}],"isError":{}}})JSON",
-                            restResp.body, isError ? "true" : "false");
 
                     return { 200, wrapResult(content) };
                 }
