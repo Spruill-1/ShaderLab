@@ -296,6 +296,7 @@ namespace winrt::ShaderLab::implementation
             int outIdx = OutputTypeSelector().SelectedIndex();
             if (outIdx == 1) def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::Histogram;
             else if (outIdx == 2) def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::FloatBuffer;
+            else if (outIdx == 3) def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::KeyValue;
         }
 
         def.hlslSource = std::wstring(HlslEditorBox().Text());

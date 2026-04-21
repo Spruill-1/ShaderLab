@@ -145,7 +145,41 @@ static std::string NodeToJson(const ::ShaderLab::Graph::EffectNode& node)
             else escapedHlsl += c;
         }
         json += ",\"hlslSource\":\"" + escapedHlsl + "\"";
+
+        // Analysis field names.
+        if (!def.analysisFieldNames.empty())
+        {
+            json += ",\"analysisFieldNames\":[";
+            for (size_t i = 0; i < def.analysisFieldNames.size(); ++i)
+            {
+                if (i > 0) json += ",";
+                json += "\"" + ToUtf8(def.analysisFieldNames[i]) + "\"";
+            }
+            json += "]";
+        }
         json += "}";
+    }
+
+    // Analysis output results (runtime data, not serialized in graph JSON).
+    if (node.analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::KeyValue &&
+        !node.analysisOutput.keyValues.empty())
+    {
+        json += ",\"analysisResults\":{";
+        bool first = true;
+        for (const auto& [label, val] : node.analysisOutput.keyValues)
+        {
+            if (!first) json += ",";
+            json += "\"" + ToUtf8(label) + "\":[" +
+                std::format("{:.6f},{:.6f},{:.6f},{:.6f}", val[0], val[1], val[2], val[3]) + "]";
+            first = false;
+        }
+        json += "}";
+    }
+    else if (node.analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Histogram &&
+             !node.analysisOutput.data.empty())
+    {
+        json += std::format(",\"analysisResults\":{{\"type\":\"histogram\",\"channel\":{},\"bins\":{}}}",
+            node.analysisOutput.channelIndex, node.analysisOutput.data.size());
     }
 
     json += "}";

@@ -2633,6 +2633,43 @@ namespace winrt::ShaderLab::implementation
             panel.Children().Append(canvas);
         }
 
+        // ---- KeyValue analysis output ----
+        if (node->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::KeyValue &&
+            !node->analysisOutput.keyValues.empty())
+        {
+            auto analysisHeader = Controls::TextBlock();
+            analysisHeader.Text(winrt::hstring(node->analysisOutput.label.empty()
+                ? L"Analysis Results" : node->analysisOutput.label));
+            analysisHeader.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            analysisHeader.Margin({ 0, 8, 0, 4 });
+            panel.Children().Append(analysisHeader);
+
+            for (const auto& [label, val] : node->analysisOutput.keyValues)
+            {
+                auto row = Controls::StackPanel();
+                row.Orientation(Controls::Orientation::Horizontal);
+                row.Spacing(8);
+                row.Margin({ 0, 2, 0, 2 });
+
+                auto labelText = Controls::TextBlock();
+                labelText.Text(winrt::hstring(label));
+                labelText.FontSize(12);
+                labelText.Width(140);
+                labelText.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::Gray()));
+                row.Children().Append(labelText);
+
+                auto valueText = Controls::TextBlock();
+                valueText.Text(winrt::hstring(std::format(L"{:.4f}  {:.4f}  {:.4f}  {:.4f}",
+                    val[0], val[1], val[2], val[3])));
+                valueText.FontSize(12);
+                valueText.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Consolas"));
+                valueText.IsTextSelectionEnabled(true);
+                row.Children().Append(valueText);
+
+                panel.Children().Append(row);
+            }
+        }
+
         // ---- Input pins info ----
         if (!node->inputPins.empty())
         {
@@ -3012,6 +3049,10 @@ namespace winrt::ShaderLab::implementation
         D2D1_RECT_F bounds{};
         dc->GetImageLocalBounds(image, &bounds);
         dc->SetDpi(oldDpiX, oldDpiY);
+
+        // Clamp bounds origin to zero — compute effects may report offset rects.
+        if (bounds.left < 0) { bounds.right -= bounds.left; bounds.left = 0; }
+        if (bounds.top < 0) { bounds.bottom -= bounds.top; bounds.top = 0; }
 
         uint32_t w = static_cast<uint32_t>(bounds.right - bounds.left);
         uint32_t h = static_cast<uint32_t>(bounds.bottom - bounds.top);
