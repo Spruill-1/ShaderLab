@@ -624,5 +624,195 @@ namespace winrt::ShaderLab::implementation
             return { 200, R"({"note":"Image capture via MCP coming soon","previewNodeId":)" +
                 std::format("{}}}", m_previewNodeId) };
         });
+
+        // =====================================================================
+        // POST /  — MCP JSON-RPC 2.0 endpoint (Streamable HTTP transport)
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            try
+            {
+                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+                auto method = ToUtf8(std::wstring(jobj.GetNamedString(L"method")));
+                auto id = jobj.HasKey(L"id") ? jobj.GetNamedValue(L"id") : winrt::Windows::Data::Json::JsonValue::CreateNullValue();
+                std::string idStr;
+                if (id.ValueType() == winrt::Windows::Data::Json::JsonValueType::Number)
+                    idStr = std::format("{}", static_cast<int64_t>(id.GetNumber()));
+                else if (id.ValueType() == winrt::Windows::Data::Json::JsonValueType::String)
+                    idStr = "\"" + ToUtf8(std::wstring(id.GetString())) + "\"";
+                else
+                    idStr = "null";
+
+                auto wrapResult = [&](const std::string& result) -> std::string {
+                    return std::format(R"JSON({{"jsonrpc":"2.0","id":{},"result":{}}})JSON", idStr, result);
+                };
+
+                // ---- initialize ----
+                if (method == "initialize")
+                {
+                    std::string result = R"JSON({
+"protocolVersion": "2024-11-05",
+"capabilities": {
+    "tools": {},
+    "resources": {}
+},
+"serverInfo": {
+    "name": "shaderlab",
+    "version": "1.0.0"
+}
+})JSON";
+                    return { 200, wrapResult(result) };
+                }
+
+                // ---- notifications/initialized (no response needed but we ack) ----
+                if (method == "notifications/initialized")
+                {
+                    return { 200, "" };
+                }
+
+                // ---- tools/list ----
+                if (method == "tools/list")
+                {
+                    std::string tools = R"JSON({"tools":[
+{"name":"graph_add_node","description":"Add a built-in D2D effect node by name","inputSchema":{"type":"object","properties":{"effectName":{"type":"string","description":"Effect name e.g. Gaussian Blur"}},"required":["effectName"]}},
+{"name":"graph_remove_node","description":"Remove a node by ID","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
+{"name":"graph_connect","description":"Connect output pin to input pin","inputSchema":{"type":"object","properties":{"srcId":{"type":"number"},"srcPin":{"type":"number"},"dstId":{"type":"number"},"dstPin":{"type":"number"}},"required":["srcId","srcPin","dstId","dstPin"]}},
+{"name":"graph_disconnect","description":"Disconnect an edge","inputSchema":{"type":"object","properties":{"srcId":{"type":"number"},"srcPin":{"type":"number"},"dstId":{"type":"number"},"dstPin":{"type":"number"}},"required":["srcId","srcPin","dstId","dstPin"]}},
+{"name":"graph_set_property","description":"Set a node property. Value can be number, bool, string, or array for vectors.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"key":{"type":"string"},"value":{}},"required":["nodeId","key","value"]}},
+{"name":"graph_get_node","description":"Get detailed info about a node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
+{"name":"graph_save_json","description":"Serialize graph to JSON","inputSchema":{"type":"object","properties":{}}},
+{"name":"graph_load_json","description":"Load graph from JSON string","inputSchema":{"type":"object","properties":{"json":{"type":"string"}},"required":["json"]}},
+{"name":"graph_clear","description":"Clear the graph, keeping Output node","inputSchema":{"type":"object","properties":{}}},
+{"name":"effect_compile","description":"Compile HLSL for a custom effect node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"hlsl":{"type":"string"}},"required":["nodeId","hlsl"]}},
+{"name":"set_preview_node","description":"Set which node is previewed","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
+{"name":"render_capture","description":"Capture preview as PNG. Note: HDR values clipped to SDR.","inputSchema":{"type":"object","properties":{}}},
+{"name":"registry_get_effect","description":"Get metadata for a built-in effect","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}
+]})JSON";
+                    return { 200, wrapResult(tools) };
+                }
+
+                // ---- tools/call ----
+                if (method == "tools/call")
+                {
+                    auto params = jobj.GetNamedObject(L"params");
+                    auto toolName = ToUtf8(std::wstring(params.GetNamedString(L"name")));
+                    auto args = params.HasKey(L"arguments") ? params.GetNamedObject(L"arguments") : winrt::Windows::Data::Json::JsonObject();
+                    auto argsStr = ToUtf8(std::wstring(args.Stringify()));
+
+                    // Route to existing REST handlers.
+                    ::ShaderLab::McpHttpServer::Response restResp = { 404, "" };
+
+                    if (toolName == "graph_add_node")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/add-node", argsStr);
+                    else if (toolName == "graph_remove_node")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/remove-node", argsStr);
+                    else if (toolName == "graph_connect")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/connect", argsStr);
+                    else if (toolName == "graph_disconnect")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/disconnect", argsStr);
+                    else if (toolName == "graph_set_property")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/set-property", argsStr);
+                    else if (toolName == "graph_get_node")
+                    {
+                        auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(L"nodeId"));
+                        restResp = m_mcpServer->RouteRequest(L"GET", std::format(L"/graph/node/{}", nodeId), "");
+                    }
+                    else if (toolName == "graph_save_json")
+                        restResp = m_mcpServer->RouteRequest(L"GET", L"/graph/save", "");
+                    else if (toolName == "graph_load_json")
+                    {
+                        auto jsonStr = ToUtf8(std::wstring(args.GetNamedString(L"json")));
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/load", jsonStr);
+                    }
+                    else if (toolName == "graph_clear")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/clear", "");
+                    else if (toolName == "effect_compile")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/effect/compile", argsStr);
+                    else if (toolName == "set_preview_node")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/render/preview-node", argsStr);
+                    else if (toolName == "render_capture")
+                        restResp = m_mcpServer->RouteRequest(L"GET", L"/render/capture", "");
+                    else if (toolName == "registry_get_effect")
+                    {
+                        auto name = std::wstring(args.GetNamedString(L"name"));
+                        restResp = m_mcpServer->RouteRequest(L"GET", L"/registry/effect/" + name, "");
+                    }
+
+                    bool isError = restResp.statusCode >= 400;
+                    std::string content = std::format(
+                        R"JSON({{"content":[{{"type":"text","text":{}}}],"isError":{}}})JSON",
+                        restResp.body.empty() ? "\"\"" : restResp.body,
+                        isError ? "true" : "false");
+                    // Wrap body in quotes if it's not already JSON
+                    if (!restResp.body.empty() && restResp.body[0] != '{' && restResp.body[0] != '[')
+                        content = std::format(
+                            R"JSON({{"content":[{{"type":"text","text":"{}"}}],"isError":{}}})JSON",
+                            restResp.body, isError ? "true" : "false");
+
+                    return { 200, wrapResult(content) };
+                }
+
+                // ---- resources/list ----
+                if (method == "resources/list")
+                {
+                    std::string resources = R"JSON({"resources":[
+{"uri":"shaderlab://context","name":"ShaderLab Context","description":"System prompt: pipeline format, shader conventions, API reference","mimeType":"application/json"},
+{"uri":"shaderlab://graph","name":"Effect Graph","description":"Full graph state with nodes, edges, properties, custom effect definitions","mimeType":"application/json"},
+{"uri":"shaderlab://registry/effects","name":"Built-in Effects","description":"All 48+ built-in D2D effects with property metadata","mimeType":"application/json"},
+{"uri":"shaderlab://custom-effects","name":"Custom Effects","description":"Custom effects in graph with HLSL source and compile status","mimeType":"application/json"}
+]})JSON";
+                    return { 200, wrapResult(resources) };
+                }
+
+                // ---- resources/read ----
+                if (method == "resources/read")
+                {
+                    auto params2 = jobj.GetNamedObject(L"params");
+                    auto uri = ToUtf8(std::wstring(params2.GetNamedString(L"uri")));
+
+                    std::string restPath;
+                    if (uri == "shaderlab://context") restPath = "/context";
+                    else if (uri == "shaderlab://graph") restPath = "/graph";
+                    else if (uri == "shaderlab://registry/effects") restPath = "/registry/effects";
+                    else if (uri == "shaderlab://custom-effects") restPath = "/custom-effects";
+                    else
+                        return { 200, wrapResult(R"JSON({"contents":[]})JSON") };
+
+                    auto restResp = m_mcpServer->RouteRequest(L"GET", std::wstring(restPath.begin(), restPath.end()), "");
+
+                    // Escape the JSON body for embedding in the text field.
+                    std::string escaped;
+                    for (char c : restResp.body)
+                    {
+                        if (c == '"') escaped += "\\\"";
+                        else if (c == '\\') escaped += "\\\\";
+                        else if (c == '\n') escaped += "\\n";
+                        else if (c == '\r') escaped += "\\r";
+                        else escaped += c;
+                    }
+
+                    std::string result = std::format(
+                        R"JSON({{"contents":[{{"uri":"{}","mimeType":"application/json","text":"{}"}}]}})JSON",
+                        uri, escaped);
+                    return { 200, wrapResult(result) };
+                }
+
+                // ---- ping ----
+                if (method == "ping")
+                    return { 200, wrapResult("{}") };
+
+                // Unknown method.
+                return { 200, std::format(
+                    R"JSON({{"jsonrpc":"2.0","id":{},"error":{{"code":-32601,"message":"Method not found: {}"}}}})JSON",
+                    idStr, method) };
+            }
+            catch (const std::exception& ex)
+            {
+                return { 200, std::format(
+                    R"JSON({{"jsonrpc":"2.0","id":null,"error":{{"code":-32700,"message":"Parse error: {}"}}}})JSON",
+                    ex.what()) };
+            }
+        });
     }
 }

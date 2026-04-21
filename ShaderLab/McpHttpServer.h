@@ -35,10 +35,12 @@ namespace ShaderLab
         void Stop();
         bool IsRunning() const { return m_running.load(); }
 
+        // Route a request programmatically (used by the MCP JSON-RPC handler).
+        Response RouteRequest(const std::wstring& method, const std::wstring& path, const std::string& body);
+
     private:
         void ListenerThread(uint16_t port);
         void HandleConnection(SOCKET_T clientSock);
-        Response RouteRequest(const std::wstring& method, const std::wstring& path, const std::string& body);
 
         struct Route
         {
