@@ -223,19 +223,20 @@ namespace ShaderLab::Effects
                 outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
             }
 
-            // Clamp to a reasonable origin-at-zero rect. D2D maps TEXCOORD
-            // relative to this output rect — if it's infinite, the viewport
-            // maps to a tiny fraction and all pixels sample the same texel.
-            // With SampleLevel + CLAMP, any viewport within (0,0,4096,4096)
-            // works correctly; out-of-bounds samples get edge color.
+            // Clamp to reasonable bounds. D2D maps TEXCOORD proportionally
+            // between this output rect and the input rects from MapOutputRectToInputRects.
+            // We return this same rect from MapOutputRectToInputRects to ensure 1:1 mapping.
             outputRect->left   = (std::max)(outputRect->left,   0L);
             outputRect->top    = (std::max)(outputRect->top,    0L);
             outputRect->right  = (std::min)(outputRect->right,  4096L);
             outputRect->bottom = (std::min)(outputRect->bottom, 4096L);
+
+            m_lastOutputRect = *outputRect;
         }
         else
         {
             *outputRect = D2D1_RECT_L{ 0, 0, 0, 0 };
+            m_lastOutputRect = *outputRect;
         }
 
         *outputOpaqueSubRect = D2D1_RECT_L{ 0, 0, 0, 0 };
@@ -247,9 +248,12 @@ namespace ShaderLab::Effects
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const
     {
+        // Return the FULL clamped output rect (not the clipped viewport).
+        // This ensures the intermediate textures match the output rect,
+        // so TEXCOORD maps 1:1 with GetDimensions() normalization.
         for (UINT32 i = 0; i < inputRectCount; ++i)
         {
-            inputRects[i] = *outputRect;
+            inputRects[i] = m_lastOutputRect;
         }
         return S_OK;
     }

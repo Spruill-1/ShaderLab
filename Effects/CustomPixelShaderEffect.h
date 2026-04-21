@@ -149,8 +149,7 @@ namespace ShaderLab::Effects
         std::vector<BYTE> m_constantBuffer;
         UINT32            m_inputCount{ 1 };
         D2D1_RECT_L       m_inputRect{};
-        D2D1_RECT_L       m_lastRequestedRect{};
-        bool              m_hasRequestedRect{ false };
+        D2D1_RECT_L       m_lastOutputRect{}; // From MapInputRectsToOutputRect, for 1:1 TEXCOORD mapping.
 
         // Whether we need to re-upload the constant buffer.
         bool m_cbDirty{ false };
