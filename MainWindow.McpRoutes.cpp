@@ -608,8 +608,9 @@ namespace winrt::ShaderLab::implementation
                     auto& def = node->customEffect.value();
                     def.hlslSource = hlsl;
                     def.compiledBytecode = std::move(bytecode);
-                    if (def.shaderGuid == GUID{})
-                        CoCreateGuid(&def.shaderGuid);
+                    // Always generate a new GUID on recompile so D2D registers
+                    // the updated shader under a fresh CLSID.
+                    CoCreateGuid(&def.shaderGuid);
                     node->dirty = true;
                     m_graph.MarkAllDirty();
                     m_graphEvaluator.InvalidateNode(nodeId);

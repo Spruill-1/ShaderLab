@@ -193,6 +193,9 @@ namespace ShaderLab::Effects
     {
         m_computeInfo.copy_from(computeInfo);
 
+        // Set output buffer to FP16 for HDR/WCG support.
+        computeInfo->SetOutputBuffer(D2D1_BUFFER_PRECISION_16BPC_FLOAT, D2D1_CHANNEL_DEPTH_4);
+
         if (!m_shaderBytecode.empty())
             m_shaderDirty = true;
 
@@ -230,22 +233,13 @@ namespace ShaderLab::Effects
     {
         if (inputRectCount > 0 && inputRects)
         {
+            m_inputRect = inputRects[0];
             *outputRect = inputRects[0];
-            for (UINT32 i = 1; i < inputRectCount; ++i)
-            {
-                outputRect->left   = (std::min)(outputRect->left,   inputRects[i].left);
-                outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
-                outputRect->right  = (std::max)(outputRect->right,  inputRects[i].right);
-                outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
-            }
-            outputRect->left   = (std::max)(outputRect->left,   0L);
-            outputRect->top    = (std::max)(outputRect->top,    0L);
-            outputRect->right  = (std::min)(outputRect->right,  4096L);
-            outputRect->bottom = (std::min)(outputRect->bottom, 4096L);
         }
         else
         {
-            *outputRect = D2D1_RECT_L{ 0, 0, 0, 0 };
+            m_inputRect = D2D1_RECT_L{ 0, 0, 0, 0 };
+            *outputRect = m_inputRect;
         }
 
         *outputOpaqueSubRect = D2D1_RECT_L{ 0, 0, 0, 0 };
@@ -253,23 +247,25 @@ namespace ShaderLab::Effects
     }
 
     IFACEMETHODIMP CustomComputeShaderEffect::MapOutputRectToInputRects(
-        const D2D1_RECT_L* outputRect,
+        const D2D1_RECT_L* /*outputRect*/,
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const
     {
+        // Return the full stored input rect so D2D evaluates the entire input,
+        // matching the pattern from the official DFT compute shader sample.
         for (UINT32 i = 0; i < inputRectCount; ++i)
         {
-            inputRects[i] = *outputRect;
+            inputRects[i] = m_inputRect;
         }
         return S_OK;
     }
 
     IFACEMETHODIMP CustomComputeShaderEffect::MapInvalidRect(
         UINT32 /*inputIndex*/,
-        D2D1_RECT_L invalidInputRect,
+        D2D1_RECT_L /*invalidInputRect*/,
         D2D1_RECT_L* invalidOutputRect) const
     {
-        *invalidOutputRect = invalidInputRect;
+        *invalidOutputRect = m_inputRect;
         return S_OK;
     }
 

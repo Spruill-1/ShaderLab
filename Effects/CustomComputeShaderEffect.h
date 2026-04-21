@@ -144,6 +144,7 @@ namespace ShaderLab::Effects
         GUID m_shaderGuid{};
         std::vector<BYTE> m_constantBuffer;
         UINT32            m_inputCount{ 1 };
+        D2D1_RECT_L       m_inputRect{};  // Stored from MapInputRectsToOutputRect.
 
         // Thread group dimensions for compute dispatch.
         UINT32 m_threadGroupX{ 8 };
