@@ -16,6 +16,7 @@
 #include "Controls/PixelInspectorController.h"
 #include "Controls/PixelTraceController.h"
 #include "EffectDesignerWindow.xaml.h"
+#include "ShaderLab/McpHttpServer.h"
 
 namespace winrt::ShaderLab::implementation
 {
@@ -211,6 +212,10 @@ namespace winrt::ShaderLab::implementation
 
         // Effect Designer window.
         winrt::ShaderLab::EffectDesignerWindow m_designerWindow{ nullptr };
+
+        // MCP HTTP server for AI agent integration.
+        std::unique_ptr<::ShaderLab::McpHttpServer> m_mcpServer;
+        void SetupMcpRoutes();
 
         // Column splitter drag state.
         bool m_isDraggingSplitter{ false };
