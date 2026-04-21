@@ -367,7 +367,7 @@ namespace winrt::ShaderLab::implementation
                     return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                         auto id = m_graph.AddNode(std::move(node));
                         m_graph.MarkAllDirty();
-                        m_nodeGraphController.RebuildLayout();
+                        m_nodeGraphController.AutoLayout();
                         PopulatePreviewNodeSelector();
                         return { 200, std::format("{{\"nodeId\":{}}}", id) };
                     });
@@ -391,7 +391,7 @@ namespace winrt::ShaderLab::implementation
                     m_graph.RemoveNode(nodeId);
                     m_graphEvaluator.InvalidateNode(nodeId);
                     m_graph.MarkAllDirty();
-                    m_nodeGraphController.RebuildLayout();
+                    m_nodeGraphController.AutoLayout();
                     PopulatePreviewNodeSelector();
                     return { 200, R"({"ok":true})" };
                 });
@@ -535,7 +535,7 @@ namespace winrt::ShaderLab::implementation
                 m_graph.Clear();
                 m_nodeGraphController.EnsureOutputNode();
                 m_graph.MarkAllDirty();
-                m_nodeGraphController.RebuildLayout();
+                m_nodeGraphController.AutoLayout();
                 PopulatePreviewNodeSelector();
                 return { 200, R"({"ok":true})" };
             });

@@ -25,6 +25,99 @@ namespace ShaderLab::Controls
         }
     }
 
+    void NodeGraphController::AutoLayout()
+    {
+        if (!m_graph || m_graph->IsEmpty()) return;
+
+        // 1. Compute topological depth for each node (longest path from sources).
+        std::unordered_map<uint32_t, int> depth;
+        std::vector<uint32_t> topoOrder;
+        try { topoOrder = m_graph->TopologicalSort(); }
+        catch (...) { return; } // Cycle — can't layout.
+
+        for (uint32_t id : topoOrder)
+        {
+            int maxParentDepth = -1;
+            for (const auto* edge : m_graph->GetInputEdges(id))
+            {
+                auto it = depth.find(edge->sourceNodeId);
+                if (it != depth.end())
+                    maxParentDepth = (std::max)(maxParentDepth, it->second);
+            }
+            depth[id] = maxParentDepth + 1;
+        }
+
+        // 2. Group nodes by depth column.
+        int maxDepth = 0;
+        for (auto& [id, d] : depth)
+            maxDepth = (std::max)(maxDepth, d);
+
+        std::vector<std::vector<uint32_t>> columns(maxDepth + 1);
+        for (uint32_t id : topoOrder)
+            columns[depth[id]].push_back(id);
+
+        // 3. Order nodes within each column to minimize edge crossings.
+        //    Heuristic: sort by the average Y position of connected upstream nodes.
+        for (int col = 1; col <= maxDepth; ++col)
+        {
+            auto& colNodes = columns[col];
+            std::sort(colNodes.begin(), colNodes.end(), [&](uint32_t a, uint32_t b)
+            {
+                auto avgParentY = [&](uint32_t nodeId) -> float
+                {
+                    float sum = 0; int count = 0;
+                    for (const auto* edge : m_graph->GetInputEdges(nodeId))
+                    {
+                        auto* parent = m_graph->FindNode(edge->sourceNodeId);
+                        if (parent) { sum += parent->position.y; ++count; }
+                    }
+                    return count > 0 ? sum / count : 0.0f;
+                };
+                return avgParentY(a) < avgParentY(b);
+            });
+        }
+
+        // 4. Assign positions: columns left-to-right, nodes top-to-bottom.
+        constexpr float colSpacing = 250.0f;
+        constexpr float rowSpacing = 120.0f;
+        constexpr float startX = 60.0f;
+        constexpr float startY = 60.0f;
+
+        for (int col = 0; col <= maxDepth; ++col)
+        {
+            float x = startX + col * colSpacing;
+            float y = startY;
+            for (uint32_t id : columns[col])
+            {
+                auto* node = m_graph->FindNode(id);
+                if (node)
+                {
+                    node->position = { x, y };
+                    y += rowSpacing;
+                }
+            }
+        }
+
+        // 5. Center columns vertically relative to the tallest column.
+        float maxHeight = 0;
+        for (int col = 0; col <= maxDepth; ++col)
+            maxHeight = (std::max)(maxHeight, static_cast<float>(columns[col].size()) * rowSpacing);
+
+        for (int col = 0; col <= maxDepth; ++col)
+        {
+            float colHeight = static_cast<float>(columns[col].size()) * rowSpacing;
+            float offset = (maxHeight - colHeight) * 0.5f;
+            for (uint32_t id : columns[col])
+            {
+                auto* node = m_graph->FindNode(id);
+                if (node)
+                    node->position.y += offset;
+            }
+        }
+
+        RebuildLayout();
+    }
+
     void NodeGraphController::SetPanOffset(float x, float y)
     {
         m_panOffset = { x, y };

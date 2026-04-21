@@ -64,6 +64,10 @@ namespace ShaderLab::Controls
         // Rebuild visual layout from the current graph state.
         void RebuildLayout();
 
+        // Auto-arrange nodes left-to-right by topological depth,
+        // minimizing edge crossings. Called when nodes/edges change.
+        void AutoLayout();
+
         // Set canvas pan offset (scrolling).
         void SetPanOffset(float x, float y);
         D2D1_POINT_2F PanOffset() const { return m_panOffset; }
