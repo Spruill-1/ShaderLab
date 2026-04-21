@@ -204,6 +204,10 @@ namespace winrt::ShaderLab::implementation
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
         winrt::fire_and_forget SaveImageAsync();
+
+        // Capture the current preview as a PNG byte buffer.
+        // Returns empty vector on failure.
+        std::vector<uint8_t> CapturePreviewAsPng();
         void OpenEffectDesigner();
 
         uint32_t m_selectedNodeId{ 0 };

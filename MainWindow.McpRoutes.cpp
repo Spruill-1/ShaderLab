@@ -659,14 +659,33 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // GET /render/capture — Output as base64 PNG (placeholder)
+        // GET /render/capture -- Output as base64 PNG
         // =====================================================================
         m_mcpServer->AddRoute(L"GET", L"/render/capture", [this](const std::wstring&, const std::string&)
             -> ::ShaderLab::McpHttpServer::Response
         {
-            // TODO: render to bitmap, WIC encode to PNG, base64 encode
-            return { 200, R"({"note":"Image capture via MCP coming soon","previewNodeId":)" +
-                std::format("{}}}", m_previewNodeId) };
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                auto pngData = CapturePreviewAsPng();
+                if (pngData.empty())
+                    return { 404, R"({"error":"No output image"})" };
+
+                // Base64 encode.
+                static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                std::string b64str;
+                b64str.reserve(pngData.size() * 4 / 3 + 4);
+                for (size_t i = 0; i < pngData.size(); i += 3)
+                {
+                    uint32_t val = pngData[i] << 16;
+                    if (i + 1 < pngData.size()) val |= pngData[i + 1] << 8;
+                    if (i + 2 < pngData.size()) val |= pngData[i + 2];
+                    b64str += b64[(val >> 18) & 63];
+                    b64str += b64[(val >> 12) & 63];
+                    b64str += (i + 1 < pngData.size()) ? b64[(val >> 6) & 63] : '=';
+                    b64str += (i + 2 < pngData.size()) ? b64[val & 63] : '=';
+                }
+
+                return { 200, std::format("{{\"format\":\"png\",\"size\":{},\"data\":\"{}\"}}", pngData.size(), b64str) };
+            });
         });
 
         // =====================================================================
