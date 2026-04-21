@@ -415,6 +415,7 @@ namespace winrt::ShaderLab::implementation
                 return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                     bool ok = m_graph.Connect(srcId, srcPin, dstId, dstPin);
                     m_graph.MarkAllDirty();
+                    m_nodeGraphController.AutoLayout();
                     return { 200, std::format("{{\"connected\":{}}}", ok ? "true" : "false") };
                 });
             }
@@ -437,6 +438,7 @@ namespace winrt::ShaderLab::implementation
                 return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                     bool ok = m_graph.Disconnect(srcId, srcPin, dstId, dstPin);
                     m_graph.MarkAllDirty();
+                    m_nodeGraphController.AutoLayout();
                     return { 200, std::format("{{\"disconnected\":{}}}", ok ? "true" : "false") };
                 });
             }
@@ -515,6 +517,7 @@ namespace winrt::ShaderLab::implementation
                     m_graphEvaluator.ReleaseCache();
                     m_graph = std::move(loaded);
                     ResetAfterGraphLoad();
+                    m_nodeGraphController.AutoLayout();
                     return { 200, R"({"ok":true})" };
                 });
             }
