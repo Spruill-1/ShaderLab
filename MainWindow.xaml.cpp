@@ -127,6 +127,10 @@ namespace winrt::ShaderLab::implementation
     {
         m_isShuttingDown = true;
 
+        // Stop MCP server before tearing down resources.
+        if (m_mcpServer)
+            m_mcpServer->Stop();
+
         if (m_renderTimer)
         {
             m_renderTimer.Stop();
@@ -210,6 +214,12 @@ namespace winrt::ShaderLab::implementation
 
         InitializeRendering();
         RegisterCustomEffects();
+
+        // Start MCP HTTP server for AI agent integration.
+        SetupMcpRoutes();
+        if (m_mcpServer)
+            m_mcpServer->Start(47808);
+
         UpdateStatusBar();
 
         m_nodeGraphController.SetGraph(&m_graph);
