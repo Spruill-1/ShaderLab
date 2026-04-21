@@ -659,7 +659,8 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // GET /render/capture -- Output as base64 PNG
+        // =====================================================================
+        // GET /render/capture -- Save output PNG to temp file, return path
         // =====================================================================
         m_mcpServer->AddRoute(L"GET", L"/render/capture", [this](const std::wstring&, const std::string&)
             -> ::ShaderLab::McpHttpServer::Response
@@ -669,22 +670,24 @@ namespace winrt::ShaderLab::implementation
                 if (pngData.empty())
                     return { 404, R"({"error":"No output image"})" };
 
-                // Base64 encode.
-                static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-                std::string b64str;
-                b64str.reserve(pngData.size() * 4 / 3 + 4);
-                for (size_t i = 0; i < pngData.size(); i += 3)
-                {
-                    uint32_t val = pngData[i] << 16;
-                    if (i + 1 < pngData.size()) val |= pngData[i + 1] << 8;
-                    if (i + 2 < pngData.size()) val |= pngData[i + 2];
-                    b64str += b64[(val >> 18) & 63];
-                    b64str += b64[(val >> 12) & 63];
-                    b64str += (i + 1 < pngData.size()) ? b64[(val >> 6) & 63] : '=';
-                    b64str += (i + 2 < pngData.size()) ? b64[val & 63] : '=';
-                }
+                // Write to temp file.
+                wchar_t tempPath[MAX_PATH]{};
+                GetTempPathW(MAX_PATH, tempPath);
+                std::wstring filePath = std::wstring(tempPath) + L"shaderlab_capture.png";
+                HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_WRITE, 0, nullptr,
+                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hFile == INVALID_HANDLE_VALUE)
+                    return { 500, R"({"error":"Failed to create temp file"})" };
+                DWORD written = 0;
+                WriteFile(hFile, pngData.data(), static_cast<DWORD>(pngData.size()), &written, nullptr);
+                CloseHandle(hFile);
 
-                return { 200, std::format("{{\"format\":\"png\",\"size\":{},\"data\":\"{}\"}}", pngData.size(), b64str) };
+                auto pathUtf8 = ToUtf8(filePath);
+                // Escape backslashes for JSON.
+                std::string escaped;
+                for (char c : pathUtf8) { if (c == '\\') escaped += "\\\\"; else escaped += c; }
+
+                return { 200, std::format("{{\"path\":\"{}\",\"size\":{}}}", escaped, pngData.size()) };
             });
         });
 
