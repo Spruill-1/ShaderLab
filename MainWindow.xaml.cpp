@@ -146,23 +146,20 @@ namespace winrt::ShaderLab::implementation
 
         McpExportConfigButton().Click([this](auto&&, auto&&)
         {
-            // Copy MCP config JSON to clipboard.
+            // Copy MCP server URL to clipboard.
             namespace DP = winrt::Windows::ApplicationModel::DataTransfer;
             auto pkg = DP::DataPackage();
-            std::wstring bridgePath = L"<path-to>/mcp-bridge/dist/index.js";
             std::wstring config = std::format(
                 L"{{\n"
                 L"  \"mcpServers\": {{\n"
                 L"    \"shaderlab\": {{\n"
-                L"      \"command\": \"node\",\n"
-                L"      \"args\": [\"{}\"],\n"
-                L"      \"env\": {{ \"SHADERLAB_PORT\": \"47808\" }}\n"
+                L"      \"url\": \"http://localhost:47808/\"\n"
                 L"    }}\n"
                 L"  }}\n"
-                L"}}", bridgePath);
+                L"}}");
             pkg.SetText(config);
             DP::Clipboard::SetContent(pkg);
-            PipelineFormatText().Text(L"MCP config copied to clipboard");
+            PipelineFormatText().Text(L"MCP config copied to clipboard (http://localhost:47808)");
         });
     }
 
