@@ -154,6 +154,27 @@ static std::string NodeToJson(const ::ShaderLab::Graph::EffectNode& node)
 
 namespace winrt::ShaderLab::implementation
 {
+    // Helper: dispatch a lambda to the UI thread and block until completion.
+    // Returns the result from the lambda. Must NOT be called from the UI thread.
+    template<typename F>
+    auto MainWindow::DispatchSync(F&& fn) -> decltype(fn())
+    {
+        using R = decltype(fn());
+        std::optional<R> result;
+        std::exception_ptr ex;
+        HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        DispatcherQueue().TryEnqueue([&]()
+        {
+            try { result = fn(); }
+            catch (...) { ex = std::current_exception(); }
+            SetEvent(event);
+        });
+        WaitForSingleObject(event, 10000); // 10s timeout
+        CloseHandle(event);
+        if (ex) std::rethrow_exception(ex);
+        return *result;
+    }
+
     void MainWindow::SetupMcpRoutes()
     {
         if (!m_mcpServer)
@@ -343,11 +364,13 @@ namespace winrt::ShaderLab::implementation
                     auto* desc = ::ShaderLab::Effects::EffectRegistry::Instance().FindByName(name);
                     if (!desc) return { 400, R"({"error":"Unknown effect name"})" };
                     auto node = ::ShaderLab::Effects::EffectRegistry::CreateNode(*desc);
-                    auto id = m_graph.AddNode(std::move(node));
-                    m_graph.MarkAllDirty();
-                    m_nodeGraphController.RebuildLayout();
-                    PopulatePreviewNodeSelector();
-                    return { 200, std::format("{{\"nodeId\":{}}}", id) };
+                    return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                        auto id = m_graph.AddNode(std::move(node));
+                        m_graph.MarkAllDirty();
+                        m_nodeGraphController.RebuildLayout();
+                        PopulatePreviewNodeSelector();
+                        return { 200, std::format("{{\"nodeId\":{}}}", id) };
+                    });
                 }
                 return { 400, R"({"error":"Provide effectName"})" };
             }
@@ -364,12 +387,14 @@ namespace winrt::ShaderLab::implementation
             {
                 auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
                 uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
-                m_graph.RemoveNode(nodeId);
-                m_graphEvaluator.InvalidateNode(nodeId);
-                m_graph.MarkAllDirty();
-                m_nodeGraphController.RebuildLayout();
-                PopulatePreviewNodeSelector();
-                return { 200, R"({"ok":true})" };
+                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    m_graph.RemoveNode(nodeId);
+                    m_graphEvaluator.InvalidateNode(nodeId);
+                    m_graph.MarkAllDirty();
+                    m_nodeGraphController.RebuildLayout();
+                    PopulatePreviewNodeSelector();
+                    return { 200, R"({"ok":true})" };
+                });
             }
             catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
         });
@@ -387,9 +412,11 @@ namespace winrt::ShaderLab::implementation
                 uint32_t srcPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"srcPin"));
                 uint32_t dstId = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstId"));
                 uint32_t dstPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstPin"));
-                bool ok = m_graph.Connect(srcId, srcPin, dstId, dstPin);
-                m_graph.MarkAllDirty();
-                return { 200, std::format("{{\"connected\":{}}}", ok ? "true" : "false") };
+                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    bool ok = m_graph.Connect(srcId, srcPin, dstId, dstPin);
+                    m_graph.MarkAllDirty();
+                    return { 200, std::format("{{\"connected\":{}}}", ok ? "true" : "false") };
+                });
             }
             catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
         });
@@ -407,9 +434,11 @@ namespace winrt::ShaderLab::implementation
                 uint32_t srcPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"srcPin"));
                 uint32_t dstId = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstId"));
                 uint32_t dstPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstPin"));
-                bool ok = m_graph.Disconnect(srcId, srcPin, dstId, dstPin);
-                m_graph.MarkAllDirty();
-                return { 200, std::format("{{\"disconnected\":{}}}", ok ? "true" : "false") };
+                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    bool ok = m_graph.Disconnect(srcId, srcPin, dstId, dstPin);
+                    m_graph.MarkAllDirty();
+                    return { 200, std::format("{{\"disconnected\":{}}}", ok ? "true" : "false") };
+                });
             }
             catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
         });
@@ -425,48 +454,50 @@ namespace winrt::ShaderLab::implementation
                 auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
                 uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
                 auto key = std::wstring(jobj.GetNamedString(L"key"));
-
-                auto* node = m_graph.FindNode(nodeId);
-                if (!node) return { 404, R"({"error":"Node not found"})" };
-
                 auto val = jobj.GetNamedValue(L"value");
-                switch (val.ValueType())
-                {
-                case winrt::Windows::Data::Json::JsonValueType::Number:
-                    node->properties[key] = static_cast<float>(val.GetNumber());
-                    break;
-                case winrt::Windows::Data::Json::JsonValueType::Boolean:
-                    node->properties[key] = val.GetBoolean();
-                    break;
-                case winrt::Windows::Data::Json::JsonValueType::String:
-                    node->properties[key] = std::wstring(val.GetString());
-                    break;
-                case winrt::Windows::Data::Json::JsonValueType::Array:
-                {
-                    auto arr = val.GetArray();
-                    if (arr.Size() == 2)
-                        node->properties[key] = winrt::Windows::Foundation::Numerics::float2{
-                            static_cast<float>(arr.GetAt(0).GetNumber()),
-                            static_cast<float>(arr.GetAt(1).GetNumber()) };
-                    else if (arr.Size() == 3)
-                        node->properties[key] = winrt::Windows::Foundation::Numerics::float3{
-                            static_cast<float>(arr.GetAt(0).GetNumber()),
-                            static_cast<float>(arr.GetAt(1).GetNumber()),
-                            static_cast<float>(arr.GetAt(2).GetNumber()) };
-                    else if (arr.Size() == 4)
-                        node->properties[key] = winrt::Windows::Foundation::Numerics::float4{
-                            static_cast<float>(arr.GetAt(0).GetNumber()),
-                            static_cast<float>(arr.GetAt(1).GetNumber()),
-                            static_cast<float>(arr.GetAt(2).GetNumber()),
-                            static_cast<float>(arr.GetAt(3).GetNumber()) };
-                    break;
-                }
-                default:
-                    return { 400, R"({"error":"Unsupported value type"})" };
-                }
-                node->dirty = true;
-                m_graph.MarkAllDirty();
-                return { 200, R"({"ok":true})" };
+
+                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    auto* node = m_graph.FindNode(nodeId);
+                    if (!node) return { 404, R"({"error":"Node not found"})" };
+
+                    switch (val.ValueType())
+                    {
+                    case winrt::Windows::Data::Json::JsonValueType::Number:
+                        node->properties[key] = static_cast<float>(val.GetNumber());
+                        break;
+                    case winrt::Windows::Data::Json::JsonValueType::Boolean:
+                        node->properties[key] = val.GetBoolean();
+                        break;
+                    case winrt::Windows::Data::Json::JsonValueType::String:
+                        node->properties[key] = std::wstring(val.GetString());
+                        break;
+                    case winrt::Windows::Data::Json::JsonValueType::Array:
+                    {
+                        auto arr = val.GetArray();
+                        if (arr.Size() == 2)
+                            node->properties[key] = winrt::Windows::Foundation::Numerics::float2{
+                                static_cast<float>(arr.GetAt(0).GetNumber()),
+                                static_cast<float>(arr.GetAt(1).GetNumber()) };
+                        else if (arr.Size() == 3)
+                            node->properties[key] = winrt::Windows::Foundation::Numerics::float3{
+                                static_cast<float>(arr.GetAt(0).GetNumber()),
+                                static_cast<float>(arr.GetAt(1).GetNumber()),
+                                static_cast<float>(arr.GetAt(2).GetNumber()) };
+                        else if (arr.Size() == 4)
+                            node->properties[key] = winrt::Windows::Foundation::Numerics::float4{
+                                static_cast<float>(arr.GetAt(0).GetNumber()),
+                                static_cast<float>(arr.GetAt(1).GetNumber()),
+                                static_cast<float>(arr.GetAt(2).GetNumber()),
+                                static_cast<float>(arr.GetAt(3).GetNumber()) };
+                        break;
+                    }
+                    default:
+                        return { 400, R"({"error":"Unsupported value type"})" };
+                    }
+                    node->dirty = true;
+                    m_graph.MarkAllDirty();
+                    return { 200, R"({"ok":true})" };
+                });
             }
             catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
         });
@@ -480,11 +511,12 @@ namespace winrt::ShaderLab::implementation
             try
             {
                 auto loaded = ::ShaderLab::Graph::EffectGraph::FromJson(winrt::to_hstring(body));
-                m_graphEvaluator.ReleaseCache();
-                m_graph = std::move(loaded);
-                // Dispatch UI reset to the UI thread.
-                DispatcherQueue().TryEnqueue([this]() { ResetAfterGraphLoad(); });
-                return { 200, R"({"ok":true})" };
+                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    m_graphEvaluator.ReleaseCache();
+                    m_graph = std::move(loaded);
+                    ResetAfterGraphLoad();
+                    return { 200, R"({"ok":true})" };
+                });
             }
             catch (const std::exception& ex)
             {
@@ -498,13 +530,15 @@ namespace winrt::ShaderLab::implementation
         m_mcpServer->AddRoute(L"POST", L"/graph/clear", [this](const std::wstring&, const std::string&)
             -> ::ShaderLab::McpHttpServer::Response
         {
-            m_graphEvaluator.ReleaseCache();
-            m_graph.Clear();
-            m_nodeGraphController.EnsureOutputNode();
-            m_graph.MarkAllDirty();
-            m_nodeGraphController.RebuildLayout();
-            PopulatePreviewNodeSelector();
-            return { 200, R"({"ok":true})" };
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                m_graphEvaluator.ReleaseCache();
+                m_graph.Clear();
+                m_nodeGraphController.EnsureOutputNode();
+                m_graph.MarkAllDirty();
+                m_nodeGraphController.RebuildLayout();
+                PopulatePreviewNodeSelector();
+                return { 200, R"({"ok":true})" };
+            });
         });
 
         // =====================================================================
@@ -516,8 +550,11 @@ namespace winrt::ShaderLab::implementation
             try
             {
                 auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
-                m_previewNodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
-                return { 200, R"({"ok":true})" };
+                uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
+                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    m_previewNodeId = nodeId;
+                    return { 200, R"({"ok":true})" };
+                });
             }
             catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
         });
@@ -534,43 +571,47 @@ namespace winrt::ShaderLab::implementation
                 uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
                 auto hlsl = std::wstring(jobj.GetNamedString(L"hlsl"));
 
-                auto* node = m_graph.FindNode(nodeId);
-                if (!node || !node->customEffect.has_value())
-                    return { 404, R"({"error":"Custom effect node not found"})" };
-
-                auto& def = node->customEffect.value();
-                def.hlslSource = hlsl;
-
-                // Convert \r -> \n for D3DCompile.
+                // Compilation itself is thread-safe. Do it here.
                 std::string hlslUtf8 = ToUtf8(hlsl);
                 for (auto& ch : hlslUtf8) { if (ch == '\r') ch = '\n'; }
 
-                std::string target = (def.shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader)
+                // Need to check node type before compiling.
+                auto* checkNode = m_graph.FindNode(nodeId);
+                if (!checkNode || !checkNode->customEffect.has_value())
+                    return { 404, R"({"error":"Custom effect node not found"})" };
+
+                std::string target = (checkNode->customEffect->shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader)
                     ? "ps_5_0" : "cs_5_0";
                 auto result = ::ShaderLab::Effects::ShaderCompiler::CompileFromString(
                     hlslUtf8, "McpCompile", "main", target);
 
                 if (!result.succeeded)
                 {
-                    def.compiledBytecode.clear();
                     auto errMsg = ToUtf8(result.ErrorMessage());
-                    // Escape for JSON.
                     std::string escaped;
                     for (char c : errMsg) { if (c == '"') escaped += "\\\""; else if (c == '\n') escaped += "\\n"; else escaped += c; }
                     return { 200, std::format("{{\"compiled\":false,\"error\":\"{}\"}}", escaped) };
                 }
 
                 auto* blob = result.bytecode.get();
-                def.compiledBytecode.resize(blob->GetBufferSize());
-                memcpy(def.compiledBytecode.data(), blob->GetBufferPointer(), blob->GetBufferSize());
-                if (def.shaderGuid == GUID{})
-                    CoCreateGuid(&def.shaderGuid);
+                std::vector<uint8_t> bytecode(blob->GetBufferSize());
+                memcpy(bytecode.data(), blob->GetBufferPointer(), blob->GetBufferSize());
 
-                node->dirty = true;
-                m_graph.MarkAllDirty();
-                m_graphEvaluator.InvalidateNode(nodeId);
-
-                return { 200, std::format("{{\"compiled\":true,\"bytecodeSize\":{}}}", def.compiledBytecode.size()) };
+                // Apply to node on UI thread.
+                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    auto* node = m_graph.FindNode(nodeId);
+                    if (!node || !node->customEffect.has_value())
+                        return { 404, R"({"error":"Node not found"})" };
+                    auto& def = node->customEffect.value();
+                    def.hlslSource = hlsl;
+                    def.compiledBytecode = std::move(bytecode);
+                    if (def.shaderGuid == GUID{})
+                        CoCreateGuid(&def.shaderGuid);
+                    node->dirty = true;
+                    m_graph.MarkAllDirty();
+                    m_graphEvaluator.InvalidateNode(nodeId);
+                    return { 200, std::format("{{\"compiled\":true,\"bytecodeSize\":{}}}", def.compiledBytecode.size()) };
+                });
             }
             catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
         });

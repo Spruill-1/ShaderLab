@@ -216,6 +216,7 @@ namespace winrt::ShaderLab::implementation
         // MCP HTTP server for AI agent integration.
         std::unique_ptr<::ShaderLab::McpHttpServer> m_mcpServer;
         void SetupMcpRoutes();
+        template<typename F> auto DispatchSync(F&& fn) -> decltype(fn());
 
         // Column splitter drag state.
         bool m_isDraggingSplitter{ false };
