@@ -121,6 +121,49 @@ namespace winrt::ShaderLab::implementation
 
         SaveImageButton().Click({ this, &MainWindow::OnSaveImageClicked });
         EffectDesignerButton().Click([this](auto&&, auto&&) { OpenEffectDesigner(); });
+
+        // MCP server toggle.
+        McpServerToggle().Click([this](auto&&, auto&&)
+        {
+            bool checked = McpServerToggle().IsChecked().GetBoolean();
+            if (checked)
+            {
+                if (!m_mcpServer)
+                    SetupMcpRoutes();
+                if (m_mcpServer && !m_mcpServer->IsRunning())
+                    m_mcpServer->Start(47808);
+                McpServerToggle().Content(winrt::box_value(L"MCP Server :47808"));
+                McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
+            }
+            else
+            {
+                if (m_mcpServer)
+                    m_mcpServer->Stop();
+                McpServerToggle().Content(winrt::box_value(L"MCP Server"));
+                McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
+            }
+        });
+
+        McpExportConfigButton().Click([this](auto&&, auto&&)
+        {
+            // Copy MCP config JSON to clipboard.
+            namespace DP = winrt::Windows::ApplicationModel::DataTransfer;
+            auto pkg = DP::DataPackage();
+            std::wstring bridgePath = L"<path-to>/mcp-bridge/dist/index.js";
+            std::wstring config = std::format(
+                L"{{\n"
+                L"  \"mcpServers\": {{\n"
+                L"    \"shaderlab\": {{\n"
+                L"      \"command\": \"node\",\n"
+                L"      \"args\": [\"{}\"],\n"
+                L"      \"env\": {{ \"SHADERLAB_PORT\": \"47808\" }}\n"
+                L"    }}\n"
+                L"  }}\n"
+                L"}}", bridgePath);
+            pkg.SetText(config);
+            DP::Clipboard::SetContent(pkg);
+            PipelineFormatText().Text(L"MCP config copied to clipboard");
+        });
     }
 
     MainWindow::~MainWindow()
@@ -215,10 +258,8 @@ namespace winrt::ShaderLab::implementation
         InitializeRendering();
         RegisterCustomEffects();
 
-        // Start MCP HTTP server for AI agent integration.
+        // Pre-setup MCP routes (server starts when user toggles the button).
         SetupMcpRoutes();
-        if (m_mcpServer)
-            m_mcpServer->Start(47808);
 
         UpdateStatusBar();
 

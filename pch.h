@@ -31,6 +31,9 @@
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.Storage.Pickers.h>
 
+// Clipboard
+#include <winrt/Windows.ApplicationModel.DataTransfer.h>
+
 // Input (PointerPoint)
 #include <winrt/Microsoft.UI.Input.h>
 #include <winrt/Microsoft.UI.h>

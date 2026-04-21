@@ -41,6 +41,9 @@
                 <Button x:Name="SaveImageButton" Content="Save Image" />
                 <AppBarSeparator />
                 <Button x:Name="EffectDesignerButton" Content="Effect Designer" />
+                <AppBarSeparator />
+                <ToggleButton x:Name="McpServerToggle" Content="MCP Server" IsChecked="False" />
+                <Button x:Name="McpExportConfigButton" Content="Export MCP Config" Visibility="Collapsed" />
             </StackPanel>
         </Grid>
 
