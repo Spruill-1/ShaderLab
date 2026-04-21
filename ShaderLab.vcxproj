@@ -123,6 +123,7 @@
     <ClInclude Include="Effects\ImageLoader.h" />
     <ClInclude Include="Effects\ShaderCompiler.h" />
     <ClInclude Include="Effects\SourceNodeFactory.h" />
+    <ClInclude Include="ShaderLab\McpHttpServer.h" />
     <ClInclude Include="Graph\EffectEdge.h" />
     <ClInclude Include="Graph\EffectGraph.h" />
     <ClInclude Include="Graph\EffectNode.h" />
@@ -164,6 +165,9 @@
     <ClCompile Include="Effects\ImageLoader.cpp" />
     <ClCompile Include="Effects\ShaderCompiler.cpp" />
     <ClCompile Include="Effects\SourceNodeFactory.cpp" />
+    <ClCompile Include="ShaderLab\McpHttpServer.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="Graph\EffectGraph.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
