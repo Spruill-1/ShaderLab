@@ -47,6 +47,7 @@ namespace ShaderLab::Effects
     }
 
     thread_local CustomComputeShaderEffect* CustomComputeShaderEffect::s_lastCreated = nullptr;
+    thread_local UINT32 CustomComputeShaderEffect::s_pendingInputCount = 0;
 
     HRESULT __stdcall CustomComputeShaderEffect::CreateFactory(IUnknown** effect)
     {
@@ -56,7 +57,11 @@ namespace ShaderLab::Effects
         return *effect ? S_OK : E_OUTOFMEMORY;
     }
 
-    CustomComputeShaderEffect::CustomComputeShaderEffect() = default;
+    CustomComputeShaderEffect::CustomComputeShaderEffect()
+    {
+        if (s_pendingInputCount > 0)
+            m_inputCount = s_pendingInputCount;
+    }
 
     // -----------------------------------------------------------------------
     // IUnknown
@@ -327,6 +332,16 @@ namespace ShaderLab::Effects
     {
         m_constantBuffer.assign(data, data + dataSize);
         m_cbDirty = true;
+    }
+
+    HRESULT CustomComputeShaderEffect::ForceUploadConstantBuffer()
+    {
+        if (!m_computeInfo || m_constantBuffer.empty())
+            return E_FAIL;
+        m_cbDirty = false;
+        return m_computeInfo->SetComputeShaderConstantBuffer(
+            m_constantBuffer.data(),
+            static_cast<UINT32>(m_constantBuffer.size()));
     }
 
     void CustomComputeShaderEffect::PackConstantBuffer(

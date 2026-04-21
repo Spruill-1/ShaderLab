@@ -99,6 +99,8 @@ namespace ShaderLab::Rendering
                         {
                             if (node->type == NodeType::PixelShader && implIt->second.pixelImpl)
                                 implIt->second.pixelImpl->ForceUploadConstantBuffer();
+                            else if (node->type == NodeType::ComputeShader && implIt->second.computeImpl)
+                                implIt->second.computeImpl->ForceUploadConstantBuffer();
                         }
 
                         // Force D2D to re-render by toggling input 0.
@@ -241,13 +243,15 @@ namespace ShaderLab::Rendering
             UINT32 ic = static_cast<UINT32>(node.customEffect->inputNames.size());
             if (node.type == NodeType::PixelShader)
                 Effects::CustomPixelShaderEffect::s_pendingInputCount = ic;
-            // TODO: same for compute
+            else if (node.type == NodeType::ComputeShader)
+                Effects::CustomComputeShaderEffect::s_pendingInputCount = ic;
         }
 
         HRESULT hr = dc->CreateEffect(clsid, effect.put());
 
         // Clear pending counts.
         Effects::CustomPixelShaderEffect::s_pendingInputCount = 0;
+        Effects::CustomComputeShaderEffect::s_pendingInputCount = 0;
 
         if (FAILED(hr))
         {

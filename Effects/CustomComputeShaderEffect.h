@@ -53,6 +53,7 @@ namespace ShaderLab::Effects
         // D2D creation callback (invoked by CreateEffect).
         static HRESULT __stdcall CreateFactory(IUnknown** effect);
         static thread_local CustomComputeShaderEffect* s_lastCreated;
+        static thread_local UINT32 s_pendingInputCount;
 
         // ---- IUnknown ----
         IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override;
@@ -115,6 +116,9 @@ namespace ShaderLab::Effects
 
         // Set raw constant buffer data (will be uploaded on next PrepareForRender).
         void SetConstantBufferData(const BYTE* data, UINT32 dataSize);
+
+        // Force-upload the constant buffer directly to the GPU.
+        HRESULT ForceUploadConstantBuffer();
 
         // Pack PropertyValue map into the constant buffer using reflection info.
         void PackConstantBuffer(
