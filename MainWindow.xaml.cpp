@@ -1206,7 +1206,37 @@ namespace winrt::ShaderLab::implementation
         if (!traceNode.pinName.empty())
             labelText = L"[" + traceNode.pinName + L"] " + labelText;
 
-        auto valuesText = L"\n" + FormatPixelValues(traceNode.pixel, m_traceUnit);
+        // For analysis nodes: show field values instead of pixel values.
+        std::wstring valuesText;
+        if (traceNode.hasAnalysisOutput && !traceNode.analysisFields.empty())
+        {
+            valuesText = L"\n";
+            for (const auto& fv : traceNode.analysisFields)
+            {
+                valuesText += fv.name + L": ";
+                if (!::ShaderLab::Graph::AnalysisFieldIsArray(fv.type))
+                {
+                    uint32_t cc = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                    for (uint32_t c = 0; c < cc; ++c)
+                    {
+                        if (c > 0) valuesText += L"  ";
+                        valuesText += std::format(L"{:.4f}", fv.components[c]);
+                    }
+                }
+                else
+                {
+                    uint32_t stride = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                    uint32_t count = stride > 0 ? static_cast<uint32_t>(fv.arrayData.size()) / stride : 0;
+                    valuesText += std::format(L"[{} elements]", count);
+                }
+                valuesText += L"\n";
+            }
+        }
+        else
+        {
+            valuesText = L"\n" + FormatPixelValues(traceNode.pixel, m_traceUnit);
+        }
+
         label.Text(labelText + valuesText);
         label.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Cascadia Mono, Consolas, Courier New"));
         label.FontSize(12);
@@ -1214,9 +1244,12 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(label, 0);
         row.Children().Append(label);
 
-        // Luminance column.
+        // Luminance column (skip for analysis nodes).
         auto lumText = winrt::Microsoft::UI::Xaml::Controls::TextBlock();
-        lumText.Text(std::format(L"{:.1f} cd/m\u00B2", traceNode.pixel.luminanceNits));
+        if (traceNode.hasAnalysisOutput)
+            lumText.Text(L"");
+        else
+            lumText.Text(std::format(L"{:.1f} cd/m\u00B2", traceNode.pixel.luminanceNits));
         lumText.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Cascadia Mono, Consolas, Courier New"));
         lumText.FontSize(12);
         lumText.Margin({ 8, 0, 0, 0 });
@@ -1365,11 +1398,43 @@ namespace winrt::ShaderLab::implementation
             std::wstring labelText = traceNode.nodeName;
             if (!traceNode.pinName.empty())
                 labelText = L"[" + traceNode.pinName + L"] " + labelText;
-            label.Text(labelText + L"\n" + FormatPixelValues(traceNode.pixel, m_traceUnit));
+
+            if (traceNode.hasAnalysisOutput && !traceNode.analysisFields.empty())
+            {
+                std::wstring valText = L"\n";
+                for (const auto& fv : traceNode.analysisFields)
+                {
+                    valText += fv.name + L": ";
+                    if (!::ShaderLab::Graph::AnalysisFieldIsArray(fv.type))
+                    {
+                        uint32_t cc = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                        for (uint32_t c = 0; c < cc; ++c)
+                        {
+                            if (c > 0) valText += L"  ";
+                            valText += std::format(L"{:.4f}", fv.components[c]);
+                        }
+                    }
+                    else
+                    {
+                        uint32_t stride = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                        uint32_t count = stride > 0 ? static_cast<uint32_t>(fv.arrayData.size()) / stride : 0;
+                        valText += std::format(L"[{} elements]", count);
+                    }
+                    valText += L"\n";
+                }
+                label.Text(labelText + valText);
+            }
+            else
+            {
+                label.Text(labelText + L"\n" + FormatPixelValues(traceNode.pixel, m_traceUnit));
+            }
 
             // Update luminance (child 1).
             auto lumText = row.Children().GetAt(1).as<winrt::Microsoft::UI::Xaml::Controls::TextBlock>();
-            lumText.Text(std::format(L"{:.1f} cd/m\u00B2", traceNode.pixel.luminanceNits));
+            if (traceNode.hasAnalysisOutput)
+                lumText.Text(L"");
+            else
+                lumText.Text(std::format(L"{:.1f} cd/m\u00B2", traceNode.pixel.luminanceNits));
 
             for (const auto& child : traceNode.inputs)
                 update(child);
@@ -2040,9 +2105,179 @@ namespace winrt::ShaderLab::implementation
                 propLabel.Text(winrt::hstring(key));
                 propLabel.FontSize(12);
                 propLabel.Margin({ 0, 6, 0, 2 });
-                panel.Children().Append(propLabel);
 
                 auto capturedKey = key;
+
+                // Check if this property has an active binding.
+                auto bindIt = node->propertyBindings.find(key);
+                bool isBound = (bindIt != node->propertyBindings.end());
+
+                // Build a row: [label] [bind/unbind button]
+                auto labelRow = Controls::StackPanel();
+                labelRow.Orientation(Controls::Orientation::Horizontal);
+                labelRow.Spacing(6);
+                labelRow.Children().Append(propLabel);
+
+                if (isBound)
+                {
+                    // Show binding info: "← NodeName.FieldName"
+                    auto& binding = bindIt->second;
+                    auto* srcNode = m_graph.FindNode(binding.sourceNodeId);
+                    std::wstring bindLabel = L"\u2190 ";  // ← arrow
+                    if (srcNode) bindLabel += srcNode->name + L".";
+                    bindLabel += binding.sourceFieldName;
+                    if (!::ShaderLab::Graph::AnalysisFieldIsArray(::ShaderLab::Graph::AnalysisFieldType::Float))
+                    {
+                        // Show component for scalar bindings.
+                        const wchar_t* comp[] = { L".x", L".y", L".z", L".w" };
+                        if (binding.sourceComponent < 4)
+                            bindLabel += comp[binding.sourceComponent];
+                    }
+
+                    auto bindInfo = Controls::TextBlock();
+                    bindInfo.Text(winrt::hstring(bindLabel));
+                    bindInfo.FontSize(11);
+                    bindInfo.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::CornflowerBlue()));
+                    labelRow.Children().Append(bindInfo);
+
+                    // Unbind button.
+                    auto unbindBtn = Controls::HyperlinkButton();
+                    unbindBtn.Content(winrt::box_value(L"Unbind"));
+                    unbindBtn.FontSize(11);
+                    unbindBtn.Padding({ 2, 0, 2, 0 });
+                    unbindBtn.Click([this, capturedId, capturedKey](auto&&, auto&&)
+                    {
+                        auto* n = m_graph.FindNode(capturedId);
+                        if (n) {
+                            n->propertyBindings.erase(capturedKey);
+                            n->dirty = true;
+                            m_graph.MarkAllDirty();
+                            UpdatePropertiesPanel();
+                        }
+                    });
+                    labelRow.Children().Append(unbindBtn);
+                }
+                else
+                {
+                    // Bind button — only show if there are analysis sources available.
+                    bool hasAnalysisSources = false;
+                    for (const auto& n : m_graph.Nodes())
+                    {
+                        if (n.id != capturedId &&
+                            n.analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Typed &&
+                            !n.analysisOutput.fields.empty())
+                        {
+                            hasAnalysisSources = true;
+                            break;
+                        }
+                    }
+
+                    if (hasAnalysisSources)
+                    {
+                        // Build a flyout with available analysis fields.
+                        auto bindBtn = Controls::DropDownButton();
+                        bindBtn.Content(winrt::box_value(L"\U0001F517"));  // 🔗
+                        bindBtn.FontSize(10);
+                        bindBtn.Padding({ 4, 0, 4, 0 });
+                        bindBtn.MinWidth(0);
+                        bindBtn.MinHeight(0);
+
+                        auto flyout = Controls::MenuFlyout();
+                        for (const auto& srcNode : m_graph.Nodes())
+                        {
+                            if (srcNode.id == capturedId) continue;
+                            if (srcNode.analysisOutput.type != ::ShaderLab::Graph::AnalysisOutputType::Typed) continue;
+                            if (srcNode.analysisOutput.fields.empty()) continue;
+
+                            auto subItem = Controls::MenuFlyoutSubItem();
+                            subItem.Text(winrt::hstring(srcNode.name));
+
+                            for (const auto& fv : srcNode.analysisOutput.fields)
+                            {
+                                uint32_t srcNodeId = srcNode.id;
+                                auto fieldName = fv.name;
+                                bool isArray = ::ShaderLab::Graph::AnalysisFieldIsArray(fv.type);
+                                uint32_t cc = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+
+                                if (isArray || cc == 1)
+                                {
+                                    // Single item: bind directly.
+                                    auto item = Controls::MenuFlyoutItem();
+                                    item.Text(winrt::hstring(fieldName));
+                                    item.Click([this, capturedId, capturedKey, srcNodeId, fieldName](auto&&, auto&&)
+                                    {
+                                        auto* n = m_graph.FindNode(capturedId);
+                                        if (!n) return;
+                                        if (m_graph.WouldCreateCycle(srcNodeId, capturedId)) return;
+                                        ::ShaderLab::Graph::PropertyBinding b;
+                                        b.sourceNodeId = srcNodeId;
+                                        b.sourceFieldName = fieldName;
+                                        b.sourceComponent = 0;
+                                        n->propertyBindings[capturedKey] = std::move(b);
+                                        n->dirty = true;
+                                        m_graph.MarkAllDirty();
+                                        UpdatePropertiesPanel();
+                                    });
+                                    subItem.Items().Append(item);
+                                }
+                                else
+                                {
+                                    // Multi-component: show sub-items for .x/.y/.z/.w + whole.
+                                    auto fieldSub = Controls::MenuFlyoutSubItem();
+                                    fieldSub.Text(winrt::hstring(fieldName));
+
+                                    // Whole vector binding.
+                                    auto wholeItem = Controls::MenuFlyoutItem();
+                                    wholeItem.Text(L"(all)");
+                                    wholeItem.Click([this, capturedId, capturedKey, srcNodeId, fieldName](auto&&, auto&&)
+                                    {
+                                        auto* n = m_graph.FindNode(capturedId);
+                                        if (!n) return;
+                                        if (m_graph.WouldCreateCycle(srcNodeId, capturedId)) return;
+                                        ::ShaderLab::Graph::PropertyBinding b;
+                                        b.sourceNodeId = srcNodeId;
+                                        b.sourceFieldName = fieldName;
+                                        b.sourceComponent = 0;
+                                        n->propertyBindings[capturedKey] = std::move(b);
+                                        n->dirty = true;
+                                        m_graph.MarkAllDirty();
+                                        UpdatePropertiesPanel();
+                                    });
+                                    fieldSub.Items().Append(wholeItem);
+
+                                    const wchar_t* compNames[] = { L".x", L".y", L".z", L".w" };
+                                    for (uint32_t c = 0; c < cc; ++c)
+                                    {
+                                        auto compItem = Controls::MenuFlyoutItem();
+                                        compItem.Text(winrt::hstring(fieldName + compNames[c]));
+                                        auto capturedComp = c;
+                                        compItem.Click([this, capturedId, capturedKey, srcNodeId, fieldName, capturedComp](auto&&, auto&&)
+                                        {
+                                            auto* n = m_graph.FindNode(capturedId);
+                                            if (!n) return;
+                                            if (m_graph.WouldCreateCycle(srcNodeId, capturedId)) return;
+                                            ::ShaderLab::Graph::PropertyBinding b;
+                                            b.sourceNodeId = srcNodeId;
+                                            b.sourceFieldName = fieldName;
+                                            b.sourceComponent = capturedComp;
+                                            n->propertyBindings[capturedKey] = std::move(b);
+                                            n->dirty = true;
+                                            m_graph.MarkAllDirty();
+                                            UpdatePropertiesPanel();
+                                        });
+                                        fieldSub.Items().Append(compItem);
+                                    }
+                                    subItem.Items().Append(fieldSub);
+                                }
+                            }
+                            flyout.Items().Append(subItem);
+                        }
+                        bindBtn.Flyout(flyout);
+                        labelRow.Children().Append(bindBtn);
+                    }
+                }
+
+                panel.Children().Append(labelRow);
 
                 // Lambda to mark the node dirty after a property change.
                 auto markDirty = [this, capturedId]()
@@ -2060,6 +2295,41 @@ namespace winrt::ShaderLab::implementation
                             [this]() { if (!m_isShuttingDown) UpdatePropertiesPanel(); });
                     }
                 };
+
+                // If bound, skip creating the editable control — show the live value instead.
+                if (isBound)
+                {
+                    auto boundVal = Controls::TextBlock();
+                    // Show the current effective value.
+                    std::wstring valStr;
+                    std::visit([&](const auto& v)
+                    {
+                        using VT = std::decay_t<decltype(v)>;
+                        if constexpr (std::is_same_v<VT, float>)
+                            valStr = std::format(L"{:.4f}", v);
+                        else if constexpr (std::is_same_v<VT, int32_t> || std::is_same_v<VT, uint32_t>)
+                            valStr = std::to_wstring(v);
+                        else if constexpr (std::is_same_v<VT, bool>)
+                            valStr = v ? L"true" : L"false";
+                        else if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float2>)
+                            valStr = std::format(L"{:.4f}, {:.4f}", v.x, v.y);
+                        else if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float3>)
+                            valStr = std::format(L"{:.4f}, {:.4f}, {:.4f}", v.x, v.y, v.z);
+                        else if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float4>)
+                            valStr = std::format(L"{:.4f}, {:.4f}, {:.4f}, {:.4f}", v.x, v.y, v.z, v.w);
+                        else if constexpr (std::is_same_v<VT, std::vector<float>>)
+                            valStr = std::format(L"[{} floats]", v.size());
+                        else
+                            valStr = L"(bound)";
+                    }, value);
+                    boundVal.Text(winrt::hstring(valStr));
+                    boundVal.FontSize(12);
+                    boundVal.FontFamily(Media::FontFamily(L"Consolas"));
+                    boundVal.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::CornflowerBlue()));
+                    boundVal.Margin({ 0, 0, 0, 4 });
+                    panel.Children().Append(boundVal);
+                    continue;  // Skip the normal control creation.
+                }
 
                 // ---- Dispatch by variant type + metadata hint ----
                 std::visit([&](const auto& v)

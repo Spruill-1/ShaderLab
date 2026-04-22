@@ -155,6 +155,14 @@ namespace ShaderLab::Controls
         result.pixel.y = pixelY;
         result.pixel.nodeId = nodeId;
 
+        // Copy analysis output for compute/analysis nodes.
+        if (node->analysisOutput.type == Graph::AnalysisOutputType::Typed &&
+            !node->analysisOutput.fields.empty())
+        {
+            result.hasAnalysisOutput = true;
+            result.analysisFields = node->analysisOutput.fields;
+        }
+
         // Recurse backward through input edges.
         auto inputEdges = graph.GetInputEdges(nodeId);
         for (const auto* edge : inputEdges)

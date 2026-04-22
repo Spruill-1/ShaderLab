@@ -15,6 +15,11 @@ namespace ShaderLab::Controls
         uint32_t    inputPin{ 0 };      // which pin of the PARENT this feeds into
         std::wstring pinName;            // e.g. "Source", "Destination", "Input 0"
         InspectedPixel pixel;            // color values read at this node
+
+        // Analysis output (for compute/analysis nodes with typed output).
+        bool hasAnalysisOutput{ false };
+        std::vector<Graph::AnalysisFieldValue> analysisFields;
+
         std::vector<PixelTraceNode> inputs;  // upstream nodes (children in the tree)
     };
 
