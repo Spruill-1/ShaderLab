@@ -270,13 +270,13 @@ namespace ShaderLab::Graph
             srcNode->customEffect->analysisOutputType != AnalysisOutputType::Typed)
             return L"Source node has no typed analysis output";
 
-        // Verify field exists on source.
-        bool fieldFound = false;
+        // Verify field exists on source and get its type.
+        const AnalysisFieldDescriptor* srcField = nullptr;
         for (const auto& fd : srcNode->customEffect->analysisFields)
         {
-            if (fd.name == sourceFieldName) { fieldFound = true; break; }
+            if (fd.name == sourceFieldName) { srcField = &fd; break; }
         }
-        if (!fieldFound) return L"Source field not found";
+        if (!srcField) return L"Source field not found";
 
         // Verify destination property exists and is bindable.
         auto propIt = destNode->properties.find(propertyName);
@@ -284,6 +284,18 @@ namespace ShaderLab::Graph
             return L"Property not found on destination node";
         if (!IsBindablePropertyType(propIt->second))
             return L"Property type is not bindable (must be float, float2, float3, float4, or float array)";
+
+        // Type compatibility check.
+        bool srcIsArray = AnalysisFieldIsArray(srcField->type);
+        bool destIsArray = std::holds_alternative<std::vector<float>>(propIt->second);
+
+        if (srcIsArray && !destIsArray)
+            return L"Cannot bind array output to scalar property";
+        if (!srcIsArray && destIsArray)
+            return L"Cannot bind scalar output to array property";
+
+        // Scalar→scalar: wider source is OK (user picks component via sourceComponent).
+        // Narrower source→wider dest: replicate (float→float4 fills x,x,x,0).
 
         // Cycle check.
         if (WouldCreateCycle(sourceNodeId, destNodeId))

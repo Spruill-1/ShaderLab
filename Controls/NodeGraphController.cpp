@@ -247,6 +247,8 @@ namespace ShaderLab::Controls
                 vit->second.bounds.bottom += ddy;
                 for (auto& p : vit->second.inputPinPositions)  { p.x += ddx; p.y += ddy; }
                 for (auto& p : vit->second.outputPinPositions) { p.x += ddx; p.y += ddy; }
+                for (auto& p : vit->second.dataInputPinPositions)  { p.x += ddx; p.y += ddy; }
+                for (auto& p : vit->second.dataOutputPinPositions) { p.x += ddx; p.y += ddy; }
             }
         }
 

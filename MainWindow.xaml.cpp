@@ -2134,22 +2134,88 @@ namespace winrt::ShaderLab::implementation
                     // Show binding info: "← NodeName.FieldName"
                     auto& binding = bindIt->second;
                     auto* srcNode = m_graph.FindNode(binding.sourceNodeId);
-                    std::wstring bindLabel = L"\u2190 ";  // ← arrow
+
+                    // Look up source field type to determine component count.
+                    uint32_t srcComponents = 1;
+                    if (srcNode && srcNode->customEffect.has_value())
+                    {
+                        for (const auto& fd : srcNode->customEffect->analysisFields)
+                        {
+                            if (fd.name == binding.sourceFieldName)
+                            {
+                                srcComponents = ::ShaderLab::Graph::AnalysisFieldComponentCount(fd.type);
+                                break;
+                            }
+                        }
+                    }
+
+                    // Determine dest component count.
+                    uint32_t destComponents = std::visit([](auto&& v) -> uint32_t
+                    {
+                        using VT = std::decay_t<decltype(v)>;
+                        if constexpr (std::is_same_v<VT, float>) return 1;
+                        else if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float2>) return 2;
+                        else if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float3>) return 3;
+                        else if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float4>) return 4;
+                        else return 1;
+                    }, value);
+
+                    std::wstring bindLabel = L"\u2190 ";
                     if (srcNode) bindLabel += srcNode->name + L".";
                     bindLabel += binding.sourceFieldName;
-                    if (!::ShaderLab::Graph::AnalysisFieldIsArray(::ShaderLab::Graph::AnalysisFieldType::Float))
-                    {
-                        // Show component for scalar bindings.
-                        const wchar_t* comp[] = { L".x", L".y", L".z", L".w" };
-                        if (binding.sourceComponent < 4)
-                            bindLabel += comp[binding.sourceComponent];
-                    }
 
                     auto bindInfo = Controls::TextBlock();
                     bindInfo.Text(winrt::hstring(bindLabel));
                     bindInfo.FontSize(11);
                     bindInfo.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::CornflowerBlue()));
                     labelRow.Children().Append(bindInfo);
+
+                    // Show component picker when source has more components than dest needs.
+                    if (srcComponents > 1 && destComponents == 1)
+                    {
+                        auto compPicker = Controls::ComboBox();
+                        compPicker.FontSize(11);
+                        compPicker.MinWidth(55);
+                        compPicker.Padding({ 4, 0, 4, 0 });
+                        const wchar_t* compLabels[] = { L".x", L".y", L".z", L".w" };
+                        for (uint32_t c = 0; c < srcComponents && c < 4; ++c)
+                            compPicker.Items().Append(winrt::box_value(winrt::hstring(compLabels[c])));
+                        compPicker.SelectedIndex(static_cast<int32_t>(
+                            (std::min)(binding.sourceComponent, srcComponents - 1)));
+                        compPicker.SelectionChanged([this, capturedId, capturedKey](auto&&, auto&&)
+                        {
+                            auto* n = m_graph.FindNode(capturedId);
+                            if (!n) return;
+                            auto bit = n->propertyBindings.find(capturedKey);
+                            if (bit == n->propertyBindings.end()) return;
+                            // Read selected index from the combo box.
+                            // We need to find this combo again... use a simpler approach:
+                            // the SelectionChanged event gives us the sender.
+                        });
+                        // Use a simpler click-based approach: rebuild panel on change.
+                        compPicker.SelectionChanged([this, capturedId, capturedKey](
+                            winrt::Windows::Foundation::IInspectable const& sender, auto&&)
+                        {
+                            auto combo = sender.as<Controls::ComboBox>();
+                            auto* n = m_graph.FindNode(capturedId);
+                            if (!n) return;
+                            auto bit = n->propertyBindings.find(capturedKey);
+                            if (bit == n->propertyBindings.end()) return;
+                            bit->second.sourceComponent = static_cast<uint32_t>(combo.SelectedIndex());
+                            n->dirty = true;
+                            m_graph.MarkAllDirty();
+                        });
+                        labelRow.Children().Append(compPicker);
+                    }
+                    else if (destComponents == 1 && srcComponents == 1)
+                    {
+                        // Both scalar — show .x
+                        auto compText = Controls::TextBlock();
+                        compText.Text(L".x");
+                        compText.FontSize(11);
+                        compText.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::CornflowerBlue()));
+                        labelRow.Children().Append(compText);
+                    }
 
                     // Unbind button.
                     auto unbindBtn = Controls::HyperlinkButton();
@@ -2160,9 +2226,8 @@ namespace winrt::ShaderLab::implementation
                     {
                         auto* n = m_graph.FindNode(capturedId);
                         if (n) {
-                            n->propertyBindings.erase(capturedKey);
-                            n->dirty = true;
-                            m_graph.MarkAllDirty();
+                            m_graph.UnbindProperty(capturedId, capturedKey);
+                            m_nodeGraphController.RebuildLayout();
                             UpdatePropertiesPanel();
                         }
                     });
