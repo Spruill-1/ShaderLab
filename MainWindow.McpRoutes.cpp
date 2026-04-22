@@ -148,14 +148,30 @@ static std::string NodeToJson(const ::ShaderLab::Graph::EffectNode& node)
         }
         json += ",\"hlslSource\":\"" + escapedHlsl + "\"";
 
-        // Analysis field names.
-        if (!def.analysisFieldNames.empty())
+        // Analysis fields.
+        if (!def.analysisFields.empty())
         {
-            json += ",\"analysisFieldNames\":[";
-            for (size_t i = 0; i < def.analysisFieldNames.size(); ++i)
+            json += ",\"analysisFields\":[";
+            for (size_t i = 0; i < def.analysisFields.size(); ++i)
             {
                 if (i > 0) json += ",";
-                json += "\"" + ToUtf8(def.analysisFieldNames[i]) + "\"";
+                const auto& fd = def.analysisFields[i];
+                std::string typeTag;
+                switch (fd.type)
+                {
+                case ::ShaderLab::Graph::AnalysisFieldType::Float:       typeTag = "float"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float2:      typeTag = "float2"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float3:      typeTag = "float3"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float4:      typeTag = "float4"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::FloatArray:   typeTag = "floatarray"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float2Array:  typeTag = "float2array"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float3Array:  typeTag = "float3array"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float4Array:  typeTag = "float4array"; break;
+                }
+                json += "{\"name\":\"" + ToUtf8(fd.name) + "\",\"type\":\"" + typeTag + "\"";
+                if (::ShaderLab::Graph::AnalysisFieldIsArray(fd.type))
+                    json += ",\"length\":" + std::to_string(fd.arrayLength);
+                json += "}";
             }
             json += "]";
         }
@@ -163,19 +179,40 @@ static std::string NodeToJson(const ::ShaderLab::Graph::EffectNode& node)
     }
 
     // Analysis output results (runtime data, not serialized in graph JSON).
-    if (node.analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::KeyValue &&
-        !node.analysisOutput.keyValues.empty())
+    if (node.analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Typed &&
+        !node.analysisOutput.fields.empty())
     {
-        json += ",\"analysisResults\":{";
+        json += ",\"analysisResults\":[";
         bool first = true;
-        for (const auto& [label, val] : node.analysisOutput.keyValues)
+        for (const auto& fv : node.analysisOutput.fields)
         {
             if (!first) json += ",";
-            json += "\"" + ToUtf8(label) + "\":[" +
-                std::format("{:.6f},{:.6f},{:.6f},{:.6f}", val[0], val[1], val[2], val[3]) + "]";
+            json += "{\"name\":\"" + ToUtf8(fv.name) + "\"";
+            if (!::ShaderLab::Graph::AnalysisFieldIsArray(fv.type))
+            {
+                uint32_t cc = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                json += ",\"value\":[";
+                for (uint32_t c = 0; c < cc; ++c)
+                {
+                    if (c > 0) json += ",";
+                    json += std::format("{:.6f}", fv.components[c]);
+                }
+                json += "]";
+            }
+            else
+            {
+                json += ",\"value\":[";
+                for (size_t i = 0; i < fv.arrayData.size(); ++i)
+                {
+                    if (i > 0) json += ",";
+                    json += std::format("{:.6f}", fv.arrayData[i]);
+                }
+                json += "]";
+            }
+            json += "}";
             first = false;
         }
-        json += "}";
+        json += "]";
     }
     else if (node.analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Histogram &&
              !node.analysisOutput.data.empty())
@@ -240,12 +277,14 @@ namespace winrt::ShaderLab::implementation
     "computeOutput": "RWTexture2D<float4> Output : register u0"
 },
 "analysisEffects": {
-    "pattern": "Compute shaders can act as analysis effects that read an entire image and produce summary statistics",
-    "outputConvention": "Write float4 results to Output[int2 fieldIndex 0] for each named field",
-    "readback": "The host reads back the first N pixels of the output to get the analysis results",
-    "fieldNames": "Define analysisFieldNames in the custom effect definition to label each output pixel",
+    "pattern": "Compute shaders can act as analysis effects that read an entire image and produce typed output fields",
+    "outputTypes": "float, float2, float3, float4, floatarray, float2array, float3array, float4array",
+    "outputConvention": "Write results to Output[int2(pixelOffset, 0)]. Each field occupies pixelCount() pixels sequentially",
+    "readback": "The host reads the output row and unpacks typed fields based on analysisFields descriptors",
+    "fieldDescriptors": "Define analysisFields array in custom effect definition with name, type, and length (for arrays)",
+    "propertyBindings": "Analysis output fields can be bound to downstream node properties via propertyBindings",
     "builtInExample": "D2D Histogram effect: processes input, exposes 256-float histogram via GetValue",
-    "customExample": "Gamut analysis: Output[0 0] = maxRGB+luminance, Output[1 0] = minRGB+count, etc."
+    "customExample": "Gamut analysis: Output[0,0].x = maxLuminance (float), Output[1,0] = gamutBounds (float4), etc."
 },
 "nodeTypes": ["Source", "BuiltInEffect", "PixelShader", "ComputeShader", "Output"],
 "outputNote": "PNG captures are tone-mapped SDR. Use /render/pixel/X/Y for true scRGB float values. Values above 1.0 are HDR.",

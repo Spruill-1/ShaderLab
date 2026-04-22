@@ -296,7 +296,7 @@ namespace winrt::ShaderLab::implementation
             int outIdx = OutputTypeSelector().SelectedIndex();
             if (outIdx == 1) def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::Histogram;
             else if (outIdx == 2) def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::FloatBuffer;
-            else if (outIdx == 3) def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::KeyValue;
+            else if (outIdx == 3) def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::Typed;
         }
 
         def.hlslSource = std::wstring(HlslEditorBox().Text());
@@ -378,14 +378,14 @@ namespace winrt::ShaderLab::implementation
                 hlsl += L"SamplerState Sampler0 : register(s0);\n";
             hlsl += L"\n";
 
-            if (def.analysisOutputType == ::ShaderLab::Graph::AnalysisOutputType::KeyValue)
+            if (def.analysisOutputType == ::ShaderLab::Graph::AnalysisOutputType::Typed)
             {
                 // Analysis compute shader: reads entire input, writes summary stats
-                // to the first N pixels of the output row.
+                // to the output row. Each field occupies a known pixel offset.
                 hlsl += L"// Analysis compute shader pattern:\n";
                 hlsl += L"// The output texture is used as a data buffer.\n";
-                hlsl += L"// Write float4 results to Output[int2(fieldIndex, 0)].\n";
-                hlsl += L"// The host reads these pixels back after evaluation.\n\n";
+                hlsl += L"// Write results to Output[int2(pixelOffset, 0)].\n";
+                hlsl += L"// The host reads typed fields back after evaluation.\n\n";
 
                 hlsl += L"cbuffer Constants : register(b0)\n{\n";
                 hlsl += L"    int2  _TileOffset;  // Auto-injected: tile origin in full image\n";
@@ -393,9 +393,29 @@ namespace winrt::ShaderLab::implementation
                     hlsl += L"    " + p.typeName + L" " + p.name + L";\n";
                 hlsl += L"};\n\n";
 
-                // Generate field index comments.
-                for (size_t i = 0; i < def.analysisFieldNames.size(); ++i)
-                    hlsl += std::format(L"// Output[int2({}, 0)] = {}\n", i, def.analysisFieldNames[i]);
+                // Generate field pixel offset comments.
+                uint32_t pixOff = 0;
+                for (const auto& fd : def.analysisFields)
+                {
+                    std::wstring typeTag;
+                    switch (fd.type)
+                    {
+                    case ::ShaderLab::Graph::AnalysisFieldType::Float:       typeTag = L"float"; break;
+                    case ::ShaderLab::Graph::AnalysisFieldType::Float2:      typeTag = L"float2"; break;
+                    case ::ShaderLab::Graph::AnalysisFieldType::Float3:      typeTag = L"float3"; break;
+                    case ::ShaderLab::Graph::AnalysisFieldType::Float4:      typeTag = L"float4"; break;
+                    case ::ShaderLab::Graph::AnalysisFieldType::FloatArray:   typeTag = L"float[]"; break;
+                    case ::ShaderLab::Graph::AnalysisFieldType::Float2Array:  typeTag = L"float2[]"; break;
+                    case ::ShaderLab::Graph::AnalysisFieldType::Float3Array:  typeTag = L"float3[]"; break;
+                    case ::ShaderLab::Graph::AnalysisFieldType::Float4Array:  typeTag = L"float4[]"; break;
+                    }
+                    hlsl += std::format(L"// pixel {}: {} {} ({})\n",
+                        pixOff, typeTag, fd.name,
+                        ::ShaderLab::Graph::AnalysisFieldIsArray(fd.type)
+                            ? std::format(L"{} pixels", fd.pixelCount())
+                            : L"1 pixel");
+                    pixOff += fd.pixelCount();
+                }
                 hlsl += L"\n";
 
                 hlsl += std::format(L"[numthreads({}, {}, {})]\n",
@@ -416,15 +436,17 @@ namespace winrt::ShaderLab::implementation
                 }
 
                 hlsl += L"    // TODO: Accumulate statistics across pixels.\n";
-                hlsl += L"    // Note: Compute shaders cannot easily reduce across threads without\n";
-                hlsl += L"    // shared memory atomics. For now, this scaffold processes per-pixel.\n";
                 hlsl += L"    // For whole-image statistics, use groupshared memory and atomic ops,\n";
                 hlsl += L"    // or output per-pixel data and reduce on the CPU.\n\n";
 
                 hlsl += L"    // Write results to known pixel locations.\n";
-                for (size_t i = 0; i < def.analysisFieldNames.size(); ++i)
-                    hlsl += std::format(L"    // Output[int2({}, 0)] = ...; // {}\n", i, def.analysisFieldNames[i]);
-                if (def.analysisFieldNames.empty())
+                pixOff = 0;
+                for (const auto& fd : def.analysisFields)
+                {
+                    hlsl += std::format(L"    // Output[int2({}, 0)] = ...; // {}\n", pixOff, fd.name);
+                    pixOff += fd.pixelCount();
+                }
+                if (def.analysisFields.empty())
                     hlsl += L"    // Output[int2(0, 0)] = float4(result, 0, 0, 0);\n";
 
                 hlsl += L"}\n";

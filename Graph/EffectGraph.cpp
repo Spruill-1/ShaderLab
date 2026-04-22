@@ -381,6 +381,21 @@ namespace ShaderLab::Graph
             }
             obj.SetNamedValue(L"properties", props);
 
+            // Property bindings.
+            if (!node.propertyBindings.empty())
+            {
+                WDJ::JsonObject bindingsObj;
+                for (const auto& [propName, binding] : node.propertyBindings)
+                {
+                    WDJ::JsonObject bobj;
+                    bobj.SetNamedValue(L"sourceNodeId", WDJ::JsonValue::CreateNumberValue(binding.sourceNodeId));
+                    bobj.SetNamedValue(L"sourceFieldName", WDJ::JsonValue::CreateStringValue(binding.sourceFieldName));
+                    bobj.SetNamedValue(L"sourceComponent", WDJ::JsonValue::CreateNumberValue(binding.sourceComponent));
+                    bindingsObj.SetNamedValue(propName, bobj);
+                }
+                obj.SetNamedValue(L"propertyBindings", bindingsObj);
+            }
+
             // Effect CLSID (stored as string for portability)
             if (node.effectClsid.has_value())
             {
@@ -451,13 +466,33 @@ namespace ShaderLab::Graph
                     static_cast<double>(def.analysisOutputType)));
                 ced.SetNamedValue(L"analysisOutputSize", WDJ::JsonValue::CreateNumberValue(def.analysisOutputSize));
 
-                // Serialize analysis field names.
-                if (!def.analysisFieldNames.empty())
+                // Serialize typed analysis fields.
+                if (!def.analysisFields.empty())
                 {
                     WDJ::JsonArray fields;
-                    for (const auto& name : def.analysisFieldNames)
-                        fields.Append(WDJ::JsonValue::CreateStringValue(name));
-                    ced.SetNamedValue(L"analysisFieldNames", fields);
+                    for (const auto& fd : def.analysisFields)
+                    {
+                        WDJ::JsonObject fobj;
+                        fobj.SetNamedValue(L"name", WDJ::JsonValue::CreateStringValue(fd.name));
+                        // Serialize type as string tag.
+                        std::wstring typeTag;
+                        switch (fd.type)
+                        {
+                        case AnalysisFieldType::Float:       typeTag = L"float"; break;
+                        case AnalysisFieldType::Float2:      typeTag = L"float2"; break;
+                        case AnalysisFieldType::Float3:      typeTag = L"float3"; break;
+                        case AnalysisFieldType::Float4:      typeTag = L"float4"; break;
+                        case AnalysisFieldType::FloatArray:   typeTag = L"floatarray"; break;
+                        case AnalysisFieldType::Float2Array:  typeTag = L"float2array"; break;
+                        case AnalysisFieldType::Float3Array:  typeTag = L"float3array"; break;
+                        case AnalysisFieldType::Float4Array:  typeTag = L"float4array"; break;
+                        }
+                        fobj.SetNamedValue(L"type", WDJ::JsonValue::CreateStringValue(typeTag));
+                        if (AnalysisFieldIsArray(fd.type))
+                            fobj.SetNamedValue(L"length", WDJ::JsonValue::CreateNumberValue(fd.arrayLength));
+                        fields.Append(fobj);
+                    }
+                    ced.SetNamedValue(L"analysisFields", fields);
                 }
 
                 obj.SetNamedValue(L"customEffect", ced);
@@ -485,6 +520,22 @@ namespace ShaderLab::Graph
                 auto propObj = props.GetObjectAt(i);
                 auto key = std::wstring(propObj.GetNamedString(L"name"));
                 node.properties[key] = PropertyValueFromJson(propObj);
+            }
+
+            // Property bindings.
+            if (obj.HasKey(L"propertyBindings"))
+            {
+                auto bindingsObj = obj.GetNamedObject(L"propertyBindings");
+                for (const auto& pair : bindingsObj)
+                {
+                    auto propName = std::wstring(pair.Key());
+                    auto bobj = pair.Value().GetObject();
+                    PropertyBinding binding;
+                    binding.sourceNodeId = static_cast<uint32_t>(bobj.GetNamedNumber(L"sourceNodeId"));
+                    binding.sourceFieldName = std::wstring(bobj.GetNamedString(L"sourceFieldName"));
+                    binding.sourceComponent = static_cast<uint32_t>(bobj.GetNamedNumber(L"sourceComponent"));
+                    node.propertyBindings[propName] = std::move(binding);
+                }
             }
 
             if (obj.HasKey(L"effectClsid"))
@@ -558,12 +609,40 @@ namespace ShaderLab::Graph
                     static_cast<int>(ced.GetNamedNumber(L"analysisOutputType")));
                 def.analysisOutputSize = static_cast<uint32_t>(ced.GetNamedNumber(L"analysisOutputSize"));
 
-                // Deserialize analysis field names.
-                if (ced.HasKey(L"analysisFieldNames"))
+                // Deserialize typed analysis fields (new format).
+                if (ced.HasKey(L"analysisFields"))
+                {
+                    auto fields = ced.GetNamedArray(L"analysisFields");
+                    for (uint32_t fi = 0; fi < fields.Size(); ++fi)
+                    {
+                        auto fobj = fields.GetObjectAt(fi);
+                        AnalysisFieldDescriptor fd;
+                        fd.name = std::wstring(fobj.GetNamedString(L"name"));
+                        auto typeTag = std::wstring(fobj.GetNamedString(L"type"));
+                        if (typeTag == L"float")        fd.type = AnalysisFieldType::Float;
+                        else if (typeTag == L"float2")   fd.type = AnalysisFieldType::Float2;
+                        else if (typeTag == L"float3")   fd.type = AnalysisFieldType::Float3;
+                        else if (typeTag == L"float4")   fd.type = AnalysisFieldType::Float4;
+                        else if (typeTag == L"floatarray")  fd.type = AnalysisFieldType::FloatArray;
+                        else if (typeTag == L"float2array") fd.type = AnalysisFieldType::Float2Array;
+                        else if (typeTag == L"float3array") fd.type = AnalysisFieldType::Float3Array;
+                        else if (typeTag == L"float4array") fd.type = AnalysisFieldType::Float4Array;
+                        if (fobj.HasKey(L"length"))
+                            fd.arrayLength = static_cast<uint32_t>(fobj.GetNamedNumber(L"length"));
+                        def.analysisFields.push_back(std::move(fd));
+                    }
+                }
+                // Legacy: convert old analysisFieldNames (all float4) to typed fields.
+                else if (ced.HasKey(L"analysisFieldNames"))
                 {
                     auto fields = ced.GetNamedArray(L"analysisFieldNames");
                     for (uint32_t fi = 0; fi < fields.Size(); ++fi)
-                        def.analysisFieldNames.push_back(std::wstring(fields.GetStringAt(fi)));
+                    {
+                        AnalysisFieldDescriptor fd;
+                        fd.name = std::wstring(fields.GetStringAt(fi));
+                        fd.type = AnalysisFieldType::Float4;
+                        def.analysisFields.push_back(std::move(fd));
+                    }
                 }
 
                 // Recompile from source on load.

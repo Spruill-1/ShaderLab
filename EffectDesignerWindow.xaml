@@ -76,7 +76,7 @@
                 <x:String>None</x:String>
                 <x:String>Histogram</x:String>
                 <x:String>Float Buffer</x:String>
-                <x:String>Key-Value Analysis</x:String>
+                <x:String>Typed Analysis</x:String>
             </ComboBox>
         </StackPanel>
 

@@ -122,8 +122,8 @@ namespace ShaderLab::Rendering
                     node->cachedOutput = output.get();
 
                     // Read back analysis data from custom compute effects.
-                    if (node->customEffect->analysisOutputType == AnalysisOutputType::KeyValue &&
-                        !node->customEffect->analysisFieldNames.empty() &&
+                    if (node->customEffect->analysisOutputType == AnalysisOutputType::Typed &&
+                        !node->customEffect->analysisFields.empty() &&
                         node->cachedOutput)
                     {
                         ReadCustomAnalysisOutput(dc, *node);
@@ -609,8 +609,10 @@ namespace ShaderLab::Rendering
     {
         if (!node.cachedOutput || !node.customEffect.has_value()) return;
         auto& def = node.customEffect.value();
-        uint32_t fieldCount = static_cast<uint32_t>(def.analysisFieldNames.size());
-        if (fieldCount == 0) return;
+        if (def.analysisFields.empty()) return;
+
+        uint32_t totalPixels = def.totalAnalysisPixels();
+        if (totalPixels == 0) return;
 
         // Force D2D to evaluate the compute effect by drawing its output.
         winrt::com_ptr<ID2D1Image> prevTarget;
@@ -642,14 +644,13 @@ namespace ShaderLab::Rendering
         dc->EndDraw();
         dc->SetTarget(prevTarget.get());
 
-        // Create a CPU-readable bitmap to read back the analysis pixels.
+        // Create a CPU-readable bitmap to read back analysis pixels.
         winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
         D2D1_BITMAP_PROPERTIES1 cpuProps = {};
         cpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
         cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
 
-        // Only need enough pixels for the field count.
-        uint32_t readW = (std::max)(fieldCount, 1u);
+        uint32_t readW = (std::max)(totalPixels, 1u);
         HRESULT hr = dc->CreateBitmap(D2D1::SizeU(readW, 1), nullptr, 0, cpuProps, cpuBitmap.put());
         if (FAILED(hr)) return;
 
@@ -662,21 +663,52 @@ namespace ShaderLab::Rendering
         hr = cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped);
         if (FAILED(hr)) return;
 
-        // Read float4 values from the first row.
-        node.analysisOutput.type = AnalysisOutputType::KeyValue;
-        node.analysisOutput.keyValues.clear();
-        node.analysisOutput.label = L"Analysis";
+        // Unpack typed fields from the pixel row.
+        node.analysisOutput.type = AnalysisOutputType::Typed;
+        node.analysisOutput.fields.clear();
 
         const float* pixels = reinterpret_cast<const float*>(mapped.bits);
-        for (uint32_t i = 0; i < fieldCount; ++i)
+        uint32_t pixelOffset = 0;
+
+        for (const auto& fieldDesc : def.analysisFields)
         {
-            std::array<float, 4> val = {
-                pixels[i * 4 + 0],
-                pixels[i * 4 + 1],
-                pixels[i * 4 + 2],
-                pixels[i * 4 + 3]
-            };
-            node.analysisOutput.keyValues.push_back({ def.analysisFieldNames[i], val });
+            AnalysisFieldValue fv;
+            fv.name = fieldDesc.name;
+            fv.type = fieldDesc.type;
+            uint32_t pc = fieldDesc.pixelCount();
+
+            if (!AnalysisFieldIsArray(fieldDesc.type))
+            {
+                // Scalar: read one pixel's worth of components.
+                uint32_t cc = AnalysisFieldComponentCount(fieldDesc.type);
+                for (uint32_t c = 0; c < cc && c < 4; ++c)
+                    fv.components[c] = pixels[(pixelOffset) * 4 + c];
+            }
+            else if (fieldDesc.type == AnalysisFieldType::FloatArray)
+            {
+                // FloatArray: 4 floats packed per pixel.
+                fv.arrayData.resize(fieldDesc.arrayLength, 0.0f);
+                for (uint32_t i = 0; i < fieldDesc.arrayLength; ++i)
+                {
+                    uint32_t pix = pixelOffset + i / 4;
+                    uint32_t comp = i % 4;
+                    fv.arrayData[i] = pixels[pix * 4 + comp];
+                }
+            }
+            else
+            {
+                // Float2Array, Float3Array, Float4Array: 1 pixel per element.
+                uint32_t cc = AnalysisFieldComponentCount(fieldDesc.type);
+                fv.arrayData.resize(fieldDesc.arrayLength * cc, 0.0f);
+                for (uint32_t i = 0; i < fieldDesc.arrayLength; ++i)
+                {
+                    for (uint32_t c = 0; c < cc; ++c)
+                        fv.arrayData[i * cc + c] = pixels[(pixelOffset + i) * 4 + c];
+                }
+            }
+
+            pixelOffset += pc;
+            node.analysisOutput.fields.push_back(std::move(fv));
         }
 
         cpuBitmap->Unmap();

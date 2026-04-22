@@ -37,7 +37,86 @@ namespace ShaderLab::Graph
         None,
         Histogram,      // Built-in D2D histogram (256 float bins).
         FloatBuffer,    // Custom compute: array of float4 values read from output pixels.
-        KeyValue,       // Custom compute: named float values (e.g., maxLuminance, gamutCoverage).
+        Typed,          // Custom compute: typed named fields (replaces old KeyValue).
+    };
+
+    // Type of a single analysis output field.
+    enum class AnalysisFieldType
+    {
+        Float,          // 1 component, 1 pixel
+        Float2,         // 2 components, 1 pixel
+        Float3,         // 3 components, 1 pixel
+        Float4,         // 4 components, 1 pixel
+        FloatArray,     // N floats packed 4-per-pixel (ceil(N/4) pixels)
+        Float2Array,    // N×float2, 1 pixel each (.xy used)
+        Float3Array,    // N×float3, 1 pixel each (.xyz used)
+        Float4Array,    // N×float4, 1 pixel each
+    };
+
+    // Returns the number of scalar components per element for a field type.
+    inline uint32_t AnalysisFieldComponentCount(AnalysisFieldType type)
+    {
+        switch (type)
+        {
+        case AnalysisFieldType::Float:       return 1;
+        case AnalysisFieldType::Float2:      return 2;
+        case AnalysisFieldType::Float3:      return 3;
+        case AnalysisFieldType::Float4:      return 4;
+        case AnalysisFieldType::FloatArray:  return 1;
+        case AnalysisFieldType::Float2Array: return 2;
+        case AnalysisFieldType::Float3Array: return 3;
+        case AnalysisFieldType::Float4Array: return 4;
+        default: return 4;
+        }
+    }
+
+    // Returns true if the field type is an array type.
+    inline bool AnalysisFieldIsArray(AnalysisFieldType type)
+    {
+        return type >= AnalysisFieldType::FloatArray;
+    }
+
+    // Returns the number of UAV pixels consumed by one field.
+    inline uint32_t AnalysisFieldPixelCount(AnalysisFieldType type, uint32_t arrayLength)
+    {
+        switch (type)
+        {
+        case AnalysisFieldType::Float:
+        case AnalysisFieldType::Float2:
+        case AnalysisFieldType::Float3:
+        case AnalysisFieldType::Float4:
+            return 1;
+        case AnalysisFieldType::FloatArray:
+            return (arrayLength + 3) / 4;  // pack 4 floats per pixel
+        case AnalysisFieldType::Float2Array:
+        case AnalysisFieldType::Float3Array:
+        case AnalysisFieldType::Float4Array:
+            return arrayLength;  // 1 pixel per element
+        default: return 1;
+        }
+    }
+
+    // Describes one output field of an analysis compute shader.
+    struct AnalysisFieldDescriptor
+    {
+        std::wstring name;
+        AnalysisFieldType type{ AnalysisFieldType::Float4 };
+        uint32_t arrayLength{ 0 };  // only for array types; max 4096 elements
+
+        uint32_t pixelCount() const { return AnalysisFieldPixelCount(type, arrayLength); }
+    };
+
+    // Runtime value of a single analysis output field (read back from GPU).
+    struct AnalysisFieldValue
+    {
+        std::wstring name;
+        AnalysisFieldType type{ AnalysisFieldType::Float4 };
+
+        // For scalar types (Float/Float2/Float3/Float4).
+        std::array<float, 4> components{ 0, 0, 0, 0 };
+
+        // For array types. Flat storage, stride = AnalysisFieldComponentCount(type).
+        std::vector<float> arrayData;
     };
 
     // Complete definition of a custom effect authored in the Effect Designer.
@@ -58,10 +137,10 @@ namespace ShaderLab::Graph
         AnalysisOutputType analysisOutputType{ AnalysisOutputType::None };
         uint32_t analysisOutputSize{ 256 };
 
-        // Labels for analysis output pixels. Each entry names the float4 at that pixel index.
-        // E.g., ["Max RGB + Luminance", "Min RGB + Count", "Gamut Coverage"]
-        // The compute shader writes to Output[int2(i, 0)] for each field.
-        std::vector<std::wstring> analysisFieldNames;
+        // Typed analysis output field descriptors.
+        // The compute shader writes fields sequentially to Output row 0.
+        // Each field's pixel offset = sum of prior fields' pixelCount().
+        std::vector<AnalysisFieldDescriptor> analysisFields;
 
         // Runtime: compiled bytecode (not serialized — recompiled from hlslSource on load).
         std::vector<uint8_t> compiledBytecode;
@@ -70,6 +149,15 @@ namespace ShaderLab::Graph
         GUID shaderGuid{};
 
         bool isCompiled() const { return !compiledBytecode.empty(); }
+
+        // Total UAV pixels needed for all analysis fields.
+        uint32_t totalAnalysisPixels() const
+        {
+            uint32_t total = 0;
+            for (const auto& f : analysisFields)
+                total += f.pixelCount();
+            return total;
+        }
     };
 
     // Stores non-image output data from analysis/compute effects.
@@ -77,13 +165,27 @@ namespace ShaderLab::Graph
     struct AnalysisOutput
     {
         AnalysisOutputType type{ AnalysisOutputType::None };
+
+        // Typed field values (for AnalysisOutputType::Typed).
+        std::vector<AnalysisFieldValue> fields;
+
+        // Legacy/histogram support.
         std::vector<float> data;         // Bin values, buffer contents, etc.
         std::wstring       label;        // Human-readable description.
         uint32_t           channelIndex{ 0 }; // For per-channel data (R=0, G=1, B=2, A=3).
+    };
 
-        // Key-value results from custom analysis compute shaders.
-        // Each entry maps a label to a float4 read from a specific output pixel.
-        std::vector<std::pair<std::wstring, std::array<float, 4>>> keyValues;
+    // Binds a downstream node's property to an upstream analysis output field.
+    // Evaluated every frame: source field value overrides the authored property.
+    struct PropertyBinding
+    {
+        uint32_t sourceNodeId{ 0 };
+        std::wstring sourceFieldName;    // stable name from AnalysisFieldDescriptor
+        uint32_t sourceComponent{ 0 };   // 0-3: which .xyzw for scalar dest properties
+        // Binding rules:
+        //   float dest         ← scalar source, picks sourceComponent
+        //   float2/3/4 dest    ← matching or larger source, takes .xy/.xyz/.xyzw
+        //   vector<float> dest ← array source, takes entire arrayData
     };
 
     // A node in the effect graph DAG.
@@ -99,7 +201,12 @@ namespace ShaderLab::Graph
         winrt::Windows::Foundation::Numerics::float2 position{ 0.0f, 0.0f };
 
         // Effect-specific properties (e.g., Gaussian blur StdDeviation, Flood Color).
+        // These are the "authored" defaults — never mutated by bindings at runtime.
         std::map<std::wstring, PropertyValue> properties;
+
+        // Property bindings: property name → upstream analysis field source.
+        // During evaluation, bound values override authored properties.
+        std::map<std::wstring, PropertyBinding> propertyBindings;
 
         // Pin descriptors — filled when the node type is known.
         std::vector<PinDescriptor> inputPins;

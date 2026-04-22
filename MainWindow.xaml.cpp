@@ -2635,18 +2635,17 @@ namespace winrt::ShaderLab::implementation
             panel.Children().Append(canvas);
         }
 
-        // ---- KeyValue analysis output ----
-        if (node->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::KeyValue &&
-            !node->analysisOutput.keyValues.empty())
+        // ---- Typed analysis output ----
+        if (node->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Typed &&
+            !node->analysisOutput.fields.empty())
         {
             auto analysisHeader = Controls::TextBlock();
-            analysisHeader.Text(winrt::hstring(node->analysisOutput.label.empty()
-                ? L"Analysis Results" : node->analysisOutput.label));
+            analysisHeader.Text(L"Analysis Results");
             analysisHeader.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
             analysisHeader.Margin({ 0, 8, 0, 4 });
             panel.Children().Append(analysisHeader);
 
-            for (const auto& [label, val] : node->analysisOutput.keyValues)
+            for (const auto& fv : node->analysisOutput.fields)
             {
                 auto row = Controls::StackPanel();
                 row.Orientation(Controls::Orientation::Horizontal);
@@ -2654,15 +2653,30 @@ namespace winrt::ShaderLab::implementation
                 row.Margin({ 0, 2, 0, 2 });
 
                 auto labelText = Controls::TextBlock();
-                labelText.Text(winrt::hstring(label));
+                labelText.Text(winrt::hstring(fv.name));
                 labelText.FontSize(12);
                 labelText.Width(140);
                 labelText.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::Gray()));
                 row.Children().Append(labelText);
 
                 auto valueText = Controls::TextBlock();
-                valueText.Text(winrt::hstring(std::format(L"{:.4f}  {:.4f}  {:.4f}  {:.4f}",
-                    val[0], val[1], val[2], val[3])));
+                std::wstring valStr;
+                if (!::ShaderLab::Graph::AnalysisFieldIsArray(fv.type))
+                {
+                    uint32_t cc = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                    for (uint32_t c = 0; c < cc; ++c)
+                    {
+                        if (c > 0) valStr += L"  ";
+                        valStr += std::format(L"{:.4f}", fv.components[c]);
+                    }
+                }
+                else
+                {
+                    uint32_t stride = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                    uint32_t count = static_cast<uint32_t>(fv.arrayData.size()) / (std::max)(stride, 1u);
+                    valStr = std::format(L"[{} elements]", count);
+                }
+                valueText.Text(winrt::hstring(valStr));
                 valueText.FontSize(12);
                 valueText.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Consolas"));
                 valueText.IsTextSelectionEnabled(true);
