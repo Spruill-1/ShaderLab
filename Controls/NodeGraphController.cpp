@@ -77,9 +77,9 @@ namespace ShaderLab::Controls
             });
         }
 
-        // 4. Assign positions: columns left-to-right, nodes top-to-bottom.
+        // 4. Assign positions: columns left-to-right, using actual node heights.
         constexpr float colSpacing = 250.0f;
-        constexpr float rowSpacing = 120.0f;
+        constexpr float rowGap = 30.0f;  // gap between nodes
         constexpr float startX = 60.0f;
         constexpr float startY = 60.0f;
 
@@ -93,20 +93,45 @@ namespace ShaderLab::Controls
                 if (node)
                 {
                     node->position = { x, y };
-                    y += rowSpacing;
+                    // Compute actual height for spacing.
+                    auto v = ComputeNodeVisual(*node);
+                    float nodeHeight = v.bounds.bottom - v.bounds.top;
+                    y += nodeHeight + rowGap;
                 }
             }
         }
 
         // 5. Center columns vertically relative to the tallest column.
-        float maxHeight = 0;
+        // First compute actual column heights.
+        float maxColHeight = 0;
         for (int col = 0; col <= maxDepth; ++col)
-            maxHeight = (std::max)(maxHeight, static_cast<float>(columns[col].size()) * rowSpacing);
+        {
+            float colH = 0;
+            for (uint32_t id : columns[col])
+            {
+                auto* node = m_graph->FindNode(id);
+                if (node)
+                {
+                    auto v = ComputeNodeVisual(*node);
+                    colH += (v.bounds.bottom - v.bounds.top) + rowGap;
+                }
+            }
+            maxColHeight = (std::max)(maxColHeight, colH);
+        }
 
         for (int col = 0; col <= maxDepth; ++col)
         {
-            float colHeight = static_cast<float>(columns[col].size()) * rowSpacing;
-            float offset = (maxHeight - colHeight) * 0.5f;
+            float colH = 0;
+            for (uint32_t id : columns[col])
+            {
+                auto* node = m_graph->FindNode(id);
+                if (node)
+                {
+                    auto v = ComputeNodeVisual(*node);
+                    colH += (v.bounds.bottom - v.bounds.top) + rowGap;
+                }
+            }
+            float offset = (maxColHeight - colH) * 0.5f;
             for (uint32_t id : columns[col])
             {
                 auto* node = m_graph->FindNode(id);

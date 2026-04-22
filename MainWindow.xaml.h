@@ -203,6 +203,13 @@ namespace winrt::ShaderLab::implementation
         void OnGraphPanelPointerReleased(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnGraphPanelPointerWheel(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+
+        bool m_isGraphPanning{ false };
+        D2D1_POINT_2F m_graphPanStart{};
+        D2D1_POINT_2F m_graphPanOrigin{};
         void UpdatePropertiesPanel();
         void ShowCurveEditorDialog(uint32_t nodeId, const std::wstring& propertyKey, std::function<void()> markDirty);
         winrt::fire_and_forget BrowseImageForSourceNode(uint32_t nodeId);

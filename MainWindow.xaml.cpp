@@ -88,6 +88,7 @@ namespace winrt::ShaderLab::implementation
         NodeGraphContainer().PointerPressed({ this, &MainWindow::OnGraphPanelPointerPressed });
         NodeGraphContainer().PointerMoved({ this, &MainWindow::OnGraphPanelPointerMoved });
         NodeGraphContainer().PointerReleased({ this, &MainWindow::OnGraphPanelPointerReleased });
+        NodeGraphContainer().PointerWheelChanged({ this, &MainWindow::OnGraphPanelPointerWheel });
         NodeGraphContainer().KeyDown([this](auto&&, winrt::Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const& args)
         {
             if (args.Key() == winrt::Windows::System::VirtualKey::Delete && m_selectedNodeId != 0)
@@ -1735,12 +1736,14 @@ namespace winrt::ShaderLab::implementation
     D2D1_POINT_2F MainWindow::GraphPanelPointerToCanvas(
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
-        // Pointer position is in DIPs. Node positions are also in DIPs.
-        // Return DIP coordinates directly — the render function handles the
-        // physical pixel scaling separately.
+        // Convert pointer DIP position to canvas coordinates
+        // by inverting the pan/zoom transform.
         auto point = args.GetCurrentPoint(NodeGraphContainer());
-        return { static_cast<float>(point.Position().X),
-                 static_cast<float>(point.Position().Y) };
+        float sx = static_cast<float>(point.Position().X);
+        float sy = static_cast<float>(point.Position().Y);
+        auto pan = m_nodeGraphController.PanOffset();
+        float zoom = m_nodeGraphController.Zoom();
+        return { (sx - pan.x) / zoom, (sy - pan.y) / zoom };
     }
 
     void MainWindow::OnGraphPanelPointerPressed(
@@ -1748,6 +1751,19 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
         auto canvasPoint = GraphPanelPointerToCanvas(args);
+        auto point = args.GetCurrentPoint(NodeGraphContainer());
+
+        // Right-click or middle-click: start graph canvas panning.
+        if (point.Properties().IsRightButtonPressed() || point.Properties().IsMiddleButtonPressed())
+        {
+            m_isGraphPanning = true;
+            m_graphPanStart = { static_cast<float>(point.Position().X),
+                                static_cast<float>(point.Position().Y) };
+            m_graphPanOrigin = m_nodeGraphController.PanOffset();
+            NodeGraphContainer().CapturePointer(args.Pointer());
+            args.Handled(true);
+            return;
+        }
 
         OutputDebugStringW(std::format(L"[GraphClick] canvas=({:.1f},{:.1f}) visuals={}\n",
             canvasPoint.x, canvasPoint.y, m_nodeGraphController.SelectedNodes().size()).c_str());
@@ -1873,6 +1889,16 @@ namespace winrt::ShaderLab::implementation
         winrt::Windows::Foundation::IInspectable const& /*sender*/,
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
+        if (m_isGraphPanning)
+        {
+            auto point = args.GetCurrentPoint(NodeGraphContainer());
+            float dx = static_cast<float>(point.Position().X) - m_graphPanStart.x;
+            float dy = static_cast<float>(point.Position().Y) - m_graphPanStart.y;
+            m_nodeGraphController.SetPanOffset(m_graphPanOrigin.x + dx, m_graphPanOrigin.y + dy);
+            args.Handled(true);
+            return;
+        }
+
         auto canvasPoint = GraphPanelPointerToCanvas(args);
 
         if (m_isDraggingNode)
@@ -1891,6 +1917,14 @@ namespace winrt::ShaderLab::implementation
         winrt::Windows::Foundation::IInspectable const& /*sender*/,
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
+        if (m_isGraphPanning)
+        {
+            m_isGraphPanning = false;
+            NodeGraphContainer().ReleasePointerCapture(args.Pointer());
+            args.Handled(true);
+            return;
+        }
+
         if (m_isDraggingNode)
         {
             m_nodeGraphController.EndDragNodes();
@@ -1909,6 +1943,29 @@ namespace winrt::ShaderLab::implementation
                 PopulatePreviewNodeSelector();
             }
         }
+        args.Handled(true);
+    }
+
+    void MainWindow::OnGraphPanelPointerWheel(
+        winrt::Windows::Foundation::IInspectable const& /*sender*/,
+        winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
+    {
+        auto point = args.GetCurrentPoint(NodeGraphContainer());
+        int32_t delta = point.Properties().MouseWheelDelta();
+
+        float oldZoom = m_nodeGraphController.Zoom();
+        float factor = (delta > 0) ? 1.1f : 0.9f;
+        float newZoom = (std::clamp)(oldZoom * factor, 0.2f, 3.0f);
+
+        // Zoom toward the pointer position.
+        float px = static_cast<float>(point.Position().X);
+        float py = static_cast<float>(point.Position().Y);
+        auto pan = m_nodeGraphController.PanOffset();
+        float newPanX = px - (px - pan.x) * (newZoom / oldZoom);
+        float newPanY = py - (py - pan.y) * (newZoom / oldZoom);
+
+        m_nodeGraphController.SetZoom(newZoom);
+        m_nodeGraphController.SetPanOffset(newPanX, newPanY);
         args.Handled(true);
     }
 
