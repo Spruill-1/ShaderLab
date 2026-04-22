@@ -66,38 +66,55 @@ namespace ShaderLab
 
     void McpHttpServer::ListenerThread(uint16_t port)
     {
-        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        SOCKET sock = INVALID_SOCKET;
+
+        // Try up to 10 ports starting from the requested port.
+        for (uint16_t attempt = 0; attempt < 10; ++attempt)
+        {
+            uint16_t tryPort = port + attempt;
+            sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (sock == INVALID_SOCKET)
+            {
+                OutputDebugStringW(L"[MCP] socket() failed\n");
+                return;
+            }
+
+            int yes = 1;
+            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
+
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(tryPort);
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+            if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR)
+            {
+                OutputDebugStringW(std::format(L"[MCP] bind() failed on port {}, trying next\n", tryPort).c_str());
+                closesocket(sock);
+                sock = INVALID_SOCKET;
+                continue;
+            }
+
+            if (listen(sock, SOMAXCONN) == SOCKET_ERROR)
+            {
+                OutputDebugStringW(std::format(L"[MCP] listen() failed on port {}\n", tryPort).c_str());
+                closesocket(sock);
+                sock = INVALID_SOCKET;
+                continue;
+            }
+
+            // Success!
+            m_port = tryPort;
+            OutputDebugStringW(std::format(L"[MCP] Listening on port {}\n", tryPort).c_str());
+            break;
+        }
+
         if (sock == INVALID_SOCKET)
         {
-            OutputDebugStringW(L"[MCP] socket() failed\n");
+            OutputDebugStringW(L"[MCP] Failed to bind to any port\n");
             return;
         }
         m_listenSock = static_cast<SOCKET_T>(sock);
-
-        // Allow port reuse for quick restart.
-        int yes = 1;
-        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
-
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // localhost only
-
-        if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR)
-        {
-            OutputDebugStringW(std::format(L"[MCP] bind() failed on port {}\n", port).c_str());
-            closesocket(sock);
-            m_listenSock = ~0ULL;
-            return;
-        }
-
-        if (listen(sock, SOMAXCONN) == SOCKET_ERROR)
-        {
-            OutputDebugStringW(L"[MCP] listen() failed\n");
-            closesocket(sock);
-            m_listenSock = ~0ULL;
-            return;
-        }
 
         OutputDebugStringW(std::format(L"[MCP] Listening on http://localhost:{}/\n", port).c_str());
         m_running.store(true);

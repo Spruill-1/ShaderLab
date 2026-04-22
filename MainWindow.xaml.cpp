@@ -132,7 +132,11 @@ namespace winrt::ShaderLab::implementation
                     SetupMcpRoutes();
                 if (m_mcpServer && !m_mcpServer->IsRunning())
                     m_mcpServer->Start(47808);
-                McpServerToggle().Content(winrt::box_value(L"MCP Server :47808"));
+                // Wait briefly for the listener thread to bind and set the port.
+                Sleep(100);
+                uint16_t actualPort = m_mcpServer ? m_mcpServer->Port() : 47808;
+                McpServerToggle().Content(winrt::box_value(
+                    std::format(L"MCP Server :{}", actualPort)));
                 McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
             }
             else
@@ -146,20 +150,20 @@ namespace winrt::ShaderLab::implementation
 
         McpExportConfigButton().Click([this](auto&&, auto&&)
         {
-            // Copy MCP server URL to clipboard.
+            uint16_t port = m_mcpServer ? m_mcpServer->Port() : 47808;
             namespace DP = winrt::Windows::ApplicationModel::DataTransfer;
             auto pkg = DP::DataPackage();
             std::wstring config = std::format(
                 L"{{\n"
                 L"  \"mcpServers\": {{\n"
                 L"    \"shaderlab\": {{\n"
-                L"      \"url\": \"http://localhost:47808/\"\n"
+                L"      \"url\": \"http://localhost:{}/\"\n"
                 L"    }}\n"
                 L"  }}\n"
-                L"}}");
+                L"}}", port);
             pkg.SetText(config);
             DP::Clipboard::SetContent(pkg);
-            PipelineFormatText().Text(L"MCP config copied to clipboard (http://localhost:47808)");
+            PipelineFormatText().Text(std::format(L"MCP config copied to clipboard (http://localhost:{})", port));
         });
     }
 
@@ -261,8 +265,14 @@ namespace winrt::ShaderLab::implementation
         {
             m_mcpServer->Start(47808);
             McpServerToggle().IsChecked(true);
-            McpServerToggle().Content(winrt::box_value(L"MCP Server :47808"));
-            McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
+            // Delay slightly to let the listener thread bind.
+            DispatcherQueue().TryEnqueue([this]()
+            {
+                uint16_t actualPort = m_mcpServer ? m_mcpServer->Port() : 47808;
+                McpServerToggle().Content(winrt::box_value(
+                    std::format(L"MCP Server :{}", actualPort)));
+                McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
+            });
         }
 
         UpdateStatusBar();

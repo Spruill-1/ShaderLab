@@ -34,6 +34,7 @@ namespace ShaderLab
         bool Start(uint16_t port = 47808);
         void Stop();
         bool IsRunning() const { return m_running.load(); }
+        uint16_t Port() const { return m_port; }
 
         // Route a request programmatically (used by the MCP JSON-RPC handler).
         Response RouteRequest(const std::wstring& method, const std::wstring& path, const std::string& body);
@@ -53,5 +54,6 @@ namespace ShaderLab
         SOCKET_T            m_listenSock{ ~0ULL };
         std::jthread        m_thread;
         std::atomic<bool>   m_running{ false };
+        uint16_t            m_port{ 0 };
     };
 }
