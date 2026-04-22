@@ -28,6 +28,15 @@ namespace ShaderLab::Graph
             return e.sourceNodeId == nodeId || e.destNodeId == nodeId;
         });
 
+        // Remove property bindings referencing this node as a source.
+        for (auto& node : m_nodes)
+        {
+            std::erase_if(node.propertyBindings, [nodeId](const auto& pair)
+            {
+                return pair.second.sourceNodeId == nodeId;
+            });
+        }
+
         // Remove the node itself.
         std::erase_if(m_nodes, [nodeId](const EffectNode& n)
         {
@@ -121,6 +130,7 @@ namespace ShaderLab::Graph
     std::vector<uint32_t> EffectGraph::TopologicalSort() const
     {
         // Build adjacency list and in-degree map.
+        // Includes both image edges AND property binding dependencies.
         std::unordered_map<uint32_t, std::vector<uint32_t>> adj;
         std::unordered_map<uint32_t, uint32_t> inDegree;
 
@@ -130,10 +140,25 @@ namespace ShaderLab::Graph
             inDegree[node.id] = 0;
         }
 
+        // Image edges: source → dest.
         for (const auto& edge : m_edges)
         {
             adj[edge.sourceNodeId].push_back(edge.destNodeId);
             inDegree[edge.destNodeId]++;
+        }
+
+        // Property binding edges: source analysis node → this node.
+        for (const auto& node : m_nodes)
+        {
+            for (const auto& [propName, binding] : node.propertyBindings)
+            {
+                // Only add if source node exists and isn't already an image edge.
+                if (adj.contains(binding.sourceNodeId))
+                {
+                    adj[binding.sourceNodeId].push_back(node.id);
+                    inDegree[node.id]++;
+                }
+            }
         }
 
         // Seed queue with zero-in-degree nodes.
@@ -172,7 +197,8 @@ namespace ShaderLab::Graph
 
     bool EffectGraph::WouldCreateCycle(uint32_t srcId, uint32_t dstId) const
     {
-        // If dstId can already reach srcId, adding src->dst creates a cycle.
+        // If dstId can already reach srcId via image edges OR binding edges,
+        // adding src->dst creates a cycle.
         std::unordered_set<uint32_t> visited;
         std::queue<uint32_t> work;
         work.push(dstId);
@@ -188,10 +214,22 @@ namespace ShaderLab::Graph
             if (!visited.insert(current).second)
                 continue;
 
+            // Follow image edges.
             for (const auto& edge : m_edges)
             {
                 if (edge.sourceNodeId == current)
                     work.push(edge.destNodeId);
+            }
+
+            // Follow binding edges (current's bindings point to source nodes,
+            // but we need outgoing: nodes whose bindings reference current).
+            for (const auto& node : m_nodes)
+            {
+                for (const auto& [propName, binding] : node.propertyBindings)
+                {
+                    if (binding.sourceNodeId == current)
+                        work.push(node.id);
+                }
             }
         }
         return false;
