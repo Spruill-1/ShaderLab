@@ -92,8 +92,6 @@ namespace ShaderLab::Rendering
                         ApplyCustomEffect(effect, *node);
 
                         // Force-upload the cbuffer directly to the GPU.
-                        // D2D won't call PrepareForRender for host-side cbuffer changes,
-                        // so we push it via DrawInfo immediately.
                         auto implIt = m_customImplCache.find(node->id);
                         if (implIt != m_customImplCache.end())
                         {
@@ -103,18 +101,21 @@ namespace ShaderLab::Rendering
                                 implIt->second.computeImpl->ForceUploadConstantBuffer();
                         }
 
-                        // Force D2D to re-render by toggling input 0.
-                        // D2D caches effect output and skips re-rendering if it sees
-                        // no changes. Briefly nulling input 0 signals a change.
-                        winrt::com_ptr<ID2D1Image> savedInput;
-                        effect->GetInput(0, savedInput.put());
-                        effect->SetInput(0, nullptr);
-                        effect->SetInput(0, savedInput.get());
-
                         node->dirty = false;
                     }
 
                     WireInputs(effect, *node, graph);
+
+                    // Force D2D to re-render by toggling input 0.
+                    {
+                        winrt::com_ptr<ID2D1Image> savedInput;
+                        effect->GetInput(0, savedInput.put());
+                        if (savedInput)
+                        {
+                            effect->SetInput(0, nullptr);
+                            effect->SetInput(0, savedInput.get());
+                        }
+                    }
 
                     winrt::com_ptr<ID2D1Image> output;
                     effect->GetOutput(output.put());
@@ -131,17 +132,24 @@ namespace ShaderLab::Rendering
                 else
                 {
                     if (node->customEffect.has_value() && !node->customEffect->isCompiled())
-                        node->runtimeError = L"Shader not compiled. Open in Effect Designer and compile.";
-
-                    WireInputs(effect, *node, graph);
-                    if (node->dirty)
                     {
-                        ApplyProperties(effect, *node);
-                        node->dirty = false;
+                        node->runtimeError = L"Shader not compiled. Open in Effect Designer and compile.";
+                        // Don't wire or use this node's output — no shader loaded,
+                        // D2D would crash trying to dispatch.
+                        node->cachedOutput = nullptr;
                     }
-                    winrt::com_ptr<ID2D1Image> output;
-                    effect->GetOutput(output.put());
-                    node->cachedOutput = output.get();
+                    else
+                    {
+                        WireInputs(effect, *node, graph);
+                        if (node->dirty)
+                        {
+                            ApplyProperties(effect, *node);
+                            node->dirty = false;
+                        }
+                        winrt::com_ptr<ID2D1Image> output;
+                        effect->GetOutput(output.put());
+                        node->cachedOutput = output.get();
+                    }
                 }
                 break;
             }
@@ -459,6 +467,16 @@ namespace ShaderLab::Rendering
             // Pack each property into the cbuffer at the reflected offset.
             for (const auto& var : cb.variables)
             {
+                // Skip system-injected variables for compute shaders.
+                // _TileOffset (int2, offset 0) is populated per-tile in
+                // CalculateThreadgroups. Shaders use Source.GetDimensions()
+                // for image size instead of a cbuffer variable.
+                if (node.type == NodeType::ComputeShader &&
+                    var.name == L"_TileOffset")
+                {
+                    continue;
+                }
+
                 auto propIt = node.properties.find(
                     std::wstring(var.name.begin(), var.name.end()));
                 if (propIt == node.properties.end()) continue;

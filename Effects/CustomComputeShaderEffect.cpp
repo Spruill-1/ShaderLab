@@ -61,6 +61,8 @@ namespace ShaderLab::Effects
     {
         if (s_pendingInputCount > 0)
             m_inputCount = s_pendingInputCount;
+        // Sentinel value to detect if MapInputRectsToOutputRect was called.
+        m_inputRect = { -9999, -9999, -9999, -9999 };
     }
 
     // -----------------------------------------------------------------------
@@ -140,6 +142,10 @@ namespace ShaderLab::Effects
         if (!m_computeInfo)
             return E_FAIL;
 
+        // If no shader has been loaded yet, nothing to render.
+        if (m_shaderBytecode.empty() && !m_shaderLoaded)
+            return E_FAIL;
+
         // If the shader bytecode changed, load it into D2D.
         if (m_shaderDirty && !m_shaderBytecode.empty())
         {
@@ -152,28 +158,19 @@ namespace ShaderLab::Effects
                 static_cast<UINT32>(m_shaderBytecode.size()));
 
             if (SUCCEEDED(hr))
-            {
                 hr = m_computeInfo->SetComputeShader(m_shaderGuid);
-            }
 
             if (FAILED(hr))
                 return hr;
 
             m_shaderDirty = false;
+            m_shaderLoaded = true;
         }
 
-        // If the constant buffer data changed, push it to the GPU.
-        if (m_cbDirty && !m_constantBuffer.empty())
-        {
-            HRESULT hr = m_computeInfo->SetComputeShaderConstantBuffer(
-                m_constantBuffer.data(),
-                static_cast<UINT32>(m_constantBuffer.size()));
-
-            if (FAILED(hr))
-                return hr;
-
-            m_cbDirty = false;
-        }
+        // DO NOT upload cbuffer here — D2D latches the cbuffer state at this
+        // point, preventing per-tile updates in CalculateThreadgroups from
+        // taking effect. We upload exclusively in CalculateThreadgroups where
+        // we can inject correct _TileOffset and _ImageSize per tile.
 
         return S_OK;
     }
@@ -208,14 +205,39 @@ namespace ShaderLab::Effects
         UINT32* dimensionY,
         UINT32* dimensionZ)
     {
-        // Calculate thread group count based on output dimensions and group size.
         UINT32 width  = static_cast<UINT32>(outputRect->right - outputRect->left);
         UINT32 height = static_cast<UINT32>(outputRect->bottom - outputRect->top);
+        if (width == 0) width = 1;
+        if (height == 0) height = 1;
 
-        // Round up to cover the full output area.
+        // Upload the constant buffer here (NOT in PrepareForRender) so that
+        // per-tile system constants are correct for each tile dispatch.
+        // D2D calls CalculateThreadgroups once per tile, after
+        // MapInputRectsToOutputRect has set the tile region.
+        if (m_computeInfo && !m_constantBuffer.empty())
+        {
+            // Inject system constant into reserved cbuffer prefix:
+            //   offset  0: int2 _TileOffset  (tile origin in full image)
+            // User properties start at offset 8+.
+            // NOTE: _ImageSize is NOT injected — shaders must use
+            // Source.GetDimensions() which returns the full source size.
+            if (m_constantBuffer.size() >= 8)
+            {
+                int32_t offX = outputRect->left;
+                int32_t offY = outputRect->top;
+                memcpy(m_constantBuffer.data() + 0, &offX, sizeof(int32_t));
+                memcpy(m_constantBuffer.data() + 4, &offY, sizeof(int32_t));
+            }
+
+            m_computeInfo->SetComputeShaderConstantBuffer(
+                m_constantBuffer.data(),
+                static_cast<UINT32>(m_constantBuffer.size()));
+            m_cbDirty = false;
+        }
+
         *dimensionX = (width  + m_threadGroupX - 1) / m_threadGroupX;
         *dimensionY = (height + m_threadGroupY - 1) / m_threadGroupY;
-        *dimensionZ = m_threadGroupZ;
+        *dimensionZ = 1;
 
         return S_OK;
     }
@@ -326,7 +348,11 @@ namespace ShaderLab::Effects
 
     void CustomComputeShaderEffect::SetConstantBufferData(const BYTE* data, UINT32 dataSize)
     {
-        m_constantBuffer.assign(data, data + dataSize);
+        // D3D11 constant buffers must be multiples of 16 bytes.
+        UINT32 paddedSize = (dataSize + 15) & ~15u;
+        m_constantBuffer.assign(paddedSize, 0);
+        if (data && dataSize > 0)
+            memcpy(m_constantBuffer.data(), data, dataSize);
         m_cbDirty = true;
     }
 
@@ -345,7 +371,9 @@ namespace ShaderLab::Effects
         const std::vector<ShaderVariable>& variables,
         uint32_t cbSizeBytes)
     {
-        m_constantBuffer.resize(cbSizeBytes, 0);
+        // Pad to 16-byte boundary for D3D11 constant buffer alignment.
+        uint32_t paddedSize = (cbSizeBytes + 15) & ~15u;
+        m_constantBuffer.resize(paddedSize, 0);
 
         for (const auto& var : variables)
         {

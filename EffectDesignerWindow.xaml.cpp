@@ -387,13 +387,11 @@ namespace winrt::ShaderLab::implementation
                 hlsl += L"// Write float4 results to Output[int2(fieldIndex, 0)].\n";
                 hlsl += L"// The host reads these pixels back after evaluation.\n\n";
 
-                if (!def.parameters.empty())
-                {
-                    hlsl += L"cbuffer Constants : register(b0)\n{\n";
-                    for (const auto& p : def.parameters)
-                        hlsl += L"    " + p.typeName + L" " + p.name + L";\n";
-                    hlsl += L"};\n\n";
-                }
+                hlsl += L"cbuffer Constants : register(b0)\n{\n";
+                hlsl += L"    int2  _TileOffset;  // Auto-injected: tile origin in full image\n";
+                for (const auto& p : def.parameters)
+                    hlsl += L"    " + p.typeName + L" " + p.name + L";\n";
+                hlsl += L"};\n\n";
 
                 // Generate field index comments.
                 for (size_t i = 0; i < def.analysisFieldNames.size(); ++i)
@@ -407,12 +405,14 @@ namespace winrt::ShaderLab::implementation
 
                 if (!def.inputNames.empty())
                 {
-                    hlsl += L"    // Get input dimensions.\n";
-                    hlsl += L"    uint inW, inH;\n";
-                    hlsl += std::format(L"    {}.GetDimensions(inW, inH);\n\n", def.inputNames[0]);
-                    hlsl += L"    // Each thread processes one pixel of the input.\n";
-                    hlsl += L"    if (DTid.x >= inW || DTid.y >= inH) return;\n\n";
-                    hlsl += std::format(L"    float4 pixel = {}.Load(int3(DTid.xy, 0));\n\n", def.inputNames[0]);
+                    hlsl += L"    // Get full source dimensions and compute global position.\n";
+                    hlsl += L"    uint srcW, srcH;\n";
+                    hlsl += std::format(L"    {}.GetDimensions(srcW, srcH);\n", def.inputNames[0]);
+                    hlsl += L"    uint2 globalPos = DTid.xy + uint2(_TileOffset);\n";
+                    hlsl += L"    if (globalPos.x >= srcW || globalPos.y >= srcH) return;\n\n";
+                    hlsl += L"    // Sample input using normalized UVs (Load() not available in D2D compute).\n";
+                    hlsl += L"    float2 uv = (float2(globalPos) + 0.5) / float2(srcW, srcH);\n";
+                    hlsl += std::format(L"    float4 pixel = {}.SampleLevel(Sampler0, uv, 0);\n\n", def.inputNames[0]);
                 }
 
                 hlsl += L"    // TODO: Accumulate statistics across pixels.\n";
@@ -433,26 +433,31 @@ namespace winrt::ShaderLab::implementation
             {
                 // Image-processing compute shader (passthrough scaffold).
                 hlsl += L"// Image-processing compute shader:\n";
-                hlsl += L"// Each thread processes one output pixel.\n\n";
+                hlsl += L"// D2D evaluates compute effects in tiles. _TileOffset is auto-injected\n";
+                hlsl += L"// per tile so the shader sees correct global coordinates.\n";
+                hlsl += L"// Use Source.GetDimensions() for the full image size.\n";
+                hlsl += L"// Use SampleLevel() with normalized UVs (Load() not available in D2D compute).\n\n";
 
-                if (!def.parameters.empty())
-                {
-                    hlsl += L"cbuffer Constants : register(b0)\n{\n";
-                    for (const auto& p : def.parameters)
-                        hlsl += L"    " + p.typeName + L" " + p.name + L";\n";
-                    hlsl += L"};\n\n";
-                }
+                hlsl += L"cbuffer Constants : register(b0)\n{\n";
+                hlsl += L"    int2  _TileOffset;  // Auto-injected: tile origin in full image\n";
+                for (const auto& p : def.parameters)
+                    hlsl += L"    " + p.typeName + L" " + p.name + L";\n";
+                hlsl += L"};\n\n";
 
                 hlsl += std::format(L"[numthreads({}, {}, {})]\n",
                     def.threadGroupX, def.threadGroupY, def.threadGroupZ);
                 hlsl += L"void main(uint3 DTid : SV_DispatchThreadID)\n";
                 hlsl += L"{\n";
-                hlsl += L"    uint width, height;\n";
-                hlsl += L"    Output.GetDimensions(width, height);\n";
-                hlsl += L"    if (DTid.x >= width || DTid.y >= height) return;\n\n";
                 if (!def.inputNames.empty())
                 {
-                    hlsl += std::format(L"    float4 color = {}.Load(int3(DTid.xy, 0));\n", def.inputNames[0]);
+                    hlsl += L"    // Get full source dimensions and compute global position.\n";
+                    hlsl += L"    uint srcW, srcH;\n";
+                    hlsl += std::format(L"    {}.GetDimensions(srcW, srcH);\n", def.inputNames[0]);
+                    hlsl += L"    uint2 globalPos = DTid.xy + uint2(_TileOffset);\n";
+                    hlsl += L"    if (globalPos.x >= srcW || globalPos.y >= srcH) return;\n\n";
+                    hlsl += L"    // Sample input using normalized UVs.\n";
+                    hlsl += L"    float2 uv = (float2(globalPos) + 0.5) / float2(srcW, srcH);\n";
+                    hlsl += std::format(L"    float4 color = {}.SampleLevel(Sampler0, uv, 0);\n", def.inputNames[0]);
                     hlsl += L"\n    // Your code here\n\n";
                     hlsl += L"    Output[DTid.xy] = color;\n";
                 }

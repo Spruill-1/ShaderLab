@@ -120,6 +120,9 @@ namespace ShaderLab::Effects
         // Force-upload the constant buffer directly to the GPU.
         HRESULT ForceUploadConstantBuffer();
 
+        // Get the stored input rect (from MapInputRectsToOutputRect).
+        D2D1_RECT_L GetInputRect() const { return m_inputRect; }
+
         // Pack PropertyValue map into the constant buffer using reflection info.
         void PackConstantBuffer(
             const std::map<std::wstring, Graph::PropertyValue>& properties,
@@ -155,5 +158,7 @@ namespace ShaderLab::Effects
         bool m_cbDirty{ false };
         // Whether we need to re-set the compute shader.
         bool m_shaderDirty{ false };
+        // Whether a shader has ever been successfully loaded.
+        bool m_shaderLoaded{ false };
     };
 }

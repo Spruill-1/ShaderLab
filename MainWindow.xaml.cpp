@@ -3046,16 +3046,23 @@ namespace winrt::ShaderLab::implementation
         float oldDpiX, oldDpiY;
         dc->GetDpi(&oldDpiX, &oldDpiY);
         dc->SetDpi(96.0f, 96.0f);
-        D2D1_RECT_F bounds{};
-        dc->GetImageLocalBounds(image, &bounds);
+
+        // Get the swap chain dimensions as the capture size.
+        // This matches what the user sees in the preview panel.
+        uint32_t w = m_renderEngine.BackBufferWidth();
+        uint32_t h = m_renderEngine.BackBufferHeight();
+
+        // If no swap chain, fall back to image bounds.
+        if (w == 0 || h == 0)
+        {
+            D2D1_RECT_F bounds{};
+            dc->GetImageLocalBounds(image, &bounds);
+            w = static_cast<uint32_t>(bounds.right - bounds.left);
+            h = static_cast<uint32_t>(bounds.bottom - bounds.top);
+        }
+
         dc->SetDpi(oldDpiX, oldDpiY);
 
-        // Clamp bounds origin to zero — compute effects may report offset rects.
-        if (bounds.left < 0) { bounds.right -= bounds.left; bounds.left = 0; }
-        if (bounds.top < 0) { bounds.bottom -= bounds.top; bounds.top = 0; }
-
-        uint32_t w = static_cast<uint32_t>(bounds.right - bounds.left);
-        uint32_t h = static_cast<uint32_t>(bounds.bottom - bounds.top);
         if (w == 0 || h == 0) return {};
         w = (std::min)(w, 2048u);
         h = (std::min)(h, 2048u);
@@ -3073,7 +3080,13 @@ namespace winrt::ShaderLab::implementation
             dc->SetTarget(renderBitmap.get());
             dc->BeginDraw();
             dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-            dc->DrawImage(image, D2D1::Point2F(-bounds.left, -bounds.top));
+            // Apply same pan/zoom as preview so capture matches what user sees.
+            D2D1_MATRIX_3X2_F transform =
+                D2D1::Matrix3x2F::Scale(m_previewZoom, m_previewZoom) *
+                D2D1::Matrix3x2F::Translation(m_previewPanX, m_previewPanY);
+            dc->SetTransform(transform);
+            dc->DrawImage(image);
+            dc->SetTransform(D2D1::Matrix3x2F::Identity());
             dc->EndDraw();
             dc->SetTarget(oldTarget.get());
 

@@ -1,6 +1,8 @@
 #include "pch.h"
 #include "MainWindow.xaml.h"
 #include "ShaderLab/McpHttpServer.h"
+#include "Effects/CustomPixelShaderEffect.h"
+#include "Effects/CustomComputeShaderEffect.h"
 
 // Helper: narrow string from wide string.
 static std::string ToUtf8(const std::wstring& ws)
@@ -404,6 +406,45 @@ namespace winrt::ShaderLab::implementation
                 if (jobj.HasKey(L"effectName"))
                 {
                     auto name = jobj.GetNamedString(L"effectName");
+
+                    // Support creating custom compute/pixel shader nodes directly.
+                    if (name == L"Custom Compute Shader" || name == L"Custom Pixel Shader")
+                    {
+                        ::ShaderLab::Graph::EffectNode node;
+                        bool isCompute = (name == L"Custom Compute Shader");
+                        node.type = isCompute
+                            ? ::ShaderLab::Graph::NodeType::ComputeShader
+                            : ::ShaderLab::Graph::NodeType::PixelShader;
+                        node.name = std::wstring(name);
+                        node.effectClsid = isCompute
+                            ? ::ShaderLab::Effects::CustomComputeShaderEffect::CLSID_CustomComputeShader
+                            : ::ShaderLab::Effects::CustomPixelShaderEffect::CLSID_CustomPixelShader;
+                        node.outputPins.push_back({ L"Output", 0 });
+
+                        // Create a default custom effect definition.
+                        ::ShaderLab::Graph::CustomEffectDefinition def;
+                        def.shaderType = isCompute
+                            ? ::ShaderLab::Graph::CustomShaderType::ComputeShader
+                            : ::ShaderLab::Graph::CustomShaderType::PixelShader;
+                        CoCreateGuid(&def.shaderGuid);
+
+                        // Default: 1 input named "Source".
+                        def.inputNames.push_back(L"Source");
+                        node.inputPins.push_back({ L"I0", 0 });
+
+                        if (isCompute) { def.threadGroupX = 8; def.threadGroupY = 8; def.threadGroupZ = 1; }
+
+                        node.customEffect = std::move(def);
+
+                        return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                            auto id = m_graph.AddNode(std::move(node));
+                            m_graph.MarkAllDirty();
+                            m_nodeGraphController.AutoLayout();
+                            PopulatePreviewNodeSelector();
+                            return { 200, std::format("{{\"nodeId\":{}}}", id) };
+                        });
+                    }
+
                     auto* desc = ::ShaderLab::Effects::EffectRegistry::Instance().FindByName(name);
                     if (!desc) return { 400, R"({"error":"Unknown effect name"})" };
                     auto node = ::ShaderLab::Effects::EffectRegistry::CreateNode(*desc);
