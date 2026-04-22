@@ -758,108 +758,72 @@ namespace ShaderLab::Controls
 
                 for (const auto& [propName, binding] : node.propertyBindings)
                 {
-                    auto srcIt = m_visuals.find(binding.sourceNodeId);
-                    if (srcIt == m_visuals.end()) continue;
-
-                    // Find source data output pin by field name.
-                    D2D1_POINT_2F start{};
-                    bool foundSrc = false;
-                    for (uint32_t i = 0; i < srcIt->second.dataOutputPinNames.size(); ++i)
+                    // Collect unique (sourceNodeId, sourceFieldName) pairs from the binding.
+                    struct SrcRef { uint32_t nodeId; std::wstring field; };
+                    std::vector<SrcRef> srcRefs;
+                    if (binding.wholeArray)
                     {
-                        if (srcIt->second.dataOutputPinNames[i] == binding.sourceFieldName &&
-                            i < srcIt->second.dataOutputPinPositions.size())
+                        srcRefs.push_back({ binding.wholeArraySourceNodeId, binding.wholeArraySourceFieldName });
+                    }
+                    else
+                    {
+                        for (const auto& src : binding.sources)
                         {
-                            start = srcIt->second.dataOutputPinPositions[i];
-                            foundSrc = true;
-                            break;
+                            if (!src.has_value()) continue;
+                            bool dup = false;
+                            for (const auto& r : srcRefs)
+                                if (r.nodeId == src->sourceNodeId && r.field == src->sourceFieldName)
+                                { dup = true; break; }
+                            if (!dup)
+                                srcRefs.push_back({ src->sourceNodeId, src->sourceFieldName });
                         }
                     }
 
-                    // Find dest data input pin by property name.
+                    // Find dest data input pin position.
                     D2D1_POINT_2F end{};
                     bool foundDst = false;
                     for (uint32_t i = 0; i < dstIt->second.dataInputPinNames.size(); ++i)
                     {
                         if (dstIt->second.dataInputPinNames[i] == propName &&
                             i < dstIt->second.dataInputPinPositions.size())
-                        {
-                            end = dstIt->second.dataInputPinPositions[i];
-                            foundDst = true;
-                            break;
-                        }
-                    }
-
-                    if (!foundSrc || !foundDst) continue;
-
-                    float bdx = (end.x - start.x) * 0.4f;
-                    D2D1_POINT_2F bcp1 = { start.x + bdx, start.y };
-                    D2D1_POINT_2F bcp2 = { end.x - bdx, end.y };
-
-                    winrt::com_ptr<ID2D1PathGeometry> bpath;
-                    winrt::com_ptr<ID2D1Factory> bfactory;
-                    dc->GetFactory(bfactory.put());
-                    bfactory->CreatePathGeometry(bpath.put());
-
-                    if (bpath)
-                    {
-                        winrt::com_ptr<ID2D1GeometrySink> bsink;
-                        bpath->Open(bsink.put());
-                        if (bsink)
-                        {
-                            bsink->BeginFigure(start, D2D1_FIGURE_BEGIN_HOLLOW);
-                            bsink->AddBezier({ bcp1, bcp2, end });
-                            bsink->EndFigure(D2D1_FIGURE_END_OPEN);
-                            bsink->Close();
-                        }
-                        dc->DrawGeometry(bpath.get(), m_brushDataEdge.get(), 1.5f);
-                    }
-                }
-            }
-        }
-
-        // Render data edges (property bindings) as orange curves.
-        if (m_brushDataEdge)
-        {
-            for (const auto& node : m_graph->Nodes())
-            {
-                auto dstIt = m_visuals.find(node.id);
-                if (dstIt == m_visuals.end()) continue;
-
-                for (const auto& [propName, binding] : node.propertyBindings)
-                {
-                    auto srcIt = m_visuals.find(binding.sourceNodeId);
-                    if (srcIt == m_visuals.end()) continue;
-
-                    // Find pin positions by name.
-                    D2D1_POINT_2F start{}, end{};
-                    bool foundSrc = false, foundDst = false;
-                    for (uint32_t i = 0; i < srcIt->second.dataOutputPinNames.size(); ++i)
-                        if (srcIt->second.dataOutputPinNames[i] == binding.sourceFieldName &&
-                            i < srcIt->second.dataOutputPinPositions.size())
-                        { start = srcIt->second.dataOutputPinPositions[i]; foundSrc = true; break; }
-                    for (uint32_t i = 0; i < dstIt->second.dataInputPinNames.size(); ++i)
-                        if (dstIt->second.dataInputPinNames[i] == propName &&
-                            i < dstIt->second.dataInputPinPositions.size())
                         { end = dstIt->second.dataInputPinPositions[i]; foundDst = true; break; }
-                    if (!foundSrc || !foundDst) continue;
+                    }
+                    if (!foundDst) continue;
 
-                    float bdx = (end.x - start.x) * 0.4f;
-                    winrt::com_ptr<ID2D1PathGeometry> bpath;
-                    winrt::com_ptr<ID2D1Factory> bfactory;
-                    dc->GetFactory(bfactory.put());
-                    bfactory->CreatePathGeometry(bpath.put());
-                    if (bpath)
+                    // Draw one edge per unique source.
+                    for (const auto& ref : srcRefs)
                     {
-                        winrt::com_ptr<ID2D1GeometrySink> bsink;
-                        bpath->Open(bsink.put());
-                        if (bsink)
+                        auto srcIt = m_visuals.find(ref.nodeId);
+                        if (srcIt == m_visuals.end()) continue;
+
+                        D2D1_POINT_2F start{};
+                        bool foundSrc = false;
+                        for (uint32_t i = 0; i < srcIt->second.dataOutputPinNames.size(); ++i)
                         {
-                            bsink->BeginFigure(start, D2D1_FIGURE_BEGIN_HOLLOW);
-                            bsink->AddBezier({ { start.x + bdx, start.y }, { end.x - bdx, end.y }, end });
-                            bsink->EndFigure(D2D1_FIGURE_END_OPEN);
-                            bsink->Close();
+                            if (srcIt->second.dataOutputPinNames[i] == ref.field &&
+                                i < srcIt->second.dataOutputPinPositions.size())
+                            { start = srcIt->second.dataOutputPinPositions[i]; foundSrc = true; break; }
                         }
-                        dc->DrawGeometry(bpath.get(), m_brushDataEdge.get(), 1.5f);
+                        if (!foundSrc) continue;
+
+                        float bdx = (end.x - start.x) * 0.4f;
+                        winrt::com_ptr<ID2D1PathGeometry> bpath;
+                        winrt::com_ptr<ID2D1Factory> bfactory;
+                        dc->GetFactory(bfactory.put());
+                        bfactory->CreatePathGeometry(bpath.put());
+                        if (bpath)
+                        {
+                            winrt::com_ptr<ID2D1GeometrySink> bsink;
+                            bpath->Open(bsink.put());
+                            if (bsink)
+                            {
+                                bsink->BeginFigure(start, D2D1_FIGURE_BEGIN_HOLLOW);
+                                bsink->AddBezier({ { start.x + bdx, start.y }, { end.x - bdx, end.y }, end });
+                                bsink->EndFigure(D2D1_FIGURE_END_OPEN);
+                                bsink->Close();
+                            }
+                            dc->DrawGeometry(bpath.get(), m_brushDataEdge.get(), 1.5f);
+                        }
                     }
                 }
             }

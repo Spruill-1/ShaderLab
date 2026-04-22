@@ -435,6 +435,41 @@ namespace ShaderLab::Rendering
     // Property binding resolution
     // -----------------------------------------------------------------------
 
+    // Helper: resolve a single ComponentSource to a float value.
+    static bool ResolveComponentSource(
+        const ComponentSource& src,
+        const EffectGraph& graph,
+        float& outValue)
+    {
+        const EffectNode* srcNode = graph.FindNode(src.sourceNodeId);
+        if (!srcNode || srcNode->analysisOutput.type != AnalysisOutputType::Typed)
+            return false;
+
+        for (const auto& fv : srcNode->analysisOutput.fields)
+        {
+            if (fv.name != src.sourceFieldName) continue;
+
+            if (AnalysisFieldIsArray(fv.type))
+            {
+                uint32_t stride = AnalysisFieldComponentCount(fv.type);
+                uint32_t flatIdx = src.sourceIndex * stride + (std::min)(src.sourceComponent, stride - 1);
+                if (flatIdx < fv.arrayData.size())
+                {
+                    outValue = fv.arrayData[flatIdx];
+                    return true;
+                }
+            }
+            else
+            {
+                uint32_t comp = (std::min)(src.sourceComponent, 3u);
+                outValue = fv.components[comp];
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
     bool GraphEvaluator::ResolveBindings(
         EffectNode& node,
         const EffectGraph& graph,
@@ -450,92 +485,110 @@ namespace ShaderLab::Rendering
 
         for (const auto& [propName, binding] : node.propertyBindings)
         {
-            const EffectNode* srcNode = graph.FindNode(binding.sourceNodeId);
-            if (!srcNode || srcNode->analysisOutput.type != AnalysisOutputType::Typed)
-                continue;
-
-            // Find the source field by name.
-            const AnalysisFieldValue* srcField = nullptr;
-            for (const auto& fv : srcNode->analysisOutput.fields)
-            {
-                if (fv.name == binding.sourceFieldName)
-                {
-                    srcField = &fv;
-                    break;
-                }
-            }
-            if (!srcField) continue;
-
-            // Get the current authored property to determine destination type.
             auto propIt = effectiveProps.find(propName);
+            if (propIt == effectiveProps.end()) continue;
+
+            // Whole-array mode.
+            if (binding.wholeArray)
+            {
+                const EffectNode* srcNode = graph.FindNode(binding.wholeArraySourceNodeId);
+                if (!srcNode || srcNode->analysisOutput.type != AnalysisOutputType::Typed)
+                    continue;
+                for (const auto& fv : srcNode->analysisOutput.fields)
+                {
+                    if (fv.name == binding.wholeArraySourceFieldName && AnalysisFieldIsArray(fv.type))
+                    {
+                        effectiveProps[propName] = fv.arrayData;
+                        anyChanged = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            // Per-component mode.
+            if (binding.sources.empty()) continue;
+
             PropertyValue newVal;
             bool resolved = false;
 
-            if (AnalysisFieldIsArray(srcField->type))
+            std::visit([&](auto&& existing)
             {
-                // Array source → vector<float> destination.
-                newVal = srcField->arrayData;
-                resolved = true;
-            }
-            else
-            {
-                // Scalar source → match destination type.
-                uint32_t comp = (std::min)(binding.sourceComponent, 3u);
+                using T = std::decay_t<decltype(existing)>;
 
-                if (propIt != effectiveProps.end())
+                if constexpr (std::is_same_v<T, float>)
                 {
-                    // Match destination property type.
-                    std::visit([&](auto&& existing)
+                    if (!binding.sources.empty() && binding.sources[0].has_value())
                     {
-                        using T = std::decay_t<decltype(existing)>;
-                        if constexpr (std::is_same_v<T, float>)
-                        {
-                            newVal = srcField->components[comp];
-                            resolved = true;
-                        }
-                        else if constexpr (std::is_same_v<T, int32_t>)
-                        {
-                            newVal = static_cast<int32_t>(srcField->components[comp]);
-                            resolved = true;
-                        }
-                        else if constexpr (std::is_same_v<T, uint32_t>)
-                        {
-                            newVal = static_cast<uint32_t>(srcField->components[comp]);
-                            resolved = true;
-                        }
-                        else if constexpr (std::is_same_v<T, bool>)
-                        {
-                            newVal = srcField->components[comp] != 0.0f;
-                            resolved = true;
-                        }
-                        else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
-                        {
-                            newVal = winrt::Windows::Foundation::Numerics::float2{
-                                srcField->components[0], srcField->components[1] };
-                            resolved = true;
-                        }
-                        else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
-                        {
-                            newVal = winrt::Windows::Foundation::Numerics::float3{
-                                srcField->components[0], srcField->components[1], srcField->components[2] };
-                            resolved = true;
-                        }
-                        else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
-                        {
-                            newVal = winrt::Windows::Foundation::Numerics::float4{
-                                srcField->components[0], srcField->components[1],
-                                srcField->components[2], srcField->components[3] };
-                            resolved = true;
-                        }
-                    }, propIt->second);
+                        float v = 0;
+                        if (ResolveComponentSource(*binding.sources[0], graph, v))
+                        { newVal = v; resolved = true; }
+                    }
                 }
-                else
+                else if constexpr (std::is_same_v<T, int32_t>)
                 {
-                    // No existing property — default to float.
-                    newVal = srcField->components[comp];
-                    resolved = true;
+                    if (!binding.sources.empty() && binding.sources[0].has_value())
+                    {
+                        float v = 0;
+                        if (ResolveComponentSource(*binding.sources[0], graph, v))
+                        { newVal = static_cast<int32_t>(v); resolved = true; }
+                    }
                 }
-            }
+                else if constexpr (std::is_same_v<T, uint32_t>)
+                {
+                    if (!binding.sources.empty() && binding.sources[0].has_value())
+                    {
+                        float v = 0;
+                        if (ResolveComponentSource(*binding.sources[0], graph, v))
+                        { newVal = static_cast<uint32_t>(v); resolved = true; }
+                    }
+                }
+                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
+                {
+                    auto result = existing; // start from authored
+                    bool any = false;
+                    for (uint32_t c = 0; c < 2 && c < binding.sources.size(); ++c)
+                    {
+                        if (binding.sources[c].has_value())
+                        {
+                            float v = 0;
+                            if (ResolveComponentSource(*binding.sources[c], graph, v))
+                            { (&result.x)[c] = v; any = true; }
+                        }
+                    }
+                    if (any) { newVal = result; resolved = true; }
+                }
+                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
+                {
+                    auto result = existing;
+                    bool any = false;
+                    for (uint32_t c = 0; c < 3 && c < binding.sources.size(); ++c)
+                    {
+                        if (binding.sources[c].has_value())
+                        {
+                            float v = 0;
+                            if (ResolveComponentSource(*binding.sources[c], graph, v))
+                            { (&result.x)[c] = v; any = true; }
+                        }
+                    }
+                    if (any) { newVal = result; resolved = true; }
+                }
+                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
+                {
+                    auto result = existing;
+                    bool any = false;
+                    for (uint32_t c = 0; c < 4 && c < binding.sources.size(); ++c)
+                    {
+                        if (binding.sources[c].has_value())
+                        {
+                            float v = 0;
+                            if (ResolveComponentSource(*binding.sources[c], graph, v))
+                            { (&result.x)[c] = v; any = true; }
+                        }
+                    }
+                    if (any) { newVal = result; resolved = true; }
+                }
+            }, propIt->second);
 
             if (resolved)
             {

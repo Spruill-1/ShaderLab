@@ -2193,7 +2193,31 @@ namespace winrt::ShaderLab::implementation
                 {
                     // Show binding info: "← NodeName.FieldName"
                     auto& binding = bindIt->second;
-                    auto* srcNode = m_graph.FindNode(binding.sourceNodeId);
+
+                    // Extract primary source info from the new per-component format.
+                    uint32_t primarySrcNodeId = 0;
+                    std::wstring primarySrcFieldName;
+                    uint32_t primarySrcComponent = 0;
+                    if (binding.wholeArray)
+                    {
+                        primarySrcNodeId = binding.wholeArraySourceNodeId;
+                        primarySrcFieldName = binding.wholeArraySourceFieldName;
+                    }
+                    else
+                    {
+                        for (const auto& src : binding.sources)
+                        {
+                            if (src.has_value())
+                            {
+                                primarySrcNodeId = src->sourceNodeId;
+                                primarySrcFieldName = src->sourceFieldName;
+                                primarySrcComponent = src->sourceComponent;
+                                break;
+                            }
+                        }
+                    }
+
+                    auto* srcNode = m_graph.FindNode(primarySrcNodeId);
 
                     // Look up source field type to determine component count.
                     uint32_t srcComponents = 1;
@@ -2201,7 +2225,7 @@ namespace winrt::ShaderLab::implementation
                     {
                         for (const auto& fd : srcNode->customEffect->analysisFields)
                         {
-                            if (fd.name == binding.sourceFieldName)
+                            if (fd.name == primarySrcFieldName)
                             {
                                 srcComponents = ::ShaderLab::Graph::AnalysisFieldComponentCount(fd.type);
                                 break;
@@ -2222,7 +2246,7 @@ namespace winrt::ShaderLab::implementation
 
                     std::wstring bindLabel = L"\u2190 ";
                     if (srcNode) bindLabel += srcNode->name + L".";
-                    bindLabel += binding.sourceFieldName;
+                    bindLabel += primarySrcFieldName;
 
                     auto bindInfo = Controls::TextBlock();
                     bindInfo.Text(winrt::hstring(bindLabel));
@@ -2241,16 +2265,13 @@ namespace winrt::ShaderLab::implementation
                         for (uint32_t c = 0; c < srcComponents && c < 4; ++c)
                             compPicker.Items().Append(winrt::box_value(winrt::hstring(compLabels[c])));
                         compPicker.SelectedIndex(static_cast<int32_t>(
-                            (std::min)(binding.sourceComponent, srcComponents - 1)));
+                            (std::min)(primarySrcComponent, srcComponents - 1)));
                         compPicker.SelectionChanged([this, capturedId, capturedKey](auto&&, auto&&)
                         {
                             auto* n = m_graph.FindNode(capturedId);
                             if (!n) return;
                             auto bit = n->propertyBindings.find(capturedKey);
                             if (bit == n->propertyBindings.end()) return;
-                            // Read selected index from the combo box.
-                            // We need to find this combo again... use a simpler approach:
-                            // the SelectionChanged event gives us the sender.
                         });
                         // Use a simpler click-based approach: rebuild panel on change.
                         compPicker.SelectionChanged([this, capturedId, capturedKey](
@@ -2261,7 +2282,10 @@ namespace winrt::ShaderLab::implementation
                             if (!n) return;
                             auto bit = n->propertyBindings.find(capturedKey);
                             if (bit == n->propertyBindings.end()) return;
-                            bit->second.sourceComponent = static_cast<uint32_t>(combo.SelectedIndex());
+                            // Update the first component source's sourceComponent.
+                            auto& b = bit->second;
+                            if (!b.sources.empty() && b.sources[0].has_value())
+                                b.sources[0]->sourceComponent = static_cast<uint32_t>(combo.SelectedIndex());
                             n->dirty = true;
                             m_graph.MarkAllDirty();
                         });
@@ -2342,16 +2366,8 @@ namespace winrt::ShaderLab::implementation
                                     item.Text(winrt::hstring(fieldName));
                                     item.Click([this, capturedId, capturedKey, srcNodeId, fieldName](auto&&, auto&&)
                                     {
-                                        auto* n = m_graph.FindNode(capturedId);
-                                        if (!n) return;
-                                        if (m_graph.WouldCreateCycle(srcNodeId, capturedId)) return;
-                                        ::ShaderLab::Graph::PropertyBinding b;
-                                        b.sourceNodeId = srcNodeId;
-                                        b.sourceFieldName = fieldName;
-                                        b.sourceComponent = 0;
-                                        n->propertyBindings[capturedKey] = std::move(b);
-                                        n->dirty = true;
-                                        m_graph.MarkAllDirty();
+                                        m_graph.BindProperty(capturedId, capturedKey, srcNodeId, fieldName, 0);
+                                        m_nodeGraphController.RebuildLayout();
                                         UpdatePropertiesPanel();
                                     });
                                     subItem.Items().Append(item);
@@ -2367,16 +2383,8 @@ namespace winrt::ShaderLab::implementation
                                     wholeItem.Text(L"(all)");
                                     wholeItem.Click([this, capturedId, capturedKey, srcNodeId, fieldName](auto&&, auto&&)
                                     {
-                                        auto* n = m_graph.FindNode(capturedId);
-                                        if (!n) return;
-                                        if (m_graph.WouldCreateCycle(srcNodeId, capturedId)) return;
-                                        ::ShaderLab::Graph::PropertyBinding b;
-                                        b.sourceNodeId = srcNodeId;
-                                        b.sourceFieldName = fieldName;
-                                        b.sourceComponent = 0;
-                                        n->propertyBindings[capturedKey] = std::move(b);
-                                        n->dirty = true;
-                                        m_graph.MarkAllDirty();
+                                        m_graph.BindProperty(capturedId, capturedKey, srcNodeId, fieldName, 0);
+                                        m_nodeGraphController.RebuildLayout();
                                         UpdatePropertiesPanel();
                                     });
                                     fieldSub.Items().Append(wholeItem);
@@ -2389,16 +2397,8 @@ namespace winrt::ShaderLab::implementation
                                         auto capturedComp = c;
                                         compItem.Click([this, capturedId, capturedKey, srcNodeId, fieldName, capturedComp](auto&&, auto&&)
                                         {
-                                            auto* n = m_graph.FindNode(capturedId);
-                                            if (!n) return;
-                                            if (m_graph.WouldCreateCycle(srcNodeId, capturedId)) return;
-                                            ::ShaderLab::Graph::PropertyBinding b;
-                                            b.sourceNodeId = srcNodeId;
-                                            b.sourceFieldName = fieldName;
-                                            b.sourceComponent = capturedComp;
-                                            n->propertyBindings[capturedKey] = std::move(b);
-                                            n->dirty = true;
-                                            m_graph.MarkAllDirty();
+                                            m_graph.BindProperty(capturedId, capturedKey, srcNodeId, fieldName, capturedComp);
+                                            m_nodeGraphController.RebuildLayout();
                                             UpdatePropertiesPanel();
                                         });
                                         fieldSub.Items().Append(compItem);

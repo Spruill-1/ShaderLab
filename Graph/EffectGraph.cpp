@@ -33,7 +33,13 @@ namespace ShaderLab::Graph
         {
             std::erase_if(node.propertyBindings, [nodeId](const auto& pair)
             {
-                return pair.second.sourceNodeId == nodeId;
+                const auto& b = pair.second;
+                if (b.wholeArray)
+                    return b.wholeArraySourceNodeId == nodeId;
+                for (const auto& src : b.sources)
+                    if (src.has_value() && src->sourceNodeId == nodeId)
+                        return true;
+                return false;
             });
         }
 
@@ -147,15 +153,30 @@ namespace ShaderLab::Graph
             inDegree[edge.destNodeId]++;
         }
 
-        // Property binding edges: source analysis node → this node.
+        // Property binding edges: collect all unique source nodes.
         for (const auto& node : m_nodes)
         {
+            std::unordered_set<uint32_t> bindingSources;
             for (const auto& [propName, binding] : node.propertyBindings)
             {
-                // Only add if source node exists and isn't already an image edge.
-                if (adj.contains(binding.sourceNodeId))
+                if (binding.wholeArray)
                 {
-                    adj[binding.sourceNodeId].push_back(node.id);
+                    bindingSources.insert(binding.wholeArraySourceNodeId);
+                }
+                else
+                {
+                    for (const auto& src : binding.sources)
+                    {
+                        if (src.has_value())
+                            bindingSources.insert(src->sourceNodeId);
+                    }
+                }
+            }
+            for (uint32_t srcId : bindingSources)
+            {
+                if (adj.contains(srcId))
+                {
+                    adj[srcId].push_back(node.id);
                     inDegree[node.id]++;
                 }
             }
@@ -221,14 +242,23 @@ namespace ShaderLab::Graph
                     work.push(edge.destNodeId);
             }
 
-            // Follow binding edges (current's bindings point to source nodes,
-            // but we need outgoing: nodes whose bindings reference current).
+            // Follow binding edges: nodes whose bindings reference current as a source.
             for (const auto& node : m_nodes)
             {
                 for (const auto& [propName, binding] : node.propertyBindings)
                 {
-                    if (binding.sourceNodeId == current)
-                        work.push(node.id);
+                    bool references = false;
+                    if (binding.wholeArray && binding.wholeArraySourceNodeId == current)
+                        references = true;
+                    else
+                    {
+                        for (const auto& src : binding.sources)
+                        {
+                            if (src.has_value() && src->sourceNodeId == current)
+                            { references = true; break; }
+                        }
+                    }
+                    if (references) work.push(node.id);
                 }
             }
         }
@@ -301,11 +331,49 @@ namespace ShaderLab::Graph
         if (WouldCreateCycle(sourceNodeId, destNodeId))
             return L"Binding would create a cycle";
 
-        // Create binding.
+        // Create binding with smart defaults.
         PropertyBinding binding;
-        binding.sourceNodeId = sourceNodeId;
-        binding.sourceFieldName = sourceFieldName;
-        binding.sourceComponent = sourceComponent;
+
+        if (destIsArray && srcIsArray)
+        {
+            // Whole-array passthrough.
+            binding.wholeArray = true;
+            binding.wholeArraySourceNodeId = sourceNodeId;
+            binding.wholeArraySourceFieldName = sourceFieldName;
+        }
+        else
+        {
+            // Per-component: determine dest component count.
+            uint32_t destCC = std::visit([](auto&& v) -> uint32_t
+            {
+                using T = std::decay_t<decltype(v)>;
+                if constexpr (std::is_same_v<T, float>) return 1;
+                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>) return 2;
+                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>) return 3;
+                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>) return 4;
+                else return 1;
+            }, propIt->second);
+
+            uint32_t srcCC = AnalysisFieldComponentCount(srcField->type);
+            binding.sources.resize(destCC);
+
+            if (destCC == 1)
+            {
+                // float dest: pick the requested component from source.
+                binding.sources[0] = ComponentSource{ sourceNodeId, sourceFieldName, 0, sourceComponent };
+            }
+            else
+            {
+                // Vector dest: map 1:1 from source components.
+                for (uint32_t c = 0; c < destCC; ++c)
+                {
+                    if (c < srcCC)
+                        binding.sources[c] = ComponentSource{ sourceNodeId, sourceFieldName, 0, c };
+                    // else: leave as nullopt (keeps authored default)
+                }
+            }
+        }
+
         destNode->propertyBindings[propertyName] = std::move(binding);
         destNode->dirty = true;
         MarkAllDirty();
@@ -514,9 +582,33 @@ namespace ShaderLab::Graph
                 for (const auto& [propName, binding] : node.propertyBindings)
                 {
                     WDJ::JsonObject bobj;
-                    bobj.SetNamedValue(L"sourceNodeId", WDJ::JsonValue::CreateNumberValue(binding.sourceNodeId));
-                    bobj.SetNamedValue(L"sourceFieldName", WDJ::JsonValue::CreateStringValue(binding.sourceFieldName));
-                    bobj.SetNamedValue(L"sourceComponent", WDJ::JsonValue::CreateNumberValue(binding.sourceComponent));
+                    if (binding.wholeArray)
+                    {
+                        bobj.SetNamedValue(L"wholeArray", WDJ::JsonValue::CreateBooleanValue(true));
+                        bobj.SetNamedValue(L"sourceNodeId", WDJ::JsonValue::CreateNumberValue(binding.wholeArraySourceNodeId));
+                        bobj.SetNamedValue(L"sourceFieldName", WDJ::JsonValue::CreateStringValue(binding.wholeArraySourceFieldName));
+                    }
+                    else
+                    {
+                        WDJ::JsonArray srcs;
+                        for (const auto& src : binding.sources)
+                        {
+                            if (src.has_value())
+                            {
+                                WDJ::JsonObject sobj;
+                                sobj.SetNamedValue(L"nodeId", WDJ::JsonValue::CreateNumberValue(src->sourceNodeId));
+                                sobj.SetNamedValue(L"field", WDJ::JsonValue::CreateStringValue(src->sourceFieldName));
+                                sobj.SetNamedValue(L"index", WDJ::JsonValue::CreateNumberValue(src->sourceIndex));
+                                sobj.SetNamedValue(L"comp", WDJ::JsonValue::CreateNumberValue(src->sourceComponent));
+                                srcs.Append(sobj);
+                            }
+                            else
+                            {
+                                srcs.Append(WDJ::JsonValue::CreateNullValue());
+                            }
+                        }
+                        bobj.SetNamedValue(L"sources", srcs);
+                    }
                     bindingsObj.SetNamedValue(propName, bobj);
                 }
                 obj.SetNamedValue(L"propertyBindings", bindingsObj);
@@ -672,9 +764,78 @@ namespace ShaderLab::Graph
                     auto propName = std::wstring(pair.Key());
                     auto bobj = pair.Value().GetObject();
                     PropertyBinding binding;
-                    binding.sourceNodeId = static_cast<uint32_t>(bobj.GetNamedNumber(L"sourceNodeId"));
-                    binding.sourceFieldName = std::wstring(bobj.GetNamedString(L"sourceFieldName"));
-                    binding.sourceComponent = static_cast<uint32_t>(bobj.GetNamedNumber(L"sourceComponent"));
+
+                    if (bobj.HasKey(L"wholeArray") && bobj.GetNamedBoolean(L"wholeArray"))
+                    {
+                        // New whole-array format.
+                        binding.wholeArray = true;
+                        binding.wholeArraySourceNodeId = static_cast<uint32_t>(bobj.GetNamedNumber(L"sourceNodeId"));
+                        binding.wholeArraySourceFieldName = std::wstring(bobj.GetNamedString(L"sourceFieldName"));
+                    }
+                    else if (bobj.HasKey(L"sources"))
+                    {
+                        // New per-component format.
+                        auto srcs = bobj.GetNamedArray(L"sources");
+                        for (uint32_t si = 0; si < srcs.Size(); ++si)
+                        {
+                            if (srcs.GetAt(si).ValueType() == WDJ::JsonValueType::Null)
+                            {
+                                binding.sources.push_back(std::nullopt);
+                            }
+                            else
+                            {
+                                auto sobj = srcs.GetObjectAt(si);
+                                ComponentSource cs;
+                                cs.sourceNodeId = static_cast<uint32_t>(sobj.GetNamedNumber(L"nodeId"));
+                                cs.sourceFieldName = std::wstring(sobj.GetNamedString(L"field"));
+                                cs.sourceIndex = static_cast<uint32_t>(sobj.GetNamedNumber(L"index"));
+                                cs.sourceComponent = static_cast<uint32_t>(sobj.GetNamedNumber(L"comp"));
+                                binding.sources.push_back(cs);
+                            }
+                        }
+                    }
+                    else if (bobj.HasKey(L"sourceNodeId"))
+                    {
+                        // Legacy single-source format → migrate.
+                        uint32_t srcNodeId = static_cast<uint32_t>(bobj.GetNamedNumber(L"sourceNodeId"));
+                        auto srcField = std::wstring(bobj.GetNamedString(L"sourceFieldName"));
+                        uint32_t srcComp = static_cast<uint32_t>(bobj.GetNamedNumber(L"sourceComponent"));
+
+                        // Determine dest component count from property.
+                        auto propIt = node.properties.find(propName);
+                        uint32_t destCC = 1;
+                        if (propIt != node.properties.end())
+                        {
+                            destCC = std::visit([](auto&& v) -> uint32_t
+                            {
+                                using T = std::decay_t<decltype(v)>;
+                                if constexpr (std::is_same_v<T, float>) return 1;
+                                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>) return 2;
+                                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>) return 3;
+                                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>) return 4;
+                                else if constexpr (std::is_same_v<T, std::vector<float>>) return 0; // array
+                                else return 1;
+                            }, propIt->second);
+                        }
+
+                        if (destCC == 0)
+                        {
+                            binding.wholeArray = true;
+                            binding.wholeArraySourceNodeId = srcNodeId;
+                            binding.wholeArraySourceFieldName = srcField;
+                        }
+                        else if (destCC == 1)
+                        {
+                            binding.sources.push_back(ComponentSource{ srcNodeId, srcField, 0, srcComp });
+                        }
+                        else
+                        {
+                            binding.sources.resize(destCC);
+                            for (uint32_t c = 0; c < destCC; ++c)
+                                binding.sources[c] = ComponentSource{ srcNodeId, srcField, 0, c };
+                        }
+                    }
+
                     node.propertyBindings[propName] = std::move(binding);
                 }
             }
@@ -853,9 +1014,10 @@ namespace ShaderLab::Graph
                     {
                         auto bobj = arr.GetObjectAt(bi);
                         PropertyBinding binding;
-                        binding.sourceNodeId = static_cast<uint32_t>(bobj.GetNamedNumber(L"sourceNodeId"));
-                        binding.sourceFieldName = std::wstring(bobj.GetNamedString(L"sourceField"));
-                        binding.sourceComponent = static_cast<uint32_t>(bobj.GetNamedNumber(L"component"));
+                        uint32_t srcNodeId = static_cast<uint32_t>(bobj.GetNamedNumber(L"sourceNodeId"));
+                        auto srcField = std::wstring(bobj.GetNamedString(L"sourceField"));
+                        uint32_t srcComp = static_cast<uint32_t>(bobj.GetNamedNumber(L"component"));
+                        binding.sources.push_back(ComponentSource{ srcNodeId, srcField, 0, srcComp });
                         auto targetProp = std::wstring(bobj.GetNamedString(L"targetProperty"));
                         node.propertyBindings[targetProp] = std::move(binding);
                     }

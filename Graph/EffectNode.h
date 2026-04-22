@@ -175,17 +175,30 @@ namespace ShaderLab::Graph
         uint32_t           channelIndex{ 0 }; // For per-channel data (R=0, G=1, B=2, A=3).
     };
 
-    // Binds a downstream node's property to an upstream analysis output field.
-    // Evaluated every frame: source field value overrides the authored property.
-    struct PropertyBinding
+    // Specifies the source of a single scalar value in a property binding.
+    struct ComponentSource
     {
         uint32_t sourceNodeId{ 0 };
-        std::wstring sourceFieldName;    // stable name from AnalysisFieldDescriptor
-        uint32_t sourceComponent{ 0 };   // 0-3: which .xyzw for scalar dest properties
-        // Binding rules:
-        //   float dest         ← scalar source, picks sourceComponent
-        //   float2/3/4 dest    ← matching or larger source, takes .xy/.xyz/.xyzw
-        //   vector<float> dest ← array source, takes entire arrayData
+        std::wstring sourceFieldName;   // analysis field name on source node
+        uint32_t sourceIndex{ 0 };      // array element index (0 for scalar fields)
+        uint32_t sourceComponent{ 0 };  // 0-3 for .xyzw within that element
+    };
+
+    // Binds a downstream node's property to upstream analysis output values.
+    // Supports per-component routing: each destination component can come from
+    // a different source field/node/component.
+    struct PropertyBinding
+    {
+        // Per-component sources. Size matches destination component count:
+        //   float → 1, float2 → 2, float3 → 3, float4 → 4
+        // Use nullopt for unbound components (keeps authored default).
+        std::vector<std::optional<ComponentSource>> sources;
+
+        // Whole-array mode: for vector<float> destination properties.
+        // When set, ignores per-component sources and copies entire array.
+        bool wholeArray{ false };
+        uint32_t wholeArraySourceNodeId{ 0 };
+        std::wstring wholeArraySourceFieldName;
     };
 
     // A node in the effect graph DAG.
