@@ -240,6 +240,7 @@ namespace winrt::ShaderLab::implementation
         float m_previewPanX{ 0.0f };
         float m_previewPanY{ 0.0f };
         float m_previewZoom{ 1.0f };
+        bool  m_needsFitPreview{ false };
         bool m_isPreviewPanning{ false };
         float m_previewPanStartX{ 0.0f };
         float m_previewPanStartY{ 0.0f };

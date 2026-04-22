@@ -714,7 +714,9 @@ namespace winrt::ShaderLab::implementation
         PixelTracePanel().Children().Clear();
         TracePositionText().Text(L"Click preview to trace a pixel");
 
-        FitPreviewToView();
+        // Defer FitPreviewToView until after the first evaluation
+        // produces valid cachedOutput (image bounds aren't available yet).
+        m_needsFitPreview = true;
         UpdateStatusBar();
     }
 
@@ -3323,6 +3325,13 @@ namespace winrt::ShaderLab::implementation
 
         // Evaluate the effect graph.
         m_graphEvaluator.Evaluate(m_graph, dc);
+
+        // Deferred fit: after first evaluation with valid output, fit the preview.
+        if (m_needsFitPreview && GetPreviewImage())
+        {
+            m_needsFitPreview = false;
+            FitPreviewToView();
+        }
 
         // Begin draw to swap chain.
         auto* drawDc = m_renderEngine.BeginDraw();
