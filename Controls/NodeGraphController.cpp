@@ -248,8 +248,9 @@ namespace ShaderLab::Controls
         if (!m_selection.isDragging || !m_graph)
             return;
 
-        float dx = (currentPoint.x - m_selection.dragStart.x) / m_zoom;
-        float dy = (currentPoint.y - m_selection.dragStart.y) / m_zoom;
+        // currentPoint is in canvas space (already pan/zoom adjusted).
+        float dx = currentPoint.x - m_selection.dragStart.x;
+        float dy = currentPoint.y - m_selection.dragStart.y;
 
         float ddx = dx - m_selection.dragOffset.x;
         float ddy = dy - m_selection.dragOffset.y;
@@ -320,8 +321,9 @@ namespace ShaderLab::Controls
 
     void NodeGraphController::UpdateConnection(D2D1_POINT_2F currentPoint)
     {
+        // currentPoint is in canvas space (caller already converted).
         if (m_connectionDrag.active)
-            m_connectionDrag.currentPos = ScreenToCanvas(currentPoint);
+            m_connectionDrag.currentPos = currentPoint;
     }
 
     bool NodeGraphController::EndConnection(D2D1_POINT_2F dropPoint)
@@ -332,7 +334,8 @@ namespace ShaderLab::Controls
             return false;
         }
 
-        D2D1_POINT_2F canvasPoint = ScreenToCanvas(dropPoint);
+        // dropPoint is in canvas space (caller already converted).
+        D2D1_POINT_2F canvasPoint = dropPoint;
 
         uint32_t targetNodeId = 0;
         uint32_t targetPin = 0;
