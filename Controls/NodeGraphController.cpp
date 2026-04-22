@@ -490,12 +490,13 @@ namespace ShaderLab::Controls
             static_cast<uint32_t>(node.outputPins.size()));
 
         // Count data pins: bindable properties (float/float2/3/4) as inputs,
-        // analysis fields as outputs.
+        // analysis fields as outputs. Build name (for binding lookup) and label (for display).
         for (const auto& [key, val] : node.properties)
         {
             if (Graph::EffectGraph::IsBindablePropertyType(val))
             {
                 v.dataInputPinNames.push_back(key);
+                v.dataInputPinLabels.push_back(key + L" (" + Graph::PropertyValueTypeTag(val) + L")");
             }
         }
 
@@ -503,7 +504,22 @@ namespace ShaderLab::Controls
             node.customEffect->analysisOutputType == Graph::AnalysisOutputType::Typed)
         {
             for (const auto& fd : node.customEffect->analysisFields)
+            {
                 v.dataOutputPinNames.push_back(fd.name);
+                std::wstring typeTag;
+                switch (fd.type)
+                {
+                case Graph::AnalysisFieldType::Float:       typeTag = L"float"; break;
+                case Graph::AnalysisFieldType::Float2:      typeTag = L"float2"; break;
+                case Graph::AnalysisFieldType::Float3:      typeTag = L"float3"; break;
+                case Graph::AnalysisFieldType::Float4:      typeTag = L"float4"; break;
+                case Graph::AnalysisFieldType::FloatArray:   typeTag = L"float[]"; break;
+                case Graph::AnalysisFieldType::Float2Array:  typeTag = L"float2[]"; break;
+                case Graph::AnalysisFieldType::Float3Array:  typeTag = L"float3[]"; break;
+                case Graph::AnalysisFieldType::Float4Array:  typeTag = L"float4[]"; break;
+                }
+                v.dataOutputPinLabels.push_back(fd.name + L" (" + typeTag + L")");
+            }
         }
 
         uint32_t dataInputCount = static_cast<uint32_t>(v.dataInputPinNames.size());
@@ -916,13 +932,13 @@ namespace ShaderLab::Controls
                     }
                 };
 
-                // Data input pins (left side) + labels.
+                // Data input pins (left side) + labels with types.
                 for (uint32_t i = 0; i < visual.dataInputPinPositions.size(); ++i)
                 {
                     drawDiamond(visual.dataInputPinPositions[i]);
-                    if (m_pinLabelFormat && i < visual.dataInputPinNames.size())
+                    if (m_pinLabelFormat && i < visual.dataInputPinLabels.size())
                     {
-                        auto& name = visual.dataInputPinNames[i];
+                        auto& label = visual.dataInputPinLabels[i];
                         D2D1_RECT_F labelRect = {
                             visual.dataInputPinPositions[i].x + PinRadius + 3.0f,
                             visual.dataInputPinPositions[i].y - 7.0f,
@@ -930,18 +946,18 @@ namespace ShaderLab::Controls
                             visual.dataInputPinPositions[i].y + 7.0f
                         };
                         m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                        dc->DrawText(name.c_str(), static_cast<UINT32>(name.size()),
+                        dc->DrawText(label.c_str(), static_cast<UINT32>(label.size()),
                             m_pinLabelFormat.get(), labelRect, m_brushDataPin.get());
                     }
                 }
 
-                // Data output pins (right side) + labels.
+                // Data output pins (right side) + labels with types.
                 for (uint32_t i = 0; i < visual.dataOutputPinPositions.size(); ++i)
                 {
                     drawDiamond(visual.dataOutputPinPositions[i]);
-                    if (m_pinLabelFormat && i < visual.dataOutputPinNames.size())
+                    if (m_pinLabelFormat && i < visual.dataOutputPinLabels.size())
                     {
-                        auto& name = visual.dataOutputPinNames[i];
+                        auto& label = visual.dataOutputPinLabels[i];
                         D2D1_RECT_F labelRect = {
                             visual.bounds.left + 4.0f,
                             visual.dataOutputPinPositions[i].y - 7.0f,
@@ -949,7 +965,7 @@ namespace ShaderLab::Controls
                             visual.dataOutputPinPositions[i].y + 7.0f
                         };
                         m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                        dc->DrawText(name.c_str(), static_cast<UINT32>(name.size()),
+                        dc->DrawText(label.c_str(), static_cast<UINT32>(label.size()),
                             m_pinLabelFormat.get(), labelRect, m_brushDataPin.get());
                     }
                 }

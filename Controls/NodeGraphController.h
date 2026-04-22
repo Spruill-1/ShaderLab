@@ -21,8 +21,10 @@ namespace ShaderLab::Controls
         // Data pin positions and names (for property bindings).
         std::vector<D2D1_POINT_2F> dataInputPinPositions;
         std::vector<D2D1_POINT_2F> dataOutputPinPositions;
-        std::vector<std::wstring>  dataInputPinNames;   // property names
-        std::vector<std::wstring>  dataOutputPinNames;   // analysis field names
+        std::vector<std::wstring>  dataInputPinNames;    // "PropName (type)"
+        std::vector<std::wstring>  dataOutputPinNames;   // field names (for binding lookup)
+        std::vector<std::wstring>  dataInputPinLabels;   // "PropName (type)" for display
+        std::vector<std::wstring>  dataOutputPinLabels;  // "FieldName (type)" for display
     };
 
     // Describes a pending connection drag operation.
