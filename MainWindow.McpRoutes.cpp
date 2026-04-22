@@ -868,28 +868,12 @@ namespace winrt::ShaderLab::implementation
                     ? static_cast<uint32_t>(jobj.GetNamedNumber(L"sourceComponent")) : 0;
 
                 return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                    auto* node = m_graph.FindNode(nodeId);
-                    if (!node) return { 404, R"({"error":"Node not found"})" };
-
-                    auto* srcNode = m_graph.FindNode(srcNodeId);
-                    if (!srcNode) return { 404, R"({"error":"Source node not found"})" };
-
-                    // Verify source has typed analysis output.
-                    if (!srcNode->customEffect.has_value() ||
-                        srcNode->customEffect->analysisOutputType != ::ShaderLab::Graph::AnalysisOutputType::Typed)
-                        return { 400, R"({"error":"Source node has no typed analysis output"})" };
-
-                    // Check for cycles: adding binding srcNodeId→nodeId.
-                    if (m_graph.WouldCreateCycle(srcNodeId, nodeId))
-                        return { 400, R"({"error":"Binding would create a cycle"})" };
-
-                    ::ShaderLab::Graph::PropertyBinding binding;
-                    binding.sourceNodeId = srcNodeId;
-                    binding.sourceFieldName = srcFieldName;
-                    binding.sourceComponent = srcComponent;
-                    node->propertyBindings[propName] = std::move(binding);
-                    node->dirty = true;
-                    m_graph.MarkAllDirty();
+                    auto err = m_graph.BindProperty(nodeId, propName, srcNodeId, srcFieldName, srcComponent);
+                    if (!err.empty())
+                    {
+                        std::string errUtf8 = ToUtf8(err);
+                        return { 400, "{\"error\":\"" + errUtf8 + "\"}" };
+                    }
                     return { 200, R"({"ok":true})" };
                 });
             }
@@ -909,14 +893,8 @@ namespace winrt::ShaderLab::implementation
                 auto propName = std::wstring(jobj.GetNamedString(L"propertyName"));
 
                 return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                    auto* node = m_graph.FindNode(nodeId);
-                    if (!node) return { 404, R"({"error":"Node not found"})" };
-
-                    if (node->propertyBindings.erase(propName) == 0)
+                    if (!m_graph.UnbindProperty(nodeId, propName))
                         return { 404, R"({"error":"No binding for that property"})" };
-
-                    node->dirty = true;
-                    m_graph.MarkAllDirty();
                     return { 200, R"({"ok":true})" };
                 });
             }

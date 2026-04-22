@@ -58,6 +58,24 @@ namespace ShaderLab::Graph
         // Clears all cached outputs.
         void ClearCachedOutputs();
 
+        // --- Property bindings ---
+
+        // Bind a downstream node's property to an upstream analysis output field.
+        // Validates type compatibility, rejects cycles, replaces existing binding.
+        // Returns empty string on success, or an error message on failure.
+        std::wstring BindProperty(
+            uint32_t destNodeId,
+            const std::wstring& propertyName,
+            uint32_t sourceNodeId,
+            const std::wstring& sourceFieldName,
+            uint32_t sourceComponent = 0);
+
+        // Remove a property binding. Returns true if a binding was removed.
+        bool UnbindProperty(uint32_t nodeId, const std::wstring& propertyName);
+
+        // Returns true if the property type is bindable (float, float2, float3, float4).
+        static bool IsBindablePropertyType(const PropertyValue& value);
+
         // --- Accessors ---
 
         const std::vector<EffectNode>& Nodes() const { return m_nodes; }

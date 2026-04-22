@@ -149,13 +149,13 @@ namespace ShaderLab::Controls
 
     bool NodeGraphController::HitTestPin(
         D2D1_POINT_2F canvasPoint,
-        uint32_t& nodeId, uint32_t& pinIndex, bool& isOutput) const
+        uint32_t& nodeId, uint32_t& pinIndex, bool& isOutput, bool& isDataPin) const
     {
         constexpr float hitRadius = PinRadius * 2.5f;
 
         for (const auto& [id, visual] : m_visuals)
         {
-            // Check output pins.
+            // Check image output pins.
             for (uint32_t i = 0; i < visual.outputPinPositions.size(); ++i)
             {
                 auto& p = visual.outputPinPositions[i];
@@ -163,13 +163,11 @@ namespace ShaderLab::Controls
                 float dy = canvasPoint.y - p.y;
                 if (dx * dx + dy * dy <= hitRadius * hitRadius)
                 {
-                    nodeId = id;
-                    pinIndex = i;
-                    isOutput = true;
+                    nodeId = id; pinIndex = i; isOutput = true; isDataPin = false;
                     return true;
                 }
             }
-            // Check input pins.
+            // Check image input pins.
             for (uint32_t i = 0; i < visual.inputPinPositions.size(); ++i)
             {
                 auto& p = visual.inputPinPositions[i];
@@ -177,9 +175,31 @@ namespace ShaderLab::Controls
                 float dy = canvasPoint.y - p.y;
                 if (dx * dx + dy * dy <= hitRadius * hitRadius)
                 {
-                    nodeId = id;
-                    pinIndex = i;
-                    isOutput = false;
+                    nodeId = id; pinIndex = i; isOutput = false; isDataPin = false;
+                    return true;
+                }
+            }
+            // Check data output pins.
+            for (uint32_t i = 0; i < visual.dataOutputPinPositions.size(); ++i)
+            {
+                auto& p = visual.dataOutputPinPositions[i];
+                float dx = canvasPoint.x - p.x;
+                float dy = canvasPoint.y - p.y;
+                if (dx * dx + dy * dy <= hitRadius * hitRadius)
+                {
+                    nodeId = id; pinIndex = i; isOutput = true; isDataPin = true;
+                    return true;
+                }
+            }
+            // Check data input pins.
+            for (uint32_t i = 0; i < visual.dataInputPinPositions.size(); ++i)
+            {
+                auto& p = visual.dataInputPinPositions[i];
+                float dx = canvasPoint.x - p.x;
+                float dy = canvasPoint.y - p.y;
+                if (dx * dx + dy * dy <= hitRadius * hitRadius)
+                {
+                    nodeId = id; pinIndex = i; isOutput = false; isDataPin = true;
                     return true;
                 }
             }
@@ -242,21 +262,32 @@ namespace ShaderLab::Controls
     // Connection dragging
     // -----------------------------------------------------------------------
 
-    void NodeGraphController::BeginConnection(uint32_t nodeId, uint32_t pinIndex, bool fromOutput)
+    void NodeGraphController::BeginConnection(uint32_t nodeId, uint32_t pinIndex, bool fromOutput, bool isDataPin)
     {
         m_connectionDrag.active = true;
         m_connectionDrag.sourceNodeId = nodeId;
         m_connectionDrag.sourcePin = pinIndex;
         m_connectionDrag.fromOutput = fromOutput;
+        m_connectionDrag.isDataPin = isDataPin;
 
         // Set start position to the pin center.
         auto it = m_visuals.find(nodeId);
         if (it != m_visuals.end())
         {
-            if (fromOutput && pinIndex < it->second.outputPinPositions.size())
-                m_connectionDrag.currentPos = it->second.outputPinPositions[pinIndex];
-            else if (!fromOutput && pinIndex < it->second.inputPinPositions.size())
-                m_connectionDrag.currentPos = it->second.inputPinPositions[pinIndex];
+            if (isDataPin)
+            {
+                if (fromOutput && pinIndex < it->second.dataOutputPinPositions.size())
+                    m_connectionDrag.currentPos = it->second.dataOutputPinPositions[pinIndex];
+                else if (!fromOutput && pinIndex < it->second.dataInputPinPositions.size())
+                    m_connectionDrag.currentPos = it->second.dataInputPinPositions[pinIndex];
+            }
+            else
+            {
+                if (fromOutput && pinIndex < it->second.outputPinPositions.size())
+                    m_connectionDrag.currentPos = it->second.outputPinPositions[pinIndex];
+                else if (!fromOutput && pinIndex < it->second.inputPinPositions.size())
+                    m_connectionDrag.currentPos = it->second.inputPinPositions[pinIndex];
+            }
         }
     }
 
@@ -279,26 +310,75 @@ namespace ShaderLab::Controls
         uint32_t targetNodeId = 0;
         uint32_t targetPin = 0;
         bool targetIsOutput = false;
+        bool targetIsData = false;
 
-        if (!HitTestPin(canvasPoint, targetNodeId, targetPin, targetIsOutput))
+        if (!HitTestPin(canvasPoint, targetNodeId, targetPin, targetIsOutput, targetIsData))
         {
             CancelConnection();
             return false;
         }
 
-        // Must connect output→input (not same direction).
-        bool result = false;
-        if (m_connectionDrag.fromOutput && !targetIsOutput)
+        // Must connect output→input, same pin type (image↔image, data↔data).
+        if (targetIsData != m_connectionDrag.isDataPin)
         {
-            result = m_graph->Connect(
-                m_connectionDrag.sourceNodeId, m_connectionDrag.sourcePin,
-                targetNodeId, targetPin);
+            CancelConnection();
+            return false;
         }
-        else if (!m_connectionDrag.fromOutput && targetIsOutput)
+
+        bool result = false;
+        if (m_connectionDrag.isDataPin)
         {
-            result = m_graph->Connect(
-                targetNodeId, targetPin,
-                m_connectionDrag.sourceNodeId, m_connectionDrag.sourcePin);
+            // Data pin connection → creates a PropertyBinding.
+            uint32_t srcNodeId, dstNodeId;
+            uint32_t srcPinIdx, dstPinIdx;
+            if (m_connectionDrag.fromOutput && !targetIsOutput)
+            {
+                srcNodeId = m_connectionDrag.sourceNodeId;
+                srcPinIdx = m_connectionDrag.sourcePin;
+                dstNodeId = targetNodeId;
+                dstPinIdx = targetPin;
+            }
+            else if (!m_connectionDrag.fromOutput && targetIsOutput)
+            {
+                srcNodeId = targetNodeId;
+                srcPinIdx = targetPin;
+                dstNodeId = m_connectionDrag.sourceNodeId;
+                dstPinIdx = m_connectionDrag.sourcePin;
+            }
+            else
+            {
+                CancelConnection();
+                return false;
+            }
+
+            // Resolve pin indices to field/property names.
+            auto srcIt = m_visuals.find(srcNodeId);
+            auto dstIt = m_visuals.find(dstNodeId);
+            if (srcIt != m_visuals.end() && dstIt != m_visuals.end() &&
+                srcPinIdx < srcIt->second.dataOutputPinNames.size() &&
+                dstPinIdx < dstIt->second.dataInputPinNames.size())
+            {
+                auto& fieldName = srcIt->second.dataOutputPinNames[srcPinIdx];
+                auto& propName = dstIt->second.dataInputPinNames[dstPinIdx];
+                auto err = m_graph->BindProperty(dstNodeId, propName, srcNodeId, fieldName, 0);
+                result = err.empty();
+            }
+        }
+        else
+        {
+            // Image pin connection (existing behavior).
+            if (m_connectionDrag.fromOutput && !targetIsOutput)
+            {
+                result = m_graph->Connect(
+                    m_connectionDrag.sourceNodeId, m_connectionDrag.sourcePin,
+                    targetNodeId, targetPin);
+            }
+            else if (!m_connectionDrag.fromOutput && targetIsOutput)
+            {
+                result = m_graph->Connect(
+                    targetNodeId, targetPin,
+                    m_connectionDrag.sourceNodeId, m_connectionDrag.sourcePin);
+            }
         }
 
         CancelConnection();
@@ -403,11 +483,39 @@ namespace ShaderLab::Controls
         NodeVisual v;
         v.nodeId = node.id;
 
-        uint32_t maxPins = (std::max)(
+        uint32_t maxImagePins = (std::max)(
             static_cast<uint32_t>(node.inputPins.size()),
             static_cast<uint32_t>(node.outputPins.size()));
-        float bodyHeight = (std::max)(maxPins * v.pinSpacing + 10.0f, 40.0f);
-        float totalHeight = v.headerHeight + bodyHeight;
+
+        // Count data pins: bindable properties (float/float2/3/4) as inputs,
+        // analysis fields as outputs.
+        for (const auto& [key, val] : node.properties)
+        {
+            if (Graph::EffectGraph::IsBindablePropertyType(val))
+            {
+                v.dataInputPinNames.push_back(key);
+            }
+        }
+
+        if (node.customEffect.has_value() &&
+            node.customEffect->analysisOutputType == Graph::AnalysisOutputType::Typed)
+        {
+            for (const auto& fd : node.customEffect->analysisFields)
+                v.dataOutputPinNames.push_back(fd.name);
+        }
+
+        uint32_t dataInputCount = static_cast<uint32_t>(v.dataInputPinNames.size());
+        uint32_t dataOutputCount = static_cast<uint32_t>(v.dataOutputPinNames.size());
+
+        // Compute body height: image section + gap + data section.
+        float imageBodyHeight = (std::max)(maxImagePins * v.pinSpacing + 10.0f, 40.0f);
+        float dataBodyHeight = 0.0f;
+        if (dataInputCount > 0 || dataOutputCount > 0)
+        {
+            uint32_t maxDataPins = (std::max)(dataInputCount, dataOutputCount);
+            dataBodyHeight = 8.0f + maxDataPins * v.pinSpacing;  // 8px gap
+        }
+        float totalHeight = v.headerHeight + imageBodyHeight + dataBodyHeight;
 
         v.bounds = {
             node.position.x,
@@ -416,7 +524,7 @@ namespace ShaderLab::Controls
             node.position.y + totalHeight
         };
 
-        // Compute pin positions.
+        // Compute image pin positions.
         float pinStartY = node.position.y + v.headerHeight + 15.0f;
         for (uint32_t i = 0; i < node.inputPins.size(); ++i)
         {
@@ -430,6 +538,23 @@ namespace ShaderLab::Controls
             v.outputPinPositions.push_back({
                 node.position.x + NodeWidth,
                 pinStartY + i * v.pinSpacing
+            });
+        }
+
+        // Compute data pin positions (below image pins).
+        float dataStartY = node.position.y + v.headerHeight + imageBodyHeight + 4.0f;
+        for (uint32_t i = 0; i < dataInputCount; ++i)
+        {
+            v.dataInputPinPositions.push_back({
+                node.position.x,
+                dataStartY + i * v.pinSpacing
+            });
+        }
+        for (uint32_t i = 0; i < dataOutputCount; ++i)
+        {
+            v.dataOutputPinPositions.push_back({
+                node.position.x + NodeWidth,
+                dataStartY + i * v.pinSpacing
             });
         }
 
@@ -470,6 +595,8 @@ namespace ShaderLab::Controls
         dc->CreateSolidColorBrush(D2D1::ColorF(0xCCCCCC), m_brushPin.put());
         dc->CreateSolidColorBrush(D2D1::ColorF(0x264F78), m_brushSelection.put());
         dc->CreateSolidColorBrush(D2D1::ColorF(0xF0F0F0), m_brushText.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(0xFF9800), m_brushDataPin.put());     // Orange
+        dc->CreateSolidColorBrush(D2D1::ColorF(0xFF9800, 0.8f), m_brushDataEdge.put());
 
         winrt::com_ptr<IDWriteFactory> dwriteFactory;
         DWriteCreateFactory(
@@ -490,6 +617,18 @@ namespace ShaderLab::Controls
             {
                 m_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            }
+
+            dwriteFactory->CreateTextFormat(
+                L"Segoe UI", nullptr,
+                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                9.0f, L"en-US",
+                m_pinLabelFormat.put());
+
+            if (m_pinLabelFormat)
+            {
+                m_pinLabelFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             }
         }
 
@@ -562,6 +701,123 @@ namespace ShaderLab::Controls
                 dc->DrawGeometry(path.get(), m_brushEdge.get(), 2.0f);
             }
         }
+
+        // Render data edges (property bindings) as orange curves.
+        if (m_brushDataEdge)
+        {
+            for (const auto& node : m_graph->Nodes())
+            {
+                auto dstIt = m_visuals.find(node.id);
+                if (dstIt == m_visuals.end()) continue;
+
+                for (const auto& [propName, binding] : node.propertyBindings)
+                {
+                    auto srcIt = m_visuals.find(binding.sourceNodeId);
+                    if (srcIt == m_visuals.end()) continue;
+
+                    // Find source data output pin by field name.
+                    D2D1_POINT_2F start{};
+                    bool foundSrc = false;
+                    for (uint32_t i = 0; i < srcIt->second.dataOutputPinNames.size(); ++i)
+                    {
+                        if (srcIt->second.dataOutputPinNames[i] == binding.sourceFieldName &&
+                            i < srcIt->second.dataOutputPinPositions.size())
+                        {
+                            start = srcIt->second.dataOutputPinPositions[i];
+                            foundSrc = true;
+                            break;
+                        }
+                    }
+
+                    // Find dest data input pin by property name.
+                    D2D1_POINT_2F end{};
+                    bool foundDst = false;
+                    for (uint32_t i = 0; i < dstIt->second.dataInputPinNames.size(); ++i)
+                    {
+                        if (dstIt->second.dataInputPinNames[i] == propName &&
+                            i < dstIt->second.dataInputPinPositions.size())
+                        {
+                            end = dstIt->second.dataInputPinPositions[i];
+                            foundDst = true;
+                            break;
+                        }
+                    }
+
+                    if (!foundSrc || !foundDst) continue;
+
+                    float bdx = (end.x - start.x) * 0.4f;
+                    D2D1_POINT_2F bcp1 = { start.x + bdx, start.y };
+                    D2D1_POINT_2F bcp2 = { end.x - bdx, end.y };
+
+                    winrt::com_ptr<ID2D1PathGeometry> bpath;
+                    winrt::com_ptr<ID2D1Factory> bfactory;
+                    dc->GetFactory(bfactory.put());
+                    bfactory->CreatePathGeometry(bpath.put());
+
+                    if (bpath)
+                    {
+                        winrt::com_ptr<ID2D1GeometrySink> bsink;
+                        bpath->Open(bsink.put());
+                        if (bsink)
+                        {
+                            bsink->BeginFigure(start, D2D1_FIGURE_BEGIN_HOLLOW);
+                            bsink->AddBezier({ bcp1, bcp2, end });
+                            bsink->EndFigure(D2D1_FIGURE_END_OPEN);
+                            bsink->Close();
+                        }
+                        dc->DrawGeometry(bpath.get(), m_brushDataEdge.get(), 1.5f);
+                    }
+                }
+            }
+        }
+
+        // Render data edges (property bindings) as orange curves.
+        if (m_brushDataEdge)
+        {
+            for (const auto& node : m_graph->Nodes())
+            {
+                auto dstIt = m_visuals.find(node.id);
+                if (dstIt == m_visuals.end()) continue;
+
+                for (const auto& [propName, binding] : node.propertyBindings)
+                {
+                    auto srcIt = m_visuals.find(binding.sourceNodeId);
+                    if (srcIt == m_visuals.end()) continue;
+
+                    // Find pin positions by name.
+                    D2D1_POINT_2F start{}, end{};
+                    bool foundSrc = false, foundDst = false;
+                    for (uint32_t i = 0; i < srcIt->second.dataOutputPinNames.size(); ++i)
+                        if (srcIt->second.dataOutputPinNames[i] == binding.sourceFieldName &&
+                            i < srcIt->second.dataOutputPinPositions.size())
+                        { start = srcIt->second.dataOutputPinPositions[i]; foundSrc = true; break; }
+                    for (uint32_t i = 0; i < dstIt->second.dataInputPinNames.size(); ++i)
+                        if (dstIt->second.dataInputPinNames[i] == propName &&
+                            i < dstIt->second.dataInputPinPositions.size())
+                        { end = dstIt->second.dataInputPinPositions[i]; foundDst = true; break; }
+                    if (!foundSrc || !foundDst) continue;
+
+                    float bdx = (end.x - start.x) * 0.4f;
+                    winrt::com_ptr<ID2D1PathGeometry> bpath;
+                    winrt::com_ptr<ID2D1Factory> bfactory;
+                    dc->GetFactory(bfactory.put());
+                    bfactory->CreatePathGeometry(bpath.put());
+                    if (bpath)
+                    {
+                        winrt::com_ptr<ID2D1GeometrySink> bsink;
+                        bpath->Open(bsink.put());
+                        if (bsink)
+                        {
+                            bsink->BeginFigure(start, D2D1_FIGURE_BEGIN_HOLLOW);
+                            bsink->AddBezier({ { start.x + bdx, start.y }, { end.x - bdx, end.y }, end });
+                            bsink->EndFigure(D2D1_FIGURE_END_OPEN);
+                            bsink->Close();
+                        }
+                        dc->DrawGeometry(bpath.get(), m_brushDataEdge.get(), 1.5f);
+                    }
+                }
+            }
+        }
     }
 
     void NodeGraphController::RenderNodes(ID2D1DeviceContext* dc)
@@ -610,17 +866,90 @@ namespace ShaderLab::Controls
                     m_brushText.get());
             }
 
-            // Input pins.
+            // Input pins (image).
             if (m_brushPin)
             {
                 for (const auto& p : visual.inputPinPositions)
                 {
                     dc->FillEllipse({ p, PinRadius, PinRadius }, m_brushPin.get());
                 }
-                // Output pins.
+                // Output pins (image).
                 for (const auto& p : visual.outputPinPositions)
                 {
                     dc->FillEllipse({ p, PinRadius, PinRadius }, m_brushPin.get());
+                }
+            }
+
+            // Data pins (diamonds, orange).
+            if (m_brushDataPin)
+            {
+                constexpr float dr = PinRadius * 0.85f;
+                auto drawDiamond = [&](D2D1_POINT_2F center)
+                {
+                    // Rotated square (diamond).
+                    D2D1_POINT_2F pts[4] = {
+                        { center.x,      center.y - dr },  // top
+                        { center.x + dr, center.y      },  // right
+                        { center.x,      center.y + dr },  // bottom
+                        { center.x - dr, center.y      },  // left
+                    };
+                    winrt::com_ptr<ID2D1PathGeometry> diamond;
+                    winrt::com_ptr<ID2D1Factory> factory;
+                    dc->GetFactory(factory.put());
+                    factory->CreatePathGeometry(diamond.put());
+                    if (diamond)
+                    {
+                        winrt::com_ptr<ID2D1GeometrySink> sink;
+                        diamond->Open(sink.put());
+                        if (sink)
+                        {
+                            sink->BeginFigure(pts[0], D2D1_FIGURE_BEGIN_FILLED);
+                            sink->AddLine(pts[1]);
+                            sink->AddLine(pts[2]);
+                            sink->AddLine(pts[3]);
+                            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                            sink->Close();
+                        }
+                        dc->FillGeometry(diamond.get(), m_brushDataPin.get());
+                    }
+                };
+
+                // Data input pins (left side) + labels.
+                for (uint32_t i = 0; i < visual.dataInputPinPositions.size(); ++i)
+                {
+                    drawDiamond(visual.dataInputPinPositions[i]);
+                    if (m_pinLabelFormat && i < visual.dataInputPinNames.size())
+                    {
+                        auto& name = visual.dataInputPinNames[i];
+                        D2D1_RECT_F labelRect = {
+                            visual.dataInputPinPositions[i].x + PinRadius + 3.0f,
+                            visual.dataInputPinPositions[i].y - 7.0f,
+                            visual.bounds.right - 4.0f,
+                            visual.dataInputPinPositions[i].y + 7.0f
+                        };
+                        m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                        dc->DrawText(name.c_str(), static_cast<UINT32>(name.size()),
+                            m_pinLabelFormat.get(), labelRect, m_brushDataPin.get());
+                    }
+                }
+
+                // Data output pins (right side) + labels.
+                for (uint32_t i = 0; i < visual.dataOutputPinPositions.size(); ++i)
+                {
+                    drawDiamond(visual.dataOutputPinPositions[i]);
+                    if (m_pinLabelFormat && i < visual.dataOutputPinNames.size())
+                    {
+                        auto& name = visual.dataOutputPinNames[i];
+                        D2D1_RECT_F labelRect = {
+                            visual.bounds.left + 4.0f,
+                            visual.dataOutputPinPositions[i].y - 7.0f,
+                            visual.dataOutputPinPositions[i].x - PinRadius - 3.0f,
+                            visual.dataOutputPinPositions[i].y + 7.0f
+                        };
+                        m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                        dc->DrawText(name.c_str(), static_cast<UINT32>(name.size()),
+                            m_pinLabelFormat.get(), labelRect, m_brushDataPin.get());
+                    }
                 }
             }
         }

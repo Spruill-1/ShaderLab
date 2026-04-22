@@ -14,9 +14,15 @@ namespace ShaderLab::Controls
         float headerHeight{ 28.0f };    // Height of the title bar
         float pinSpacing{ 20.0f };      // Vertical spacing between pins
 
-        // Computed pin positions (center of the pin circle).
+        // Image pin positions (center of the pin circle).
         std::vector<D2D1_POINT_2F> inputPinPositions;
         std::vector<D2D1_POINT_2F> outputPinPositions;
+
+        // Data pin positions and names (for property bindings).
+        std::vector<D2D1_POINT_2F> dataInputPinPositions;
+        std::vector<D2D1_POINT_2F> dataOutputPinPositions;
+        std::vector<std::wstring>  dataInputPinNames;   // property names
+        std::vector<std::wstring>  dataOutputPinNames;   // analysis field names
     };
 
     // Describes a pending connection drag operation.
@@ -26,6 +32,7 @@ namespace ShaderLab::Controls
         uint32_t sourceNodeId{ 0 };
         uint32_t sourcePin{ 0 };
         bool     fromOutput{ true };    // true = dragging from an output pin
+        bool     isDataPin{ false };    // true = data pin (property binding)
         D2D1_POINT_2F currentPos{};     // Current mouse/pointer position
     };
 
@@ -81,9 +88,10 @@ namespace ShaderLab::Controls
         // Hit-test a canvas point. Returns the node ID under the point, or 0.
         uint32_t HitTestNode(D2D1_POINT_2F canvasPoint) const;
 
-        // Hit-test for a pin. Returns true and fills nodeId/pinIndex/isOutput.
+        // Hit-test for a pin. Returns true and fills nodeId/pinIndex/isOutput/isDataPin.
         bool HitTestPin(D2D1_POINT_2F canvasPoint,
-                        uint32_t& nodeId, uint32_t& pinIndex, bool& isOutput) const;
+                        uint32_t& nodeId, uint32_t& pinIndex, bool& isOutput,
+                        bool& isDataPin) const;
 
         // Begin dragging selected nodes.
         void BeginDragNodes(D2D1_POINT_2F startPoint);
@@ -91,7 +99,7 @@ namespace ShaderLab::Controls
         void EndDragNodes();
 
         // Begin dragging a connection from a pin.
-        void BeginConnection(uint32_t nodeId, uint32_t pinIndex, bool fromOutput);
+        void BeginConnection(uint32_t nodeId, uint32_t pinIndex, bool fromOutput, bool isDataPin = false);
         void UpdateConnection(D2D1_POINT_2F currentPoint);
         bool EndConnection(D2D1_POINT_2F dropPoint);
         void CancelConnection();
@@ -167,7 +175,10 @@ namespace ShaderLab::Controls
         winrt::com_ptr<ID2D1SolidColorBrush> m_brushPin;
         winrt::com_ptr<ID2D1SolidColorBrush> m_brushSelection;
         winrt::com_ptr<ID2D1SolidColorBrush> m_brushText;
+        winrt::com_ptr<ID2D1SolidColorBrush> m_brushDataPin;     // Orange for data pins
+        winrt::com_ptr<ID2D1SolidColorBrush> m_brushDataEdge;    // Orange for data edges
         winrt::com_ptr<IDWriteTextFormat>     m_textFormat;
+        winrt::com_ptr<IDWriteTextFormat>     m_pinLabelFormat;   // Small text for pin labels
         bool m_resourcesCreated{ false };
 
         void EnsureResources(ID2D1DeviceContext* dc);

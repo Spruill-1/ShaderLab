@@ -236,6 +236,82 @@ namespace ShaderLab::Graph
     }
 
     // -----------------------------------------------------------------------
+    // Property bindings
+    // -----------------------------------------------------------------------
+
+    bool EffectGraph::IsBindablePropertyType(const PropertyValue& value)
+    {
+        return std::visit([](auto&& v) -> bool
+        {
+            using T = std::decay_t<decltype(v)>;
+            return std::is_same_v<T, float> ||
+                   std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2> ||
+                   std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3> ||
+                   std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4> ||
+                   std::is_same_v<T, std::vector<float>>;
+        }, value);
+    }
+
+    std::wstring EffectGraph::BindProperty(
+        uint32_t destNodeId,
+        const std::wstring& propertyName,
+        uint32_t sourceNodeId,
+        const std::wstring& sourceFieldName,
+        uint32_t sourceComponent)
+    {
+        auto* destNode = FindNode(destNodeId);
+        if (!destNode) return L"Destination node not found";
+
+        auto* srcNode = FindNode(sourceNodeId);
+        if (!srcNode) return L"Source node not found";
+
+        // Verify source has typed analysis output.
+        if (!srcNode->customEffect.has_value() ||
+            srcNode->customEffect->analysisOutputType != AnalysisOutputType::Typed)
+            return L"Source node has no typed analysis output";
+
+        // Verify field exists on source.
+        bool fieldFound = false;
+        for (const auto& fd : srcNode->customEffect->analysisFields)
+        {
+            if (fd.name == sourceFieldName) { fieldFound = true; break; }
+        }
+        if (!fieldFound) return L"Source field not found";
+
+        // Verify destination property exists and is bindable.
+        auto propIt = destNode->properties.find(propertyName);
+        if (propIt == destNode->properties.end())
+            return L"Property not found on destination node";
+        if (!IsBindablePropertyType(propIt->second))
+            return L"Property type is not bindable (must be float, float2, float3, float4, or float array)";
+
+        // Cycle check.
+        if (WouldCreateCycle(sourceNodeId, destNodeId))
+            return L"Binding would create a cycle";
+
+        // Create binding.
+        PropertyBinding binding;
+        binding.sourceNodeId = sourceNodeId;
+        binding.sourceFieldName = sourceFieldName;
+        binding.sourceComponent = sourceComponent;
+        destNode->propertyBindings[propertyName] = std::move(binding);
+        destNode->dirty = true;
+        MarkAllDirty();
+        return {};  // success
+    }
+
+    bool EffectGraph::UnbindProperty(uint32_t nodeId, const std::wstring& propertyName)
+    {
+        auto* node = FindNode(nodeId);
+        if (!node) return false;
+        if (node->propertyBindings.erase(propertyName) == 0)
+            return false;
+        node->dirty = true;
+        MarkAllDirty();
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
     // Dirty / cache helpers
     // -----------------------------------------------------------------------
 

@@ -1753,9 +1753,10 @@ namespace winrt::ShaderLab::implementation
         uint32_t pinNodeId = 0;
         uint32_t pinIndex = 0;
         bool isOutput = false;
-        if (m_nodeGraphController.HitTestPin(canvasPoint, pinNodeId, pinIndex, isOutput))
+        bool isDataPin = false;
+        if (m_nodeGraphController.HitTestPin(canvasPoint, pinNodeId, pinIndex, isOutput, isDataPin))
         {
-            m_nodeGraphController.BeginConnection(pinNodeId, pinIndex, isOutput);
+            m_nodeGraphController.BeginConnection(pinNodeId, pinIndex, isOutput, isDataPin);
             m_isDraggingConnection = true;
             NodeGraphContainer().CapturePointer(args.Pointer());
             args.Handled(true);
