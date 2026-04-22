@@ -41,7 +41,19 @@ namespace ShaderLab::Rendering
             const Graph::EffectNode& node);
 
         // Apply the node's property map to its D2D effect.
-        void ApplyProperties(ID2D1Effect* effect, const Graph::EffectNode& node);
+        // Uses effective properties (authored + binding overrides).
+        void ApplyProperties(
+            ID2D1Effect* effect,
+            const Graph::EffectNode& node,
+            const std::map<std::wstring, Graph::PropertyValue>& effectiveProps);
+
+        // Resolve property bindings: build effective properties map from
+        // authored defaults + upstream analysis output values.
+        // Returns true if any binding produced a new value (node should be dirtied).
+        bool ResolveBindings(
+            Graph::EffectNode& node,
+            const Graph::EffectGraph& graph,
+            std::map<std::wstring, Graph::PropertyValue>& effectiveProps);
 
         // Wire input edges: for each input pin on destNode, find the upstream
         // node's cachedOutput and call effect->SetInput(pin, image).
@@ -63,7 +75,10 @@ namespace ShaderLab::Rendering
         std::unordered_map<uint32_t, CustomEffectEntry> m_customImplCache;
 
         // Apply bytecode and cbuffer to a custom effect node.
-        void ApplyCustomEffect(ID2D1Effect* effect, Graph::EffectNode& node);
+        void ApplyCustomEffect(
+            ID2D1Effect* effect,
+            Graph::EffectNode& node,
+            const std::map<std::wstring, Graph::PropertyValue>& effectiveProps);
 
         // Force D2D to compute the histogram and read output data.
         void ReadHistogramOutput(

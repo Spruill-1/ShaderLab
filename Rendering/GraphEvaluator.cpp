@@ -52,9 +52,13 @@ namespace ShaderLab::Rendering
                 {
                     WireInputs(effect, *node, graph);
 
-                    if (node->dirty)
+                    // Resolve property bindings every frame.
+                    std::map<std::wstring, PropertyValue> effectiveProps;
+                    bool bindingsChanged = ResolveBindings(*node, graph, effectiveProps);
+
+                    if (node->dirty || bindingsChanged)
                     {
-                        ApplyProperties(effect, *node);
+                        ApplyProperties(effect, *node, effectiveProps);
                         node->dirty = false;
                     }
 
@@ -87,9 +91,13 @@ namespace ShaderLab::Rendering
 
                 if (node->customEffect.has_value() && node->customEffect->isCompiled())
                 {
-                    if (node->dirty)
+                    // Resolve property bindings every frame.
+                    std::map<std::wstring, PropertyValue> effectiveProps;
+                    bool bindingsChanged = ResolveBindings(*node, graph, effectiveProps);
+
+                    if (node->dirty || bindingsChanged)
                     {
-                        ApplyCustomEffect(effect, *node);
+                        ApplyCustomEffect(effect, *node, effectiveProps);
 
                         // Force-upload the cbuffer directly to the GPU.
                         auto implIt = m_customImplCache.find(node->id);
@@ -143,7 +151,7 @@ namespace ShaderLab::Rendering
                         WireInputs(effect, *node, graph);
                         if (node->dirty)
                         {
-                            ApplyProperties(effect, *node);
+                            ApplyProperties(effect, *node, node->properties);
                             node->dirty = false;
                         }
                         winrt::com_ptr<ID2D1Image> output;
@@ -298,7 +306,10 @@ namespace ShaderLab::Rendering
     // Property application
     // -----------------------------------------------------------------------
 
-    void GraphEvaluator::ApplyProperties(ID2D1Effect* effect, const EffectNode& node)
+    void GraphEvaluator::ApplyProperties(
+        ID2D1Effect* effect,
+        const EffectNode& node,
+        const std::map<std::wstring, PropertyValue>& effectiveProps)
     {
         if (!effect)
             return;
@@ -307,7 +318,7 @@ namespace ShaderLab::Rendering
         // The property map in EffectNode uses string keys. We map numeric
         // string keys ("0", "1", ...) directly to D2D property indices.
         // Named keys are resolved through the effect's property name table.
-        for (const auto& [key, value] : node.properties)
+        for (const auto& [key, value] : effectiveProps)
         {
             // Try to parse the key as a numeric index first.
             uint32_t index = UINT32_MAX;
@@ -421,10 +432,129 @@ namespace ShaderLab::Rendering
     }
 
     // -----------------------------------------------------------------------
+    // Property binding resolution
+    // -----------------------------------------------------------------------
+
+    bool GraphEvaluator::ResolveBindings(
+        EffectNode& node,
+        const EffectGraph& graph,
+        std::map<std::wstring, PropertyValue>& effectiveProps)
+    {
+        // Start with authored properties.
+        effectiveProps = node.properties;
+
+        if (node.propertyBindings.empty())
+            return false;
+
+        bool anyChanged = false;
+
+        for (const auto& [propName, binding] : node.propertyBindings)
+        {
+            const EffectNode* srcNode = graph.FindNode(binding.sourceNodeId);
+            if (!srcNode || srcNode->analysisOutput.type != AnalysisOutputType::Typed)
+                continue;
+
+            // Find the source field by name.
+            const AnalysisFieldValue* srcField = nullptr;
+            for (const auto& fv : srcNode->analysisOutput.fields)
+            {
+                if (fv.name == binding.sourceFieldName)
+                {
+                    srcField = &fv;
+                    break;
+                }
+            }
+            if (!srcField) continue;
+
+            // Get the current authored property to determine destination type.
+            auto propIt = effectiveProps.find(propName);
+            PropertyValue newVal;
+            bool resolved = false;
+
+            if (AnalysisFieldIsArray(srcField->type))
+            {
+                // Array source → vector<float> destination.
+                newVal = srcField->arrayData;
+                resolved = true;
+            }
+            else
+            {
+                // Scalar source → match destination type.
+                uint32_t comp = (std::min)(binding.sourceComponent, 3u);
+
+                if (propIt != effectiveProps.end())
+                {
+                    // Match destination property type.
+                    std::visit([&](auto&& existing)
+                    {
+                        using T = std::decay_t<decltype(existing)>;
+                        if constexpr (std::is_same_v<T, float>)
+                        {
+                            newVal = srcField->components[comp];
+                            resolved = true;
+                        }
+                        else if constexpr (std::is_same_v<T, int32_t>)
+                        {
+                            newVal = static_cast<int32_t>(srcField->components[comp]);
+                            resolved = true;
+                        }
+                        else if constexpr (std::is_same_v<T, uint32_t>)
+                        {
+                            newVal = static_cast<uint32_t>(srcField->components[comp]);
+                            resolved = true;
+                        }
+                        else if constexpr (std::is_same_v<T, bool>)
+                        {
+                            newVal = srcField->components[comp] != 0.0f;
+                            resolved = true;
+                        }
+                        else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
+                        {
+                            newVal = winrt::Windows::Foundation::Numerics::float2{
+                                srcField->components[0], srcField->components[1] };
+                            resolved = true;
+                        }
+                        else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
+                        {
+                            newVal = winrt::Windows::Foundation::Numerics::float3{
+                                srcField->components[0], srcField->components[1], srcField->components[2] };
+                            resolved = true;
+                        }
+                        else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
+                        {
+                            newVal = winrt::Windows::Foundation::Numerics::float4{
+                                srcField->components[0], srcField->components[1],
+                                srcField->components[2], srcField->components[3] };
+                            resolved = true;
+                        }
+                    }, propIt->second);
+                }
+                else
+                {
+                    // No existing property — default to float.
+                    newVal = srcField->components[comp];
+                    resolved = true;
+                }
+            }
+
+            if (resolved)
+            {
+                effectiveProps[propName] = newVal;
+                anyChanged = true;
+            }
+        }
+
+        return anyChanged;
+    }
+
+    // -----------------------------------------------------------------------
     // Custom effect application
     // -----------------------------------------------------------------------
 
-    void GraphEvaluator::ApplyCustomEffect(ID2D1Effect* effect, EffectNode& node)
+    void GraphEvaluator::ApplyCustomEffect(
+        ID2D1Effect* effect,
+        EffectNode& node,
+        const std::map<std::wstring, PropertyValue>& effectiveProps)
     {
         if (!node.customEffect.has_value()) return;
         auto& def = node.customEffect.value();
@@ -477,9 +607,9 @@ namespace ShaderLab::Rendering
                     continue;
                 }
 
-                auto propIt = node.properties.find(
+                auto propIt = effectiveProps.find(
                     std::wstring(var.name.begin(), var.name.end()));
-                if (propIt == node.properties.end()) continue;
+                if (propIt == effectiveProps.end()) continue;
 
                 std::visit([&](const auto& v)
                 {
