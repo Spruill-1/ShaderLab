@@ -773,6 +773,7 @@ namespace winrt::ShaderLab::implementation
                     node->dirty = true;
                     m_graph.MarkAllDirty();
                     m_graphEvaluator.InvalidateNode(nodeId);
+                    m_nodeGraphController.RebuildLayout();
                     return { 200, std::format("{{\"compiled\":true,\"bytecodeSize\":{}}}", def.compiledBytecode.size()) };
                 });
             }
@@ -874,6 +875,7 @@ namespace winrt::ShaderLab::implementation
                         std::string errUtf8 = ToUtf8(err);
                         return { 400, "{\"error\":\"" + errUtf8 + "\"}" };
                     }
+                    m_nodeGraphController.RebuildLayout();
                     return { 200, R"({"ok":true})" };
                 });
             }
@@ -895,6 +897,7 @@ namespace winrt::ShaderLab::implementation
                 return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                     if (!m_graph.UnbindProperty(nodeId, propName))
                         return { 404, R"({"error":"No binding for that property"})" };
+                    m_nodeGraphController.RebuildLayout();
                     return { 200, R"({"ok":true})" };
                 });
             }
