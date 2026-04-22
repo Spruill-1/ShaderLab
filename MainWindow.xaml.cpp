@@ -3079,13 +3079,36 @@ namespace winrt::ShaderLab::implementation
                 else
                 {
                     uint32_t stride = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
-                    uint32_t count = static_cast<uint32_t>(fv.arrayData.size()) / (std::max)(stride, 1u);
-                    valStr = std::format(L"[{} elements]", count);
+                    uint32_t count = stride > 0
+                        ? static_cast<uint32_t>(fv.arrayData.size()) / stride : 0;
+                    valStr = std::format(L"[{} elements]\n", count);
+                    // Show elements (up to 32, then truncate).
+                    uint32_t showCount = (std::min)(count, 32u);
+                    for (uint32_t i = 0; i < showCount; ++i)
+                    {
+                        if (stride == 1)
+                        {
+                            valStr += std::format(L"  [{}] {:.4f}\n", i, fv.arrayData[i]);
+                        }
+                        else
+                        {
+                            valStr += std::format(L"  [{}] ", i);
+                            for (uint32_t c = 0; c < stride; ++c)
+                            {
+                                if (c > 0) valStr += L"  ";
+                                valStr += std::format(L"{:.4f}", fv.arrayData[i * stride + c]);
+                            }
+                            valStr += L"\n";
+                        }
+                    }
+                    if (count > showCount)
+                        valStr += std::format(L"  ... ({} more)\n", count - showCount);
                 }
                 valueText.Text(winrt::hstring(valStr));
                 valueText.FontSize(12);
                 valueText.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Consolas"));
                 valueText.IsTextSelectionEnabled(true);
+                valueText.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
                 row.Children().Append(valueText);
 
                 panel.Children().Append(row);
