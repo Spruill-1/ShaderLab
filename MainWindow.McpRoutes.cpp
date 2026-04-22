@@ -973,6 +973,134 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
+        // POST /render/pixel-trace — Run pixel trace at normalized coordinates
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/render/pixel-trace", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            try
+            {
+                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+                uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
+                float normX = static_cast<float>(jobj.GetNamedNumber(L"x"));
+                float normY = static_cast<float>(jobj.GetNamedNumber(L"y"));
+
+                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    auto* dc = m_renderEngine.D2DDeviceContext();
+                    if (!dc) return { 500, R"({"error":"No device context"})" };
+
+                    auto bounds = GetPreviewImageBounds();
+                    uint32_t imageW = static_cast<uint32_t>(bounds.right - bounds.left);
+                    uint32_t imageH = static_cast<uint32_t>(bounds.bottom - bounds.top);
+                    if (imageW == 0 || imageH == 0)
+                        return { 404, R"({"error":"No preview image"})" };
+
+                    if (!m_pixelTrace.BuildTrace(dc, m_graph, nodeId, normX, normY, imageW, imageH))
+                        return { 500, R"({"error":"Pixel trace failed"})" };
+
+                    const auto& root = m_pixelTrace.Root();
+                    uint32_t pixelX = static_cast<uint32_t>(normX * imageW);
+                    uint32_t pixelY = static_cast<uint32_t>(normY * imageH);
+
+                    // Recursive lambda to serialize the trace tree.
+                    std::function<std::string(const ::ShaderLab::Controls::PixelTraceNode&)> serializeNode;
+                    serializeNode = [&](const ::ShaderLab::Controls::PixelTraceNode& tn) -> std::string
+                    {
+                        std::string j = "{";
+                        j += std::format("\"nodeId\":{},\"name\":\"{}\",\"pin\":\"{}\"",
+                            tn.nodeId, ToUtf8(tn.nodeName), ToUtf8(tn.pinName));
+
+                        // Pixel values.
+                        const auto& px = tn.pixel;
+                        j += std::format(",\"pixel\":{{\"scRGB\":[{:.6f},{:.6f},{:.6f},{:.6f}]",
+                            px.scR, px.scG, px.scB, px.scA);
+                        j += std::format(",\"sRGB\":[{},{},{},{}]",
+                            px.sR, px.sG, px.sB, px.sA);
+                        j += std::format(",\"luminance\":{:.2f}}}", px.luminanceNits);
+
+                        // Analysis fields (for compute/analysis nodes).
+                        if (tn.hasAnalysisOutput && !tn.analysisFields.empty())
+                        {
+                            j += ",\"analysisFields\":[";
+                            bool first = true;
+                            for (const auto& fv : tn.analysisFields)
+                            {
+                                if (!first) j += ",";
+                                j += "{\"name\":\"" + ToUtf8(fv.name) + "\"";
+
+                                std::string typeTag;
+                                switch (fv.type)
+                                {
+                                case ::ShaderLab::Graph::AnalysisFieldType::Float:       typeTag = "float"; break;
+                                case ::ShaderLab::Graph::AnalysisFieldType::Float2:      typeTag = "float2"; break;
+                                case ::ShaderLab::Graph::AnalysisFieldType::Float3:      typeTag = "float3"; break;
+                                case ::ShaderLab::Graph::AnalysisFieldType::Float4:      typeTag = "float4"; break;
+                                case ::ShaderLab::Graph::AnalysisFieldType::FloatArray:   typeTag = "floatarray"; break;
+                                case ::ShaderLab::Graph::AnalysisFieldType::Float2Array:  typeTag = "float2array"; break;
+                                case ::ShaderLab::Graph::AnalysisFieldType::Float3Array:  typeTag = "float3array"; break;
+                                case ::ShaderLab::Graph::AnalysisFieldType::Float4Array:  typeTag = "float4array"; break;
+                                }
+                                j += ",\"type\":\"" + typeTag + "\"";
+
+                                if (!::ShaderLab::Graph::AnalysisFieldIsArray(fv.type))
+                                {
+                                    uint32_t cc = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                                    j += ",\"value\":[";
+                                    for (uint32_t c = 0; c < cc; ++c)
+                                    {
+                                        if (c > 0) j += ",";
+                                        j += std::format("{:.6f}", fv.components[c]);
+                                    }
+                                    j += "]";
+                                }
+                                else
+                                {
+                                    uint32_t stride = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                                    uint32_t count = stride > 0 ? static_cast<uint32_t>(fv.arrayData.size()) / stride : 0;
+                                    j += ",\"count\":" + std::to_string(count);
+                                    j += ",\"value\":[";
+                                    for (size_t i = 0; i < fv.arrayData.size(); ++i)
+                                    {
+                                        if (i > 0) j += ",";
+                                        j += std::format("{:.6f}", fv.arrayData[i]);
+                                    }
+                                    j += "]";
+                                }
+                                j += "}";
+                                first = false;
+                            }
+                            j += "]";
+                        }
+                        else
+                        {
+                            j += ",\"analysisFields\":[]";
+                        }
+
+                        // Recurse into inputs.
+                        j += ",\"inputs\":[";
+                        for (size_t i = 0; i < tn.inputs.size(); ++i)
+                        {
+                            if (i > 0) j += ",";
+                            j += serializeNode(tn.inputs[i]);
+                        }
+                        j += "]";
+
+                        j += "}";
+                        return j;
+                    };
+
+                    std::string json = "{";
+                    json += std::format("\"position\":{{\"x\":{:.6f},\"y\":{:.6f},\"pixelX\":{},\"pixelY\":{}}}",
+                        normX, normY, pixelX, pixelY);
+                    json += ",\"nodes\":[" + serializeNode(root) + "]";
+                    json += "}";
+                    return { 200, json };
+                });
+            }
+            catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
+        });
+
+        // =====================================================================
         // POST /  — MCP JSON-RPC 2.0 endpoint (Streamable HTTP transport)
         // =====================================================================
         m_mcpServer->AddRoute(L"POST", L"/", [this](const std::wstring&, const std::string& body)
@@ -1037,7 +1165,8 @@ namespace winrt::ShaderLab::implementation
 {"name":"registry_get_effect","description":"Get metadata for a built-in effect","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
 {"name":"graph_bind_property","description":"Bind a node property to an upstream analysis output field","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"propertyName":{"type":"string"},"sourceNodeId":{"type":"number"},"sourceFieldName":{"type":"string"},"sourceComponent":{"type":"number","description":"0-3 for .xyzw component (scalar dest only)"}},"required":["nodeId","propertyName","sourceNodeId","sourceFieldName"]}},
 {"name":"graph_unbind_property","description":"Remove a property binding","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"propertyName":{"type":"string"}},"required":["nodeId","propertyName"]}},
-{"name":"read_analysis_output","description":"Read typed analysis output fields from a compute/analysis node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}}
+{"name":"read_analysis_output","description":"Read typed analysis output fields from a compute/analysis node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
+{"name":"read_pixel_trace","description":"Run pixel trace at normalized coordinates, returns per-node pixel values and analysis outputs","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"x":{"type":"number","description":"Normalized X (0-1)"},"y":{"type":"number","description":"Normalized Y (0-1)"}},"required":["nodeId","x","y"]}}
 ]})JSON";
                     return { 200, wrapResult(tools) };
                 }
@@ -1097,6 +1226,8 @@ namespace winrt::ShaderLab::implementation
                         auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(L"nodeId"));
                         restResp = m_mcpServer->RouteRequest(L"GET", std::format(L"/analysis/{}", nodeId), "");
                     }
+                    else if (toolName == "read_pixel_trace")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/render/pixel-trace", argsStr);
 
                     bool isError = restResp.statusCode >= 400;
 

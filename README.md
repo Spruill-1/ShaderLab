@@ -402,7 +402,13 @@ ShaderLab/
 │   ├── NodeGraphController.h       # Canvas-based node graph editor (layout, hit-test, D2D render)
 │   ├── NodeGraphController.cpp     # Bezier edges, color-coded nodes, drag/connect/select, pan/zoom
 │   ├── PixelInspectorController.h  # GPU readback, scRGB→sRGB/PQ/luminance conversion
-│   └── PixelInspectorController.cpp # D2D1Bitmap1 CPU_READ readback, tracked pixel position
+│   ├── PixelInspectorController.cpp # D2D1Bitmap1 CPU_READ readback, tracked pixel position
+│   ├── PixelTraceController.h     # Recursive pixel trace through effect graph
+│   └── PixelTraceController.cpp   # Per-node pixel readback + analysis output collection
+├── ShaderLab/                  # MCP HTTP server (separate compilation unit)
+│   ├── McpHttpServer.h            # Winsock2 TCP server, route registration, JSON-RPC
+│   └── McpHttpServer.cpp          # HTTP parsing, request dispatch (no PCH)
+├── MainWindow.McpRoutes.cpp    # All MCP REST endpoints + JSON-RPC 2.0 handler
 ├── Shaders/                    # HLSL source files (user shaders)
 ├── Assets/                     # App icons, splash screen
 │
@@ -410,3 +416,132 @@ ShaderLab/
 │   └── copilot-instructions.md
 └── packages/                   # NuGet packages (restored)
 ```
+
+## Compute Shader Analysis Pipeline
+
+Custom compute shaders can act as analysis effects, producing typed output fields that are read back to the CPU and can drive downstream effect properties via data bindings.
+
+### Analysis Output Types
+
+| Type | Pixels | Packing |
+|------|--------|---------|
+| `float` | 1 | `.x` used |
+| `float2` | 1 | `.xy` used |
+| `float3` | 1 | `.xyz` used |
+| `float4` | 1 | all 4 components |
+| `floatarray` | ceil(N/4) | 4 floats packed per pixel |
+| `float2array` | N | `.xy` per pixel |
+| `float3array` | N | `.xyz` per pixel |
+| `float4array` | N | all 4 per pixel |
+
+### D2D Compute Shader Conventions
+
+D2D evaluates compute effects in **tiles**. Key conventions:
+
+- **`_TileOffset`** (int2): Auto-injected at cbuffer offset 0 in `CalculateThreadgroups`. Gives the tile's origin in the full image.
+- **`Source.GetDimensions()`**: Returns the full source image size (not tile size).
+- **`SampleLevel()`**: Must use normalized UVs via `SampleLevel()`. `Load()` is not available in D2D compute shaders.
+- **`Output.GetDimensions()`**: Returns the tile size, not the full image.
+- **Constant buffer upload**: Done in `CalculateThreadgroups` (not `PrepareForRender`) for correct per-tile values.
+
+### Shader Pattern
+```hlsl
+cbuffer Constants : register(b0) {
+    int2 _TileOffset;  // Auto-injected per tile
+    // User parameters here...
+};
+Texture2D Source : register(t0);
+RWTexture2D<float4> Output : register(u0);
+SamplerState Sampler0 : register(s0);
+
+[numthreads(8, 8, 1)]
+void main(uint3 DTid : SV_DispatchThreadID) {
+    uint srcW, srcH;
+    Source.GetDimensions(srcW, srcH);
+    uint2 globalPos = DTid.xy + uint2(_TileOffset);
+    if (globalPos.x >= srcW || globalPos.y >= srcH) return;
+    
+    float2 uv = (float2(globalPos) + 0.5) / float2(srcW, srcH);
+    float4 color = Source.SampleLevel(Sampler0, uv, 0);
+    Output[DTid.xy] = color;
+}
+```
+
+## Property Binding System (Grasshopper-style)
+
+Analysis output fields can be visually connected to downstream effect properties using **data pins** on the node graph canvas.
+
+```mermaid
+graph LR
+    subgraph Compute["Analysis Compute"]
+        CO1["◆ MaxLuminance (float)"]
+        CO2["◆ GamutBounds (float4)"]
+    end
+    subgraph Blur["Gaussian Blur"]
+        BI1["◆ StandardDeviation (float)"]
+    end
+    CO1 -->|"data binding"| BI1
+```
+
+### Visual Data Pins
+
+- **Image pins**: White circles on node edges (existing D2D image connections)
+- **Data pins**: Orange diamonds below image pins
+  - Output data pins (right side): analysis fields from compute nodes
+  - Input data pins (left side): bindable float/float2/float3/float4 properties
+- **Data edges**: Orange bezier curves connecting data pins
+- **Type labels**: Each pin shows its type, e.g., `MaxLuminance (float)`
+
+### Binding Rules
+
+| Source → Dest | Behavior |
+|---|---|
+| float → float | Direct |
+| float → float2/3/4 | Replicate (x,x,x,0) |
+| float4 → float | Component picker (.x/.y/.z/.w) |
+| float4 → float4 | Direct |
+| array → array | Direct |
+| array ↔ scalar | Rejected |
+
+### Evaluation
+
+- Bindings participate in **topological sort** (source must evaluate before destination)
+- **Cycle detection** covers both image edges and binding edges
+- Bound values resolved **every frame** (bypass dirty logic — upstream analysis may change)
+- **Authored properties never mutated** — bindings build an effective properties map at evaluation time
+
+## MCP Server (AI Agent Integration)
+
+ShaderLab includes an embedded HTTP server implementing the **Model Context Protocol (MCP)** JSON-RPC 2.0 for programmatic control by AI agents.
+
+### Connection
+
+- Default port: **47808** (auto-increments if in use)
+- Transport: Streamable HTTP (`POST /` for JSON-RPC)
+- Enable: MCP toggle in toolbar, `--mcp` flag, or `config.json`
+
+### Tools (16 total)
+
+| Tool | Description |
+|------|-------------|
+| `graph_add_node` | Add built-in or custom shader node |
+| `graph_remove_node` | Remove a node |
+| `graph_connect` | Connect image pins |
+| `graph_disconnect` | Disconnect image pins |
+| `graph_set_property` | Set a node property |
+| `graph_get_node` | Get node details + analysis results |
+| `graph_save_json` | Serialize graph to JSON |
+| `graph_load_json` | Load graph from JSON |
+| `graph_clear` | Clear entire graph |
+| `effect_compile` | Compile HLSL (+ optional analysisFields) |
+| `set_preview_node` | Set which node is previewed |
+| `render_capture` | Capture preview as PNG |
+| `registry_get_effect` | Get built-in effect metadata |
+| `graph_bind_property` | Bind property to analysis field |
+| `graph_unbind_property` | Remove binding |
+| `read_analysis_output` | Read typed analysis fields |
+
+### Known Limitations
+
+- **Compile-before-connect**: First-time compile of a compute shader node that's already connected to the render pipeline crashes D2D. Workaround: compile the shader while the node is disconnected, then wire it in. Recompiles of already-compiled nodes work fine.
+- **FP16 precision**: Analysis readback values show minor quantization (e.g., 0.1 → 0.099976) due to the D2D output buffer using 16-bit float precision.
