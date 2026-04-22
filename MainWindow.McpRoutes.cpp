@@ -816,6 +816,156 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
+        // POST /graph/bind-property — Bind a property to an analysis output field
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/graph/bind-property", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            try
+            {
+                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+                uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
+                auto propName = std::wstring(jobj.GetNamedString(L"propertyName"));
+                uint32_t srcNodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"sourceNodeId"));
+                auto srcFieldName = std::wstring(jobj.GetNamedString(L"sourceFieldName"));
+                uint32_t srcComponent = jobj.HasKey(L"sourceComponent")
+                    ? static_cast<uint32_t>(jobj.GetNamedNumber(L"sourceComponent")) : 0;
+
+                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    auto* node = m_graph.FindNode(nodeId);
+                    if (!node) return { 404, R"({"error":"Node not found"})" };
+
+                    auto* srcNode = m_graph.FindNode(srcNodeId);
+                    if (!srcNode) return { 404, R"({"error":"Source node not found"})" };
+
+                    // Verify source has typed analysis output.
+                    if (!srcNode->customEffect.has_value() ||
+                        srcNode->customEffect->analysisOutputType != ::ShaderLab::Graph::AnalysisOutputType::Typed)
+                        return { 400, R"({"error":"Source node has no typed analysis output"})" };
+
+                    // Check for cycles: adding binding srcNodeId→nodeId.
+                    if (m_graph.WouldCreateCycle(srcNodeId, nodeId))
+                        return { 400, R"({"error":"Binding would create a cycle"})" };
+
+                    ::ShaderLab::Graph::PropertyBinding binding;
+                    binding.sourceNodeId = srcNodeId;
+                    binding.sourceFieldName = srcFieldName;
+                    binding.sourceComponent = srcComponent;
+                    node->propertyBindings[propName] = std::move(binding);
+                    node->dirty = true;
+                    m_graph.MarkAllDirty();
+                    return { 200, R"({"ok":true})" };
+                });
+            }
+            catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
+        });
+
+        // =====================================================================
+        // POST /graph/unbind-property — Remove a property binding
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/graph/unbind-property", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            try
+            {
+                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+                uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
+                auto propName = std::wstring(jobj.GetNamedString(L"propertyName"));
+
+                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    auto* node = m_graph.FindNode(nodeId);
+                    if (!node) return { 404, R"({"error":"Node not found"})" };
+
+                    if (node->propertyBindings.erase(propName) == 0)
+                        return { 404, R"({"error":"No binding for that property"})" };
+
+                    node->dirty = true;
+                    m_graph.MarkAllDirty();
+                    return { 200, R"({"ok":true})" };
+                });
+            }
+            catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
+        });
+
+        // =====================================================================
+        // GET /graph/node/{id}/analysis — Read analysis output fields
+        // =====================================================================
+        m_mcpServer->AddRoute(L"GET", L"/graph/node/", [this](const std::wstring& path, const std::string&)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            // Parse path: /graph/node/{id}/analysis
+            auto rest = path.substr(12); // after "/graph/node/"
+            auto slash = rest.find(L'/');
+            if (slash == std::wstring::npos)
+            {
+                // Plain /graph/node/{id} — handled by the existing route
+                return { 404, R"({"error":"Use /graph/node/{id}/analysis"})" };
+            }
+            auto suffix = rest.substr(slash + 1);
+            if (suffix != L"analysis")
+                return { 404, R"({"error":"Unknown sub-path"})" };
+
+            uint32_t nodeId = static_cast<uint32_t>(std::stoul(rest.substr(0, slash)));
+            auto* node = m_graph.FindNode(nodeId);
+            if (!node) return { 404, R"({"error":"Node not found"})" };
+
+            if (node->analysisOutput.type != ::ShaderLab::Graph::AnalysisOutputType::Typed ||
+                node->analysisOutput.fields.empty())
+                return { 200, R"({"fields":[]})" };
+
+            std::string json = R"({"fields":[)";
+            bool first = true;
+            for (const auto& fv : node->analysisOutput.fields)
+            {
+                if (!first) json += ",";
+                json += "{\"name\":\"" + ToUtf8(fv.name) + "\"";
+
+                std::string typeTag;
+                switch (fv.type)
+                {
+                case ::ShaderLab::Graph::AnalysisFieldType::Float:       typeTag = "float"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float2:      typeTag = "float2"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float3:      typeTag = "float3"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float4:      typeTag = "float4"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::FloatArray:   typeTag = "floatarray"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float2Array:  typeTag = "float2array"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float3Array:  typeTag = "float3array"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float4Array:  typeTag = "float4array"; break;
+                }
+                json += ",\"type\":\"" + typeTag + "\"";
+
+                if (!::ShaderLab::Graph::AnalysisFieldIsArray(fv.type))
+                {
+                    uint32_t cc = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                    json += ",\"value\":[";
+                    for (uint32_t c = 0; c < cc; ++c)
+                    {
+                        if (c > 0) json += ",";
+                        json += std::format("{:.6f}", fv.components[c]);
+                    }
+                    json += "]";
+                }
+                else
+                {
+                    uint32_t stride = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                    uint32_t count = stride > 0 ? static_cast<uint32_t>(fv.arrayData.size()) / stride : 0;
+                    json += ",\"count\":" + std::to_string(count);
+                    json += ",\"value\":[";
+                    for (size_t i = 0; i < fv.arrayData.size(); ++i)
+                    {
+                        if (i > 0) json += ",";
+                        json += std::format("{:.6f}", fv.arrayData[i]);
+                    }
+                    json += "]";
+                }
+                json += "}";
+                first = false;
+            }
+            json += "]}";
+            return { 200, json };
+        });
+
+        // =====================================================================
         // POST /  — MCP JSON-RPC 2.0 endpoint (Streamable HTTP transport)
         // =====================================================================
         m_mcpServer->AddRoute(L"POST", L"/", [this](const std::wstring&, const std::string& body)
@@ -877,7 +1027,10 @@ namespace winrt::ShaderLab::implementation
 {"name":"effect_compile","description":"Compile HLSL for a custom effect node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"hlsl":{"type":"string"}},"required":["nodeId","hlsl"]}},
 {"name":"set_preview_node","description":"Set which node is previewed","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
 {"name":"render_capture","description":"Capture preview as PNG. Note: HDR values clipped to SDR.","inputSchema":{"type":"object","properties":{}}},
-{"name":"registry_get_effect","description":"Get metadata for a built-in effect","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}
+{"name":"registry_get_effect","description":"Get metadata for a built-in effect","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
+{"name":"graph_bind_property","description":"Bind a node property to an upstream analysis output field","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"propertyName":{"type":"string"},"sourceNodeId":{"type":"number"},"sourceFieldName":{"type":"string"},"sourceComponent":{"type":"number","description":"0-3 for .xyzw component (scalar dest only)"}},"required":["nodeId","propertyName","sourceNodeId","sourceFieldName"]}},
+{"name":"graph_unbind_property","description":"Remove a property binding","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"propertyName":{"type":"string"}},"required":["nodeId","propertyName"]}},
+{"name":"read_analysis_output","description":"Read typed analysis output fields from a compute/analysis node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}}
 ]})JSON";
                     return { 200, wrapResult(tools) };
                 }
@@ -927,6 +1080,15 @@ namespace winrt::ShaderLab::implementation
                     {
                         auto name = std::wstring(args.GetNamedString(L"name"));
                         restResp = m_mcpServer->RouteRequest(L"GET", L"/registry/effect/" + name, "");
+                    }
+                    else if (toolName == "graph_bind_property")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/bind-property", argsStr);
+                    else if (toolName == "graph_unbind_property")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/unbind-property", argsStr);
+                    else if (toolName == "read_analysis_output")
+                    {
+                        auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(L"nodeId"));
+                        restResp = m_mcpServer->RouteRequest(L"GET", std::format(L"/graph/node/{}/analysis", nodeId), "");
                     }
 
                     bool isError = restResp.statusCode >= 400;
