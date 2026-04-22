@@ -641,13 +641,25 @@ namespace ShaderLab::Graph
             };
 
             auto props = obj.GetNamedArray(L"properties");
+            std::wstring legacyAnalysisFieldsJson;
+            std::wstring legacyPropertyBindingsJson;
             for (uint32_t i = 0; i < props.Size(); ++i)
             {
                 auto propObj = props.GetObjectAt(i);
                 auto key = std::wstring(propObj.GetNamedString(L"name"));
-                // Skip internal metadata that shouldn't be in the properties map.
-                if (key == L"analysisFields" || key == L"propertyBindings")
+                // Extract legacy internal metadata stored as string properties.
+                if (key == L"analysisFields")
+                {
+                    if (propObj.HasKey(L"value"))
+                        legacyAnalysisFieldsJson = std::wstring(propObj.GetNamedString(L"value"));
                     continue;
+                }
+                if (key == L"propertyBindings")
+                {
+                    if (propObj.HasKey(L"value"))
+                        legacyPropertyBindingsJson = std::wstring(propObj.GetNamedString(L"value"));
+                    continue;
+                }
                 node.properties[key] = PropertyValueFromJson(propObj);
             }
 
@@ -798,6 +810,57 @@ namespace ShaderLab::Graph
                 }
 
                 node.customEffect = std::move(def);
+            }
+
+            // Migrate legacy analysisFields from string property to customEffect.
+            if (!legacyAnalysisFieldsJson.empty() && node.customEffect.has_value() &&
+                node.customEffect->analysisFields.empty())
+            {
+                try
+                {
+                    auto arr = WDJ::JsonArray::Parse(legacyAnalysisFieldsJson);
+                    for (uint32_t fi = 0; fi < arr.Size(); ++fi)
+                    {
+                        auto fobj = arr.GetObjectAt(fi);
+                        AnalysisFieldDescriptor fd;
+                        fd.name = std::wstring(fobj.GetNamedString(L"name"));
+                        auto typeTag = std::wstring(fobj.GetNamedString(L"type"));
+                        if (typeTag == L"float")        fd.type = AnalysisFieldType::Float;
+                        else if (typeTag == L"float2")   fd.type = AnalysisFieldType::Float2;
+                        else if (typeTag == L"float3")   fd.type = AnalysisFieldType::Float3;
+                        else if (typeTag == L"float4")   fd.type = AnalysisFieldType::Float4;
+                        else if (typeTag == L"floatarray")  fd.type = AnalysisFieldType::FloatArray;
+                        else if (typeTag == L"float2array") fd.type = AnalysisFieldType::Float2Array;
+                        else if (typeTag == L"float3array") fd.type = AnalysisFieldType::Float3Array;
+                        else if (typeTag == L"float4array") fd.type = AnalysisFieldType::Float4Array;
+                        if (fobj.HasKey(L"length"))
+                            fd.arrayLength = static_cast<uint32_t>(fobj.GetNamedNumber(L"length"));
+                        node.customEffect->analysisFields.push_back(std::move(fd));
+                    }
+                    if (!node.customEffect->analysisFields.empty())
+                        node.customEffect->analysisOutputType = AnalysisOutputType::Typed;
+                }
+                catch (...) {} // Ignore malformed legacy data.
+            }
+
+            // Migrate legacy propertyBindings from string property.
+            if (!legacyPropertyBindingsJson.empty() && node.propertyBindings.empty())
+            {
+                try
+                {
+                    auto arr = WDJ::JsonArray::Parse(legacyPropertyBindingsJson);
+                    for (uint32_t bi = 0; bi < arr.Size(); ++bi)
+                    {
+                        auto bobj = arr.GetObjectAt(bi);
+                        PropertyBinding binding;
+                        binding.sourceNodeId = static_cast<uint32_t>(bobj.GetNamedNumber(L"sourceNodeId"));
+                        binding.sourceFieldName = std::wstring(bobj.GetNamedString(L"sourceField"));
+                        binding.sourceComponent = static_cast<uint32_t>(bobj.GetNamedNumber(L"component"));
+                        auto targetProp = std::wstring(bobj.GetNamedString(L"targetProperty"));
+                        node.propertyBindings[targetProp] = std::move(binding);
+                    }
+                }
+                catch (...) {}
             }
 
             node.dirty = true;
