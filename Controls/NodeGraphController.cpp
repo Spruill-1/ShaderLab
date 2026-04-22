@@ -963,23 +963,35 @@ namespace ShaderLab::Controls
         if (it == m_visuals.end()) return;
 
         D2D1_POINT_2F start{};
-        if (m_connectionDrag.fromOutput &&
-            m_connectionDrag.sourcePin < it->second.outputPinPositions.size())
+        if (m_connectionDrag.isDataPin)
         {
-            start = it->second.outputPinPositions[m_connectionDrag.sourcePin];
+            if (m_connectionDrag.fromOutput &&
+                m_connectionDrag.sourcePin < it->second.dataOutputPinPositions.size())
+                start = it->second.dataOutputPinPositions[m_connectionDrag.sourcePin];
+            else if (!m_connectionDrag.fromOutput &&
+                     m_connectionDrag.sourcePin < it->second.dataInputPinPositions.size())
+                start = it->second.dataInputPinPositions[m_connectionDrag.sourcePin];
         }
-        else if (!m_connectionDrag.fromOutput &&
-                 m_connectionDrag.sourcePin < it->second.inputPinPositions.size())
+        else
         {
-            start = it->second.inputPinPositions[m_connectionDrag.sourcePin];
+            if (m_connectionDrag.fromOutput &&
+                m_connectionDrag.sourcePin < it->second.outputPinPositions.size())
+                start = it->second.outputPinPositions[m_connectionDrag.sourcePin];
+            else if (!m_connectionDrag.fromOutput &&
+                     m_connectionDrag.sourcePin < it->second.inputPinPositions.size())
+                start = it->second.inputPinPositions[m_connectionDrag.sourcePin];
         }
 
         D2D1_POINT_2F end = m_connectionDrag.currentPos;
 
-        // Draw a dashed line from pin to cursor.
-        m_brushEdge->SetColor(D2D1::ColorF(0xFFFF00, 0.7f));
-        dc->DrawLine(start, end, m_brushEdge.get(), 2.0f);
-        m_brushEdge->SetColor(D2D1::ColorF(0x999999));
+        // Draw line from pin to cursor — orange for data, yellow for image.
+        auto* brush = m_connectionDrag.isDataPin && m_brushDataEdge
+            ? m_brushDataEdge.get() : m_brushEdge.get();
+        if (!m_connectionDrag.isDataPin)
+            m_brushEdge->SetColor(D2D1::ColorF(0xFFFF00, 0.7f));
+        dc->DrawLine(start, end, brush, 2.0f);
+        if (!m_connectionDrag.isDataPin)
+            m_brushEdge->SetColor(D2D1::ColorF(0x999999));
     }
 
     // -----------------------------------------------------------------------
