@@ -771,6 +771,10 @@ namespace ShaderLab::Graph
                     }
                 }
 
+                // Infer Typed output type when fields exist but type wasn't set.
+                if (!def.analysisFields.empty() && def.analysisOutputType == AnalysisOutputType::None)
+                    def.analysisOutputType = AnalysisOutputType::Typed;
+
                 // Recompile from source on load.
                 CoCreateGuid(&def.shaderGuid);
                 std::string target = (def.shaderType == CustomShaderType::PixelShader)
