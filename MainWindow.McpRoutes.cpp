@@ -724,6 +724,32 @@ namespace winrt::ShaderLab::implementation
                 memcpy(bytecode.data(), blob->GetBufferPointer(), blob->GetBufferSize());
 
                 // Apply to node on UI thread.
+                // Also update analysis fields if provided.
+                std::vector<::ShaderLab::Graph::AnalysisFieldDescriptor> newFields;
+                bool hasAnalysisFields = jobj.HasKey(L"analysisFields");
+                if (hasAnalysisFields)
+                {
+                    auto fieldsArr = jobj.GetNamedArray(L"analysisFields");
+                    for (uint32_t fi = 0; fi < fieldsArr.Size(); ++fi)
+                    {
+                        auto fobj = fieldsArr.GetObjectAt(fi);
+                        ::ShaderLab::Graph::AnalysisFieldDescriptor fd;
+                        fd.name = std::wstring(fobj.GetNamedString(L"name"));
+                        auto typeTag = std::wstring(fobj.GetNamedString(L"type"));
+                        if (typeTag == L"float")         fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float;
+                        else if (typeTag == L"float2")    fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float2;
+                        else if (typeTag == L"float3")    fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float3;
+                        else if (typeTag == L"float4")    fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float4;
+                        else if (typeTag == L"floatarray")  fd.type = ::ShaderLab::Graph::AnalysisFieldType::FloatArray;
+                        else if (typeTag == L"float2array") fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float2Array;
+                        else if (typeTag == L"float3array") fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float3Array;
+                        else if (typeTag == L"float4array") fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float4Array;
+                        if (fobj.HasKey(L"length"))
+                            fd.arrayLength = static_cast<uint32_t>(fobj.GetNamedNumber(L"length"));
+                        newFields.push_back(std::move(fd));
+                    }
+                }
+
                 return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                     auto* node = m_graph.FindNode(nodeId);
                     if (!node || !node->customEffect.has_value())
@@ -734,6 +760,16 @@ namespace winrt::ShaderLab::implementation
                     // Always generate a new GUID on recompile so D2D registers
                     // the updated shader under a fresh CLSID.
                     CoCreateGuid(&def.shaderGuid);
+
+                    // Update analysis fields if provided.
+                    if (hasAnalysisFields)
+                    {
+                        def.analysisFields = std::move(newFields);
+                        def.analysisOutputType = def.analysisFields.empty()
+                            ? ::ShaderLab::Graph::AnalysisOutputType::None
+                            : ::ShaderLab::Graph::AnalysisOutputType::Typed;
+                    }
+
                     node->dirty = true;
                     m_graph.MarkAllDirty();
                     m_graphEvaluator.InvalidateNode(nodeId);
@@ -888,24 +924,14 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // GET /graph/node/{id}/analysis — Read analysis output fields
+        // GET /analysis/{id} — Read analysis output fields
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/graph/node/", [this](const std::wstring& path, const std::string&)
+        m_mcpServer->AddRoute(L"GET", L"/analysis/", [this](const std::wstring& path, const std::string&)
             -> ::ShaderLab::McpHttpServer::Response
         {
-            // Parse path: /graph/node/{id}/analysis
-            auto rest = path.substr(12); // after "/graph/node/"
-            auto slash = rest.find(L'/');
-            if (slash == std::wstring::npos)
-            {
-                // Plain /graph/node/{id} — handled by the existing route
-                return { 404, R"({"error":"Use /graph/node/{id}/analysis"})" };
-            }
-            auto suffix = rest.substr(slash + 1);
-            if (suffix != L"analysis")
-                return { 404, R"({"error":"Unknown sub-path"})" };
-
-            uint32_t nodeId = static_cast<uint32_t>(std::stoul(rest.substr(0, slash)));
+            // Parse path: /analysis/{id}
+            auto rest = path.substr(10); // after "/analysis/"
+            uint32_t nodeId = static_cast<uint32_t>(std::stoul(rest));
             auto* node = m_graph.FindNode(nodeId);
             if (!node) return { 404, R"({"error":"Node not found"})" };
 
@@ -1088,7 +1114,7 @@ namespace winrt::ShaderLab::implementation
                     else if (toolName == "read_analysis_output")
                     {
                         auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(L"nodeId"));
-                        restResp = m_mcpServer->RouteRequest(L"GET", std::format(L"/graph/node/{}/analysis", nodeId), "");
+                        restResp = m_mcpServer->RouteRequest(L"GET", std::format(L"/analysis/{}", nodeId), "");
                     }
 
                     bool isError = restResp.statusCode >= 400;
