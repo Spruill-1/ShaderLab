@@ -645,6 +645,9 @@ namespace ShaderLab::Graph
             {
                 auto propObj = props.GetObjectAt(i);
                 auto key = std::wstring(propObj.GetNamedString(L"name"));
+                // Skip internal metadata that shouldn't be in the properties map.
+                if (key == L"analysisFields" || key == L"propertyBindings")
+                    continue;
                 node.properties[key] = PropertyValueFromJson(propObj);
             }
 

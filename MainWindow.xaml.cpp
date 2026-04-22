@@ -2154,6 +2154,9 @@ namespace winrt::ShaderLab::implementation
 
             for (const auto& [key, value] : node->properties)
             {
+                // Skip internal metadata that shouldn't appear as UI properties.
+                if (key == L"analysisFields" || key == L"propertyBindings")
+                    continue;
                 // Resolve metadata for this property.
                 const PropertyMetadata* meta = nullptr;
                 if (desc)
