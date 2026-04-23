@@ -222,6 +222,7 @@ namespace winrt::ShaderLab::implementation
         // Returns empty vector on failure.
         std::vector<uint8_t> CapturePreviewAsPng();
         void OpenEffectDesigner();
+        void EnforceCustomEffectNameUniqueness(uint32_t modifiedNodeId);
 
         uint32_t m_selectedNodeId{ 0 };
         bool m_isDraggingNode{ false };

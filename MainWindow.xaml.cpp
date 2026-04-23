@@ -850,27 +850,71 @@ namespace winrt::ShaderLab::implementation
             flyout.Items().Append(slGroup);
         }
 
-        // ---- Custom Shader nodes ----
-        auto customGroup = MUX::MenuFlyoutSubItem();
-        customGroup.Text(L"Custom Shader");
-
-        auto psItem = MUX::MenuFlyoutItem();
-        psItem.Text(L"Custom Pixel Shader");
-        psItem.Click([this](auto&&, auto&&)
+        // ---- Custom Effects (duplicate existing) ----
+        // Collect unique custom effect names from graph nodes.
+        struct CustomEffectTemplate
         {
-            OpenEffectDesigner();
-        });
-        customGroup.Items().Append(psItem);
-
-        auto csItem = MUX::MenuFlyoutItem();
-        csItem.Text(L"Custom Compute Shader");
-        csItem.Click([this](auto&&, auto&&)
+            std::wstring name;
+            uint32_t sourceNodeId;
+        };
+        std::vector<CustomEffectTemplate> customTemplates;
+        for (const auto& node : m_graph.Nodes())
         {
-            OpenEffectDesigner();
-        });
-        customGroup.Items().Append(csItem);
+            if ((node.type == ::ShaderLab::Graph::NodeType::PixelShader ||
+                 node.type == ::ShaderLab::Graph::NodeType::ComputeShader) &&
+                node.customEffect.has_value() &&
+                node.customEffect->isCompiled())
+            {
+                // Only add if this name isn't already in the list.
+                bool found = false;
+                for (const auto& t : customTemplates)
+                    if (t.name == node.name) { found = true; break; }
+                if (!found)
+                    customTemplates.push_back({ node.name, node.id });
+            }
+        }
 
-        flyout.Items().Append(customGroup);
+        if (!customTemplates.empty())
+        {
+            auto customGroup = MUX::MenuFlyoutSubItem();
+            customGroup.Text(L"Custom Effects");
+
+            for (const auto& tmpl : customTemplates)
+            {
+                auto menuItem = MUX::MenuFlyoutItem();
+                menuItem.Text(winrt::hstring(tmpl.name));
+
+                auto capturedNodeId = tmpl.sourceNodeId;
+                menuItem.Click([this, capturedNodeId](auto&&, auto&&)
+                {
+                    // Deep-copy the custom effect from the source node.
+                    auto* srcNode = m_graph.FindNode(capturedNodeId);
+                    if (!srcNode || !srcNode->customEffect.has_value()) return;
+
+                    ::ShaderLab::Graph::EffectNode newNode;
+                    newNode.name = srcNode->name;
+                    newNode.type = srcNode->type;
+                    newNode.inputPins = srcNode->inputPins;
+                    newNode.outputPins = srcNode->outputPins;
+                    newNode.properties = srcNode->properties;
+
+                    auto def = srcNode->customEffect.value();
+                    // New instance gets a fresh GUID so D2D treats it as a separate effect.
+                    CoCreateGuid(&def.shaderGuid);
+                    newNode.customEffect = std::move(def);
+
+                    auto nodeId = m_nodeGraphController.AddNode(std::move(newNode), { 0.0f, 0.0f });
+                    m_graph.MarkAllDirty();
+                    m_nodeGraphController.RebuildLayout();
+                    PopulatePreviewNodeSelector();
+                    PopulateAddNodeFlyout(); // refresh custom effects list
+                });
+
+                customGroup.Items().Append(menuItem);
+            }
+
+            flyout.Items().Append(customGroup);
+        }
     }
 
     void MainWindow::OnAddEffectNode(const ::ShaderLab::Effects::EffectDescriptor& desc)
@@ -3528,6 +3572,7 @@ namespace winrt::ShaderLab::implementation
                 m_graph.MarkAllDirty();
                 m_nodeGraphController.RebuildLayout();
                 PopulatePreviewNodeSelector();
+                PopulateAddNodeFlyout(); // refresh custom effects list
                 return nodeId;
             });
             designerImpl->SetUpdateInGraphCallback([this](uint32_t nodeId, ::ShaderLab::Graph::CustomEffectDefinition def)
@@ -3535,16 +3580,85 @@ namespace winrt::ShaderLab::implementation
                 auto* node = m_graph.FindNode(nodeId);
                 if (node)
                 {
+                    // Name enforcement: if HLSL changed and other nodes share
+                    // this name with the OLD HLSL, this node must be renamed.
+                    bool hlslChanged = !node->customEffect.has_value() ||
+                        node->customEffect->hlslSource != def.hlslSource;
+
                     node->customEffect = std::move(def);
                     node->dirty = true;
                     m_graph.MarkAllDirty();
                     m_graphEvaluator.UpdateNodeShader(nodeId, *node);
+
+                    if (hlslChanged)
+                    {
+                        EnforceCustomEffectNameUniqueness(nodeId);
+                        PopulateAddNodeFlyout();
+                    }
                 }
             });
 
             m_designerWindow.Closed([this](auto&&, auto&&) { m_designerWindow = nullptr; });
         }
         m_designerWindow.Activate();
+    }
+
+    void MainWindow::EnforceCustomEffectNameUniqueness(uint32_t modifiedNodeId)
+    {
+        auto* modNode = m_graph.FindNode(modifiedNodeId);
+        if (!modNode || !modNode->customEffect.has_value()) return;
+
+        const auto& modHlsl = modNode->customEffect->hlslSource;
+        const auto& modName = modNode->name;
+
+        // Check if any other node has the same name but different HLSL.
+        bool conflict = false;
+        for (const auto& other : m_graph.Nodes())
+        {
+            if (other.id == modifiedNodeId) continue;
+            if (other.name != modName) continue;
+            if (!other.customEffect.has_value()) continue;
+            if (other.customEffect->hlslSource != modHlsl)
+            {
+                conflict = true;
+                break;
+            }
+        }
+
+        if (!conflict) return;
+
+        // Auto-rename: append a suffix until unique.
+        std::wstring baseName = modName;
+        // Strip existing " (N)" suffix if present.
+        auto parenPos = baseName.rfind(L" (");
+        if (parenPos != std::wstring::npos && baseName.back() == L')')
+            baseName = baseName.substr(0, parenPos);
+
+        for (int suffix = 2; suffix < 100; ++suffix)
+        {
+            std::wstring candidate = baseName + L" (" + std::to_wstring(suffix) + L")";
+            bool taken = false;
+            for (const auto& other : m_graph.Nodes())
+            {
+                if (other.id == modifiedNodeId) continue;
+                if (other.name == candidate)
+                {
+                    // Same name is OK only if same HLSL.
+                    if (other.customEffect.has_value() &&
+                        other.customEffect->hlslSource != modHlsl)
+                    {
+                        taken = true;
+                        break;
+                    }
+                }
+            }
+            if (!taken)
+            {
+                modNode->name = candidate;
+                m_nodeGraphController.RebuildLayout();
+                break;
+            }
+        }
     }
 
     void MainWindow::OnSaveImageClicked(

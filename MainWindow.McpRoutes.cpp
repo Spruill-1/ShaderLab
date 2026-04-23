@@ -788,7 +788,9 @@ namespace winrt::ShaderLab::implementation
                     node->dirty = true;
                     m_graph.MarkAllDirty();
                     m_graphEvaluator.UpdateNodeShader(nodeId, *node);
+                    EnforceCustomEffectNameUniqueness(nodeId);
                     m_nodeGraphController.RebuildLayout();
+                    PopulateAddNodeFlyout();
                     return { 200, std::format("{{\"compiled\":true,\"bytecodeSize\":{}}}", def.compiledBytecode.size()) };
                 });
             }
