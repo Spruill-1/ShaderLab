@@ -61,6 +61,9 @@ namespace ShaderLab::Rendering
         // Returns the simulated profile if active, otherwise constructs one from live caps.
         DisplayProfile ActiveProfile() const;
 
+        // Returns a profile from live display caps (ignoring any simulation).
+        DisplayProfile LiveProfile() const;
+
     private:
         // Hidden message-only window for WM_DISPLAYCHANGE.
         static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);

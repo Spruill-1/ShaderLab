@@ -331,4 +331,14 @@ namespace ShaderLab::Rendering
         p.profileName = L"Live Display";
         return p;
     }
+
+    DisplayProfile DisplayMonitor::LiveProfile() const
+    {
+        std::lock_guard lock(m_capsMutex);
+        DisplayProfile p{};
+        p.caps = m_caps;
+        p.isSimulated = false;
+        p.profileName = L"Live Display";
+        return p;
+    }
 }

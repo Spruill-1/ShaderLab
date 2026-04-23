@@ -505,6 +505,8 @@ namespace winrt::ShaderLab::implementation
         m_toneMapper.SetDisplayMaxLuminance(caps.maxLuminanceNits);
         m_toneMapper.SetSDRWhiteLevel(caps.sdrWhiteLevelNits);
         m_falseColor.SetDisplayMaxLuminance(caps.maxLuminanceNits);
+        m_graph.MarkAllDirty();
+        m_forceRender = true;
         UpdateStatusBar();
     }
 
@@ -515,6 +517,8 @@ namespace winrt::ShaderLab::implementation
         m_toneMapper.SetDisplayMaxLuminance(caps.maxLuminanceNits);
         m_toneMapper.SetSDRWhiteLevel(caps.sdrWhiteLevelNits);
         m_falseColor.SetDisplayMaxLuminance(caps.maxLuminanceNits);
+        m_graph.MarkAllDirty();
+        m_forceRender = true;
         UpdateStatusBar();
     }
 
@@ -4009,7 +4013,8 @@ namespace winrt::ShaderLab::implementation
 
         // Inject display primaries into Out-of-Gamut Highlight nodes.
         {
-            auto profile = m_displayMonitor.ActiveProfile();
+            auto liveProfile = m_displayMonitor.LiveProfile();
+            auto activeProfile = m_displayMonitor.ActiveProfile();
             for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
             {
                 if (node.name != L"Out-of-Gamut Highlight") continue;
@@ -4018,15 +4023,18 @@ namespace winrt::ShaderLab::implementation
                 float gamutVal = 0;
                 if (auto* f = std::get_if<float>(&gamutIt->second)) gamutVal = *f;
 
-                // Mode 0 = Current Monitor, Mode 4 = Preview Mode
-                if (gamutVal < 0.5f || gamutVal > 3.5f)
+                const ::ShaderLab::Rendering::DisplayProfile* src = nullptr;
+                if (gamutVal < 0.5f)        src = &liveProfile;   // Current Monitor
+                else if (gamutVal > 3.5f)   src = &activeProfile;  // Preview Mode
+
+                if (src)
                 {
-                    node.properties[L"PrimRedX"]   = profile.primaryRed.x;
-                    node.properties[L"PrimRedY"]   = profile.primaryRed.y;
-                    node.properties[L"PrimGreenX"] = profile.primaryGreen.x;
-                    node.properties[L"PrimGreenY"] = profile.primaryGreen.y;
-                    node.properties[L"PrimBlueX"]  = profile.primaryBlue.x;
-                    node.properties[L"PrimBlueY"]  = profile.primaryBlue.y;
+                    node.properties[L"PrimRedX"]   = src->primaryRed.x;
+                    node.properties[L"PrimRedY"]   = src->primaryRed.y;
+                    node.properties[L"PrimGreenX"] = src->primaryGreen.x;
+                    node.properties[L"PrimGreenY"] = src->primaryGreen.y;
+                    node.properties[L"PrimBlueX"]  = src->primaryBlue.x;
+                    node.properties[L"PrimBlueY"]  = src->primaryBlue.y;
                     node.dirty = true;
                 }
             }
