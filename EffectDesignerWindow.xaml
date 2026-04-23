@@ -85,6 +85,7 @@
             <Button x:Name="GenerateScaffoldButton" Content="Generate Scaffold"
                     Style="{StaticResource AccentButtonStyle}" />
             <Button x:Name="CompileButton" Content="Compile (Ctrl+Enter)" />
+            <Button x:Name="FormatButton" Content="Format" />
             <Button x:Name="AddToGraphButton" Content="Add to Graph" IsEnabled="False" />
             <Button x:Name="UpdateInGraphButton" Content="Update in Graph" IsEnabled="False"
                     Visibility="Collapsed" />

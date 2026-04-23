@@ -835,7 +835,7 @@ namespace winrt::ShaderLab::implementation
                         auto* slDesc = ::ShaderLab::Effects::ShaderLabEffects::Instance().FindByName(capturedName);
                         if (!slDesc) return;
                         auto node = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*slDesc);
-                        auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
+                        m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
                         m_graph.MarkAllDirty();
                         m_nodeGraphController.RebuildLayout();
                         PopulatePreviewNodeSelector();
@@ -903,7 +903,7 @@ namespace winrt::ShaderLab::implementation
                     CoCreateGuid(&def.shaderGuid);
                     newNode.customEffect = std::move(def);
 
-                    auto nodeId = m_nodeGraphController.AddNode(std::move(newNode), { 0.0f, 0.0f });
+                    m_nodeGraphController.AddNode(std::move(newNode), { 0.0f, 0.0f });
                     m_graph.MarkAllDirty();
                     m_nodeGraphController.RebuildLayout();
                     PopulatePreviewNodeSelector();

@@ -20,6 +20,11 @@ namespace winrt::ShaderLab::implementation
 
         GenerateScaffoldButton().Click({ this, &EffectDesignerWindow::OnGenerateScaffold });
         CompileButton().Click({ this, &EffectDesignerWindow::OnCompile });
+        FormatButton().Click([this](auto&&, auto&&)
+        {
+            auto text = std::wstring(HlslEditorBox().Text());
+            HlslEditorBox().Text(winrt::hstring(FormatHlsl(text)));
+        });
         AddToGraphButton().Click({ this, &EffectDesignerWindow::OnAddToGraph });
         UpdateInGraphButton().Click({ this, &EffectDesignerWindow::OnUpdateInGraph });
         ShaderTypeSelector().SelectionChanged({ this, &EffectDesignerWindow::OnShaderTypeChanged });
@@ -533,13 +538,139 @@ namespace winrt::ShaderLab::implementation
         return true;
     }
 
+    std::wstring EffectDesignerWindow::FormatHlsl(const std::wstring& source)
+    {
+        // Split into lines (handle \r, \n, \r\n).
+        std::vector<std::wstring> lines;
+        std::wstring current;
+        for (size_t i = 0; i < source.size(); ++i)
+        {
+            wchar_t ch = source[i];
+            if (ch == L'\r')
+            {
+                lines.push_back(current);
+                current.clear();
+                if (i + 1 < source.size() && source[i + 1] == L'\n') ++i;
+            }
+            else if (ch == L'\n')
+            {
+                lines.push_back(current);
+                current.clear();
+            }
+            else
+            {
+                current += ch;
+            }
+        }
+        if (!current.empty()) lines.push_back(current);
+
+        // If input is a single long line (common for embedded HLSL),
+        // split on semicolons and braces first.
+        if (lines.size() <= 2)
+        {
+            std::vector<std::wstring> expanded;
+            for (const auto& line : lines)
+            {
+                std::wstring buf;
+                bool inString = false;
+                bool inLineComment = false;
+                for (size_t i = 0; i < line.size(); ++i)
+                {
+                    wchar_t ch = line[i];
+                    wchar_t next = (i + 1 < line.size()) ? line[i + 1] : 0;
+
+                    if (inLineComment) { buf += ch; continue; }
+                    if (ch == L'"') inString = !inString;
+                    if (inString) { buf += ch; continue; }
+                    if (ch == L'/' && next == L'/') { inLineComment = true; buf += ch; continue; }
+
+                    if (ch == L'{')
+                    {
+                        // Trim trailing whitespace from buf.
+                        while (!buf.empty() && buf.back() == L' ') buf.pop_back();
+                        if (!buf.empty()) expanded.push_back(buf);
+                        expanded.push_back(L"{");
+                        buf.clear();
+                        // Skip whitespace after brace.
+                        while (i + 1 < line.size() && line[i + 1] == L' ') ++i;
+                        continue;
+                    }
+                    if (ch == L'}')
+                    {
+                        while (!buf.empty() && buf.back() == L' ') buf.pop_back();
+                        if (!buf.empty()) expanded.push_back(buf);
+                        expanded.push_back(L"}");
+                        buf.clear();
+                        // Skip whitespace + optional semicolon after }.
+                        while (i + 1 < line.size() && line[i + 1] == L' ') ++i;
+                        if (i + 1 < line.size() && line[i + 1] == L';') { ++i; expanded.back() += L";"; }
+                        continue;
+                    }
+                    if (ch == L';')
+                    {
+                        buf += ch;
+                        // End this statement as a line.
+                        while (!buf.empty() && buf.front() == L' ') buf.erase(buf.begin());
+                        expanded.push_back(buf);
+                        buf.clear();
+                        // Skip whitespace after semicolon.
+                        while (i + 1 < line.size() && line[i + 1] == L' ') ++i;
+                        continue;
+                    }
+                    buf += ch;
+                }
+                while (!buf.empty() && buf.front() == L' ') buf.erase(buf.begin());
+                if (!buf.empty()) expanded.push_back(buf);
+            }
+            lines = std::move(expanded);
+        }
+
+        // Now apply indentation based on brace depth.
+        std::wstring result;
+        int indent = 0;
+
+        for (auto& line : lines)
+        {
+            // Trim leading/trailing whitespace.
+            size_t start = line.find_first_not_of(L" \t");
+            size_t end = line.find_last_not_of(L" \t");
+            if (start == std::wstring::npos) { result += L"\n"; continue; }
+            line = line.substr(start, end - start + 1);
+
+            // Decrease indent for closing braces.
+            if (!line.empty() && line[0] == L'}')
+                indent = (std::max)(indent - 1, 0);
+
+            // Apply indentation.
+            for (int i = 0; i < indent; ++i)
+                result += L"    ";
+            result += line;
+            result += L"\n";
+
+            // Increase indent after opening braces.
+            // Count net braces on this line (excluding strings/comments).
+            for (wchar_t ch : line)
+            {
+                if (ch == L'{') ++indent;
+                else if (ch == L'}') indent = (std::max)(indent - 1, 0);
+            }
+            // Re-adjust: we already decremented for leading }, so add back.
+            if (!line.empty() && line[0] == L'}')
+                indent = indent; // already handled above
+        }
+
+        // Remove trailing newline.
+        while (!result.empty() && result.back() == L'\n') result.pop_back();
+        return result;
+    }
+
     void EffectDesignerWindow::OnGenerateScaffold(
         winrt::Windows::Foundation::IInspectable const&,
         winrt::Microsoft::UI::Xaml::RoutedEventArgs const&)
     {
         auto def = BuildDefinition();
         auto hlsl = GenerateHlsl(def);
-        HlslEditorBox().Text(winrt::hstring(hlsl));
+        HlslEditorBox().Text(winrt::hstring(FormatHlsl(hlsl)));
         CompileStatusText().Text(L"Scaffold generated. Edit the HLSL and click Compile.");
     }
 
@@ -738,8 +869,8 @@ namespace winrt::ShaderLab::implementation
             ThreadGroupZ().Value(def.threadGroupZ);
         }
 
-        // HLSL source.
-        HlslEditorBox().Text(winrt::hstring(def.hlslSource));
+        // HLSL source — format for readability.
+        HlslEditorBox().Text(winrt::hstring(FormatHlsl(def.hlslSource)));
 
         // Update button states.
         UpdateInGraphButton().Visibility(Visibility::Visible);

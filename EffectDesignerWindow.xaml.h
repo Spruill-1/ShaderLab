@@ -55,6 +55,9 @@ namespace winrt::ShaderLab::implementation
         // Compile the current HLSL and update status.
         bool CompileHlsl(::ShaderLab::Graph::CustomEffectDefinition& def);
 
+        // Format HLSL source for readability.
+        static std::wstring FormatHlsl(const std::wstring& source);
+
         ::ShaderLab::Effects::ShaderCompiler m_compiler;
         AddToGraphCallback m_addToGraph;
         UpdateInGraphCallback m_updateInGraph;
