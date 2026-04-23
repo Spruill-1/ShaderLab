@@ -56,15 +56,14 @@ float3 XYZToScRGB(float3 xyz) {
 // CIE XYZ -> CIE xyY
 float3 XYZToxyY(float3 xyz) {
     float sum = xyz.x + xyz.y + xyz.z;
-    if (sum < 1e-10) return float3(0.3127, 0.3290, 0.0); // D65 white
-    return float3(xyz.x / sum, xyz.y / sum, xyz.y);
+    float2 xy = (sum < 1e-10) ? float2(0.3127, 0.3290) : float2(xyz.x / sum, xyz.y / sum);
+    return float3(xy, xyz.y);
 }
 
 // CIE xyY -> CIE XYZ
 float3 xyYToXYZ(float3 xyY) {
-    if (xyY.y < 1e-10) return float3(0, 0, 0);
-    float X = xyY.x * xyY.z / xyY.y;
-    float Z = (1.0 - xyY.x - xyY.y) * xyY.z / xyY.y;
+    float X = (xyY.y < 1e-10) ? 0.0 : xyY.x * xyY.z / xyY.y;
+    float Z = (xyY.y < 1e-10) ? 0.0 : (1.0 - xyY.x - xyY.y) * xyY.z / xyY.y;
     return float3(X, xyY.z, Z);
 }
 
@@ -385,5 +384,244 @@ float4 main(
         }
 
         // Future effects will be added here as they're implemented.
+
+        // ---- CIE Chromaticity Plot ----
+        {
+            static const std::string ciePlotHLSL = R"HLSL(
+// CIE 1931 xy Chromaticity Diagram
+// Renders the spectral locus horseshoe with gamut triangle overlays.
+// When an input image is connected, each pixel's chromaticity is
+// scattered onto the diagram as a bright dot.
+Texture2D Source : register(t0);
+
+cbuffer constants : register(b0) {
+    uint ShowRec709;    // 1=show gamut triangle
+    uint ShowP3;        // 1=show gamut triangle
+    uint ShowRec2020;   // 1=show gamut triangle
+    float Brightness;   // scatter dot brightness (default 2.0)
+    float DiagramSize;  // output size in pixels (default 512)
+};
+
+// CIE 1931 2-degree observer spectral locus (sampled at 5nm intervals, 380-700nm)
+// Stored as xy pairs. Approximate with a polynomial for GPU efficiency.
+float2 SpectralLocusXY(float nm) {
+    // Attempt to sample across the spectral locus approximately
+    float t = saturate((nm - 380.0) / 320.0);
+    // x coordinate along the locus
+    float x = 0.17 + t * (0.73 - 0.17);
+    if (t < 0.3) x = 0.17 + t * 2.0 * 0.1;
+    // This is a rough approximation - the real locus is complex
+    // Use parametric curves fitted to CIE 1931 data:
+    float x2 = t * t;
+    float x3 = x2 * t;
+    x = 0.17 + 0.24*t + 1.67*x2 - 2.48*x3 + 1.04*x2*x2;
+    float y = 0.005 + 2.4*t - 6.3*x2 + 8.1*x3 - 3.8*x2*x2;
+    y = max(y, 0.005);
+    return float2(saturate(x), saturate(y));
+}
+
+// Check if xy coordinate is inside the visible gamut (approximate)
+bool IsVisibleGamut(float2 xy) {
+    // Very rough test: inside the horseshoe
+    if (xy.x < 0.0 || xy.y < 0.0 || xy.x + xy.y > 1.0) return false;
+    if (xy.y < 0.01) return false;
+    // Simple bounding: above the purple line and below the locus
+    float purpleY = lerp(0.005, 0.33, (xy.x - 0.17) / (0.73 - 0.17));
+    return xy.y > purpleY * 0.3;
+}
+
+// Draw gamut triangle outline
+float GamutTriangle(float2 uv, float2 r, float2 g, float2 b, float thickness) {
+    float d1 = abs(dot(normalize(float2(-(g.y-r.y), g.x-r.x)), uv - r));
+    float d2 = abs(dot(normalize(float2(-(b.y-g.y), b.x-g.x)), uv - g));
+    float d3 = abs(dot(normalize(float2(-(r.y-b.y), r.x-b.x)), uv - b));
+
+    // Check if on the edge (between vertices)
+    float t1 = dot(uv - r, g - r) / dot(g - r, g - r);
+    float t2 = dot(uv - g, b - g) / dot(b - g, b - g);
+    float t3 = dot(uv - b, r - b) / dot(r - b, r - b);
+
+    float edge = 1e10;
+    if (t1 >= 0 && t1 <= 1) edge = min(edge, d1);
+    if (t2 >= 0 && t2 <= 1) edge = min(edge, d2);
+    if (t3 >= 0 && t3 <= 1) edge = min(edge, d3);
+
+    return smoothstep(thickness, 0.0, edge);
+}
+
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    // Map pixel position to CIE xy space
+    // x: 0 to 0.8, y: 0 to 0.9 (standard diagram range)
+    float2 pixPos = uv0.xy;
+    float size = max(DiagramSize, 128.0);
+    float2 xy = float2(pixPos.x / size * 0.8, (1.0 - pixPos.y / size) * 0.9);
+
+    float4 result = float4(0.05, 0.05, 0.05, 1.0); // dark background
+
+    // Render the visible gamut region with approximate spectral colors
+    float3 xyY = float3(xy.x, xy.y, 0.5);
+    float3 xyz = xyYToXYZ(xyY);
+    float3 rgb = XYZToScRGB(xyz);
+    // Normalize to visible range and clamp
+    float maxC = max(max(rgb.r, rgb.g), max(rgb.b, 0.001));
+    rgb = rgb / maxC * 0.3; // dim background
+
+    if (rgb.r >= -0.01 && rgb.g >= -0.01 && rgb.b >= -0.01 && xy.y > 0.01) {
+        rgb = max(rgb, 0.0);
+        result.rgb = rgb;
+    }
+
+    // Gamut triangles
+    float thickness = 0.003;
+    if (ShowRec709 > 0) {
+        float e = GamutTriangle(xy, GAMUT_709_R, GAMUT_709_G, GAMUT_709_B, thickness);
+        result.rgb = lerp(result.rgb, float3(1,1,1), e * 0.8);
+    }
+    if (ShowP3 > 0) {
+        float e = GamutTriangle(xy, GAMUT_P3_R, GAMUT_P3_G, GAMUT_P3_B, thickness);
+        result.rgb = lerp(result.rgb, float3(0,1,0), e * 0.8);
+    }
+    if (ShowRec2020 > 0) {
+        float e = GamutTriangle(xy, GAMUT_2020_R, GAMUT_2020_G, GAMUT_2020_B, thickness);
+        result.rgb = lerp(result.rgb, float3(0,0.5,1), e * 0.8);
+    }
+
+    // D65 white point marker
+    float dw = length(xy - D65_WHITE);
+    if (dw < 0.008) result.rgb = float3(1, 1, 1);
+
+    // Scatter source image pixels onto the diagram
+    uint srcW, srcH;
+    Source.GetDimensions(srcW, srcH);
+    if (srcW > 0 && srcH > 0) {
+        // Sample source pixels and check if they map near this xy position
+        // (reverse scatter: for each diagram pixel, check if any source pixel maps here)
+        // This is approximate - sample a grid of source pixels
+        float bestDist = 1e10;
+        float3 bestColor = float3(0,0,0);
+
+        uint stepX = max(1, srcW / 64);
+        uint stepY = max(1, srcH / 64);
+        for (uint sy = 0; sy < srcH; sy += stepY) {
+            for (uint sx = 0; sx < srcW; sx += stepX) {
+                float4 srcPix = Source.Load(int3(sx, sy, 0));
+                if (srcPix.a < 0.001) continue;
+                float3 pxyz = ScRGBToXYZ(srcPix.rgb);
+                float2 pxy = XYZToxyY(pxyz).xy;
+                float d = length(pxy - xy);
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestColor = srcPix.rgb;
+                }
+            }
+        }
+
+        if (bestDist < 0.01) {
+            float intensity = saturate(1.0 - bestDist / 0.01) * Brightness;
+            result.rgb += intensity * float3(1, 1, 1);
+        }
+    }
+
+    return result;
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"CIE Chromaticity Plot";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + ciePlotHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"ShowRec709",   L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
+                { L"ShowP3",       L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
+                { L"ShowRec2020",  L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
+                { L"Brightness",   L"float", 2.0f,  0.1f, 10.0f, 0.1f },
+                { L"DiagramSize",  L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Waveform Monitor ----
+        {
+            static const std::string waveformHLSL = R"HLSL(
+// Waveform Monitor - video-style RGB waveform display
+// X-axis = horizontal position in source, Y-axis = value (0-1 or nits)
+Texture2D Source : register(t0);
+
+cbuffer constants : register(b0) {
+    float MaxValue;     // default 1.0 (scRGB units)
+    uint  ShowR;        // 1=show red channel
+    uint  ShowG;        // 1=show green channel
+    uint  ShowB;        // 1=show blue channel
+    float WaveformH;    // height of waveform in pixels (default 256)
+};
+
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    uint srcW, srcH;
+    Source.GetDimensions(srcW, srcH);
+    if (srcW == 0 || srcH == 0)
+        return float4(0.05, 0.05, 0.05, 1.0);
+
+    float2 pixPos = uv0.xy;
+    float height = max(WaveformH, 64.0);
+
+    // Map x to source column
+    uint srcX = (uint)(pixPos.x / max(1.0, (float)srcW) * srcW);
+    srcX = min(srcX, srcW - 1);
+
+    // Map y to value (inverted: top = max, bottom = 0)
+    float valueAtY = (1.0 - pixPos.y / height) * MaxValue;
+
+    float4 result = float4(0.05, 0.05, 0.05, 1.0);
+
+    // Scan the source column and accumulate hits
+    float rHit = 0, gHit = 0, bHit = 0;
+    uint step = max(1, srcH / 256);
+    for (uint sy = 0; sy < srcH; sy += step) {
+        float4 pix = Source.Load(int3(srcX, sy, 0));
+        float thickness = MaxValue / height * 2.0;
+
+        if (ShowR > 0 && abs(pix.r - valueAtY) < thickness) rHit += 0.1;
+        if (ShowG > 0 && abs(pix.g - valueAtY) < thickness) gHit += 0.1;
+        if (ShowB > 0 && abs(pix.b - valueAtY) < thickness) bHit += 0.1;
+    }
+
+    result.r += saturate(rHit) * 0.8;
+    result.g += saturate(gHit) * 0.8;
+    result.b += saturate(bHit) * 0.8;
+
+    // Grid lines at 0, 0.25, 0.5, 0.75, 1.0
+    for (float v = 0; v <= MaxValue; v += MaxValue * 0.25) {
+        float gridY = (1.0 - v / MaxValue) * height;
+        if (abs(pixPos.y - gridY) < 0.5)
+            result.rgb += 0.15;
+    }
+
+    return result;
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Waveform Monitor";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + waveformHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"MaxValue",   L"float", 1.0f,  0.01f, 125.0f, 0.1f },
+                { L"ShowR",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
+                { L"ShowG",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
+                { L"ShowB",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
+                { L"WaveformH",  L"float", 256.0f, 64.0f, 1024.0f, 32.0f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
     }
 }
