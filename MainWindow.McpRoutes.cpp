@@ -3,6 +3,7 @@
 #include "ShaderLab/McpHttpServer.h"
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
+#include "Effects/ShaderLabEffects.h"
 
 // Helper: narrow string from wide string.
 static std::string ToUtf8(const std::wstring& ws)
@@ -475,6 +476,20 @@ namespace winrt::ShaderLab::implementation
 
                         node.customEffect = std::move(def);
 
+                        return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                            auto id = m_graph.AddNode(std::move(node));
+                            m_graph.MarkAllDirty();
+                            m_nodeGraphController.AutoLayout();
+                            PopulatePreviewNodeSelector();
+                            return { 200, std::format("{{\"nodeId\":{}}}", id) };
+                        });
+                    }
+
+                    // Check ShaderLab effects registry.
+                    auto* slDesc = ::ShaderLab::Effects::ShaderLabEffects::Instance().FindByName(name);
+                    if (slDesc)
+                    {
+                        auto node = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*slDesc);
                         return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                             auto id = m_graph.AddNode(std::move(node));
                             m_graph.MarkAllDirty();

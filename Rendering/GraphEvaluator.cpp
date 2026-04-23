@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "GraphEvaluator.h"
+#include "../Effects/ShaderCompiler.h"
 
 using namespace ShaderLab::Graph;
 
@@ -84,6 +85,34 @@ namespace ShaderLab::Rendering
             case NodeType::PixelShader:
             case NodeType::ComputeShader:
             {
+                // Auto-compile ShaderLab effects that have HLSL but no bytecode.
+                if (node->customEffect.has_value() &&
+                    !node->customEffect->isCompiled() &&
+                    !node->customEffect->hlslSource.empty())
+                {
+                    auto& def = node->customEffect.value();
+                    std::string target = (def.shaderType == CustomShaderType::PixelShader)
+                        ? "ps_5_0" : "cs_5_0";
+                    std::string hlslUtf8(def.hlslSource.begin(), def.hlslSource.end());
+                    for (auto& ch : hlslUtf8)
+                        if (ch == '\r') ch = '\n';
+                    auto result = Effects::ShaderCompiler::CompileFromString(hlslUtf8, "ShaderLabEffect", "main", target);
+                    if (result.succeeded)
+                    {
+                        auto* blob = result.bytecode.get();
+                        def.compiledBytecode.resize(blob->GetBufferSize());
+                        memcpy(def.compiledBytecode.data(), blob->GetBufferPointer(), blob->GetBufferSize());
+                        CoCreateGuid(&def.shaderGuid);
+                        node->dirty = true;
+                    }
+                    else
+                    {
+                        node->runtimeError = L"Auto-compile failed: " + result.ErrorMessage();
+                        node->cachedOutput = nullptr;
+                        break;
+                    }
+                }
+
                 ID2D1Effect* effect = GetOrCreateEffect(dc, *node);
                 if (!effect)
                 {

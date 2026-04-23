@@ -6,6 +6,7 @@
 
 #include "Rendering/PipelineFormat.h"
 #include "Rendering/IccProfileParser.h"
+#include "Effects/ShaderLabEffects.h"
 #include <microsoft.ui.xaml.media.dxinterop.h>
 
 using namespace winrt;
@@ -740,23 +741,31 @@ namespace winrt::ShaderLab::implementation
         auto flyout = AddNodeFlyout();
         flyout.Items().Clear();
 
+        namespace MUX = winrt::Microsoft::UI::Xaml::Controls;
+
+        // ---- Built-in D2D effects ----
+        auto builtInGroup = MUX::MenuFlyoutSubItem();
+        builtInGroup.Text(L"Built-in D2D");
+
         auto& registry = ::ShaderLab::Effects::EffectRegistry::Instance();
         auto categories = registry.Categories();
 
-        winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutSubItem sourceSubItem{ nullptr };
+        MUX::MenuFlyoutSubItem sourceSubItem{ nullptr };
 
         for (const auto& cat : categories)
         {
-            auto subItem = winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutSubItem();
+            // Skip the old Analysis category — replaced by ShaderLab analysis effects.
+            if (cat == L"Analysis") continue;
+
+            auto subItem = MUX::MenuFlyoutSubItem();
             subItem.Text(winrt::hstring(cat));
 
             auto effects = registry.ByCategory(cat);
             for (const auto* desc : effects)
             {
-                auto menuItem = winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutItem();
+                auto menuItem = MUX::MenuFlyoutItem();
                 menuItem.Text(winrt::hstring(desc->name));
 
-                // Capture descriptor by value for the click handler.
                 auto capturedDesc = *desc;
                 menuItem.Click([this, capturedDesc](auto&&, auto&&)
                 {
@@ -766,7 +775,7 @@ namespace winrt::ShaderLab::implementation
                 subItem.Items().Append(menuItem);
             }
 
-            flyout.Items().Append(subItem);
+            builtInGroup.Items().Append(subItem);
 
             if (cat == L"Source")
                 sourceSubItem = subItem;
@@ -775,12 +784,12 @@ namespace winrt::ShaderLab::implementation
         // Append Image and Flood sources to the Source category.
         if (!sourceSubItem)
         {
-            sourceSubItem = winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutSubItem();
+            sourceSubItem = MUX::MenuFlyoutSubItem();
             sourceSubItem.Text(L"Source");
-            flyout.Items().Append(sourceSubItem);
+            builtInGroup.Items().Append(sourceSubItem);
         }
 
-        auto imageSourceItem = winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutItem();
+        auto imageSourceItem = MUX::MenuFlyoutItem();
         imageSourceItem.Text(L"Image Source");
         imageSourceItem.Click([this](auto&&, auto&&)
         {
@@ -790,13 +799,78 @@ namespace winrt::ShaderLab::implementation
         });
         sourceSubItem.Items().Append(imageSourceItem);
 
-        auto floodSourceItem = winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutItem();
+        auto floodSourceItem = MUX::MenuFlyoutItem();
         floodSourceItem.Text(L"Flood Fill (Solid Color)");
         floodSourceItem.Click([this](auto&&, auto&&)
         {
             OnAddFloodSourceClicked(nullptr, nullptr);
         });
         sourceSubItem.Items().Append(floodSourceItem);
+
+        flyout.Items().Append(builtInGroup);
+
+        // ---- ShaderLab effects ----
+        auto& slRegistry = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+        auto slCategories = slRegistry.Categories();
+
+        if (!slCategories.empty())
+        {
+            auto slGroup = MUX::MenuFlyoutSubItem();
+            slGroup.Text(L"ShaderLab");
+
+            for (const auto& cat : slCategories)
+            {
+                auto subItem = MUX::MenuFlyoutSubItem();
+                subItem.Text(winrt::hstring(cat));
+
+                auto effects = slRegistry.ByCategory(cat);
+                for (const auto* desc : effects)
+                {
+                    auto menuItem = MUX::MenuFlyoutItem();
+                    menuItem.Text(winrt::hstring(desc->name));
+
+                    auto capturedName = desc->name;
+                    menuItem.Click([this, capturedName](auto&&, auto&&)
+                    {
+                        auto* slDesc = ::ShaderLab::Effects::ShaderLabEffects::Instance().FindByName(capturedName);
+                        if (!slDesc) return;
+                        auto node = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*slDesc);
+                        auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
+                        m_graph.MarkAllDirty();
+                        m_nodeGraphController.RebuildLayout();
+                        PopulatePreviewNodeSelector();
+                    });
+
+                    subItem.Items().Append(menuItem);
+                }
+
+                slGroup.Items().Append(subItem);
+            }
+
+            flyout.Items().Append(slGroup);
+        }
+
+        // ---- Custom Shader nodes ----
+        auto customGroup = MUX::MenuFlyoutSubItem();
+        customGroup.Text(L"Custom Shader");
+
+        auto psItem = MUX::MenuFlyoutItem();
+        psItem.Text(L"Custom Pixel Shader");
+        psItem.Click([this](auto&&, auto&&)
+        {
+            OpenEffectDesigner();
+        });
+        customGroup.Items().Append(psItem);
+
+        auto csItem = MUX::MenuFlyoutItem();
+        csItem.Text(L"Custom Compute Shader");
+        csItem.Click([this](auto&&, auto&&)
+        {
+            OpenEffectDesigner();
+        });
+        customGroup.Items().Append(csItem);
+
+        flyout.Items().Append(customGroup);
     }
 
     void MainWindow::OnAddEffectNode(const ::ShaderLab::Effects::EffectDescriptor& desc)
