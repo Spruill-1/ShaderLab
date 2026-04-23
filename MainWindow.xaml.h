@@ -186,6 +186,7 @@ namespace winrt::ShaderLab::implementation
         // Node graph editor rendering.
         winrt::com_ptr<IDXGISwapChain1>     m_graphSwapChain;
         winrt::com_ptr<ID2D1Bitmap1>        m_graphRenderTarget;
+        winrt::com_ptr<ID2D1SolidColorBrush> m_graphGridBrush;
         uint32_t m_graphPanelWidth{ 0 };
         uint32_t m_graphPanelHeight{ 0 };
 

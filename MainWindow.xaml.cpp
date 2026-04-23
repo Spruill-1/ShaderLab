@@ -329,6 +329,15 @@ namespace winrt::ShaderLab::implementation
 
         DisplayLuminanceText().Text(L"Max Luminance: " + caps.LuminanceString());
         PipelineFormatText().Text(L"Pipeline: " + m_renderEngine.ActiveFormat().name);
+
+        // GPU info.
+        if (m_renderEngine.IsInitialized())
+        {
+            if (m_renderEngine.IsWarp())
+                GpuInfoText().Text(L"GPU: Software (WARP)");
+            else
+                GpuInfoText().Text(L"GPU: " + m_renderEngine.AdapterName());
+        }
     }
 
     void MainWindow::OnPreviewSizeChanged(
@@ -1871,11 +1880,11 @@ namespace winrt::ShaderLab::implementation
             auto pan = m_nodeGraphController.PanOffset();
             float zoom = m_nodeGraphController.Zoom();
             float gridSpacing = 24.0f * zoom;
-            if (gridSpacing > 8.0f) // hide when zoomed out too far
+            if (gridSpacing > 8.0f)
             {
-                winrt::com_ptr<ID2D1SolidColorBrush> gridBrush;
-                dc->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF, 0.06f), gridBrush.put());
-                if (gridBrush)
+                if (!m_graphGridBrush)
+                    dc->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF, 0.06f), m_graphGridBrush.put());
+                if (m_graphGridBrush)
                 {
                     float startX = fmodf(pan.x, gridSpacing);
                     float startY = fmodf(pan.y, gridSpacing);
@@ -1885,7 +1894,7 @@ namespace winrt::ShaderLab::implementation
                     float h = static_cast<float>(m_graphPanelHeight);
                     for (float y = startY; y < h; y += gridSpacing)
                         for (float x = startX; x < w; x += gridSpacing)
-                            dc->FillEllipse({ { x, y }, 1.0f, 1.0f }, gridBrush.get());
+                            dc->FillEllipse({ { x, y }, 1.0f, 1.0f }, m_graphGridBrush.get());
                 }
             }
         }

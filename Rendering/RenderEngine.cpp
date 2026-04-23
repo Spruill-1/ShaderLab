@@ -83,6 +83,25 @@ namespace ShaderLab::Rendering
         m_d3dDevice = baseDevice.as<ID3D11Device5>();
         m_d3dContext = baseContext.as<ID3D11DeviceContext4>();
 
+        // Query adapter info (GPU name, WARP detection).
+        {
+            winrt::com_ptr<IDXGIDevice> dxgiDev;
+            m_d3dDevice.as(dxgiDev);
+            if (dxgiDev)
+            {
+                winrt::com_ptr<IDXGIAdapter> adapter;
+                dxgiDev->GetAdapter(adapter.put());
+                if (adapter)
+                {
+                    DXGI_ADAPTER_DESC desc{};
+                    adapter->GetDesc(&desc);
+                    m_adapterName = desc.Description;
+                    // WARP adapter has VendorId 0x1414 (Microsoft) and DeviceId 0x8C
+                    m_isWarp = (desc.VendorId == 0x1414 && desc.DeviceId == 0x008C);
+                }
+            }
+        }
+
         // --- D2D Factory ---
         D2D1_FACTORY_OPTIONS d2dOptions{};
 #ifdef _DEBUG

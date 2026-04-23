@@ -767,11 +767,6 @@ namespace ShaderLab::Rendering
 
         // Reflect the bytecode to discover cbuffer layout.
         auto reflection = Effects::ShaderCompiler::Reflect(def.compiledBytecode);
-        if (reflection.constantBuffers.empty())
-        {
-            OutputDebugStringW(std::format(L"[CBuffer] Node {} '{}': no constant buffers found in reflection!\n",
-                node.id, node.name).c_str());
-        }
         if (!reflection.constantBuffers.empty())
         {
             auto& cb = reflection.constantBuffers[0];
@@ -801,15 +796,7 @@ namespace ShaderLab::Rendering
                                   std::is_same_v<T, uint32_t> || std::is_same_v<T, bool>)
                     {
                         if (var.offset + sizeof(T) <= cbData.size())
-                        {
                             memcpy(cbData.data() + var.offset, &v, sizeof(T));
-                            if constexpr (std::is_same_v<T, uint32_t>)
-                                OutputDebugStringW(std::format(L"[CBuffer] {} = {} (uint) at offset {}\n",
-                                    var.name, v, var.offset).c_str());
-                            else if constexpr (std::is_same_v<T, float>)
-                                OutputDebugStringW(std::format(L"[CBuffer] {} = {} (float) at offset {}\n",
-                                    var.name, v, var.offset).c_str());
-                        }
                     }
                     else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
                     {

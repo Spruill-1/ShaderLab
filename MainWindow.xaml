@@ -292,6 +292,7 @@
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
@@ -321,18 +322,26 @@
                            Style="{StaticResource CaptionTextBlockStyle}" />
             </StackPanel>
 
-            <TextBlock x:Name="CursorReadoutText" Grid.Column="3"
+            <StackPanel Orientation="Horizontal" Grid.Column="3" Margin="0,0,20,0">
+                <FontIcon Glyph="&#xE964;" FontSize="11" Margin="0,0,5,0"
+                          Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                <TextBlock x:Name="GpuInfoText"
+                           Text="GPU: --"
+                           Style="{StaticResource CaptionTextBlockStyle}" />
+            </StackPanel>
+
+            <TextBlock x:Name="CursorReadoutText" Grid.Column="4"
                        Text=""
                        Margin="0,0,20,0"
                        Style="{StaticResource CaptionTextBlockStyle}"
                        FontFamily="Cascadia Mono, Consolas, Courier New" />
 
-            <TextBlock x:Name="AppVersionText" Grid.Column="5"
+            <TextBlock x:Name="AppVersionText" Grid.Column="6"
                        Text="v1.1.0"
                        Margin="0,0,16,0"
                        Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                        Style="{StaticResource CaptionTextBlockStyle}" />
-            <TextBlock x:Name="FpsText" Grid.Column="6"
+            <TextBlock x:Name="FpsText" Grid.Column="7"
                        Text="FPS: --"
                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                        Style="{StaticResource CaptionTextBlockStyle}" />

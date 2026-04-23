@@ -78,6 +78,10 @@ namespace ShaderLab::Rendering
         uint32_t                BackBufferWidth()  const { return m_width; }
         uint32_t                BackBufferHeight() const { return m_height; }
 
+        // GPU / adapter info.
+        const std::wstring&     AdapterName()      const { return m_adapterName; }
+        bool                    IsWarp()           const { return m_isWarp; }
+
     private:
         void CreateDeviceResources(DevicePreference devicePref);
         void CreateSwapChain(winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel const& panel);
@@ -102,6 +106,8 @@ namespace ShaderLab::Rendering
         uint32_t        m_width{ 0 };
         uint32_t        m_height{ 0 };
         HWND            m_hwnd{ nullptr };
+        std::wstring    m_adapterName;
+        bool            m_isWarp{ false };
 
         // Keep panel reference for swap chain recreation on format change.
         winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel m_panel{ nullptr };
