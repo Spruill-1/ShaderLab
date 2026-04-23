@@ -123,6 +123,7 @@
     <ClInclude Include="Effects\ImageLoader.h" />
     <ClInclude Include="Effects\ShaderCompiler.h" />
     <ClInclude Include="Effects\ShaderLabEffects.h" />
+    <ClInclude Include="Version.h" />
     <ClInclude Include="Effects\SourceNodeFactory.h" />
     <ClInclude Include="ShaderLab\McpHttpServer.h" />
     <ClInclude Include="Graph\EffectEdge.h" />

@@ -4,6 +4,7 @@
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
 #include "Effects/ShaderLabEffects.h"
+#include "Version.h"
 
 // Helper: narrow string from wide string.
 static std::string ToUtf8(const std::wstring& ws)
@@ -1170,6 +1171,7 @@ namespace winrt::ShaderLab::implementation
                 // ---- initialize ----
                 if (method == "initialize")
                 {
+                    auto verStr = ToUtf8(std::wstring(::ShaderLab::VersionString));
                     std::string result = R"JSON({
 "protocolVersion": "2024-11-05",
 "capabilities": {
@@ -1178,7 +1180,7 @@ namespace winrt::ShaderLab::implementation
 },
 "serverInfo": {
     "name": "shaderlab",
-    "version": "1.0.0"
+    "version": ")JSON" + verStr + R"JSON("
 }
 })JSON";
                     return { 200, wrapResult(result) };

@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "EffectGraph.h"
 #include "../Effects/ShaderCompiler.h"
+#include "../Version.h"
 
 #include <winrt/Windows.Data.Json.h>
 
@@ -1078,6 +1079,10 @@ namespace ShaderLab::Graph
     {
         WDJ::JsonObject root;
 
+        // Version metadata
+        root.SetNamedValue(L"formatVersion", WDJ::JsonValue::CreateNumberValue(::ShaderLab::GraphFormatVersion));
+        root.SetNamedValue(L"appVersion", WDJ::JsonValue::CreateStringValue(::ShaderLab::VersionString));
+
         // Nodes
         WDJ::JsonArray nodesArr;
         for (const auto& node : m_nodes)
@@ -1099,6 +1104,23 @@ namespace ShaderLab::Graph
     EffectGraph EffectGraph::FromJson(winrt::hstring const& json)
     {
         auto root = WDJ::JsonObject::Parse(json);
+
+        // Check graph format version compatibility.
+        if (root.HasKey(L"formatVersion"))
+        {
+            uint32_t fileVersion = static_cast<uint32_t>(root.GetNamedNumber(L"formatVersion"));
+            if (fileVersion > ::ShaderLab::GraphFormatVersion)
+            {
+                std::wstring appVer;
+                if (root.HasKey(L"appVersion"))
+                    appVer = std::wstring(root.GetNamedString(L"appVersion"));
+                throw std::runtime_error(
+                    "This graph was saved with a newer version of ShaderLab"
+                    + (appVer.empty() ? std::string{} : " (v" + std::string(appVer.begin(), appVer.end()) + ")")
+                    + ". Please update ShaderLab to open it.");
+            }
+        }
+
         EffectGraph graph;
 
         auto nodesArr = root.GetNamedArray(L"nodes");

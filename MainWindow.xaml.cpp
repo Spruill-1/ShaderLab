@@ -7,6 +7,7 @@
 #include "Rendering/PipelineFormat.h"
 #include "Rendering/IccProfileParser.h"
 #include "Effects/ShaderLabEffects.h"
+#include "Version.h"
 #include <microsoft.ui.xaml.media.dxinterop.h>
 
 using namespace winrt;
@@ -18,7 +19,8 @@ namespace winrt::ShaderLab::implementation
     {
         InitializeComponent();
 
-        Title(L"ShaderLab \u2014 HDR Shader Effect Development");
+        Title(std::wstring(L"ShaderLab v") + ::ShaderLab::VersionString + L" \u2014 HDR Shader Effect Development");
+        AppVersionText().Text(std::wstring(L"v") + ::ShaderLab::VersionString);
 
         m_hwnd = GetWindowHandle();
 
@@ -687,6 +689,7 @@ namespace winrt::ShaderLab::implementation
         auto file = co_await picker.PickSingleFileAsync();
         if (!file) co_return;
 
+        std::wstring versionError;
         try
         {
             auto text = co_await winrt::Windows::Storage::FileIO::ReadTextAsync(file);
@@ -699,6 +702,10 @@ namespace winrt::ShaderLab::implementation
             ResetAfterGraphLoad();
             PipelineFormatText().Text(L"Graph loaded: " + file.Name());
         }
+        catch (const std::runtime_error& ex)
+        {
+            versionError = winrt::to_hstring(ex.what());
+        }
         catch (const std::exception& ex)
         {
             PipelineFormatText().Text(L"Load error: " + winrt::to_hstring(ex.what()));
@@ -706,6 +713,16 @@ namespace winrt::ShaderLab::implementation
         catch (...)
         {
             PipelineFormatText().Text(L"Error: Failed to load graph");
+        }
+
+        if (!versionError.empty())
+        {
+            auto dialog = winrt::Microsoft::UI::Xaml::Controls::ContentDialog();
+            dialog.XamlRoot(this->Content().XamlRoot());
+            dialog.Title(winrt::box_value(L"Cannot Open Graph"));
+            dialog.Content(winrt::box_value(winrt::hstring(versionError)));
+            dialog.CloseButtonText(L"OK");
+            co_await dialog.ShowAsync();
         }
     }
 

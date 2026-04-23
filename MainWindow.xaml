@@ -258,6 +258,7 @@
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
 
             <TextBlock x:Name="PipelineFormatText" Grid.Column="0"
@@ -277,7 +278,12 @@
                        Margin="0,0,24,0"
                        Style="{StaticResource CaptionTextBlockStyle}"
                        FontFamily="Cascadia Mono, Consolas, Courier New" />
-            <TextBlock x:Name="FpsText" Grid.Column="5"
+            <TextBlock x:Name="AppVersionText" Grid.Column="5"
+                       Text="v1.1.0"
+                       Margin="0,0,16,0"
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                       Style="{StaticResource CaptionTextBlockStyle}" />
+            <TextBlock x:Name="FpsText" Grid.Column="6"
                        Text="FPS: --"
                        Style="{StaticResource CaptionTextBlockStyle}" />
         </Grid>
