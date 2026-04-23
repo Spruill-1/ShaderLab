@@ -2250,7 +2250,15 @@ namespace winrt::ShaderLab::implementation
             for (const auto& p : node->customEffect->parameters)
             {
                 PropertyMetadata pm;
-                pm.uiHint = PropertyUIHint::Slider;
+                if (!p.enumLabels.empty())
+                {
+                    pm.uiHint = PropertyUIHint::ComboBox;
+                    pm.enumLabels = p.enumLabels;
+                }
+                else
+                {
+                    pm.uiHint = PropertyUIHint::Slider;
+                }
                 pm.minValue = p.minValue;
                 pm.maxValue = p.maxValue;
                 pm.step = p.step;

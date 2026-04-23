@@ -29,6 +29,10 @@ namespace ShaderLab::Graph
         float minValue{ 0.0f };
         float maxValue{ 1.0f };
         float step{ 0.01f };
+
+        // Named labels for uint enum values (index → display name).
+        // When non-empty, the Properties panel renders a ComboBox instead of a NumberBox.
+        std::vector<std::wstring> enumLabels;
     };
 
     // Identifies the type of non-image data produced by analysis/compute effects.

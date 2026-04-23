@@ -355,7 +355,7 @@ float4 main(
             desc.parameters = {
                 { L"MinNits",      L"float", 0.0f,    0.0f, 10000.0f, 1.0f },
                 { L"MaxNits",      L"float", 10000.0f, 0.0f, 10000.0f, 100.0f },
-                { L"ColormapMode", L"uint",  uint32_t(0), 0.0f, 1.0f, 1.0f },
+                { L"ColormapMode", L"uint",  uint32_t(0), 0.0f, 1.0f, 1.0f, { L"Turbo", L"Inferno" } },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -369,7 +369,7 @@ float4 main(
             desc.hlslSource = colorMath + s_outOfGamutHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"TargetGamut",     L"uint",  uint32_t(0), 0.0f, 3.0f, 1.0f },
+                { L"TargetGamut",     L"uint",  uint32_t(0), 0.0f, 3.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020", L"Monitor" } },
                 { L"OverlayR",        L"float", 1.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayG",        L"float", 0.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayB",        L"float", 1.0f,  0.0f, 1.0f, 0.01f },
@@ -537,9 +537,9 @@ float4 main(
             desc.hlslSource = colorMath + ciePlotHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"ShowRec709",   L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
-                { L"ShowP3",       L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
-                { L"ShowRec2020",  L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
+                { L"ShowRec709",   L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
+                { L"ShowP3",       L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
+                { L"ShowRec2020",  L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"Brightness",   L"float", 2.0f,  0.1f, 10.0f, 0.1f },
                 { L"DiagramSize",  L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
             };
@@ -617,9 +617,9 @@ float4 main(
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"MaxValue",   L"float", 1.0f,  0.01f, 125.0f, 0.1f },
-                { L"ShowR",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
-                { L"ShowG",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
-                { L"ShowB",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
+                { L"ShowR",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
+                { L"ShowG",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
+                { L"ShowB",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"WaveformH",  L"float", 256.0f, 64.0f, 1024.0f, 32.0f },
             };
             m_effects.push_back(std::move(desc));
@@ -695,7 +695,7 @@ float4 main(
             desc.hlslSource = colorMath + gamutSourceHLSL;
             desc.inputNames = {};
             desc.parameters = {
-                { L"Gamut",      L"uint",  uint32_t(0), 0.0f, 2.0f, 1.0f },
+                { L"Gamut",      L"uint",  uint32_t(0), 0.0f, 2.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020" } },
                 { L"Luminance",  L"float", 80.0f, 0.01f, 10000.0f, 10.0f },
                 { L"OutputSize", L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
             };
@@ -866,7 +866,7 @@ float4 main(
             desc.hlslSource = colorMath + gradientHLSL;
             desc.inputNames = {};
             desc.parameters = {
-                { L"GradientType", L"uint",  uint32_t(0), 0.0f, 2.0f, 1.0f },
+                { L"GradientType", L"uint",  uint32_t(0), 0.0f, 2.0f, 1.0f, { L"Linear Horizontal", L"Linear Vertical", L"Radial" } },
                 { L"StartR",       L"float", 0.0f, -1.0f, 125.0f, 0.01f },
                 { L"StartG",       L"float", 0.0f, -1.0f, 125.0f, 0.01f },
                 { L"StartB",       L"float", 0.0f, -1.0f, 125.0f, 0.01f },

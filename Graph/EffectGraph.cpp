@@ -680,6 +680,13 @@ namespace ShaderLab::Graph
                     po.SetNamedValue(L"maxValue", WDJ::JsonValue::CreateNumberValue(p.maxValue));
                     po.SetNamedValue(L"step", WDJ::JsonValue::CreateNumberValue(p.step));
                     po.SetNamedValue(L"default", PropertyValueToJson(p.name, p.defaultValue));
+                    if (!p.enumLabels.empty())
+                    {
+                        WDJ::JsonArray labels;
+                        for (const auto& label : p.enumLabels)
+                            labels.Append(WDJ::JsonValue::CreateStringValue(label));
+                        po.SetNamedValue(L"enumLabels", labels);
+                    }
                     params.Append(po);
                 }
                 ced.SetNamedValue(L"parameters", params);
@@ -908,6 +915,12 @@ namespace ShaderLab::Graph
                     pd.step = static_cast<float>(po.GetNamedNumber(L"step"));
                     if (po.HasKey(L"default"))
                         pd.defaultValue = PropertyValueFromJson(po.GetNamedObject(L"default"));
+                    if (po.HasKey(L"enumLabels"))
+                    {
+                        auto labels = po.GetNamedArray(L"enumLabels");
+                        for (uint32_t j = 0; j < labels.Size(); ++j)
+                            pd.enumLabels.push_back(std::wstring(labels.GetStringAt(j)));
+                    }
                     def.parameters.push_back(std::move(pd));
                 }
 
