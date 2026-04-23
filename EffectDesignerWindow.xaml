@@ -58,26 +58,42 @@
             <StackPanel x:Name="ParamsPanel" Spacing="4" Margin="0,4,0,0" />
         </StackPanel>
 
-        <!-- Row 3: Compute Settings (visible only for Compute Shader) -->
-        <StackPanel x:Name="ComputeSettingsPanel" Grid.Row="3" Visibility="Collapsed"
-                    Orientation="Horizontal" Spacing="8">
-            <TextBlock Text="Thread Group:" VerticalAlignment="Center" />
-            <NumberBox x:Name="ThreadGroupX" Value="8" Minimum="1" Maximum="1024"
-                       SpinButtonPlacementMode="Compact" Width="80" />
-            <TextBlock Text="×" VerticalAlignment="Center" />
-            <NumberBox x:Name="ThreadGroupY" Value="8" Minimum="1" Maximum="1024"
-                       SpinButtonPlacementMode="Compact" Width="80" />
-            <TextBlock Text="×" VerticalAlignment="Center" />
-            <NumberBox x:Name="ThreadGroupZ" Value="1" Minimum="1" Maximum="64"
-                       SpinButtonPlacementMode="Compact" Width="80" />
-            <AppBarSeparator />
-            <TextBlock Text="Output:" VerticalAlignment="Center" />
-            <ComboBox x:Name="OutputTypeSelector" MinWidth="100">
-                <x:String>None</x:String>
-                <x:String>Histogram</x:String>
-                <x:String>Float Buffer</x:String>
-                <x:String>Typed Analysis</x:String>
-            </ComboBox>
+        <!-- Row 3: Compute Settings + Analysis Outputs (visible only for Compute Shader) -->
+        <StackPanel x:Name="ComputeSettingsPanel" Grid.Row="3" Visibility="Collapsed" Spacing="8">
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBlock Text="Thread Group:" VerticalAlignment="Center" />
+                <NumberBox x:Name="ThreadGroupX" Value="8" Minimum="1" Maximum="1024"
+                           SpinButtonPlacementMode="Compact" Width="80" />
+                <TextBlock Text="×" VerticalAlignment="Center" />
+                <NumberBox x:Name="ThreadGroupY" Value="8" Minimum="1" Maximum="1024"
+                           SpinButtonPlacementMode="Compact" Width="80" />
+                <TextBlock Text="×" VerticalAlignment="Center" />
+                <NumberBox x:Name="ThreadGroupZ" Value="1" Minimum="1" Maximum="64"
+                           SpinButtonPlacementMode="Compact" Width="80" />
+                <AppBarSeparator />
+                <TextBlock Text="Output:" VerticalAlignment="Center" />
+                <ComboBox x:Name="OutputTypeSelector" MinWidth="100">
+                    <x:String>None</x:String>
+                    <x:String>Histogram</x:String>
+                    <x:String>Float Buffer</x:String>
+                    <x:String>Typed Analysis</x:String>
+                </ComboBox>
+            </StackPanel>
+
+            <!-- Analysis output fields -->
+            <StackPanel x:Name="AnalysisFieldsSection" Visibility="Collapsed">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Analysis Output Fields" FontWeight="SemiBold"
+                               VerticalAlignment="Center" />
+                    <Button x:Name="AddAnalysisFieldButton" Grid.Column="1"
+                            Content="+ Add Field" />
+                </Grid>
+                <StackPanel x:Name="AnalysisFieldsPanel" Spacing="4" Margin="0,4,0,0" />
+            </StackPanel>
         </StackPanel>
 
         <!-- Row 4: Action buttons -->

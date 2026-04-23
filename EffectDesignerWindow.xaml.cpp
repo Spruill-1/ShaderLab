@@ -31,6 +31,68 @@ namespace winrt::ShaderLab::implementation
         AddInputButton().Click({ this, &EffectDesignerWindow::OnAddInput });
         AddParamButton().Click({ this, &EffectDesignerWindow::OnAddParam });
 
+        // Analysis fields: show/hide based on Output type selection.
+        OutputTypeSelector().SelectionChanged([this](auto&&, auto&&)
+        {
+            bool showFields = (OutputTypeSelector().SelectedIndex() == 3); // Typed Analysis
+            AnalysisFieldsSection().Visibility(showFields
+                ? Visibility::Visible : Visibility::Collapsed);
+        });
+        AddAnalysisFieldButton().Click([this](auto&&, auto&&)
+        {
+            auto panel = AnalysisFieldsPanel();
+            auto row = Controls::StackPanel();
+            row.Orientation(Controls::Orientation::Horizontal);
+            row.Spacing(4);
+
+            auto nameBox = Controls::TextBox();
+            nameBox.PlaceholderText(L"Field Name");
+            nameBox.MinWidth(120);
+            row.Children().Append(nameBox);
+
+            auto typeCombo = Controls::ComboBox();
+            typeCombo.Items().Append(box_value(L"Float"));
+            typeCombo.Items().Append(box_value(L"Float2"));
+            typeCombo.Items().Append(box_value(L"Float3"));
+            typeCombo.Items().Append(box_value(L"Float4"));
+            typeCombo.Items().Append(box_value(L"Float Array"));
+            typeCombo.Items().Append(box_value(L"Float2 Array"));
+            typeCombo.Items().Append(box_value(L"Float3 Array"));
+            typeCombo.Items().Append(box_value(L"Float4 Array"));
+            typeCombo.SelectedIndex(0);
+            typeCombo.MinWidth(110);
+            row.Children().Append(typeCombo);
+
+            auto lenBox = Controls::NumberBox();
+            lenBox.Header(box_value(L"Length"));
+            lenBox.Value(0);
+            lenBox.Minimum(0);
+            lenBox.Maximum(4096);
+            lenBox.Width(80);
+            lenBox.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
+            lenBox.Visibility(Visibility::Collapsed);
+            row.Children().Append(lenBox);
+
+            // Show length only for array types.
+            typeCombo.SelectionChanged([lenBox](auto&& sender, auto&&) {
+                auto c = sender.template as<Controls::ComboBox>();
+                lenBox.Visibility(c.SelectedIndex() >= 4
+                    ? Visibility::Visible : Visibility::Collapsed);
+            });
+
+            auto removeBtn = Controls::Button();
+            removeBtn.Content(box_value(L"\xE711"));
+            removeBtn.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Segoe Fluent Icons"));
+            removeBtn.Click([row, panel](auto&&, auto&&) {
+                uint32_t i = 0;
+                if (panel.Children().IndexOf(row, i))
+                    panel.Children().RemoveAt(i);
+            });
+            row.Children().Append(removeBtn);
+
+            panel.Children().Append(row);
+        });
+
         HlslEditorBox().PreviewKeyDown([this](auto&&, Input::KeyRoutedEventArgs const& args)
         {
             if (args.Key() == winrt::Windows::System::VirtualKey::Tab)
@@ -129,6 +191,7 @@ namespace winrt::ShaderLab::implementation
         typeCombo.Items().Append(box_value(L"int"));
         typeCombo.Items().Append(box_value(L"uint"));
         typeCombo.Items().Append(box_value(L"bool"));
+        typeCombo.Items().Append(box_value(L"enum"));
         typeCombo.SelectedIndex(0);
         typeCombo.MinWidth(90);
         row.Children().Append(typeCombo);
@@ -143,6 +206,26 @@ namespace winrt::ShaderLab::implementation
         auto rebuildDefaults = [defContainer](int typeIdx)
         {
             defContainer.Children().Clear();
+
+            if (typeIdx == 6) // bool
+            {
+                auto toggle = Controls::ToggleSwitch();
+                toggle.Header(box_value(L"Default"));
+                toggle.IsOn(false);
+                defContainer.Children().Append(toggle);
+                return;
+            }
+
+            if (typeIdx == 7) // enum
+            {
+                auto labelsBox = Controls::TextBox();
+                labelsBox.PlaceholderText(L"Label1, Label2, Label3");
+                labelsBox.Header(box_value(L"Labels (comma-separated)"));
+                labelsBox.MinWidth(200);
+                defContainer.Children().Append(labelsBox);
+                return;
+            }
+
             int count = 1;
             if (typeIdx == 1) count = 2;       // float2
             else if (typeIdx == 2) count = 3;  // float3
@@ -187,7 +270,8 @@ namespace winrt::ShaderLab::implementation
         row.Children().Append(maxBox);
 
         auto removeBtn = Controls::Button();
-        removeBtn.Content(box_value(L"X"));
+        removeBtn.Content(box_value(L"\xE711"));
+        removeBtn.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Segoe Fluent Icons"));
         removeBtn.Click([row, panel](auto&&, auto&&) {
             uint32_t i = 0;
             if (panel.Children().IndexOf(row, i))
@@ -281,7 +365,38 @@ namespace winrt::ShaderLab::implementation
             }
             else if (param.typeName == L"bool" && numBoxes >= 1)
             {
-                param.defaultValue = defContainer.Children().GetAt(0).as<Controls::NumberBox>().Value() != 0.0;
+                // DefContainer has a ToggleSwitch for bool.
+                auto toggle = defContainer.Children().GetAt(0).try_as<Controls::ToggleSwitch>();
+                param.defaultValue = toggle ? toggle.IsOn() : false;
+            }
+            else if (param.typeName == L"enum")
+            {
+                // Enum: stored as float in HLSL cbuffer. Labels in the TextBox.
+                param.typeName = L"float";  // HLSL type is float
+                auto labelsBox = defContainer.Children().GetAt(0).try_as<Controls::TextBox>();
+                if (labelsBox)
+                {
+                    auto text = std::wstring(labelsBox.Text());
+                    // Parse comma-separated labels.
+                    std::wstring label;
+                    for (wchar_t ch : text)
+                    {
+                        if (ch == L',')
+                        {
+                            // Trim whitespace.
+                            while (!label.empty() && label.front() == L' ') label.erase(label.begin());
+                            while (!label.empty() && label.back() == L' ') label.pop_back();
+                            if (!label.empty()) param.enumLabels.push_back(label);
+                            label.clear();
+                        }
+                        else label += ch;
+                    }
+                    while (!label.empty() && label.front() == L' ') label.erase(label.begin());
+                    while (!label.empty() && label.back() == L' ') label.pop_back();
+                    if (!label.empty()) param.enumLabels.push_back(label);
+                }
+                param.defaultValue = 0.0f;
+                param.maxValue = static_cast<float>(param.enumLabels.size() - 1);
             }
             else
             {
@@ -301,7 +416,30 @@ namespace winrt::ShaderLab::implementation
             int outIdx = OutputTypeSelector().SelectedIndex();
             if (outIdx == 1) def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::Histogram;
             else if (outIdx == 2) def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::FloatBuffer;
-            else if (outIdx == 3) def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::Typed;
+            else if (outIdx == 3)
+            {
+                def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::Typed;
+
+                // Collect analysis output fields from UI.
+                auto fieldsPanel = AnalysisFieldsPanel();
+                for (uint32_t fi = 0; fi < fieldsPanel.Children().Size(); ++fi)
+                {
+                    auto fRow = fieldsPanel.Children().GetAt(fi).try_as<Controls::StackPanel>();
+                    if (!fRow || fRow.Children().Size() < 3) continue;
+
+                    auto fName = fRow.Children().GetAt(0).try_as<Controls::TextBox>();
+                    auto fType = fRow.Children().GetAt(1).try_as<Controls::ComboBox>();
+                    auto fLen  = fRow.Children().GetAt(2).try_as<Controls::NumberBox>();
+                    if (!fName || !fType) continue;
+
+                    ::ShaderLab::Graph::AnalysisFieldDescriptor fd;
+                    fd.name = std::wstring(fName.Text());
+                    fd.type = static_cast<::ShaderLab::Graph::AnalysisFieldType>(fType.SelectedIndex());
+                    if (fLen && fType.SelectedIndex() >= 4)
+                        fd.arrayLength = static_cast<uint32_t>(fLen.Value());
+                    def.analysisFields.push_back(std::move(fd));
+                }
+            }
         }
 
         def.hlslSource = std::wstring(HlslEditorBox().Text());
@@ -777,14 +915,22 @@ namespace winrt::ShaderLab::implementation
             auto lastRow = ParamsPanel().Children().GetAt(ParamsPanel().Children().Size() - 1)
                 .as<Controls::StackPanel>();
             lastRow.Children().GetAt(0).as<Controls::TextBox>().Text(winrt::hstring(p.name));
-            // Set type combo.
+            // Set type combo — detect enum (float with enumLabels) and bool specially.
             auto combo = lastRow.Children().GetAt(1).as<Controls::ComboBox>();
-            for (int32_t i = 0; i < static_cast<int32_t>(combo.Items().Size()); ++i)
+            if (!p.enumLabels.empty())
             {
-                if (unbox_value<hstring>(combo.Items().GetAt(i)) == p.typeName)
+                // Select "enum" (index 7).
+                combo.SelectedIndex(7);
+            }
+            else
+            {
+                for (int32_t i = 0; i < static_cast<int32_t>(combo.Items().Size()); ++i)
                 {
-                    combo.SelectedIndex(i);
-                    break;
+                    if (unbox_value<hstring>(combo.Items().GetAt(i)) == p.typeName)
+                    {
+                        combo.SelectedIndex(i);
+                        break;
+                    }
                 }
             }
 
@@ -800,15 +946,45 @@ namespace winrt::ShaderLab::implementation
                 if (sp) { defContainer = sp; break; }
             }
 
-            // Set default value in DefContainer's NumberBoxes.
+            // Set default value in DefContainer.
             if (defContainer)
             {
-                std::vector<Controls::NumberBox> defBoxes;
-                for (uint32_t ci = 0; ci < defContainer.Children().Size(); ++ci)
+                // Handle enum: restore labels into TextBox.
+                if (!p.enumLabels.empty())
                 {
-                    auto nb = defContainer.Children().GetAt(ci).try_as<Controls::NumberBox>();
-                    if (nb) defBoxes.push_back(nb);
+                    auto labelsBox = defContainer.Children().GetAt(0).try_as<Controls::TextBox>();
+                    if (labelsBox)
+                    {
+                        std::wstring labels;
+                        for (size_t li = 0; li < p.enumLabels.size(); ++li)
+                        {
+                            if (li > 0) labels += L", ";
+                            labels += p.enumLabels[li];
+                        }
+                        labelsBox.Text(winrt::hstring(labels));
+                    }
                 }
+                // Handle bool: restore ToggleSwitch.
+                else if (p.typeName == L"bool")
+                {
+                    auto toggle = defContainer.Children().GetAt(0).try_as<Controls::ToggleSwitch>();
+                    if (toggle)
+                    {
+                        std::visit([&toggle](const auto& v) {
+                            using T = std::decay_t<decltype(v)>;
+                            if constexpr (std::is_same_v<T, bool>) toggle.IsOn(v);
+                        }, p.defaultValue);
+                    }
+                }
+                else
+                {
+                    // Numeric types: restore NumberBoxes.
+                    std::vector<Controls::NumberBox> defBoxes;
+                    for (uint32_t ci = 0; ci < defContainer.Children().Size(); ++ci)
+                    {
+                        auto nb = defContainer.Children().GetAt(ci).try_as<Controls::NumberBox>();
+                        if (nb) defBoxes.push_back(nb);
+                    }
 
                 std::visit([&defBoxes](const auto& v)
                 {
@@ -844,6 +1020,7 @@ namespace winrt::ShaderLab::implementation
                         if (defBoxes.size() >= 4) defBoxes[3].Value(v.w);
                     }
                 }, p.defaultValue);
+                } // end numeric types else block
             }
 
             // Set Min and Max (direct NumberBox children of row, after DefContainer).
