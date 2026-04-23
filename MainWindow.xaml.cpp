@@ -4084,7 +4084,8 @@ namespace winrt::ShaderLab::implementation
 
                 if (src)
                 {
-                    // Only update + dirty if primaries actually changed.
+                    // Always write primaries (ensures correct values on first frame).
+                    // Only mark dirty when values actually changed to avoid loops.
                     auto getF = [&](const std::wstring& k) -> float {
                         auto it = node.properties.find(k);
                         if (it != node.properties.end())
@@ -4095,16 +4096,13 @@ namespace winrt::ShaderLab::implementation
                         || std::abs(getF(L"PrimGreenX") - src->primaryGreen.x) > 0.0001f
                         || std::abs(getF(L"PrimBlueX") - src->primaryBlue.x) > 0.0001f;
 
-                    if (changed)
-                    {
-                        node.properties[L"PrimRedX"]   = src->primaryRed.x;
-                        node.properties[L"PrimRedY"]   = src->primaryRed.y;
-                        node.properties[L"PrimGreenX"] = src->primaryGreen.x;
-                        node.properties[L"PrimGreenY"] = src->primaryGreen.y;
-                        node.properties[L"PrimBlueX"]  = src->primaryBlue.x;
-                        node.properties[L"PrimBlueY"]  = src->primaryBlue.y;
-                        node.dirty = true;
-                    }
+                    node.properties[L"PrimRedX"]   = src->primaryRed.x;
+                    node.properties[L"PrimRedY"]   = src->primaryRed.y;
+                    node.properties[L"PrimGreenX"] = src->primaryGreen.x;
+                    node.properties[L"PrimGreenY"] = src->primaryGreen.y;
+                    node.properties[L"PrimBlueX"]  = src->primaryBlue.x;
+                    node.properties[L"PrimBlueY"]  = src->primaryBlue.y;
+                    if (changed) node.dirty = true;
                 }
             }
         }
