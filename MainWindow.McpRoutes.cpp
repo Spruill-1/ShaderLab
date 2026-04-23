@@ -1212,7 +1212,11 @@ namespace winrt::ShaderLab::implementation
 {"name":"graph_bind_property","description":"Bind a node property to an upstream analysis output field","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"propertyName":{"type":"string"},"sourceNodeId":{"type":"number"},"sourceFieldName":{"type":"string"},"sourceComponent":{"type":"number","description":"0-3 for .xyzw component (scalar dest only)"}},"required":["nodeId","propertyName","sourceNodeId","sourceFieldName"]}},
 {"name":"graph_unbind_property","description":"Remove a property binding","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"propertyName":{"type":"string"}},"required":["nodeId","propertyName"]}},
 {"name":"read_analysis_output","description":"Read typed analysis output fields from a compute/analysis node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
-{"name":"read_pixel_trace","description":"Run pixel trace at normalized coordinates, returns per-node pixel values and analysis outputs","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"x":{"type":"number","description":"Normalized X (0-1)"},"y":{"type":"number","description":"Normalized Y (0-1)"}},"required":["nodeId","x","y"]}}
+{"name":"read_pixel_trace","description":"Run pixel trace at normalized coordinates, returns per-node pixel values and analysis outputs","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"x":{"type":"number","description":"Normalized X (0-1)"},"y":{"type":"number","description":"Normalized Y (0-1)"}},"required":["nodeId","x","y"]}},
+{"name":"list_effects","description":"List all available effects (Built-in D2D + ShaderLab) with categories","inputSchema":{"type":"object","properties":{}}},
+{"name":"graph_overview","description":"Compact graph summary: nodes (id, name, type, error), edges, preview node","inputSchema":{"type":"object","properties":{}}},
+{"name":"get_display_info","description":"Current display capabilities, active profile, pipeline format, app version","inputSchema":{"type":"object","properties":{}}},
+{"name":"graph_rename_node","description":"Rename a node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"name":{"type":"string"}},"required":["nodeId","name"]}}
 ]})JSON";
                     return { 200, wrapResult(tools) };
                 }
@@ -1274,6 +1278,127 @@ namespace winrt::ShaderLab::implementation
                     }
                     else if (toolName == "read_pixel_trace")
                         restResp = m_mcpServer->RouteRequest(L"POST", L"/render/pixel-trace", argsStr);
+                    else if (toolName == "list_effects")
+                    {
+                        restResp = DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                            std::string json = "{\"builtIn\":{";
+                            auto& reg = ::ShaderLab::Effects::EffectRegistry::Instance();
+                            auto cats = reg.Categories();
+                            bool firstCat = true;
+                            for (const auto& cat : cats)
+                            {
+                                if (cat == L"Analysis") continue;
+                                if (!firstCat) json += ",";
+                                json += "\"" + ToUtf8(cat) + "\":[";
+                                auto effects = reg.ByCategory(cat);
+                                bool firstFx = true;
+                                for (const auto* e : effects)
+                                {
+                                    if (!firstFx) json += ",";
+                                    json += "\"" + ToUtf8(e->name) + "\"";
+                                    firstFx = false;
+                                }
+                                json += "]";
+                                firstCat = false;
+                            }
+                            json += "},\"shaderLab\":{";
+                            auto& sl = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+                            auto slCats = sl.Categories();
+                            firstCat = true;
+                            for (const auto& cat : slCats)
+                            {
+                                if (!firstCat) json += ",";
+                                json += "\"" + ToUtf8(cat) + "\":[";
+                                auto effects = sl.ByCategory(cat);
+                                bool firstFx = true;
+                                for (const auto* e : effects)
+                                {
+                                    if (!firstFx) json += ",";
+                                    json += "\"" + ToUtf8(e->name) + "\"";
+                                    firstFx = false;
+                                }
+                                json += "]";
+                                firstCat = false;
+                            }
+                            json += "}}";
+                            return { 200, json };
+                        });
+                    }
+                    else if (toolName == "graph_overview")
+                    {
+                        restResp = DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                            std::string json = "{\"previewNodeId\":" + std::to_string(m_previewNodeId) + ",\"nodes\":[";
+                            bool first = true;
+                            for (const auto& n : m_graph.Nodes())
+                            {
+                                if (!first) json += ",";
+                                std::string typeStr;
+                                switch (n.type)
+                                {
+                                case ::ShaderLab::Graph::NodeType::Source:        typeStr = "Source"; break;
+                                case ::ShaderLab::Graph::NodeType::BuiltInEffect: typeStr = "BuiltIn"; break;
+                                case ::ShaderLab::Graph::NodeType::PixelShader:   typeStr = "PixelShader"; break;
+                                case ::ShaderLab::Graph::NodeType::ComputeShader: typeStr = "ComputeShader"; break;
+                                case ::ShaderLab::Graph::NodeType::Output:        typeStr = "Output"; break;
+                                }
+                                json += std::format("{{\"id\":{},\"name\":\"{}\",\"type\":\"{}\"",
+                                    n.id, ToUtf8(n.name), typeStr);
+                                if (!n.runtimeError.empty())
+                                    json += ",\"error\":\"" + ToUtf8(n.runtimeError) + "\"";
+                                json += std::format(",\"inputs\":{},\"outputs\":{}}}", n.inputPins.size(), n.outputPins.size());
+                                first = false;
+                            }
+                            json += "],\"edges\":[";
+                            first = true;
+                            for (const auto& e : m_graph.Edges())
+                            {
+                                if (!first) json += ",";
+                                json += std::format("[{},{},{},{}]", e.sourceNodeId, e.sourcePin, e.destNodeId, e.destPin);
+                                first = false;
+                            }
+                            json += "]}";
+                            return { 200, json };
+                        });
+                    }
+                    else if (toolName == "get_display_info")
+                    {
+                        restResp = DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                            auto profile = m_displayMonitor.ActiveProfile();
+                            auto caps = m_displayMonitor.CachedCapabilities();
+                            auto verStr = ToUtf8(std::wstring(::ShaderLab::VersionString));
+                            std::string json = std::format(
+                                "{{\"appVersion\":\"{}\",\"graphFormatVersion\":{}"
+                                ",\"pipeline\":\"{}\""
+                                ",\"display\":{{\"hdr\":{},\"maxNits\":{:.0f},\"sdrWhiteNits\":{:.0f}"
+                                ",\"simulated\":{},\"profileName\":\"{}\""
+                                ",\"gamut\":{{\"red\":[{:.4f},{:.4f}],\"green\":[{:.4f},{:.4f}],\"blue\":[{:.4f},{:.4f}]}}"
+                                "}}}}",
+                                verStr, ::ShaderLab::GraphFormatVersion,
+                                ToUtf8(std::wstring(m_renderEngine.ActiveFormat().name)),
+                                caps.hdrEnabled ? "true" : "false",
+                                caps.maxLuminanceNits, caps.sdrWhiteLevelNits,
+                                profile.isSimulated ? "true" : "false",
+                                ToUtf8(profile.profileName),
+                                profile.primaryRed.x, profile.primaryRed.y,
+                                profile.primaryGreen.x, profile.primaryGreen.y,
+                                profile.primaryBlue.x, profile.primaryBlue.y);
+                            return { 200, json };
+                        });
+                    }
+                    else if (toolName == "graph_rename_node")
+                    {
+                        restResp = DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                            auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(L"nodeId"));
+                            auto newName = std::wstring(args.GetNamedString(L"name"));
+                            auto* node = m_graph.FindNode(nodeId);
+                            if (!node) return { 404, R"({"error":"Node not found"})" };
+                            node->name = newName;
+                            m_nodeGraphController.RebuildLayout();
+                            PopulatePreviewNodeSelector();
+                            PopulateAddNodeFlyout();
+                            return { 200, R"({"ok":true})" };
+                        });
+                    }
 
                     bool isError = restResp.statusCode >= 400;
 
