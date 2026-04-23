@@ -623,5 +623,446 @@ float4 main(
             };
             m_effects.push_back(std::move(desc));
         }
+
+        // ---- Color Gamut Chart (Source) ----
+        {
+            static const std::string gamutChartHLSL = R"HLSL(
+// Color Gamut Chart - renders CIE horseshoe with filled gamut regions
+// This is a source effect: it generates its own image, no input needed.
+Texture2D Source : register(t0);
+
+cbuffer constants : register(b0) {
+    uint FillRec709;   // 1=fill with color
+    uint FillP3;       // 1=fill with color
+    uint FillRec2020;  // 1=fill with color
+    float OutputSize;  // pixels (default 512)
+};
+
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    float size = max(OutputSize, 128.0);
+    float2 xy = float2(uv0.x / size * 0.8, (1.0 - uv0.y / size) * 0.9);
+
+    float4 result = float4(0.08, 0.08, 0.08, 1.0);
+
+    // Fill gamut regions with their actual colors
+    float3 xyY = float3(xy.x, xy.y, 0.4);
+    float3 xyz = xyYToXYZ(xyY);
+    float3 rgb = XYZToScRGB(xyz);
+
+    bool in709  = PointInTriangle(xy, GAMUT_709_R, GAMUT_709_G, GAMUT_709_B);
+    bool inP3   = PointInTriangle(xy, GAMUT_P3_R, GAMUT_P3_G, GAMUT_P3_B);
+    bool in2020 = PointInTriangle(xy, GAMUT_2020_R, GAMUT_2020_G, GAMUT_2020_B);
+
+    if (in2020 && FillRec2020 > 0) {
+        float3 normalized = max(rgb, 0.0);
+        float m = max(max(normalized.r, normalized.g), max(normalized.b, 0.001));
+        result.rgb = normalized / m * 0.25;
+    }
+    if (inP3 && FillP3 > 0) {
+        float3 normalized = max(rgb, 0.0);
+        float m = max(max(normalized.r, normalized.g), max(normalized.b, 0.001));
+        result.rgb = normalized / m * 0.35;
+    }
+    if (in709 && FillRec709 > 0) {
+        float3 normalized = max(rgb, 0.0);
+        float m = max(max(normalized.r, normalized.g), max(normalized.b, 0.001));
+        result.rgb = normalized / m * 0.5;
+    }
+
+    // Gamut triangle outlines
+    float thickness = 0.003;
+    if (FillRec709 > 0) {
+        float e = 0;
+        // Simple line segments
+        float2 pts709[3] = { GAMUT_709_R, GAMUT_709_G, GAMUT_709_B };
+        [unroll] for (uint i = 0; i < 3; i++) {
+            float2 a = pts709[i], b = pts709[(i+1)%3];
+            float2 ab = b - a;
+            float t = saturate(dot(xy - a, ab) / dot(ab, ab));
+            float d = length(xy - (a + t * ab));
+            e = max(e, smoothstep(thickness, 0.0, d));
+        }
+        result.rgb = lerp(result.rgb, float3(1,1,1), e * 0.9);
+    }
+    if (FillP3 > 0) {
+        float e = 0;
+        float2 ptsP3[3] = { GAMUT_P3_R, GAMUT_P3_G, GAMUT_P3_B };
+        [unroll] for (uint i = 0; i < 3; i++) {
+            float2 a = ptsP3[i], b = ptsP3[(i+1)%3];
+            float2 ab = b - a;
+            float t = saturate(dot(xy - a, ab) / dot(ab, ab));
+            float d = length(xy - (a + t * ab));
+            e = max(e, smoothstep(thickness, 0.0, d));
+        }
+        result.rgb = lerp(result.rgb, float3(0,1,0), e * 0.9);
+    }
+    if (FillRec2020 > 0) {
+        float e = 0;
+        float2 pts2020[3] = { GAMUT_2020_R, GAMUT_2020_G, GAMUT_2020_B };
+        [unroll] for (uint i = 0; i < 3; i++) {
+            float2 a = pts2020[i], b = pts2020[(i+1)%3];
+            float2 ab = b - a;
+            float t = saturate(dot(xy - a, ab) / dot(ab, ab));
+            float d = length(xy - (a + t * ab));
+            e = max(e, smoothstep(thickness, 0.0, d));
+        }
+        result.rgb = lerp(result.rgb, float3(0,0.5,1), e * 0.9);
+    }
+
+    // D65 white point
+    if (length(xy - D65_WHITE) < 0.008)
+        result.rgb = float3(1, 1, 1);
+
+    return result;
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Color Gamut Chart";
+            desc.category = L"Source";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + gamutChartHLSL;
+            desc.inputNames = { L"Source" };  // needs a dummy input for D2D sizing
+            desc.parameters = {
+                { L"FillRec709",  L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
+                { L"FillP3",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
+                { L"FillRec2020", L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
+                { L"OutputSize",  L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Color Checker (Source) ----
+        {
+            static const std::string colorCheckerHLSL = R"HLSL(
+// Macbeth ColorChecker - 24 reference patches in scRGB
+// Approximate sRGB values (converted to linear scRGB).
+Texture2D Source : register(t0);
+
+cbuffer constants : register(b0) {
+    float PatchSize; // pixels per patch (default 64)
+};
+
+// 24 ColorChecker patches in linear sRGB (scRGB)
+// Row 1: Dark Skin, Light Skin, Blue Sky, Foliage, Blue Flower, Bluish Green
+// Row 2: Orange, Purplish Blue, Moderate Red, Purple, Yellow Green, Orange Yellow
+// Row 3: Blue, Green, Red, Yellow, Magenta, Cyan
+// Row 4: White, Neutral 8, Neutral 6.5, Neutral 5, Neutral 3.5, Black
+static const float3 PATCHES[24] = {
+    float3(0.0451, 0.0225, 0.0140),  // Dark Skin
+    float3(0.3005, 0.1947, 0.1369),  // Light Skin
+    float3(0.0600, 0.0962, 0.1622),  // Blue Sky
+    float3(0.0300, 0.0410, 0.0130),  // Foliage
+    float3(0.1118, 0.1018, 0.2218),  // Blue Flower
+    float3(0.0940, 0.2560, 0.2180),  // Bluish Green
+    float3(0.3270, 0.0935, 0.0100),  // Orange
+    float3(0.0260, 0.0438, 0.2040),  // Purplish Blue
+    float3(0.2180, 0.0360, 0.0310),  // Moderate Red
+    float3(0.0280, 0.0130, 0.0510),  // Purple
+    float3(0.1940, 0.2630, 0.0220),  // Yellow Green
+    float3(0.3800, 0.1620, 0.0100),  // Orange Yellow
+    float3(0.0100, 0.0180, 0.1470),  // Blue
+    float3(0.0310, 0.1080, 0.0140),  // Green
+    float3(0.1630, 0.0120, 0.0070),  // Red
+    float3(0.4590, 0.3820, 0.0220),  // Yellow
+    float3(0.2040, 0.0380, 0.1110),  // Magenta
+    float3(0.0230, 0.1310, 0.2160),  // Cyan
+    float3(0.8740, 0.8740, 0.8740),  // White
+    float3(0.5100, 0.5100, 0.5100),  // Neutral 8
+    float3(0.3040, 0.3040, 0.3040),  // Neutral 6.5
+    float3(0.1610, 0.1610, 0.1610),  // Neutral 5
+    float3(0.0680, 0.0680, 0.0680),  // Neutral 3.5
+    float3(0.0210, 0.0210, 0.0210),  // Black
+};
+
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    float ps = max(PatchSize, 16.0);
+    float2 pixPos = uv0.xy;
+    uint col = (uint)(pixPos.x / ps);
+    uint row = (uint)(pixPos.y / ps);
+
+    if (col >= 6 || row >= 4)
+        return float4(0.05, 0.05, 0.05, 1.0);
+
+    uint idx = row * 6 + col;
+    if (idx >= 24)
+        return float4(0.05, 0.05, 0.05, 1.0);
+
+    // Add thin border between patches
+    float2 inPatch = fmod(pixPos, ps);
+    if (inPatch.x < 1.0 || inPatch.y < 1.0)
+        return float4(0.02, 0.02, 0.02, 1.0);
+
+    return float4(PATCHES[idx], 1.0);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Color Checker";
+            desc.category = L"Source";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + colorCheckerHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"PatchSize", L"float", 64.0f, 16.0f, 256.0f, 8.0f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Zone Plate (Source) ----
+        {
+            static const std::string zonePlateHLSL = R"HLSL(
+// Zone Plate - circular resolution/aliasing test pattern
+Texture2D Source : register(t0);
+
+cbuffer constants : register(b0) {
+    float Frequency;   // default 0.5
+    float PlateSize;   // pixels (default 512)
+};
+
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    float size = max(PlateSize, 64.0);
+    float2 center = float2(size * 0.5, size * 0.5);
+    float2 p = uv0.xy - center;
+    float r2 = dot(p, p);
+    float v = 0.5 + 0.5 * cos(Frequency * r2 / size);
+    return float4(v, v, v, 1.0);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Zone Plate";
+            desc.category = L"Source";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + zonePlateHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"Frequency", L"float", 0.5f, 0.01f, 5.0f, 0.01f },
+                { L"PlateSize", L"float", 512.0f, 64.0f, 2048.0f, 64.0f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Gradient Generator (Source) ----
+        {
+            static const std::string gradientHLSL = R"HLSL(
+// Gradient Generator - linear/radial gradients with HDR support
+Texture2D Source : register(t0);
+
+cbuffer constants : register(b0) {
+    uint  GradientType;  // 0=Linear horizontal, 1=Linear vertical, 2=Radial
+    float StartR;   // start color (scRGB)
+    float StartG;
+    float StartB;
+    float EndR;     // end color (scRGB)
+    float EndG;
+    float EndB;
+    float GradSize; // pixels (default 512)
+};
+
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    float size = max(GradSize, 64.0);
+    float t = 0;
+
+    if (GradientType == 0)
+        t = saturate(uv0.x / size);
+    else if (GradientType == 1)
+        t = saturate(uv0.y / size);
+    else {
+        float2 center = float2(size * 0.5, size * 0.5);
+        float r = length(uv0.xy - center) / (size * 0.5);
+        t = saturate(r);
+    }
+
+    float3 startC = float3(StartR, StartG, StartB);
+    float3 endC = float3(EndR, EndG, EndB);
+    float3 color = lerp(startC, endC, t);
+    return float4(color, 1.0);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Gradient Generator";
+            desc.category = L"Source";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + gradientHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"GradientType", L"uint",  uint32_t(0), 0.0f, 2.0f, 1.0f },
+                { L"StartR",       L"float", 0.0f, -1.0f, 125.0f, 0.01f },
+                { L"StartG",       L"float", 0.0f, -1.0f, 125.0f, 0.01f },
+                { L"StartB",       L"float", 0.0f, -1.0f, 125.0f, 0.01f },
+                { L"EndR",         L"float", 1.0f, -1.0f, 125.0f, 0.01f },
+                { L"EndG",         L"float", 1.0f, -1.0f, 125.0f, 0.01f },
+                { L"EndB",         L"float", 1.0f, -1.0f, 125.0f, 0.01f },
+                { L"GradSize",     L"float", 512.0f, 64.0f, 2048.0f, 64.0f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- HDR Test Pattern (Source) ----
+        {
+            static const std::string hdrTestHLSL = R"HLSL(
+// HDR Test Pattern - standard patches at known luminance levels
+Texture2D Source : register(t0);
+
+cbuffer constants : register(b0) {
+    float PatternSize; // pixels (default 512)
+};
+
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    float size = max(PatternSize, 256.0);
+    float2 uv = uv0.xy / size;
+
+    // 4x4 grid of patches at different luminance levels
+    uint col = (uint)(uv.x * 4.0);
+    uint row = (uint)(uv.y * 4.0);
+    col = min(col, 3u);
+    row = min(row, 3u);
+
+    // Nit levels for each patch (scRGB: nits/80)
+    // Row 0: 0.1, 1, 10, 80 nits
+    // Row 1: 100, 200, 400, 1000 nits
+    // Row 2: 2000, 4000, 10000, primaries
+    // Row 3: R, G, B, grayscale ramp
+    float nitsTable[12] = {
+        0.1, 1.0, 10.0, 80.0,
+        100.0, 200.0, 400.0, 1000.0,
+        2000.0, 4000.0, 10000.0, 0.0
+    };
+
+    float3 color = float3(0, 0, 0);
+    uint idx = row * 4 + col;
+
+    if (idx < 11) {
+        float scrgb = nitsTable[idx] / 80.0;
+        color = float3(scrgb, scrgb, scrgb);
+    } else if (idx == 11) {
+        // Rec.709 red primary at 80 nits
+        color = float3(1, 0, 0);
+    } else if (idx == 12) {
+        // Rec.709 green primary at 80 nits
+        color = float3(0, 1, 0);
+    } else if (idx == 13) {
+        // Rec.709 blue primary at 80 nits
+        color = float3(0, 0, 1);
+    } else if (idx == 14) {
+        // Yellow
+        color = float3(1, 1, 0);
+    } else {
+        // Grayscale ramp within the patch
+        float2 inPatch = frac(uv * 4.0);
+        float ramp = inPatch.x;
+        color = float3(ramp, ramp, ramp);
+    }
+
+    // Thin grid lines
+    float2 inPatch = frac(uv * 4.0);
+    if (inPatch.x < 0.01 || inPatch.y < 0.01)
+        color = float3(0.15, 0.15, 0.15);
+
+    return float4(color, 1.0);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"HDR Test Pattern";
+            desc.category = L"Source";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + hdrTestHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"PatternSize", L"float", 512.0f, 256.0f, 2048.0f, 64.0f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Vectorscope (Analysis) ----
+        {
+            static const std::string vectorscopeHLSL = R"HLSL(
+// Vectorscope - chrominance distribution on a circular plot
+Texture2D Source : register(t0);
+
+cbuffer constants : register(b0) {
+    float ScopeSize;    // pixels (default 256)
+    float Intensity;    // dot brightness (default 1.0)
+};
+
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    float size = max(ScopeSize, 64.0);
+    float2 center = float2(size * 0.5, size * 0.5);
+    float2 p = (uv0.xy - center) / (size * 0.5); // -1 to 1
+
+    float4 result = float4(0.05, 0.05, 0.05, 1.0);
+
+    // Draw circular border
+    float r = length(p);
+    if (abs(r - 1.0) < 0.01)
+        result.rgb = float3(0.3, 0.3, 0.3);
+
+    // Cross-hairs
+    if ((abs(p.x) < 0.003 || abs(p.y) < 0.003) && r < 1.0)
+        result.rgb = float3(0.2, 0.2, 0.2);
+
+    // Scatter source pixels: use Cb/Cr as position
+    uint srcW, srcH;
+    Source.GetDimensions(srcW, srcH);
+    if (srcW > 0 && srcH > 0) {
+        float bestDist = 1e10;
+        uint stepX = max(1, srcW / 64);
+        uint stepY = max(1, srcH / 64);
+        for (uint sy = 0; sy < srcH; sy += stepY) {
+            for (uint sx = 0; sx < srcW; sx += stepX) {
+                float4 pix = Source.Load(int3(sx, sy, 0));
+                if (pix.a < 0.001) continue;
+                // YCbCr: Cb = B-Y, Cr = R-Y (simplified)
+                float Y = dot(pix.rgb, float3(0.2126, 0.7152, 0.0722));
+                float Cb = (pix.b - Y) * 0.9;
+                float Cr = (pix.r - Y) * 0.9;
+                float2 sPos = float2(Cr, -Cb); // map to scope space
+                float d = length(sPos - p);
+                bestDist = min(bestDist, d);
+            }
+        }
+        if (bestDist < 0.02) {
+            float hit = saturate(1.0 - bestDist / 0.02) * Intensity;
+            result.rgb += hit * float3(0.8, 0.8, 0.8);
+        }
+    }
+
+    return result;
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Vectorscope";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + vectorscopeHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"ScopeSize",  L"float", 256.0f, 64.0f, 1024.0f, 32.0f },
+                { L"Intensity",  L"float", 1.0f,   0.1f, 5.0f, 0.1f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
     }
 }
