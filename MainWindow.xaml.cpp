@@ -4066,6 +4066,7 @@ namespace winrt::ShaderLab::implementation
         }
 
         // Inject display primaries into Out-of-Gamut Highlight nodes.
+        // Only update when primaries actually change to avoid infinite dirty loops.
         {
             auto liveProfile = m_displayMonitor.LiveProfile();
             auto activeProfile = m_displayMonitor.ActiveProfile();
@@ -4083,13 +4084,27 @@ namespace winrt::ShaderLab::implementation
 
                 if (src)
                 {
-                    node.properties[L"PrimRedX"]   = src->primaryRed.x;
-                    node.properties[L"PrimRedY"]   = src->primaryRed.y;
-                    node.properties[L"PrimGreenX"] = src->primaryGreen.x;
-                    node.properties[L"PrimGreenY"] = src->primaryGreen.y;
-                    node.properties[L"PrimBlueX"]  = src->primaryBlue.x;
-                    node.properties[L"PrimBlueY"]  = src->primaryBlue.y;
-                    node.dirty = true;
+                    // Only update + dirty if primaries actually changed.
+                    auto getF = [&](const std::wstring& k) -> float {
+                        auto it = node.properties.find(k);
+                        if (it != node.properties.end())
+                            if (auto* f = std::get_if<float>(&it->second)) return *f;
+                        return 0.0f;
+                    };
+                    bool changed = std::abs(getF(L"PrimRedX") - src->primaryRed.x) > 0.0001f
+                        || std::abs(getF(L"PrimGreenX") - src->primaryGreen.x) > 0.0001f
+                        || std::abs(getF(L"PrimBlueX") - src->primaryBlue.x) > 0.0001f;
+
+                    if (changed)
+                    {
+                        node.properties[L"PrimRedX"]   = src->primaryRed.x;
+                        node.properties[L"PrimRedY"]   = src->primaryRed.y;
+                        node.properties[L"PrimGreenX"] = src->primaryGreen.x;
+                        node.properties[L"PrimGreenY"] = src->primaryGreen.y;
+                        node.properties[L"PrimBlueX"]  = src->primaryBlue.x;
+                        node.properties[L"PrimBlueY"]  = src->primaryBlue.y;
+                        node.dirty = true;
+                    }
                 }
             }
         }

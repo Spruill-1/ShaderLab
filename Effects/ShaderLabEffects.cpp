@@ -244,23 +244,28 @@ float4 main(
     float4 color = Source.Load(int3(uv0.xy, 0));
     if (color.a < 0.001) return color;
 
+    // All modes use the same primaries-based approach.
+    // For Rec.709/P3/2020, the evaluator could inject known primaries,
+    // but we use matrix conversion for those (more accurate).
+    // The Prim* variables are always referenced to prevent HLSL optimization.
     float3 xyz = ScRGBToXYZ(color.rgb);
     float3 targetRGB = color.rgb;
 
+    // Force the compiler to keep Prim* in the cbuffer by always reading them.
+    float2 mr = float2(PrimRedX, PrimRedY);
+    float2 mg = float2(PrimGreenX, PrimGreenY);
+    float2 mb = float2(PrimBlueX, PrimBlueY);
+
     if (TargetGamut > 0.5 && TargetGamut < 1.5) {
-        // Rec.709: scRGB is Rec.709, just check negatives
-        targetRGB = color.rgb;
+        targetRGB = color.rgb; // Rec.709
     } else if (TargetGamut > 1.5 && TargetGamut < 2.5) {
         targetRGB = mul(XYZ_TO_P3D65, xyz);
     } else if (TargetGamut > 2.5 && TargetGamut < 3.5) {
         targetRGB = mul(XYZ_TO_REC2020, xyz);
     } else {
-        // Current Monitor (0) or Preview Mode (4): use injected primaries
+        // Current Monitor (0) or Preview Mode (4): chromaticity triangle test
         float sum = xyz.x + xyz.y + xyz.z;
         float2 xy = (sum > 0.0001) ? float2(xyz.x / sum, xyz.y / sum) : D65_WHITE;
-        float2 mr = float2(PrimRedX, PrimRedY);
-        float2 mg = float2(PrimGreenX, PrimGreenY);
-        float2 mb = float2(PrimBlueX, PrimBlueY);
         float2 v0 = mb - mr, v1 = mg - mr, v2 = xy - mr;
         float d00 = dot(v0, v0), d01 = dot(v0, v1), d02 = dot(v0, v2);
         float d11 = dot(v1, v1), d12 = dot(v1, v2);
