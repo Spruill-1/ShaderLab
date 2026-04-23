@@ -214,6 +214,8 @@ float4 main(
 
     static const std::string s_outOfGamutHLSL = R"HLSL(
 // Out-of-Gamut Highlight
+// Checks if source pixels are representable in the target gamut by
+// converting to that color space and checking for negative components.
 Texture2D Source : register(t0);
 
 cbuffer constants : register(b0) {
@@ -231,18 +233,33 @@ cbuffer constants : register(b0) {
     float MonitorBlueY;
 };
 
-bool IsOutOfGamut(float3 rgb, uint gamut) {
-    float3 xyz = ScRGBToXYZ(rgb);
-    float3 xyY = XYZToxyY(xyz);
-    float2 p = xyY.xy;
+bool IsOutOfGamut(float3 scrgb, uint gamut) {
+    if (gamut == 0) {
+        // Rec.709 = scRGB: out of gamut if any component < 0 or > 1
+        // (> 1 means beyond SDR white, but still representable;
+        //  < 0 means truly out of the Rec.709 gamut)
+        return scrgb.r < -0.001 || scrgb.g < -0.001 || scrgb.b < -0.001;
+    }
 
-    float2 r, g, b;
-    if (gamut == 0) { r = GAMUT_709_R;  g = GAMUT_709_G;  b = GAMUT_709_B; }
-    else if (gamut == 1) { r = GAMUT_P3_R;   g = GAMUT_P3_G;   b = GAMUT_P3_B; }
-    else if (gamut == 2) { r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }
-    else { r = float2(MonitorRedX, MonitorRedY); g = float2(MonitorGreenX, MonitorGreenY); b = float2(MonitorBlueX, MonitorBlueY); }
+    // Convert scRGB → CIE XYZ → target color space, check for negatives.
+    float3 xyz = ScRGBToXYZ(scrgb);
 
-    return !PointInTriangle(p, r, g, b);
+    float3 targetRGB;
+    if (gamut == 1) {
+        targetRGB = mul(XYZ_TO_P3D65, xyz);
+    } else if (gamut == 2) {
+        targetRGB = mul(XYZ_TO_REC2020, xyz);
+    } else {
+        // Monitor gamut: use chromaticity triangle test as fallback
+        float3 xyY = XYZToxyY(xyz);
+        float2 p = xyY.xy;
+        float2 r = float2(MonitorRedX, MonitorRedY);
+        float2 g = float2(MonitorGreenX, MonitorGreenY);
+        float2 b = float2(MonitorBlueX, MonitorBlueY);
+        return !PointInTriangle(p, r, g, b);
+    }
+
+    return targetRGB.r < -0.001 || targetRGB.g < -0.001 || targetRGB.b < -0.001;
 }
 
 float4 main(
