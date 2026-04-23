@@ -4110,6 +4110,12 @@ namespace winrt::ShaderLab::implementation
         // Evaluate the effect graph.
         m_graphEvaluator.Evaluate(m_graph, dc);
 
+        // If any effects were newly created this frame, evaluate again immediately.
+        // D2D needs the first pass to initialize transform pipeline; the second
+        // pass produces correct output with the proper cbuffer values.
+        if (m_graph.HasDirtyNodes())
+            m_graphEvaluator.Evaluate(m_graph, dc);
+
         // Deferred fit: after first evaluation with valid output, fit the preview.
         if (m_needsFitPreview && GetPreviewImage())
         {
