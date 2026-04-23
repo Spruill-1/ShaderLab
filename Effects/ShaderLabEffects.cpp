@@ -629,11 +629,13 @@ float4 main(
         {
             static const std::string gamutSourceHLSL = R"HLSL(
 // Gamut Source - generates all colors within a selected color gamut
+// Fixed coordinate system centered on D65 white point. Scale fits Rec.2020
+// so all three gamuts share the same spatial mapping.
 
 cbuffer constants : register(b0) {
     uint  Gamut;        // 0=Rec.709, 1=DCI-P3, 2=Rec.2020
     float Luminance;    // nits (default 80.0, maps to scRGB 1.0)
-    float OutputSize;   // pixels (default 3840)
+    float OutputSize;   // pixels (default 1024)
 };
 
 float4 main(
@@ -648,30 +650,21 @@ float4 main(
     else if (Gamut == 1) { r = GAMUT_P3_R;   g = GAMUT_P3_G;   b = GAMUT_P3_B; }
     else                 { r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }
 
-    // Compute bounding box of the gamut triangle with padding
-    float2 minXY = min(min(r, g), b);
-    float2 maxXY = max(max(r, g), b);
-    float2 range = maxXY - minXY;
-    float pad = max(range.x, range.y) * 0.08;
-    minXY -= pad;
-    maxXY += pad;
-    range = maxXY - minXY;
+    // Fixed coordinate system: D65 white point at image center.
+    // Scale based on Rec.2020 bounding box (the largest gamut) so all
+    // three gamuts map to the same spatial coordinates.
+    float2 center = D65_WHITE; // (0.3127, 0.3290)
 
-    // Map pixel position to CIE xy centered on the gamut
-    float aspect = range.x / range.y;
+    // Rec.2020 spans roughly x:[0.131, 0.708], y:[0.046, 0.797]
+    // Max distance from D65 in any direction ≈ 0.47
+    // Use a uniform half-extent with padding.
+    float halfExtent = 0.50;
+
+    // Map pixel [0, size] → CIE xy centered on D65
     float2 uv = uv0.xy / size;
     float2 xy;
-    if (aspect > 1.0) {
-        xy.x = minXY.x + uv.x * range.x;
-        float yRange = range.x; // square mapping
-        float yOff = (yRange - range.y) * 0.5;
-        xy.y = maxXY.y + yOff - uv.y * yRange;
-    } else {
-        xy.y = maxXY.y - uv.y * range.y;
-        float xRange = range.y;
-        float xOff = (xRange - range.x) * 0.5;
-        xy.x = minXY.x - xOff + uv.x * xRange;
-    }
+    xy.x = center.x + (uv.x - 0.5) * 2.0 * halfExtent;
+    xy.y = center.y - (uv.y - 0.5) * 2.0 * halfExtent; // y-up
 
     // Outside the gamut triangle: dark background
     if (!PointInTriangle(xy, r, g, b))
