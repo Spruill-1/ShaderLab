@@ -235,28 +235,22 @@ cbuffer constants : register(b0) {
 
 bool IsOutOfGamut(float3 scrgb, uint gamut) {
     if (gamut == 0) {
-        // Rec.709 = scRGB: out of gamut if any component < 0 or > 1
-        // (> 1 means beyond SDR white, but still representable;
-        //  < 0 means truly out of the Rec.709 gamut)
         return scrgb.r < -0.001 || scrgb.g < -0.001 || scrgb.b < -0.001;
     }
 
-    // Convert scRGB → CIE XYZ → target color space, check for negatives.
     float3 xyz = ScRGBToXYZ(scrgb);
+    float3 targetRGB = float3(0, 0, 0);
 
-    float3 targetRGB;
-    if (gamut == 1) {
+    if (gamut == 1)
         targetRGB = mul(XYZ_TO_P3D65, xyz);
-    } else if (gamut == 2) {
+    else if (gamut == 2)
         targetRGB = mul(XYZ_TO_REC2020, xyz);
-    } else {
-        // Monitor gamut: use chromaticity triangle test as fallback
+    else {
         float3 xyY = XYZToxyY(xyz);
-        float2 p = xyY.xy;
         float2 r = float2(MonitorRedX, MonitorRedY);
         float2 g = float2(MonitorGreenX, MonitorGreenY);
         float2 b = float2(MonitorBlueX, MonitorBlueY);
-        return !PointInTriangle(p, r, g, b);
+        return !PointInTriangle(xyY.xy, r, g, b);
     }
 
     return targetRGB.r < -0.001 || targetRGB.g < -0.001 || targetRGB.b < -0.001;
