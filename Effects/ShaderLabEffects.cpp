@@ -625,17 +625,15 @@ float4 main(
             m_effects.push_back(std::move(desc));
         }
 
-        // ---- Color Gamut Chart (Source) ----
+        // ---- Gamut Source ----
         {
-            static const std::string gamutChartHLSL = R"HLSL(
-// Color Gamut Chart - renders CIE horseshoe with filled gamut regions
-// Source effect: generates its own image, no input needed.
+            static const std::string gamutSourceHLSL = R"HLSL(
+// Gamut Source - generates all colors within a selected color gamut
 
 cbuffer constants : register(b0) {
-    uint FillRec709;   // 1=fill with color
-    uint FillP3;       // 1=fill with color
-    uint FillRec2020;  // 1=fill with color
-    float OutputSize;  // pixels (default 512)
+    uint  Gamut;        // 0=Rec.709, 1=DCI-P3, 2=Rec.2020
+    float Luminance;    // nits (default 80.0, maps to scRGB 1.0)
+    float OutputSize;   // pixels (default 3840)
 };
 
 float4 main(
@@ -643,94 +641,63 @@ float4 main(
     float4 uv0 : TEXCOORD0) : SV_TARGET
 {
     float size = max(OutputSize, 128.0);
-    float2 xy = float2(uv0.x / size * 0.8, (1.0 - uv0.y / size) * 0.9);
 
-    float4 result = float4(0.18, 0.18, 0.18, 1.0);
+    // Select gamut primaries
+    float2 r, g, b;
+    if (Gamut == 0)      { r = GAMUT_709_R;  g = GAMUT_709_G;  b = GAMUT_709_B; }
+    else if (Gamut == 1) { r = GAMUT_P3_R;   g = GAMUT_P3_G;   b = GAMUT_P3_B; }
+    else                 { r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }
 
-    // Fill gamut regions with their actual colors
-    float3 xyY = float3(xy.x, xy.y, 0.4);
-    float3 xyz = xyYToXYZ(xyY);
+    // Compute bounding box of the gamut triangle with padding
+    float2 minXY = min(min(r, g), b);
+    float2 maxXY = max(max(r, g), b);
+    float2 range = maxXY - minXY;
+    float pad = max(range.x, range.y) * 0.08;
+    minXY -= pad;
+    maxXY += pad;
+    range = maxXY - minXY;
+
+    // Map pixel position to CIE xy centered on the gamut
+    float aspect = range.x / range.y;
+    float2 uv = uv0.xy / size;
+    float2 xy;
+    if (aspect > 1.0) {
+        xy.x = minXY.x + uv.x * range.x;
+        float yRange = range.x; // square mapping
+        float yOff = (yRange - range.y) * 0.5;
+        xy.y = maxXY.y + yOff - uv.y * yRange;
+    } else {
+        xy.y = maxXY.y - uv.y * range.y;
+        float xRange = range.y;
+        float xOff = (xRange - range.x) * 0.5;
+        xy.x = minXY.x - xOff + uv.x * xRange;
+    }
+
+    // Outside the gamut triangle: dark background
+    if (!PointInTriangle(xy, r, g, b))
+        return float4(0.05, 0.05, 0.05, 1.0);
+
+    // Convert CIE xy + luminance to scRGB
+    float Y = Luminance / 80.0;
+    float3 xyY_val = float3(xy.x, xy.y, Y);
+    float3 xyz = xyYToXYZ(xyY_val);
     float3 rgb = XYZToScRGB(xyz);
+    rgb = max(rgb, 0.0);
 
-    bool in709  = PointInTriangle(xy, GAMUT_709_R, GAMUT_709_G, GAMUT_709_B);
-    bool inP3   = PointInTriangle(xy, GAMUT_P3_R, GAMUT_P3_G, GAMUT_P3_B);
-    bool in2020 = PointInTriangle(xy, GAMUT_2020_R, GAMUT_2020_G, GAMUT_2020_B);
-
-    if (in2020 && FillRec2020 > 0) {
-        float3 normalized = max(rgb, 0.0);
-        float m = max(max(normalized.r, normalized.g), max(normalized.b, 0.001));
-        result.rgb = normalized / m * 0.4;
-    }
-    if (inP3 && FillP3 > 0) {
-        float3 normalized = max(rgb, 0.0);
-        float m = max(max(normalized.r, normalized.g), max(normalized.b, 0.001));
-        result.rgb = normalized / m * 0.55;
-    }
-    if (in709 && FillRec709 > 0) {
-        float3 normalized = max(rgb, 0.0);
-        float m = max(max(normalized.r, normalized.g), max(normalized.b, 0.001));
-        result.rgb = normalized / m * 0.7;
-    }
-
-    // Gamut triangle outlines
-    float thickness = 0.003;
-    if (FillRec709 > 0) {
-        float e = 0;
-        // Simple line segments
-        float2 pts709[3] = { GAMUT_709_R, GAMUT_709_G, GAMUT_709_B };
-        [unroll] for (uint i = 0; i < 3; i++) {
-            float2 a = pts709[i], b = pts709[(i+1)%3];
-            float2 ab = b - a;
-            float t = saturate(dot(xy - a, ab) / dot(ab, ab));
-            float d = length(xy - (a + t * ab));
-            e = max(e, smoothstep(thickness, 0.0, d));
-        }
-        result.rgb = lerp(result.rgb, float3(1,1,1), e * 0.9);
-    }
-    if (FillP3 > 0) {
-        float e = 0;
-        float2 ptsP3[3] = { GAMUT_P3_R, GAMUT_P3_G, GAMUT_P3_B };
-        [unroll] for (uint i = 0; i < 3; i++) {
-            float2 a = ptsP3[i], b = ptsP3[(i+1)%3];
-            float2 ab = b - a;
-            float t = saturate(dot(xy - a, ab) / dot(ab, ab));
-            float d = length(xy - (a + t * ab));
-            e = max(e, smoothstep(thickness, 0.0, d));
-        }
-        result.rgb = lerp(result.rgb, float3(0,1,0), e * 0.9);
-    }
-    if (FillRec2020 > 0) {
-        float e = 0;
-        float2 pts2020[3] = { GAMUT_2020_R, GAMUT_2020_G, GAMUT_2020_B };
-        [unroll] for (uint i = 0; i < 3; i++) {
-            float2 a = pts2020[i], b = pts2020[(i+1)%3];
-            float2 ab = b - a;
-            float t = saturate(dot(xy - a, ab) / dot(ab, ab));
-            float d = length(xy - (a + t * ab));
-            e = max(e, smoothstep(thickness, 0.0, d));
-        }
-        result.rgb = lerp(result.rgb, float3(0,0.5,1), e * 0.9);
-    }
-
-    // D65 white point
-    if (length(xy - D65_WHITE) < 0.008)
-        result.rgb = float3(1, 1, 1);
-
-    return result;
+    return float4(rgb, 1.0);
 }
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
-            desc.name = L"Color Gamut Chart";
+            desc.name = L"Gamut Source";
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
-            desc.hlslSource = colorMath + gamutChartHLSL;
+            desc.hlslSource = colorMath + gamutSourceHLSL;
             desc.inputNames = {};
             desc.parameters = {
-                { L"FillRec709",  L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
-                { L"FillP3",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
-                { L"FillRec2020", L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
-                { L"OutputSize",  L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
+                { L"Gamut",      L"uint",  uint32_t(0), 0.0f, 2.0f, 1.0f },
+                { L"Luminance",  L"float", 80.0f, 0.01f, 10000.0f, 10.0f },
+                { L"OutputSize", L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
             };
             m_effects.push_back(std::move(desc));
         }

@@ -694,6 +694,9 @@ namespace winrt::ShaderLab::implementation
                 uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
                 return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                     m_previewNodeId = nodeId;
+                    m_needsFitPreview = true;
+                    m_forceRender = true;
+                    m_graph.MarkAllDirty();
                     return { 200, R"({"ok":true})" };
                 });
             }
@@ -844,6 +847,8 @@ namespace winrt::ShaderLab::implementation
             -> ::ShaderLab::McpHttpServer::Response
         {
             return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                // Force a render frame so the capture reflects current state.
+                RenderFrame();
                 auto pngData = CapturePreviewAsPng();
                 if (pngData.empty())
                     return { 404, R"({"error":"No output image"})" };

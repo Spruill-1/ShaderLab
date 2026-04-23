@@ -209,7 +209,17 @@ namespace ShaderLab::Effects
         D2D1_RECT_L* outputRect,
         D2D1_RECT_L* outputOpaqueSubRect)
     {
-        if (inputRectCount > 0 && inputRects)
+        // Source effects with a fixed output size always use it,
+        // regardless of input rect (which may be a dummy bitmap).
+        if (m_fixedOutputWidth > 0 && m_fixedOutputHeight > 0)
+        {
+            *outputRect = D2D1_RECT_L{ 0, 0,
+                static_cast<LONG>(m_fixedOutputWidth),
+                static_cast<LONG>(m_fixedOutputHeight) };
+            m_inputRect = *outputRect;
+            m_lastOutputRect = *outputRect;
+        }
+        else if (inputRectCount > 0 && inputRects)
         {
             m_inputRect = inputRects[0];
 
@@ -228,15 +238,6 @@ namespace ShaderLab::Effects
             outputRect->right  = (std::min)(outputRect->right,  4096L);
             outputRect->bottom = (std::min)(outputRect->bottom, 4096L);
 
-            m_lastOutputRect = *outputRect;
-        }
-        else if (m_fixedOutputWidth > 0 && m_fixedOutputHeight > 0)
-        {
-            // Zero-input source effect: use fixed output size.
-            *outputRect = D2D1_RECT_L{ 0, 0,
-                static_cast<LONG>(m_fixedOutputWidth),
-                static_cast<LONG>(m_fixedOutputHeight) };
-            m_inputRect = *outputRect;
             m_lastOutputRect = *outputRect;
         }
         else
