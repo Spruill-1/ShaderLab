@@ -148,6 +148,15 @@ namespace ShaderLab::Rendering
 
                     WireInputs(effect, *node, graph);
 
+                    // For source effects (no declared inputs), feed a dummy bitmap
+                    // so D2D has valid input for MapInputRectsToOutputRect sizing.
+                    if (node->customEffect->inputNames.empty())
+                    {
+                        EnsureDummySourceBitmap(dc);
+                        if (m_dummySourceBitmap)
+                            effect->SetInput(0, m_dummySourceBitmap.get());
+                    }
+
                     // Force D2D to re-render by toggling input 0.
                     {
                         winrt::com_ptr<ID2D1Image> savedInput;
@@ -228,6 +237,7 @@ namespace ShaderLab::Rendering
     {
         m_effectCache.clear();
         m_customImplCache.clear();
+        m_dummySourceBitmap = nullptr;
     }
 
     void GraphEvaluator::InvalidateNode(uint32_t nodeId)
@@ -299,6 +309,8 @@ namespace ShaderLab::Rendering
             node.customEffect.has_value() && node.customEffect->isCompiled())
         {
             clsid = node.customEffect->shaderGuid;
+            // D2D custom effects require at least 1 input. Source effects
+            // (empty inputNames) get a hidden input fed by a dummy bitmap.
             UINT32 inputCount = static_cast<UINT32>(
                 (std::max)(size_t(1), node.customEffect->inputNames.size()));
 
@@ -343,7 +355,9 @@ namespace ShaderLab::Rendering
         // initializes m_inputCount correctly for SetSingleTransformNode.
         if (node.customEffect.has_value())
         {
-            UINT32 ic = static_cast<UINT32>(node.customEffect->inputNames.size());
+            // Always at least 1 for D2D (source effects get a dummy input).
+            UINT32 ic = static_cast<UINT32>(
+                (std::max)(size_t(1), node.customEffect->inputNames.size()));
             if (node.type == NodeType::PixelShader)
                 Effects::CustomPixelShaderEffect::s_pendingInputCount = ic;
             else if (node.type == NodeType::ComputeShader)
@@ -369,7 +383,38 @@ namespace ShaderLab::Rendering
         // Capture custom effect impl for host-side API.
         if (node.type == NodeType::PixelShader && Effects::CustomPixelShaderEffect::s_lastCreated)
         {
-            m_customImplCache[node.id] = { Effects::CustomPixelShaderEffect::s_lastCreated, nullptr };
+            auto* impl = Effects::CustomPixelShaderEffect::s_lastCreated;
+            m_customImplCache[node.id] = { impl, nullptr };
+
+            // For zero-input source effects, set fixed output size from properties.
+            if (node.customEffect.has_value() && node.customEffect->inputNames.empty())
+            {
+                UINT32 outW = 512, outH = 512;
+                // Look for OutputSize/DiagramSize/PlateSize/GradSize/PatternSize/PatchSize/ScopeSize property.
+                for (const auto& [key, val] : node.properties)
+                {
+                    if (key.find(L"Size") != std::wstring::npos ||
+                        key.find(L"size") != std::wstring::npos)
+                    {
+                        if (auto* f = std::get_if<float>(&val))
+                        {
+                            outW = outH = static_cast<UINT32>(*f);
+                            break;
+                        }
+                    }
+                }
+                // Special case: PatchSize for Color Checker (6 cols × 4 rows).
+                auto patchIt = node.properties.find(L"PatchSize");
+                if (patchIt != node.properties.end())
+                {
+                    if (auto* f = std::get_if<float>(&patchIt->second))
+                    {
+                        outW = static_cast<UINT32>(*f * 6);
+                        outH = static_cast<UINT32>(*f * 4);
+                    }
+                }
+                impl->SetFixedOutputSize(outW, outH);
+            }
         }
         else if (node.type == NodeType::ComputeShader && Effects::CustomComputeShaderEffect::s_lastCreated)
         {
@@ -773,10 +818,51 @@ namespace ShaderLab::Rendering
 
             // Set the packed cbuffer on the concrete impl.
             if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
+            {
                 implIt->second.pixelImpl->SetConstantBufferData(cbData.data(), static_cast<UINT32>(cbData.size()));
+
+                // Update fixed output size for zero-input source effects.
+                if (node.customEffect->inputNames.empty())
+                {
+                    UINT32 outW = 512, outH = 512;
+                    for (const auto& [key, val] : effectiveProps)
+                    {
+                        if (key.find(L"Size") != std::wstring::npos ||
+                            key.find(L"size") != std::wstring::npos)
+                        {
+                            if (auto* f = std::get_if<float>(&val))
+                            { outW = outH = static_cast<UINT32>(*f); break; }
+                        }
+                    }
+                    auto patchIt = effectiveProps.find(L"PatchSize");
+                    if (patchIt != effectiveProps.end())
+                    {
+                        if (auto* f = std::get_if<float>(&patchIt->second))
+                        { outW = static_cast<UINT32>(*f * 6); outH = static_cast<UINT32>(*f * 4); }
+                    }
+                    implIt->second.pixelImpl->SetFixedOutputSize(outW, outH);
+                }
+            }
             else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
                 implIt->second.computeImpl->SetConstantBufferData(cbData.data(), static_cast<UINT32>(cbData.size()));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Dummy source bitmap for zero-input source effects
+    // -----------------------------------------------------------------------
+
+    void GraphEvaluator::EnsureDummySourceBitmap(ID2D1DeviceContext5* dc)
+    {
+        if (m_dummySourceBitmap) return;
+
+        // Create a bitmap sized to the max source effect output (512x512 default).
+        // The actual output rect comes from MapInputRectsToOutputRect which uses
+        // SetFixedOutputSize, but D2D needs the input bitmap to be at least as large.
+        D2D1_BITMAP_PROPERTIES1 props = {};
+        props.pixelFormat = { DXGI_FORMAT_R16G16B16A16_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+        props.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+        dc->CreateBitmap(D2D1::SizeU(2048, 2048), nullptr, 0, props, m_dummySourceBitmap.put());
     }
 
     // -----------------------------------------------------------------------

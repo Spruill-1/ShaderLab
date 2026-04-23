@@ -629,8 +629,7 @@ float4 main(
         {
             static const std::string gamutChartHLSL = R"HLSL(
 // Color Gamut Chart - renders CIE horseshoe with filled gamut regions
-// This is a source effect: it generates its own image, no input needed.
-Texture2D Source : register(t0);
+// Source effect: generates its own image, no input needed.
 
 cbuffer constants : register(b0) {
     uint FillRec709;   // 1=fill with color
@@ -726,7 +725,7 @@ float4 main(
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutChartHLSL;
-            desc.inputNames = { L"Source" };  // needs a dummy input for D2D sizing
+            desc.inputNames = {};
             desc.parameters = {
                 { L"FillRec709",  L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
                 { L"FillP3",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f },
@@ -740,8 +739,7 @@ float4 main(
         {
             static const std::string colorCheckerHLSL = R"HLSL(
 // Macbeth ColorChecker - 24 reference patches in scRGB
-// Approximate sRGB values (converted to linear scRGB).
-Texture2D Source : register(t0);
+// Source effect: no input required.
 
 cbuffer constants : register(b0) {
     float PatchSize; // pixels per patch (default 64)
@@ -809,7 +807,7 @@ float4 main(
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + colorCheckerHLSL;
-            desc.inputNames = { L"Source" };
+            desc.inputNames = {};
             desc.parameters = {
                 { L"PatchSize", L"float", 64.0f, 16.0f, 256.0f, 8.0f },
             };
@@ -820,7 +818,7 @@ float4 main(
         {
             static const std::string zonePlateHLSL = R"HLSL(
 // Zone Plate - circular resolution/aliasing test pattern
-Texture2D Source : register(t0);
+// Source effect: no input required.
 
 cbuffer constants : register(b0) {
     float Frequency;   // default 0.5
@@ -845,7 +843,7 @@ float4 main(
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + zonePlateHLSL;
-            desc.inputNames = { L"Source" };
+            desc.inputNames = {};
             desc.parameters = {
                 { L"Frequency", L"float", 0.5f, 0.01f, 5.0f, 0.01f },
                 { L"PlateSize", L"float", 512.0f, 64.0f, 2048.0f, 64.0f },
@@ -857,7 +855,7 @@ float4 main(
         {
             static const std::string gradientHLSL = R"HLSL(
 // Gradient Generator - linear/radial gradients with HDR support
-Texture2D Source : register(t0);
+// Source effect: no input required.
 
 cbuffer constants : register(b0) {
     uint  GradientType;  // 0=Linear horizontal, 1=Linear vertical, 2=Radial
@@ -899,7 +897,7 @@ float4 main(
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gradientHLSL;
-            desc.inputNames = { L"Source" };
+            desc.inputNames = {};
             desc.parameters = {
                 { L"GradientType", L"uint",  uint32_t(0), 0.0f, 2.0f, 1.0f },
                 { L"StartR",       L"float", 0.0f, -1.0f, 125.0f, 0.01f },
@@ -917,7 +915,7 @@ float4 main(
         {
             static const std::string hdrTestHLSL = R"HLSL(
 // HDR Test Pattern - standard patches at known luminance levels
-Texture2D Source : register(t0);
+// Source effect: no input required.
 
 cbuffer constants : register(b0) {
     float PatternSize; // pixels (default 512)
@@ -986,7 +984,7 @@ float4 main(
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + hdrTestHLSL;
-            desc.inputNames = { L"Source" };
+            desc.inputNames = {};
             desc.parameters = {
                 { L"PatternSize", L"float", 512.0f, 256.0f, 2048.0f, 64.0f },
             };

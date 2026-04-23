@@ -127,6 +127,14 @@ namespace ShaderLab::Effects
         // Set raw constant buffer data (will be uploaded on next PrepareForRender).
         void SetConstantBufferData(const BYTE* data, UINT32 dataSize);
 
+        // Set fixed output size for source effects (no inputs).
+        // When set, MapInputRectsToOutputRect uses this instead of requiring inputs.
+        void SetFixedOutputSize(UINT32 width, UINT32 height)
+        {
+            m_fixedOutputWidth = width;
+            m_fixedOutputHeight = height;
+        }
+
         // Pack PropertyValue map into the constant buffer using reflection info.
         void PackConstantBuffer(
             const std::map<std::wstring, Graph::PropertyValue>& properties,
@@ -150,6 +158,10 @@ namespace ShaderLab::Effects
         UINT32            m_inputCount{ 1 };
         D2D1_RECT_L       m_inputRect{};
         D2D1_RECT_L       m_lastOutputRect{}; // From MapInputRectsToOutputRect, for 1:1 TEXCOORD mapping.
+
+        // Fixed output size for zero-input source effects.
+        UINT32 m_fixedOutputWidth{ 0 };
+        UINT32 m_fixedOutputHeight{ 0 };
 
         // Whether we need to re-upload the constant buffer.
         bool m_cbDirty{ false };

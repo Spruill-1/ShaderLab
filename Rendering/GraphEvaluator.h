@@ -104,5 +104,11 @@ namespace ShaderLab::Rendering
         // Tracks nodes whose D2D effects were created this frame.
         // Analysis readback is deferred by one frame for these nodes.
         std::unordered_set<uint32_t> m_justCreated;
+
+        // Dummy 1x1 bitmap used as input for zero-input source effects.
+        // D2D custom pixel shaders require at least 1 input for sizing,
+        // but source effects generate their own content.
+        winrt::com_ptr<ID2D1Bitmap1> m_dummySourceBitmap;
+        void EnsureDummySourceBitmap(ID2D1DeviceContext5* dc);
     };
 }

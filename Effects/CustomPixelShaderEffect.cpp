@@ -223,14 +223,20 @@ namespace ShaderLab::Effects
                 outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
             }
 
-            // Clamp to reasonable bounds. D2D maps TEXCOORD proportionally
-            // between this output rect and the input rects from MapOutputRectToInputRects.
-            // We return this same rect from MapOutputRectToInputRects to ensure 1:1 mapping.
             outputRect->left   = (std::max)(outputRect->left,   0L);
             outputRect->top    = (std::max)(outputRect->top,    0L);
             outputRect->right  = (std::min)(outputRect->right,  4096L);
             outputRect->bottom = (std::min)(outputRect->bottom, 4096L);
 
+            m_lastOutputRect = *outputRect;
+        }
+        else if (m_fixedOutputWidth > 0 && m_fixedOutputHeight > 0)
+        {
+            // Zero-input source effect: use fixed output size.
+            *outputRect = D2D1_RECT_L{ 0, 0,
+                static_cast<LONG>(m_fixedOutputWidth),
+                static_cast<LONG>(m_fixedOutputHeight) };
+            m_inputRect = *outputRect;
             m_lastOutputRect = *outputRect;
         }
         else
