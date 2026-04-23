@@ -206,8 +206,9 @@ float4 main(
     float nits = ScRGBLuminanceNits(color.rgb);
     float t = saturate((nits - MinNits) / max(MaxNits - MinNits, 0.001));
     float3 mapped = TurboColormap(t);
-    // Output in scRGB linear (convert from sRGB-ish colormap)
-    return float4(SRGBToLinear(mapped), color.a);
+    // Turbo colormap outputs perceptual 0-1 values.
+    // Keep as-is in scRGB (1.0 = 80 nits SDR white) for visible display.
+    return float4(mapped, color.a);
 }
 )HLSL";
 
@@ -459,7 +460,7 @@ float4 main(
     float size = max(DiagramSize, 128.0);
     float2 xy = float2(pixPos.x / size * 0.8, (1.0 - pixPos.y / size) * 0.9);
 
-    float4 result = float4(0.05, 0.05, 0.05, 1.0); // dark background
+    float4 result = float4(0.15, 0.15, 0.15, 1.0); // dark background
 
     // Render the visible gamut region with approximate spectral colors
     float3 xyY = float3(xy.x, xy.y, 0.5);
@@ -467,7 +468,7 @@ float4 main(
     float3 rgb = XYZToScRGB(xyz);
     // Normalize to visible range and clamp
     float maxC = max(max(rgb.r, rgb.g), max(rgb.b, 0.001));
-    rgb = rgb / maxC * 0.3; // dim background
+    rgb = rgb / maxC * 0.5; // dim background
 
     if (rgb.r >= -0.01 && rgb.g >= -0.01 && rgb.b >= -0.01 && xy.y > 0.01) {
         rgb = max(rgb, 0.0);
@@ -567,7 +568,7 @@ float4 main(
     uint srcW, srcH;
     Source.GetDimensions(srcW, srcH);
     if (srcW == 0 || srcH == 0)
-        return float4(0.05, 0.05, 0.05, 1.0);
+        return float4(0.15, 0.15, 0.15, 1.0);
 
     float2 pixPos = uv0.xy;
     float height = max(WaveformH, 64.0);
@@ -579,7 +580,7 @@ float4 main(
     // Map y to value (inverted: top = max, bottom = 0)
     float valueAtY = (1.0 - pixPos.y / height) * MaxValue;
 
-    float4 result = float4(0.05, 0.05, 0.05, 1.0);
+    float4 result = float4(0.15, 0.15, 0.15, 1.0);
 
     // Scan the source column and accumulate hits
     float rHit = 0, gHit = 0, bHit = 0;
@@ -645,7 +646,7 @@ float4 main(
     float size = max(OutputSize, 128.0);
     float2 xy = float2(uv0.x / size * 0.8, (1.0 - uv0.y / size) * 0.9);
 
-    float4 result = float4(0.08, 0.08, 0.08, 1.0);
+    float4 result = float4(0.18, 0.18, 0.18, 1.0);
 
     // Fill gamut regions with their actual colors
     float3 xyY = float3(xy.x, xy.y, 0.4);
@@ -659,17 +660,17 @@ float4 main(
     if (in2020 && FillRec2020 > 0) {
         float3 normalized = max(rgb, 0.0);
         float m = max(max(normalized.r, normalized.g), max(normalized.b, 0.001));
-        result.rgb = normalized / m * 0.25;
+        result.rgb = normalized / m * 0.4;
     }
     if (inP3 && FillP3 > 0) {
         float3 normalized = max(rgb, 0.0);
         float m = max(max(normalized.r, normalized.g), max(normalized.b, 0.001));
-        result.rgb = normalized / m * 0.35;
+        result.rgb = normalized / m * 0.55;
     }
     if (in709 && FillRec709 > 0) {
         float3 normalized = max(rgb, 0.0);
         float m = max(max(normalized.r, normalized.g), max(normalized.b, 0.001));
-        result.rgb = normalized / m * 0.5;
+        result.rgb = normalized / m * 0.7;
     }
 
     // Gamut triangle outlines
@@ -788,16 +789,16 @@ float4 main(
     uint row = (uint)(pixPos.y / ps);
 
     if (col >= 6 || row >= 4)
-        return float4(0.05, 0.05, 0.05, 1.0);
+        return float4(0.15, 0.15, 0.15, 1.0);
 
     uint idx = row * 6 + col;
     if (idx >= 24)
-        return float4(0.05, 0.05, 0.05, 1.0);
+        return float4(0.15, 0.15, 0.15, 1.0);
 
     // Add thin border between patches
     float2 inPatch = fmod(pixPos, ps);
     if (inPatch.x < 1.0 || inPatch.y < 1.0)
-        return float4(0.02, 0.02, 0.02, 1.0);
+        return float4(0.06, 0.06, 0.06, 1.0);
 
     return float4(PATCHES[idx], 1.0);
 }
@@ -1011,7 +1012,7 @@ float4 main(
     float2 center = float2(size * 0.5, size * 0.5);
     float2 p = (uv0.xy - center) / (size * 0.5); // -1 to 1
 
-    float4 result = float4(0.05, 0.05, 0.05, 1.0);
+    float4 result = float4(0.15, 0.15, 0.15, 1.0);
 
     // Draw circular border
     float r = length(p);

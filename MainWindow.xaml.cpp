@@ -50,6 +50,7 @@ namespace winrt::ShaderLab::implementation
             m_previewPanX = cursorX - (cursorX - m_previewPanX) * (newZoom / m_previewZoom);
             m_previewPanY = cursorY - (cursorY - m_previewPanY) * (newZoom / m_previewZoom);
             m_previewZoom = newZoom;
+            m_forceRender = true;
             args.Handled(true);
         });
         TraceUnitSelector().SelectedIndex(0);
@@ -1601,6 +1602,7 @@ namespace winrt::ShaderLab::implementation
                 m_previewDragMoved = true;
             m_previewPanX = m_previewPanOriginX + dx;
             m_previewPanY = m_previewPanOriginY + dy;
+            m_forceRender = true;
             args.Handled(true);
             return;
         }
@@ -1820,6 +1822,10 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::RenderNodeGraph()
     {
         if (!m_graphSwapChain || !m_graphRenderTarget)
+            return;
+
+        // Skip redraw if nothing changed in the graph canvas.
+        if (!m_nodeGraphController.NeedsRedraw())
             return;
 
         auto* dc = m_renderEngine.D2DDeviceContext();
@@ -3923,7 +3929,15 @@ namespace winrt::ShaderLab::implementation
         winrt::Windows::Foundation::IInspectable const& /*args*/)
     {
         if (m_isShuttingDown) return;
-        RenderFrame();
+
+        // Only re-evaluate the graph when something changed.
+        bool needsEval = m_graph.HasDirtyNodes() || m_needsFitPreview || m_forceRender;
+        if (needsEval)
+        {
+            RenderFrame();
+            m_forceRender = false;
+        }
+
         RenderNodeGraph();
 
         // Update FPS counter every second.

@@ -249,6 +249,7 @@ namespace winrt::ShaderLab::implementation
         float m_previewPanY{ 0.0f };
         float m_previewZoom{ 1.0f };
         bool  m_needsFitPreview{ false };
+        bool  m_forceRender{ true }; // Force first render + after pan/zoom changes
         bool m_isPreviewPanning{ false };
         float m_previewPanStartX{ 0.0f };
         float m_previewPanStartY{ 0.0f };

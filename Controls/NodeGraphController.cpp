@@ -23,6 +23,7 @@ namespace ShaderLab::Controls
         {
             m_visuals[node.id] = ComputeNodeVisual(node);
         }
+        m_needsRedraw = true;
     }
 
     void NodeGraphController::AutoLayout()
@@ -146,11 +147,13 @@ namespace ShaderLab::Controls
     void NodeGraphController::SetPanOffset(float x, float y)
     {
         m_panOffset = { x, y };
+        m_needsRedraw = true;
     }
 
     void NodeGraphController::SetZoom(float zoom)
     {
         m_zoom = (std::max)(0.1f, (std::min)(zoom, 5.0f));
+        m_needsRedraw = true;
     }
 
     // -----------------------------------------------------------------------
@@ -279,11 +282,13 @@ namespace ShaderLab::Controls
         }
 
         m_selection.dragOffset = { dx, dy };
+        m_needsRedraw = true;
     }
 
     void NodeGraphController::EndDragNodes()
     {
         m_selection.isDragging = false;
+        m_needsRedraw = true;
     }
 
     // -----------------------------------------------------------------------
@@ -321,9 +326,11 @@ namespace ShaderLab::Controls
 
     void NodeGraphController::UpdateConnection(D2D1_POINT_2F currentPoint)
     {
-        // currentPoint is in canvas space (caller already converted).
         if (m_connectionDrag.active)
+        {
             m_connectionDrag.currentPos = currentPoint;
+            m_needsRedraw = true;
+        }
     }
 
     bool NodeGraphController::EndConnection(D2D1_POINT_2F dropPoint)
@@ -430,11 +437,13 @@ namespace ShaderLab::Controls
         if (!addToSelection)
             m_selection.selectedNodeIds.clear();
         m_selection.selectedNodeIds.insert(nodeId);
+        m_needsRedraw = true;
     }
 
     void NodeGraphController::DeselectAll()
     {
         m_selection.selectedNodeIds.clear();
+        m_needsRedraw = true;
     }
 
     void NodeGraphController::SelectAll()
@@ -702,6 +711,7 @@ namespace ShaderLab::Controls
         RenderConnectionDrag(dc);
 
         dc->SetTransform(D2D1::Matrix3x2F::Identity());
+        m_needsRedraw = false;
     }
 
     void NodeGraphController::RenderEdges(ID2D1DeviceContext* dc)

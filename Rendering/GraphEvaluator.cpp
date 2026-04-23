@@ -127,8 +127,9 @@ namespace ShaderLab::Rendering
                     // Resolve property bindings every frame.
                     std::map<std::wstring, PropertyValue> effectiveProps;
                     bool bindingsChanged = ResolveBindings(*node, graph, effectiveProps);
+                    bool wasDirty = node->dirty || bindingsChanged;
 
-                    if (node->dirty || bindingsChanged)
+                    if (wasDirty)
                     {
                         ApplyCustomEffect(effect, *node, effectiveProps);
 
@@ -162,10 +163,11 @@ namespace ShaderLab::Rendering
                     effect->GetOutput(output.put());
                     node->cachedOutput = output.get();
 
-                    // Read back analysis data from custom compute effects.
-                    // Defer readback for effects created this frame — D2D needs
-                    // one full render cycle to initialize the transform pipeline.
-                    if (node->customEffect->analysisOutputType == AnalysisOutputType::Typed &&
+                    // Read back analysis data only when the node was dirty
+                    // (avoids expensive BeginDraw/DrawImage/EndDraw + CPU readback every frame).
+                    // Also defer for effects created this frame.
+                    if (wasDirty &&
+                        node->customEffect->analysisOutputType == AnalysisOutputType::Typed &&
                         !node->customEffect->analysisFields.empty() &&
                         node->cachedOutput &&
                         m_justCreated.find(node->id) == m_justCreated.end())

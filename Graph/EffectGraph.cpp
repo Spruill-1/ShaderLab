@@ -401,6 +401,13 @@ namespace ShaderLab::Graph
             node.dirty = true;
     }
 
+    bool EffectGraph::HasDirtyNodes() const
+    {
+        for (const auto& node : m_nodes)
+            if (node.dirty) return true;
+        return false;
+    }
+
     void EffectGraph::ClearCachedOutputs()
     {
         for (auto& node : m_nodes)

@@ -55,6 +55,9 @@ namespace ShaderLab::Graph
         // Marks all nodes as dirty (forces full re-evaluation).
         void MarkAllDirty();
 
+        // Returns true if any node has its dirty flag set.
+        bool HasDirtyNodes() const;
+
         // Clears all cached outputs.
         void ClearCachedOutputs();
 

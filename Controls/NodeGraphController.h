@@ -182,7 +182,12 @@ namespace ShaderLab::Controls
         winrt::com_ptr<IDWriteTextFormat>     m_textFormat;
         winrt::com_ptr<IDWriteTextFormat>     m_pinLabelFormat;   // Small text for pin labels
         bool m_resourcesCreated{ false };
+        bool m_needsRedraw{ true }; // Set when graph topology/selection/layout changes
 
         void EnsureResources(ID2D1DeviceContext* dc);
+
+    public:
+        void SetNeedsRedraw() { m_needsRedraw = true; }
+        bool NeedsRedraw() const { return m_needsRedraw; }
     };
 }
