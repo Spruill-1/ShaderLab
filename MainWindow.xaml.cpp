@@ -2686,11 +2686,39 @@ namespace winrt::ShaderLab::implementation
                     else if constexpr (std::is_same_v<T, float>)
                     {
                         bool useSlider = meta && meta->uiHint == PropertyUIHint::Slider;
+                        bool useCombo = meta && meta->uiHint == PropertyUIHint::ComboBox && !meta->enumLabels.empty();
                         float minV = meta ? meta->minValue : -FLT_MAX;
                         float maxV = meta ? meta->maxValue : FLT_MAX;
                         float stepV = meta ? meta->step : 0.01f;
 
-                        if (useSlider)
+                        if (useCombo)
+                        {
+                            // ComboBox for float-backed enum values.
+                            auto combo = Controls::ComboBox();
+                            for (const auto& label : meta->enumLabels)
+                                combo.Items().Append(winrt::box_value(winrt::hstring(label)));
+                            uint32_t idx = static_cast<uint32_t>(v + 0.5f);
+                            if (idx < meta->enumLabels.size())
+                                combo.SelectedIndex(static_cast<int32_t>(idx));
+                            combo.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+                            combo.Margin({ 0, 0, 0, 4 });
+                            combo.SelectionChanged([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                            {
+                                auto* n = m_graph.FindNode(capturedId);
+                                if (!n) return;
+                                auto it = n->properties.find(capturedKey);
+                                if (it == n->properties.end()) return;
+                                auto cb = sender.template as<Controls::ComboBox>();
+                                int32_t idx = cb.SelectedIndex();
+                                if (idx >= 0)
+                                {
+                                    it->second = static_cast<float>(idx);
+                                    markDirty();
+                                }
+                            });
+                            panel.Children().Append(combo);
+                        }
+                        else if (useSlider)
                         {
                             // Slider + NumberBox pair for ranged floats.
                             // Shared flag prevents re-entrant sync loops.

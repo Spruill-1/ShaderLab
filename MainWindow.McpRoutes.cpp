@@ -603,8 +603,29 @@ namespace winrt::ShaderLab::implementation
                     switch (val.ValueType())
                     {
                     case winrt::Windows::Data::Json::JsonValueType::Number:
-                        node->properties[key] = static_cast<float>(val.GetNumber());
+                    {
+                        // Check if this parameter is declared as uint and store as uint32_t.
+                        bool isUint = false;
+                        if (node->customEffect.has_value())
+                        {
+                            for (const auto& p : node->customEffect->parameters)
+                            {
+                                if (p.name == key && p.typeName == L"uint")
+                                { isUint = true; break; }
+                            }
+                        }
+                        // Also check existing property type.
+                        auto existIt = node->properties.find(key);
+                        if (existIt != node->properties.end() &&
+                            std::holds_alternative<uint32_t>(existIt->second))
+                            isUint = true;
+
+                        if (isUint)
+                            node->properties[key] = static_cast<uint32_t>(val.GetNumber());
+                        else
+                            node->properties[key] = static_cast<float>(val.GetNumber());
                         break;
+                    }
                     case winrt::Windows::Data::Json::JsonValueType::Boolean:
                         node->properties[key] = val.GetBoolean();
                         break;
@@ -847,7 +868,8 @@ namespace winrt::ShaderLab::implementation
             -> ::ShaderLab::McpHttpServer::Response
         {
             return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                // Force a render frame so the capture reflects current state.
+                // Force a full re-evaluation so the capture reflects current state.
+                m_graph.MarkAllDirty();
                 RenderFrame();
                 auto pngData = CapturePreviewAsPng();
                 if (pngData.empty())

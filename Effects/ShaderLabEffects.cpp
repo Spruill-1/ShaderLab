@@ -195,7 +195,7 @@ Texture2D Source : register(t0);
 cbuffer constants : register(b0) {
     float MinNits;     // default 0.0
     float MaxNits;     // default 10000.0
-    uint  ColormapMode; // 0=Turbo, 1=Inferno
+    float ColormapMode; // 0=Turbo, 1=Inferno
 };
 
 float4 main(
@@ -214,17 +214,14 @@ float4 main(
 
     static const std::string s_outOfGamutHLSL = R"HLSL(
 // Out-of-Gamut Highlight
-// Checks if source pixels are representable in the target gamut by
-// converting to that color space and checking for negative components.
 Texture2D Source : register(t0);
 
 cbuffer constants : register(b0) {
-    uint  TargetGamut;     // 0=Rec.709, 1=P3, 2=Rec.2020, 3=Monitor
+    float TargetGamut;     // 0=Rec.709, 1=P3, 2=Rec.2020, 3=Monitor
     float OverlayR;        // default 1.0
     float OverlayG;        // default 0.0
     float OverlayB;        // default 1.0 (magenta)
     float OverlayStrength; // default 0.7
-    // Monitor gamut primaries (injected when TargetGamut=3)
     float MonitorRedX;
     float MonitorRedY;
     float MonitorGreenX;
@@ -233,27 +230,6 @@ cbuffer constants : register(b0) {
     float MonitorBlueY;
 };
 
-bool IsOutOfGamut(float3 scrgb, uint gamut) {
-    float3 xyz = ScRGBToXYZ(scrgb);
-    float3 targetRGB = scrgb; // default: treat as Rec.709
-
-    if (gamut == 1)
-        targetRGB = mul(XYZ_TO_P3D65, xyz);
-    else if (gamut == 2)
-        targetRGB = mul(XYZ_TO_REC2020, xyz);
-    else if (gamut == 3) {
-        float3 xyY = XYZToxyY(xyz);
-        float2 r = float2(MonitorRedX, MonitorRedY);
-        float2 g = float2(MonitorGreenX, MonitorGreenY);
-        float2 b = float2(MonitorBlueX, MonitorBlueY);
-        // For monitor gamut, negative means "not in triangle"
-        bool inside = PointInTriangle(xyY.xy, r, g, b);
-        return !inside;
-    }
-
-    return targetRGB.r < -0.001 || targetRGB.g < -0.001 || targetRGB.b < -0.001;
-}
-
 float4 main(
     float4 pos : SV_POSITION,
     float4 uv0 : TEXCOORD0) : SV_TARGET
@@ -261,7 +237,32 @@ float4 main(
     float4 color = Source.Load(int3(uv0.xy, 0));
     if (color.a < 0.001) return color;
 
-    bool oog = IsOutOfGamut(color.rgb, TargetGamut);
+    // Convert to target color space and check for negative components.
+    float3 xyz = ScRGBToXYZ(color.rgb);
+    float3 targetRGB = color.rgb; // Rec.709 = scRGB
+
+    if (TargetGamut > 2.5) {
+        // Monitor gamut: chromaticity triangle test
+        float sum = xyz.x + xyz.y + xyz.z;
+        float2 xy = (sum > 0.0001) ? float2(xyz.x / sum, xyz.y / sum) : D65_WHITE;
+        float2 mr = float2(MonitorRedX, MonitorRedY);
+        float2 mg = float2(MonitorGreenX, MonitorGreenY);
+        float2 mb = float2(MonitorBlueX, MonitorBlueY);
+        float2 v0 = mb - mr, v1 = mg - mr, v2 = xy - mr;
+        float d00 = dot(v0, v0), d01 = dot(v0, v1), d02 = dot(v0, v2);
+        float d11 = dot(v1, v1), d12 = dot(v1, v2);
+        float inv = 1.0 / (d00 * d11 - d01 * d01);
+        float u = (d11 * d02 - d01 * d12) * inv;
+        float v = (d00 * d12 - d01 * d02) * inv;
+        bool inside = (u >= 0) && (v >= 0) && (u + v <= 1.0);
+        targetRGB = inside ? float3(1, 1, 1) : float3(-1, -1, -1);
+    } else if (TargetGamut > 1.5) {
+        targetRGB = mul(XYZ_TO_REC2020, xyz);
+    } else if (TargetGamut > 0.5) {
+        targetRGB = mul(XYZ_TO_P3D65, xyz);
+    }
+
+    bool oog = (targetRGB.r < -0.001 || targetRGB.g < -0.001 || targetRGB.b < -0.001);
     if (oog) {
         float3 overlay = float3(OverlayR, OverlayG, OverlayB);
         color.rgb = lerp(color.rgb, overlay, OverlayStrength);
@@ -364,7 +365,7 @@ float4 main(
             desc.parameters = {
                 { L"MinNits",      L"float", 0.0f,    0.0f, 10000.0f, 1.0f },
                 { L"MaxNits",      L"float", 10000.0f, 0.0f, 10000.0f, 100.0f },
-                { L"ColormapMode", L"uint",  uint32_t(0), 0.0f, 1.0f, 1.0f, { L"Turbo", L"Inferno" } },
+                { L"ColormapMode", L"float", 0.0f, 0.0f, 1.0f, 1.0f, { L"Turbo", L"Inferno" } },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -378,7 +379,7 @@ float4 main(
             desc.hlslSource = colorMath + s_outOfGamutHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"TargetGamut",     L"uint",  uint32_t(0), 0.0f, 3.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020", L"Monitor" } },
+                { L"TargetGamut",     L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020", L"Monitor" } },
                 { L"OverlayR",        L"float", 1.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayG",        L"float", 0.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayB",        L"float", 1.0f,  0.0f, 1.0f, 0.01f },
@@ -486,15 +487,15 @@ float4 main(
 
     // Gamut triangles
     float thickness = 0.003;
-    if (ShowRec709 > 0) {
+    if (ShowRec709 > 0.5) {
         float e = GamutTriangle(xy, GAMUT_709_R, GAMUT_709_G, GAMUT_709_B, thickness);
         result.rgb = lerp(result.rgb, float3(1,1,1), e * 0.8);
     }
-    if (ShowP3 > 0) {
+    if (ShowP3 > 0.5) {
         float e = GamutTriangle(xy, GAMUT_P3_R, GAMUT_P3_G, GAMUT_P3_B, thickness);
         result.rgb = lerp(result.rgb, float3(0,1,0), e * 0.8);
     }
-    if (ShowRec2020 > 0) {
+    if (ShowRec2020 > 0.5) {
         float e = GamutTriangle(xy, GAMUT_2020_R, GAMUT_2020_G, GAMUT_2020_B, thickness);
         result.rgb = lerp(result.rgb, float3(0,0.5,1), e * 0.8);
     }
@@ -546,9 +547,9 @@ float4 main(
             desc.hlslSource = colorMath + ciePlotHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"ShowRec709",   L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
-                { L"ShowP3",       L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
-                { L"ShowRec2020",  L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
+                { L"ShowRec709",   L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
+                { L"ShowP3",       L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
+                { L"ShowRec2020",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"Brightness",   L"float", 2.0f,  0.1f, 10.0f, 0.1f },
                 { L"DiagramSize",  L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
             };
@@ -564,9 +565,9 @@ Texture2D Source : register(t0);
 
 cbuffer constants : register(b0) {
     float MaxValue;     // default 1.0 (scRGB units)
-    uint  ShowR;        // 1=show red channel
-    uint  ShowG;        // 1=show green channel
-    uint  ShowB;        // 1=show blue channel
+    float ShowR;        // 1=show red channel
+    float ShowG;        // 1=show green channel
+    float ShowB;        // 1=show blue channel
     float WaveformH;    // height of waveform in pixels (default 256)
 };
 
@@ -598,9 +599,9 @@ float4 main(
         float4 pix = Source.Load(int3(srcX, sy, 0));
         float thickness = MaxValue / height * 2.0;
 
-        if (ShowR > 0 && abs(pix.r - valueAtY) < thickness) rHit += 0.1;
-        if (ShowG > 0 && abs(pix.g - valueAtY) < thickness) gHit += 0.1;
-        if (ShowB > 0 && abs(pix.b - valueAtY) < thickness) bHit += 0.1;
+        if (ShowR > 0.5 && abs(pix.r - valueAtY) < thickness) rHit += 0.1;
+        if (ShowG > 0.5 && abs(pix.g - valueAtY) < thickness) gHit += 0.1;
+        if (ShowB > 0.5 && abs(pix.b - valueAtY) < thickness) bHit += 0.1;
     }
 
     result.r += saturate(rHit) * 0.8;
@@ -626,9 +627,9 @@ float4 main(
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"MaxValue",   L"float", 1.0f,  0.01f, 125.0f, 0.1f },
-                { L"ShowR",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
-                { L"ShowG",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
-                { L"ShowB",      L"uint",  uint32_t(1), 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
+                { L"ShowR",      L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
+                { L"ShowG",      L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
+                { L"ShowB",      L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"WaveformH",  L"float", 256.0f, 64.0f, 1024.0f, 32.0f },
             };
             m_effects.push_back(std::move(desc));
@@ -642,7 +643,7 @@ float4 main(
 // so all three gamuts share the same spatial mapping.
 
 cbuffer constants : register(b0) {
-    uint  Gamut;        // 0=Rec.709, 1=DCI-P3, 2=Rec.2020
+    float Gamut;        // 0=Rec.709, 1=DCI-P3, 2=Rec.2020
     float Luminance;    // nits (default 80.0, maps to scRGB 1.0)
     float OutputSize;   // pixels (default 1024)
 };
@@ -655,9 +656,9 @@ float4 main(
 
     // Select gamut primaries
     float2 r, g, b;
-    if (Gamut == 0)      { r = GAMUT_709_R;  g = GAMUT_709_G;  b = GAMUT_709_B; }
-    else if (Gamut == 1) { r = GAMUT_P3_R;   g = GAMUT_P3_G;   b = GAMUT_P3_B; }
-    else                 { r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }
+    if (Gamut > 1.5)     { r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }
+    else if (Gamut > 0.5){ r = GAMUT_P3_R;   g = GAMUT_P3_G;   b = GAMUT_P3_B; }
+    else                 { r = GAMUT_709_R;  g = GAMUT_709_G;  b = GAMUT_709_B; }
 
     // Fixed coordinate system: D65 white point at image center.
     // Scale based on Rec.2020 bounding box (the largest gamut) so all
@@ -684,7 +685,9 @@ float4 main(
     float3 xyY_val = float3(xy.x, xy.y, Y);
     float3 xyz = xyYToXYZ(xyY_val);
     float3 rgb = XYZToScRGB(xyz);
-    rgb = max(rgb, 0.0);
+    // Preserve negative scRGB values — they represent colors outside Rec.709
+    // that are valid in wider gamuts (P3, Rec.2020). Downstream effects like
+    // Out-of-Gamut Highlight rely on these negative components.
 
     return float4(rgb, 1.0);
 }
@@ -697,7 +700,7 @@ float4 main(
             desc.hlslSource = colorMath + gamutSourceHLSL;
             desc.inputNames = {};
             desc.parameters = {
-                { L"Gamut",      L"uint",  uint32_t(0), 0.0f, 2.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020" } },
+                { L"Gamut",      L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020" } },
                 { L"Luminance",  L"float", 80.0f, 0.01f, 10000.0f, 10.0f },
                 { L"OutputSize", L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
             };
@@ -827,7 +830,7 @@ float4 main(
 // Source effect: no input required.
 
 cbuffer constants : register(b0) {
-    uint  GradientType;  // 0=Linear horizontal, 1=Linear vertical, 2=Radial
+    float GradientType;  // 0=Linear horizontal, 1=Linear vertical, 2=Radial
     float StartR;   // start color (scRGB)
     float StartG;
     float StartB;
@@ -844,9 +847,9 @@ float4 main(
     float size = max(GradSize, 64.0);
     float t = 0;
 
-    if (GradientType == 0)
+    if (GradientType < 0.5)
         t = saturate(uv0.x / size);
-    else if (GradientType == 1)
+    else if (GradientType < 1.5 && GradientType > 0.5)
         t = saturate(uv0.y / size);
     else {
         float2 center = float2(size * 0.5, size * 0.5);
@@ -868,7 +871,7 @@ float4 main(
             desc.hlslSource = colorMath + gradientHLSL;
             desc.inputNames = {};
             desc.parameters = {
-                { L"GradientType", L"uint",  uint32_t(0), 0.0f, 2.0f, 1.0f, { L"Linear Horizontal", L"Linear Vertical", L"Radial" } },
+                { L"GradientType", L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Linear Horizontal", L"Linear Vertical", L"Radial" } },
                 { L"StartR",       L"float", 0.0f, -1.0f, 125.0f, 0.01f },
                 { L"StartG",       L"float", 0.0f, -1.0f, 125.0f, 0.01f },
                 { L"StartB",       L"float", 0.0f, -1.0f, 125.0f, 0.01f },
