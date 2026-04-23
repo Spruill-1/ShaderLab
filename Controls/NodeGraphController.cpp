@@ -644,14 +644,14 @@ namespace ShaderLab::Controls
     {
         if (m_resourcesCreated) return;
 
-        dc->CreateSolidColorBrush(D2D1::ColorF(0x2D2D30), m_brushNode.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(0x007ACC), m_brushHeader.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(0x999999), m_brushEdge.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(0xCCCCCC), m_brushPin.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(0x264F78), m_brushSelection.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(0xF0F0F0), m_brushText.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(0xFF9800), m_brushDataPin.put());     // Orange
-        dc->CreateSolidColorBrush(D2D1::ColorF(0xFF9800, 0.8f), m_brushDataEdge.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(0x252528), m_brushNode.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(0x3A7BD5), m_brushHeader.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(0x6B6B70), m_brushEdge.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(0xB0B0B8), m_brushPin.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(0x3A7BD5, 0.3f), m_brushSelection.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(0xE8E8EC), m_brushText.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(0xF5A623), m_brushDataPin.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(0xF5A623, 0.75f), m_brushDataEdge.put());
 
         winrt::com_ptr<IDWriteFactory> dwriteFactory;
         DWriteCreateFactory(
@@ -1022,12 +1022,12 @@ namespace ShaderLab::Controls
     {
         switch (type)
         {
-        case Graph::NodeType::Source:        return D2D1::ColorF(0x2D4A2D);
-        case Graph::NodeType::BuiltInEffect: return D2D1::ColorF(0x2D2D4A);
-        case Graph::NodeType::PixelShader:   return D2D1::ColorF(0x4A2D2D);
-        case Graph::NodeType::ComputeShader: return D2D1::ColorF(0x4A3D2D);
-        case Graph::NodeType::Output:        return D2D1::ColorF(0x3D3D3D);
-        default:                             return D2D1::ColorF(0x2D2D30);
+        case Graph::NodeType::Source:        return D2D1::ColorF(0x1E3A1E);
+        case Graph::NodeType::BuiltInEffect: return D2D1::ColorF(0x1E2440);
+        case Graph::NodeType::PixelShader:   return D2D1::ColorF(0x3A1E1E);
+        case Graph::NodeType::ComputeShader: return D2D1::ColorF(0x3A2E1E);
+        case Graph::NodeType::Output:        return D2D1::ColorF(0x2A2A2E);
+        default:                             return D2D1::ColorF(0x252528);
         }
     }
 
@@ -1035,12 +1035,12 @@ namespace ShaderLab::Controls
     {
         switch (type)
         {
-        case Graph::NodeType::Source:        return D2D1::ColorF(0x4CAF50);
-        case Graph::NodeType::BuiltInEffect: return D2D1::ColorF(0x2196F3);
-        case Graph::NodeType::PixelShader:   return D2D1::ColorF(0xF44336);
-        case Graph::NodeType::ComputeShader: return D2D1::ColorF(0xFF9800);
-        case Graph::NodeType::Output:        return D2D1::ColorF(0x9E9E9E);
-        default:                             return D2D1::ColorF(0x007ACC);
+        case Graph::NodeType::Source:        return D2D1::ColorF(0x43A047);
+        case Graph::NodeType::BuiltInEffect: return D2D1::ColorF(0x3A7BD5);
+        case Graph::NodeType::PixelShader:   return D2D1::ColorF(0xE53935);
+        case Graph::NodeType::ComputeShader: return D2D1::ColorF(0xF5A623);
+        case Graph::NodeType::Output:        return D2D1::ColorF(0x78909C);
+        default:                             return D2D1::ColorF(0x3A7BD5);
         }
     }
 }

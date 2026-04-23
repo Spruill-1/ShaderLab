@@ -1864,7 +1864,31 @@ namespace winrt::ShaderLab::implementation
 
         dc->SetTarget(m_graphRenderTarget.get());
         dc->BeginDraw();
-        dc->Clear(D2D1::ColorF(0x1e1e1e));
+        dc->Clear(D2D1::ColorF(0x1A1A1E));
+
+        // Draw subtle dot grid for spatial reference.
+        {
+            auto pan = m_nodeGraphController.PanOffset();
+            float zoom = m_nodeGraphController.Zoom();
+            float gridSpacing = 24.0f * zoom;
+            if (gridSpacing > 8.0f) // hide when zoomed out too far
+            {
+                winrt::com_ptr<ID2D1SolidColorBrush> gridBrush;
+                dc->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF, 0.06f), gridBrush.put());
+                if (gridBrush)
+                {
+                    float startX = fmodf(pan.x, gridSpacing);
+                    float startY = fmodf(pan.y, gridSpacing);
+                    if (startX < 0) startX += gridSpacing;
+                    if (startY < 0) startY += gridSpacing;
+                    float w = static_cast<float>(m_graphPanelWidth);
+                    float h = static_cast<float>(m_graphPanelHeight);
+                    for (float y = startY; y < h; y += gridSpacing)
+                        for (float x = startX; x < w; x += gridSpacing)
+                            dc->FillEllipse({ { x, y }, 1.0f, 1.0f }, gridBrush.get());
+                }
+            }
+        }
 
         D2D1_SIZE_F viewSize = { static_cast<float>(m_graphPanelWidth),
                                  static_cast<float>(m_graphPanelHeight) };
