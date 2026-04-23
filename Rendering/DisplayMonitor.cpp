@@ -84,6 +84,16 @@ namespace ShaderLab::Rendering
             caps.minLuminanceNits = desc.MinLuminance;
             caps.maxFullFrameLuminanceNits = desc.MaxFullFrameLuminance;
 
+            // Monitor color primaries from DXGI EDID data.
+            caps.redPrimaryX   = desc.RedPrimary[0];
+            caps.redPrimaryY   = desc.RedPrimary[1];
+            caps.greenPrimaryX = desc.GreenPrimary[0];
+            caps.greenPrimaryY = desc.GreenPrimary[1];
+            caps.bluePrimaryX  = desc.BluePrimary[0];
+            caps.bluePrimaryY  = desc.BluePrimary[1];
+            caps.whitePointX   = desc.WhitePoint[0];
+            caps.whitePointY   = desc.WhitePoint[1];
+
             // SDR white level: when HDR is on, this value matters for
             // tone-mapping the SDR-reference white to the correct nit level.
             // DXGI doesn't surface it directly in OUTPUT_DESC1; the
@@ -266,7 +276,10 @@ namespace ShaderLab::Rendering
             changed = (newCaps.hdrEnabled != m_caps.hdrEnabled)
                 || (newCaps.colorSpace != m_caps.colorSpace)
                 || (newCaps.bitsPerColor != m_caps.bitsPerColor)
-                || (std::abs(newCaps.maxLuminanceNits - m_caps.maxLuminanceNits) > 0.5f);
+                || (std::abs(newCaps.maxLuminanceNits - m_caps.maxLuminanceNits) > 0.5f)
+                || (std::abs(newCaps.redPrimaryX - m_caps.redPrimaryX) > 0.001f)
+                || (std::abs(newCaps.greenPrimaryX - m_caps.greenPrimaryX) > 0.001f)
+                || (std::abs(newCaps.bluePrimaryX - m_caps.bluePrimaryX) > 0.001f);
             m_caps = newCaps;
         }
 
@@ -324,11 +337,14 @@ namespace ShaderLab::Rendering
         if (m_simulatedProfile.has_value())
             return *m_simulatedProfile;
 
-        // Construct a basic profile from live capabilities.
         DisplayProfile p{};
         p.caps = m_caps;
         p.isSimulated = false;
         p.profileName = L"Live Display";
+        p.primaryRed   = { m_caps.redPrimaryX,   m_caps.redPrimaryY };
+        p.primaryGreen = { m_caps.greenPrimaryX, m_caps.greenPrimaryY };
+        p.primaryBlue  = { m_caps.bluePrimaryX,  m_caps.bluePrimaryY };
+        p.whitePoint   = { m_caps.whitePointX,   m_caps.whitePointY };
         return p;
     }
 
@@ -339,6 +355,10 @@ namespace ShaderLab::Rendering
         p.caps = m_caps;
         p.isSimulated = false;
         p.profileName = L"Live Display";
+        p.primaryRed   = { m_caps.redPrimaryX,   m_caps.redPrimaryY };
+        p.primaryGreen = { m_caps.greenPrimaryX, m_caps.greenPrimaryY };
+        p.primaryBlue  = { m_caps.bluePrimaryX,  m_caps.bluePrimaryY };
+        p.whitePoint   = { m_caps.whitePointX,   m_caps.whitePointY };
         return p;
     }
 }

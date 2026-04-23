@@ -1364,6 +1364,7 @@ namespace winrt::ShaderLab::implementation
                     {
                         restResp = DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                             auto profile = m_displayMonitor.ActiveProfile();
+                            auto live = m_displayMonitor.LiveProfile();
                             auto caps = m_displayMonitor.CachedCapabilities();
                             auto verStr = ToUtf8(std::wstring(::ShaderLab::VersionString));
                             std::string json = std::format(
@@ -1371,7 +1372,8 @@ namespace winrt::ShaderLab::implementation
                                 ",\"pipeline\":\"{}\""
                                 ",\"display\":{{\"hdr\":{},\"maxNits\":{:.0f},\"sdrWhiteNits\":{:.0f}"
                                 ",\"simulated\":{},\"profileName\":\"{}\""
-                                ",\"gamut\":{{\"red\":[{:.4f},{:.4f}],\"green\":[{:.4f},{:.4f}],\"blue\":[{:.4f},{:.4f}]}}"
+                                ",\"activeGamut\":{{\"red\":[{:.4f},{:.4f}],\"green\":[{:.4f},{:.4f}],\"blue\":[{:.4f},{:.4f}]}}"
+                                ",\"monitorGamut\":{{\"red\":[{:.4f},{:.4f}],\"green\":[{:.4f},{:.4f}],\"blue\":[{:.4f},{:.4f}]}}"
                                 "}}}}",
                                 verStr, ::ShaderLab::GraphFormatVersion,
                                 ToUtf8(std::wstring(m_renderEngine.ActiveFormat().name)),
@@ -1381,7 +1383,10 @@ namespace winrt::ShaderLab::implementation
                                 ToUtf8(profile.profileName),
                                 profile.primaryRed.x, profile.primaryRed.y,
                                 profile.primaryGreen.x, profile.primaryGreen.y,
-                                profile.primaryBlue.x, profile.primaryBlue.y);
+                                profile.primaryBlue.x, profile.primaryBlue.y,
+                                live.primaryRed.x, live.primaryRed.y,
+                                live.primaryGreen.x, live.primaryGreen.y,
+                                live.primaryBlue.x, live.primaryBlue.y);
                             return { 200, json };
                         });
                     }

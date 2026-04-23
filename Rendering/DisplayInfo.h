@@ -29,6 +29,17 @@ namespace ShaderLab::Rendering
         // Maximum full-frame luminance (in nits).
         float maxFullFrameLuminanceNits{ 270.0f };
 
+        // Monitor color primaries from DXGI (CIE xy chromaticity).
+        // Default to sRGB/Rec.709 if not available.
+        float redPrimaryX{ 0.64f };
+        float redPrimaryY{ 0.33f };
+        float greenPrimaryX{ 0.30f };
+        float greenPrimaryY{ 0.60f };
+        float bluePrimaryX{ 0.15f };
+        float bluePrimaryY{ 0.06f };
+        float whitePointX{ 0.3127f };
+        float whitePointY{ 0.3290f };
+
         // Human-readable summary for the status bar.
         std::wstring ModeString() const
         {

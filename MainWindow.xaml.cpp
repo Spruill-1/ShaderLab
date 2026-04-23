@@ -233,6 +233,10 @@ namespace winrt::ShaderLab::implementation
                 m_toneMapper.SetDisplayMaxLuminance(caps.maxLuminanceNits);
                 m_toneMapper.SetSDRWhiteLevel(caps.sdrWhiteLevelNits);
                 m_falseColor.SetDisplayMaxLuminance(caps.maxLuminanceNits);
+                // Re-evaluate graph so effects using monitor gamut (e.g. OOG)
+                // pick up the new primaries.
+                m_graph.MarkAllDirty();
+                m_forceRender = true;
                 UpdateStatusBar();
             });
         });
