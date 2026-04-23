@@ -2289,6 +2289,9 @@ namespace winrt::ShaderLab::implementation
                 // Skip internal metadata that shouldn't appear as UI properties.
                 if (key == L"analysisFields" || key == L"propertyBindings")
                     continue;
+                // Skip hidden properties (in cbuffer but not user-visible).
+                if (key.starts_with(L"Prim"))
+                    continue;
                 // Resolve metadata for this property.
                 const PropertyMetadata* meta = nullptr;
                 if (desc)
@@ -4002,6 +4005,31 @@ namespace winrt::ShaderLab::implementation
         {
             if (node.type == ::ShaderLab::Graph::NodeType::Source && node.dirty)
                 m_sourceFactory.PrepareSourceNode(node, dc);
+        }
+
+        // Inject display primaries into Out-of-Gamut Highlight nodes.
+        {
+            auto profile = m_displayMonitor.ActiveProfile();
+            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+            {
+                if (node.name != L"Out-of-Gamut Highlight") continue;
+                auto gamutIt = node.properties.find(L"TargetGamut");
+                if (gamutIt == node.properties.end()) continue;
+                float gamutVal = 0;
+                if (auto* f = std::get_if<float>(&gamutIt->second)) gamutVal = *f;
+
+                // Mode 0 = Current Monitor, Mode 4 = Preview Mode
+                if (gamutVal < 0.5f || gamutVal > 3.5f)
+                {
+                    node.properties[L"PrimRedX"]   = profile.primaryRed.x;
+                    node.properties[L"PrimRedY"]   = profile.primaryRed.y;
+                    node.properties[L"PrimGreenX"] = profile.primaryGreen.x;
+                    node.properties[L"PrimGreenY"] = profile.primaryGreen.y;
+                    node.properties[L"PrimBlueX"]  = profile.primaryBlue.x;
+                    node.properties[L"PrimBlueY"]  = profile.primaryBlue.y;
+                    node.dirty = true;
+                }
+            }
         }
 
         // Evaluate the effect graph.

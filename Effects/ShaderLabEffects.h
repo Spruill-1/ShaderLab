@@ -29,6 +29,10 @@ namespace ShaderLab::Effects
         uint32_t threadGroupX{ 8 };
         uint32_t threadGroupY{ 8 };
         uint32_t threadGroupZ{ 1 };
+
+        // Hidden default properties (in cbuffer but not shown in Properties panel).
+        // Set on node creation; auto-updated by the evaluator for dynamic values.
+        std::map<std::wstring, Graph::PropertyValue> hiddenDefaults;
     };
 
     // Registry of all ShaderLab pre-built effects.

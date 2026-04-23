@@ -214,20 +214,27 @@ float4 main(
 
     static const std::string s_outOfGamutHLSL = R"HLSL(
 // Out-of-Gamut Highlight
+// TargetGamut modes:
+//   0 = Current Monitor (primaries injected by host)
+//   1 = Rec.709
+//   2 = DCI-P3
+//   3 = Rec.2020
+//   4 = Preview Mode (primaries follow Display dropdown)
 Texture2D Source : register(t0);
 
 cbuffer constants : register(b0) {
-    float TargetGamut;     // 0=Rec.709, 1=P3, 2=Rec.2020, 3=Monitor
-    float OverlayR;        // default 1.0
-    float OverlayG;        // default 0.0
-    float OverlayB;        // default 1.0 (magenta)
-    float OverlayStrength; // default 0.7
-    float MonitorRedX;
-    float MonitorRedY;
-    float MonitorGreenX;
-    float MonitorGreenY;
-    float MonitorBlueX;
-    float MonitorBlueY;
+    float TargetGamut;
+    float OverlayR;
+    float OverlayG;
+    float OverlayB;
+    float OverlayStrength;
+    // Primaries for modes 0 and 4 (auto-injected, not user-visible)
+    float PrimRedX;
+    float PrimRedY;
+    float PrimGreenX;
+    float PrimGreenY;
+    float PrimBlueX;
+    float PrimBlueY;
 };
 
 float4 main(
@@ -237,17 +244,23 @@ float4 main(
     float4 color = Source.Load(int3(uv0.xy, 0));
     if (color.a < 0.001) return color;
 
-    // Convert to target color space and check for negative components.
     float3 xyz = ScRGBToXYZ(color.rgb);
-    float3 targetRGB = color.rgb; // Rec.709 = scRGB
+    float3 targetRGB = color.rgb;
 
-    if (TargetGamut > 2.5) {
-        // Monitor gamut: chromaticity triangle test
+    if (TargetGamut > 0.5 && TargetGamut < 1.5) {
+        // Rec.709: scRGB is Rec.709, just check negatives
+        targetRGB = color.rgb;
+    } else if (TargetGamut > 1.5 && TargetGamut < 2.5) {
+        targetRGB = mul(XYZ_TO_P3D65, xyz);
+    } else if (TargetGamut > 2.5 && TargetGamut < 3.5) {
+        targetRGB = mul(XYZ_TO_REC2020, xyz);
+    } else {
+        // Current Monitor (0) or Preview Mode (4): use injected primaries
         float sum = xyz.x + xyz.y + xyz.z;
         float2 xy = (sum > 0.0001) ? float2(xyz.x / sum, xyz.y / sum) : D65_WHITE;
-        float2 mr = float2(MonitorRedX, MonitorRedY);
-        float2 mg = float2(MonitorGreenX, MonitorGreenY);
-        float2 mb = float2(MonitorBlueX, MonitorBlueY);
+        float2 mr = float2(PrimRedX, PrimRedY);
+        float2 mg = float2(PrimGreenX, PrimGreenY);
+        float2 mb = float2(PrimBlueX, PrimBlueY);
         float2 v0 = mb - mr, v1 = mg - mr, v2 = xy - mr;
         float d00 = dot(v0, v0), d01 = dot(v0, v1), d02 = dot(v0, v2);
         float d11 = dot(v1, v1), d12 = dot(v1, v2);
@@ -256,10 +269,6 @@ float4 main(
         float v = (d00 * d12 - d01 * d02) * inv;
         bool inside = (u >= 0) && (v >= 0) && (u + v <= 1.0);
         targetRGB = inside ? float3(1, 1, 1) : float3(-1, -1, -1);
-    } else if (TargetGamut > 1.5) {
-        targetRGB = mul(XYZ_TO_REC2020, xyz);
-    } else if (TargetGamut > 0.5) {
-        targetRGB = mul(XYZ_TO_P3D65, xyz);
     }
 
     bool oog = (targetRGB.r < -0.001 || targetRGB.g < -0.001 || targetRGB.b < -0.001);
@@ -346,6 +355,10 @@ float4 main(
         for (const auto& param : desc.parameters)
             node.properties[param.name] = param.defaultValue;
 
+        // Set hidden default properties (cbuffer values not in Properties panel).
+        for (const auto& [key, val] : desc.hiddenDefaults)
+            node.properties[key] = val;
+
         node.customEffect = std::move(def);
         return node;
     }
@@ -379,17 +392,17 @@ float4 main(
             desc.hlslSource = colorMath + s_outOfGamutHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"TargetGamut",     L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020", L"Monitor" } },
+                { L"TargetGamut",     L"float", 0.0f, 0.0f, 4.0f, 1.0f, { L"Current Monitor", L"Rec.709", L"DCI-P3", L"Rec.2020", L"Preview Mode" } },
                 { L"OverlayR",        L"float", 1.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayG",        L"float", 0.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayB",        L"float", 1.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayStrength", L"float", 0.7f,  0.0f, 1.0f, 0.01f },
-                { L"MonitorRedX",     L"float", 0.64f, 0.0f, 1.0f, 0.001f },
-                { L"MonitorRedY",     L"float", 0.33f, 0.0f, 1.0f, 0.001f },
-                { L"MonitorGreenX",   L"float", 0.30f, 0.0f, 1.0f, 0.001f },
-                { L"MonitorGreenY",   L"float", 0.60f, 0.0f, 1.0f, 0.001f },
-                { L"MonitorBlueX",    L"float", 0.15f, 0.0f, 1.0f, 0.001f },
-                { L"MonitorBlueY",    L"float", 0.06f, 0.0f, 1.0f, 0.001f },
+            };
+            // Hidden cbuffer properties: primaries auto-injected by host.
+            desc.hiddenDefaults = {
+                { L"PrimRedX",   0.64f }, { L"PrimRedY",   0.33f },
+                { L"PrimGreenX", 0.30f }, { L"PrimGreenY", 0.60f },
+                { L"PrimBlueX",  0.15f }, { L"PrimBlueY",  0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
