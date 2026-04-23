@@ -34,6 +34,10 @@ namespace ShaderLab::Rendering
         // Invalidate the cached effect for a specific node (e.g., CLSID changed).
         void InvalidateNode(uint32_t nodeId);
 
+        // Update an existing cached effect's shader bytecode in-place (for recompile).
+        // If the effect isn't cached yet, does nothing (next Evaluate will create it).
+        void UpdateNodeShader(uint32_t nodeId, const Graph::EffectNode& node);
+
     private:
         // Create or retrieve the cached D2D effect for a built-in effect node.
         ID2D1Effect* GetOrCreateEffect(
@@ -95,5 +99,10 @@ namespace ShaderLab::Rendering
         winrt::com_ptr<ID2D1Bitmap1> m_analysisTarget;
         uint32_t m_analysisTargetW{ 0 };
         uint32_t m_analysisTargetH{ 0 };
+        DXGI_FORMAT m_analysisTargetFormat{ DXGI_FORMAT_UNKNOWN };
+
+        // Tracks nodes whose D2D effects were created this frame.
+        // Analysis readback is deferred by one frame for these nodes.
+        std::unordered_set<uint32_t> m_justCreated;
     };
 }

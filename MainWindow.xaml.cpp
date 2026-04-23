@@ -3464,7 +3464,7 @@ namespace winrt::ShaderLab::implementation
                     node->customEffect = std::move(def);
                     node->dirty = true;
                     m_graph.MarkAllDirty();
-                    m_graphEvaluator.InvalidateNode(nodeId);
+                    m_graphEvaluator.UpdateNodeShader(nodeId, *node);
                 }
             });
 

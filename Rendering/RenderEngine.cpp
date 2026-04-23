@@ -290,8 +290,11 @@ namespace ShaderLab::Rendering
             // Device lost — caller should recreate resources.
             ReleaseRenderTarget();
         }
-        // Other errors (e.g., deferred effect errors from missing inputs)
-        // are silently ignored to avoid crashing the render loop.
+        else if (FAILED(hr))
+        {
+            OutputDebugStringW(std::format(L"[Render] EndDraw error hr=0x{:08X}\n",
+                static_cast<uint32_t>(hr)).c_str());
+        }
     }
 
     void RenderEngine::Present(bool vsync)

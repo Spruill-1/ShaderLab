@@ -62,7 +62,7 @@ namespace ShaderLab::Effects
         if (s_pendingInputCount > 0)
             m_inputCount = s_pendingInputCount;
         // Sentinel value to detect if MapInputRectsToOutputRect was called.
-        m_inputRect = { -9999, -9999, -9999, -9999 };
+        m_inputRect = { 0, 0, 0, 0 };
     }
 
     // -----------------------------------------------------------------------
@@ -269,15 +269,19 @@ namespace ShaderLab::Effects
     }
 
     IFACEMETHODIMP CustomComputeShaderEffect::MapOutputRectToInputRects(
-        const D2D1_RECT_L* /*outputRect*/,
+        const D2D1_RECT_L* outputRect,
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const
     {
-        // Return the full stored input rect so D2D evaluates the entire input,
-        // matching the pattern from the official DFT compute shader sample.
+        // If MapInputRectsToOutputRect hasn't been called yet (no valid input rect),
+        // fall back to the requested output rect so D2D gets reasonable bounds.
+        D2D1_RECT_L rect = m_inputRect;
+        if (rect.left == 0 && rect.top == 0 && rect.right == 0 && rect.bottom == 0 && outputRect)
+            rect = *outputRect;
+
         for (UINT32 i = 0; i < inputRectCount; ++i)
         {
-            inputRects[i] = m_inputRect;
+            inputRects[i] = rect;
         }
         return S_OK;
     }
@@ -287,6 +291,7 @@ namespace ShaderLab::Effects
         D2D1_RECT_L /*invalidInputRect*/,
         D2D1_RECT_L* invalidOutputRect) const
     {
+        // Return the stored input rect, or empty if not yet initialized.
         *invalidOutputRect = m_inputRect;
         return S_OK;
     }

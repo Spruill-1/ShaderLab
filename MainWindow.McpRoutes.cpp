@@ -772,7 +772,7 @@ namespace winrt::ShaderLab::implementation
 
                     node->dirty = true;
                     m_graph.MarkAllDirty();
-                    m_graphEvaluator.InvalidateNode(nodeId);
+                    m_graphEvaluator.UpdateNodeShader(nodeId, *node);
                     m_nodeGraphController.RebuildLayout();
                     return { 200, std::format("{{\"compiled\":true,\"bytecodeSize\":{}}}", def.compiledBytecode.size()) };
                 });

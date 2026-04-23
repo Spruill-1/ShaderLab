@@ -14,6 +14,9 @@ namespace ShaderLab::Rendering
         if (graph.IsEmpty() || !dc)
             return nullptr;
 
+        // Effects created on the previous frame are now fully initialized.
+        m_justCreated.clear();
+
         // Get topological ordering (sources first → output last).
         std::vector<uint32_t> order;
         try
@@ -85,6 +88,7 @@ namespace ShaderLab::Rendering
                 if (!effect)
                 {
                     node->runtimeError = L"Failed to create D2D effect. Check effect registration.";
+                    node->cachedOutput = nullptr;
                     break;
                 }
                 node->runtimeError.clear();
@@ -130,9 +134,12 @@ namespace ShaderLab::Rendering
                     node->cachedOutput = output.get();
 
                     // Read back analysis data from custom compute effects.
+                    // Defer readback for effects created this frame — D2D needs
+                    // one full render cycle to initialize the transform pipeline.
                     if (node->customEffect->analysisOutputType == AnalysisOutputType::Typed &&
                         !node->customEffect->analysisFields.empty() &&
-                        node->cachedOutput)
+                        node->cachedOutput &&
+                        m_justCreated.find(node->id) == m_justCreated.end())
                     {
                         ReadCustomAnalysisOutput(dc, *node);
                     }
@@ -142,8 +149,6 @@ namespace ShaderLab::Rendering
                     if (node->customEffect.has_value() && !node->customEffect->isCompiled())
                     {
                         node->runtimeError = L"Shader not compiled. Open in Effect Designer and compile.";
-                        // Don't wire or use this node's output — no shader loaded,
-                        // D2D would crash trying to dispatch.
                         node->cachedOutput = nullptr;
                     }
                     else
@@ -198,6 +203,49 @@ namespace ShaderLab::Rendering
     {
         m_effectCache.erase(nodeId);
         m_customImplCache.erase(nodeId);
+    }
+
+    void GraphEvaluator::UpdateNodeShader(uint32_t nodeId, const EffectNode& node)
+    {
+        if (!node.customEffect.has_value() || !node.customEffect->isCompiled())
+            return;
+
+        auto& def = node.customEffect.value();
+        auto implIt = m_customImplCache.find(nodeId);
+        if (implIt == m_customImplCache.end())
+            return; // First compile — next Evaluate() will create the effect.
+
+        // Check if input count changed (structural change requires recreate).
+        UINT32 newIC = static_cast<UINT32>(
+            (std::max)(size_t(1), def.inputNames.size()));
+        auto effectIt = m_effectCache.find(nodeId);
+        if (effectIt != m_effectCache.end())
+        {
+            UINT32 curIC = effectIt->second->GetInputCount();
+            if (curIC != newIC)
+            {
+                InvalidateNode(nodeId);
+                return;
+            }
+        }
+
+        // Non-structural recompile: update bytecode in place.
+        if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
+        {
+            implIt->second.pixelImpl->SetShaderGuid(def.shaderGuid);
+            implIt->second.pixelImpl->LoadShaderBytecode(
+                def.compiledBytecode.data(),
+                static_cast<UINT32>(def.compiledBytecode.size()));
+        }
+        else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
+        {
+            implIt->second.computeImpl->SetShaderGuid(def.shaderGuid);
+            implIt->second.computeImpl->LoadShaderBytecode(
+                def.compiledBytecode.data(),
+                static_cast<UINT32>(def.compiledBytecode.size()));
+            implIt->second.computeImpl->SetThreadGroupSize(
+                def.threadGroupX, def.threadGroupY, def.threadGroupZ);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -299,6 +347,7 @@ namespace ShaderLab::Rendering
 
         auto* raw = effect.get();
         m_effectCache[node.id] = std::move(effect);
+        m_justCreated.insert(node.id);
         return raw;
     }
 
@@ -725,7 +774,8 @@ namespace ShaderLab::Rendering
         if (h == 0) h = 1;
 
         // Recreate temp target if size changed.
-        if (!m_analysisTarget || m_analysisTargetW != w || m_analysisTargetH != h)
+        if (!m_analysisTarget || m_analysisTargetW != w || m_analysisTargetH != h ||
+            m_analysisTargetFormat != DXGI_FORMAT_B8G8R8A8_UNORM)
         {
             m_analysisTarget = nullptr;
             D2D1_BITMAP_PROPERTIES1 props = {};
@@ -735,6 +785,7 @@ namespace ShaderLab::Rendering
             if (FAILED(hr)) { dc->SetTarget(prevTarget.get()); return; }
             m_analysisTargetW = w;
             m_analysisTargetH = h;
+            m_analysisTargetFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
         }
 
         dc->SetTarget(m_analysisTarget.get());
@@ -808,7 +859,8 @@ namespace ShaderLab::Rendering
         if (w == 0) w = 1;
         if (h == 0) h = 1;
 
-        if (!m_analysisTarget || m_analysisTargetW != w || m_analysisTargetH != h)
+        if (!m_analysisTarget || m_analysisTargetW != w || m_analysisTargetH != h ||
+            m_analysisTargetFormat != DXGI_FORMAT_R32G32B32A32_FLOAT)
         {
             m_analysisTarget = nullptr;
             D2D1_BITMAP_PROPERTIES1 props = {};
@@ -818,14 +870,16 @@ namespace ShaderLab::Rendering
             if (FAILED(hr)) { dc->SetTarget(prevTarget.get()); return; }
             m_analysisTargetW = w;
             m_analysisTargetH = h;
+            m_analysisTargetFormat = DXGI_FORMAT_R32G32B32A32_FLOAT;
         }
 
         dc->SetTarget(m_analysisTarget.get());
         dc->BeginDraw();
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
         dc->DrawImage(node.cachedOutput, D2D1::Point2F(-bounds.left, -bounds.top));
-        dc->EndDraw();
+        HRESULT drawHr = dc->EndDraw();
         dc->SetTarget(prevTarget.get());
+        if (FAILED(drawHr)) return;
 
         // Create a CPU-readable bitmap to read back analysis pixels.
         winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
