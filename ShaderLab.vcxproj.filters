@@ -83,6 +83,9 @@
     <ClInclude Include="Effects\ShaderCompiler.h">
       <Filter>Effects</Filter>
     </ClInclude>
+    <ClInclude Include="Effects\ShaderLabEffects.h">
+      <Filter>Effects</Filter>
+    </ClInclude>
     <ClInclude Include="Effects\CustomPixelShaderEffect.h">
       <Filter>Effects</Filter>
     </ClInclude>
@@ -144,6 +147,9 @@
       <Filter>Effects</Filter>
     </ClCompile>
     <ClCompile Include="Effects\ShaderCompiler.cpp">
+      <Filter>Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Effects\ShaderLabEffects.cpp">
       <Filter>Effects</Filter>
     </ClCompile>
     <ClCompile Include="Effects\CustomPixelShaderEffect.cpp">
