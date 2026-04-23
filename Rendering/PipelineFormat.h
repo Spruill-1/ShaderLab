@@ -95,11 +95,11 @@ namespace ShaderLab::Rendering
         FormatLinearFP32,
     };
 
-    // Returns a sensible default format based on the current display capabilities.
-    // - HDR display active → scRGB FP16 (full HDR compositing)
-    // - SDR display        → sRGB 8-bit (avoids unnecessary bandwidth)
-    inline PipelineFormat RecommendedFormat(const DisplayCapabilities& caps)
+    // Returns the pipeline format. Always scRGB FP16 — the app is designed
+    // for HDR/ACM workflows where scRGB swap chains are handled correctly
+    // by Windows Desktop Window Manager, even on SDR displays via ACM.
+    inline PipelineFormat RecommendedFormat(const DisplayCapabilities& /*caps*/)
     {
-        return caps.hdrEnabled ? FormatScRgbFP16 : FormatSrgb8;
+        return FormatScRgbFP16;
     }
 }
