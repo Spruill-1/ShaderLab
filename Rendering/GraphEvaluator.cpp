@@ -226,6 +226,18 @@ namespace ShaderLab::Rendering
             }
         }
 
+        // Newly created effects need a second evaluation pass —
+        // D2D requires one full render cycle to initialize the transform
+        // pipeline before the output is valid. Mark them dirty for next frame.
+        if (!m_justCreated.empty())
+        {
+            for (uint32_t id : m_justCreated)
+            {
+                auto* n = graph.FindNode(id);
+                if (n) n->dirty = true;
+            }
+        }
+
         return finalOutput;
     }
 
