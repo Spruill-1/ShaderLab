@@ -197,7 +197,6 @@ namespace winrt::ShaderLab::implementation
         // Close all output windows.
         m_outputWindows.clear();
 
-        m_toneMapper.Release();
         m_graphEvaluator.ReleaseCache();
         m_displayMonitor.Shutdown();
         m_renderEngine.Shutdown();
@@ -236,11 +235,7 @@ namespace winrt::ShaderLab::implementation
         {
             this->DispatcherQueue().TryEnqueue([this]()
             {
-                // Use ActiveProfile() so simulated profiles aren't overwritten by live changes.
-                auto caps = m_displayMonitor.CachedCapabilities();
-                m_toneMapper.SetDisplayMaxLuminance(caps.maxLuminanceNits);
-                m_toneMapper.SetSDRWhiteLevel(caps.sdrWhiteLevelNits);
-                // Re-evaluate graph so effects using monitor gamut (e.g. OOG)
+                // Re-evaluate graph so effects using monitor gamut
                 // pick up the new primaries.
                 m_graph.MarkAllDirty();
                 m_forceRender = true;
@@ -299,14 +294,6 @@ namespace winrt::ShaderLab::implementation
         {
             m_pixelInspector.Initialize(m_renderEngine.D3DDevice());
             m_pixelTrace.Initialize(m_renderEngine.D3DDevice());
-        }
-
-        if (m_renderEngine.D2DDeviceContext())
-        {
-            m_toneMapper.Initialize(m_renderEngine.D2DDeviceContext());
-            auto caps = m_displayMonitor.CachedCapabilities();
-            m_toneMapper.SetDisplayMaxLuminance(caps.maxLuminanceNits);
-            m_toneMapper.SetSDRWhiteLevel(caps.sdrWhiteLevelNits);
         }
 
         // Start render loop.
@@ -465,9 +452,6 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::ApplyDisplayProfile(const ::ShaderLab::Rendering::DisplayProfile& profile)
     {
         m_displayMonitor.SetSimulatedProfile(profile);
-        auto caps = m_displayMonitor.CachedCapabilities();
-        m_toneMapper.SetDisplayMaxLuminance(caps.maxLuminanceNits);
-        m_toneMapper.SetSDRWhiteLevel(caps.sdrWhiteLevelNits);
         m_graph.MarkAllDirty();
         m_forceRender = true;
         UpdateStatusBar();
@@ -476,9 +460,6 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::RevertToLiveDisplay()
     {
         m_displayMonitor.ClearSimulatedProfile();
-        auto caps = m_displayMonitor.CachedCapabilities();
-        m_toneMapper.SetDisplayMaxLuminance(caps.maxLuminanceNits);
-        m_toneMapper.SetSDRWhiteLevel(caps.sdrWhiteLevelNits);
         m_graph.MarkAllDirty();
         m_forceRender = true;
         UpdateStatusBar();
@@ -1042,12 +1023,6 @@ namespace winrt::ShaderLab::implementation
         }
 
         ID2D1Image* image = node->cachedOutput;
-
-        // Apply tone mapping only for the Output node.
-        bool isOutput = node->type == ::ShaderLab::Graph::NodeType::Output;
-        if (isOutput && m_toneMapper.IsActive())
-            image = m_toneMapper.Apply(image);
-
         return image;
     }
 

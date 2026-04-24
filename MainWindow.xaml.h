@@ -4,7 +4,6 @@
 #include "Rendering/RenderEngine.h"
 #include "Rendering/DisplayMonitor.h"
 #include "Rendering/GraphEvaluator.h"
-#include "Rendering/ToneMapper.h"
 #include "Graph/EffectGraph.h"
 #include "Effects/EffectRegistry.h"
 #include "Effects/SourceNodeFactory.h"
@@ -125,7 +124,6 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Rendering::RenderEngine       m_renderEngine;
         ::ShaderLab::Rendering::DisplayMonitor     m_displayMonitor;
         ::ShaderLab::Rendering::GraphEvaluator     m_graphEvaluator;
-        ::ShaderLab::Rendering::ToneMapper         m_toneMapper;
 
         // Effect graph.
         ::ShaderLab::Graph::EffectGraph         m_graph;
