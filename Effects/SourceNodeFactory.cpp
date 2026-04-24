@@ -9,6 +9,22 @@ namespace ShaderLab::Effects
     SourceNodeFactory::SourceNodeFactory() = default;
 
     // -----------------------------------------------------------------------
+    // Video file detection
+    // -----------------------------------------------------------------------
+
+    bool SourceNodeFactory::IsVideoFile(const std::wstring& filePath)
+    {
+        static const std::set<std::wstring> videoExts = {
+            L".mp4", L".mkv", L".mov", L".avi", L".wmv", L".webm",
+            L".m4v", L".ts", L".mts", L".flv", L".3gp"
+        };
+        auto ext = std::filesystem::path(filePath).extension().wstring();
+        // Lowercase.
+        for (auto& c : ext) c = static_cast<wchar_t>(towlower(c));
+        return videoExts.count(ext) > 0;
+    }
+
+    // -----------------------------------------------------------------------
     // Node creation (static — no device needed yet)
     // -----------------------------------------------------------------------
 
@@ -21,11 +37,9 @@ namespace ShaderLab::Effects
         node.name = displayName.empty()
             ? std::filesystem::path(filePath).filename().wstring()
             : displayName;
-        node.shaderPath = filePath;  // reuse shaderPath field for image path
+        node.shaderPath = filePath;
 
-        // Image sources have no inputs and one output.
         node.outputPins.push_back({ L"Image", 0 });
-
         return node;
     }
 
@@ -37,13 +51,29 @@ namespace ShaderLab::Effects
         node.type = NodeType::Source;
         node.name = displayName.empty() ? L"Flood Fill" : displayName;
         node.effectClsid = CLSID_D2D1Flood;
-
-        // Store the color as a property. D2D1Flood property index 0 = Color.
         node.properties[L"Color"] = color;
-
-        // Flood sources have no inputs and one output.
         node.outputPins.push_back({ L"Output", 0 });
+        return node;
+    }
 
+    EffectNode SourceNodeFactory::CreateVideoSourceNode(
+        const std::wstring& filePath,
+        const std::wstring& displayName)
+    {
+        EffectNode node;
+        node.type = NodeType::Source;
+        node.name = displayName.empty()
+            ? (L"\U0001F3AC " + std::filesystem::path(filePath).filename().wstring())
+            : displayName;
+        node.shaderPath = filePath;
+
+        // Video-specific properties.
+        node.properties[L"IsVideo"] = true;
+        node.properties[L"IsPlaying"] = true;
+        node.properties[L"PlaybackSpeed"] = 1.0f;
+        node.properties[L"Loop"] = true;
+
+        node.outputPins.push_back({ L"Frame", 0 });
         return node;
     }
 
@@ -53,15 +83,71 @@ namespace ShaderLab::Effects
 
     void SourceNodeFactory::PrepareSourceNode(
         EffectNode& node,
-        ID2D1DeviceContext5* dc)
+        ID2D1DeviceContext5* dc,
+        double deltaSeconds)
     {
         if (!dc || node.type != NodeType::Source)
             return;
 
+        // --- Video source ---
+        auto isVideoIt = node.properties.find(L"IsVideo");
+        if (isVideoIt != node.properties.end())
+        {
+            auto* boolVal = std::get_if<bool>(&isVideoIt->second);
+            if (boolVal && *boolVal && node.shaderPath.has_value())
+            {
+                auto& provider = m_videoCache[node.id];
+                if (!provider)
+                {
+                    provider = std::make_unique<VideoSourceProvider>();
+                    if (!provider->Open(node.shaderPath.value(), dc))
+                    {
+                        node.runtimeError = L"Failed to open video file";
+                        m_videoCache.erase(node.id);
+                        return;
+                    }
+                    node.runtimeError.clear();
+                }
+
+                // Sync playback state from properties.
+                auto playIt = node.properties.find(L"IsPlaying");
+                if (playIt != node.properties.end())
+                {
+                    auto* pv = std::get_if<bool>(&playIt->second);
+                    if (pv)
+                    {
+                        if (*pv && !provider->IsPlaying()) provider->Play();
+                        else if (!*pv && provider->IsPlaying()) provider->Pause();
+                    }
+                }
+
+                auto speedIt = node.properties.find(L"PlaybackSpeed");
+                if (speedIt != node.properties.end())
+                {
+                    auto* sv = std::get_if<float>(&speedIt->second);
+                    if (sv) provider->SetSpeed(*sv);
+                }
+
+                auto loopIt = node.properties.find(L"Loop");
+                if (loopIt != node.properties.end())
+                {
+                    auto* lv = std::get_if<bool>(&loopIt->second);
+                    if (lv) provider->SetLoop(*lv);
+                }
+
+                // Advance frame.
+                provider->AdvanceFrame(dc, deltaSeconds);
+
+                node.cachedOutput = provider->CurrentBitmap();
+                if (provider->IsPlaying())
+                    node.dirty = true;  // keep evaluating while playing
+                return;
+            }
+        }
+
         // --- Image source ---
         if (node.shaderPath.has_value() && !node.effectClsid.has_value())
         {
-            // Check bitmap cache first.
             auto it = m_bitmapCache.find(node.id);
             if (it != m_bitmapCache.end() && !node.dirty)
             {
@@ -69,7 +155,6 @@ namespace ShaderLab::Effects
                 return;
             }
 
-            // Load (or reload) the image.
             auto bitmap = m_imageLoader.LoadFromFile(node.shaderPath.value(), dc);
             if (bitmap)
             {
@@ -83,7 +168,6 @@ namespace ShaderLab::Effects
         // --- Flood source ---
         if (node.effectClsid.has_value() && node.effectClsid.value() == CLSID_D2D1Flood)
         {
-            // Check flood cache first.
             auto it = m_floodCache.find(node.id);
             winrt::com_ptr<ID2D1Effect> flood;
 
@@ -99,7 +183,6 @@ namespace ShaderLab::Effects
                 m_floodCache[node.id] = flood;
             }
 
-            // Apply the color property (index 0 = D2D1_FLOOD_PROP_COLOR).
             auto colorIt = node.properties.find(L"Color");
             if (colorIt != node.properties.end())
             {
@@ -111,7 +194,6 @@ namespace ShaderLab::Effects
                 }
             }
 
-            // Cache the flood effect's output as this node's image.
             winrt::com_ptr<ID2D1Image> output;
             flood->GetOutput(output.put());
             node.cachedOutput = output.get();
@@ -128,5 +210,22 @@ namespace ShaderLab::Effects
     {
         m_bitmapCache.clear();
         m_floodCache.clear();
+        m_videoCache.clear();
+    }
+
+    bool SourceNodeFactory::HasPlayingVideo() const
+    {
+        for (const auto& [id, provider] : m_videoCache)
+        {
+            if (provider && provider->IsPlaying())
+                return true;
+        }
+        return false;
+    }
+
+    VideoSourceProvider* SourceNodeFactory::GetVideoProvider(uint32_t nodeId)
+    {
+        auto it = m_videoCache.find(nodeId);
+        return (it != m_videoCache.end()) ? it->second.get() : nullptr;
     }
 }

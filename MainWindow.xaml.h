@@ -131,7 +131,7 @@ namespace winrt::ShaderLab::implementation
         void OnRenderTick(
             winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer const& sender,
             winrt::Windows::Foundation::IInspectable const& args);
-        void RenderFrame();
+        void RenderFrame(double deltaSeconds = 0.0);
 
         // Device stack.
         ::ShaderLab::Rendering::RenderEngine       m_renderEngine;
@@ -154,6 +154,7 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer m_renderTimer{ nullptr };
         uint32_t m_frameCount{ 0 };
         std::chrono::steady_clock::time_point m_fpsTimePoint;
+        std::chrono::steady_clock::time_point m_lastRenderTick;
 
         HWND m_hwnd{ nullptr };
         bool m_customEffectsRegistered{ false };
@@ -214,6 +215,7 @@ namespace winrt::ShaderLab::implementation
         void UpdatePropertiesPanel();
         void ShowCurveEditorDialog(uint32_t nodeId, const std::wstring& propertyKey, std::function<void()> markDirty);
         winrt::fire_and_forget BrowseImageForSourceNode(uint32_t nodeId);
+        winrt::fire_and_forget BrowseVideoForSourceNode();
         void OnSaveImageClicked(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);

@@ -65,6 +65,11 @@
 // WIC (image loading)
 #include <wincodec.h>
 
+// Media Foundation (video decoding)
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+
 // Interop helpers
 #include <microsoft.ui.xaml.window.h>
 #include <Microsoft.Graphics.Canvas.native.h>

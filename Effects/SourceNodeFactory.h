@@ -3,14 +3,16 @@
 #include "pch.h"
 #include "../Graph/EffectNode.h"
 #include "ImageLoader.h"
+#include "VideoSourceProvider.h"
 
 namespace ShaderLab::Effects
 {
     // Factory for creating and preparing Source-type graph nodes.
     //
-    // Two source types:
+    // Three source types:
     //   1. Image source — loads a file via WIC, stores ID2D1Bitmap1 as cachedOutput.
     //   2. Flood source — creates a D2D1Flood effect that fills with a solid color.
+    //   3. Video source — decodes video frames via MF Source Reader.
     //
     // PrepareSourceNode must be called before graph evaluation to ensure
     // the node's cachedOutput is populated for downstream effects.
@@ -20,36 +22,49 @@ namespace ShaderLab::Effects
         SourceNodeFactory();
 
         // Create a Source node configured for image file loading.
-        // The node's shaderPath holds the file path; cachedOutput is set
-        // after calling PrepareSourceNode.
         static Graph::EffectNode CreateImageSourceNode(
             const std::wstring& filePath,
             const std::wstring& displayName = L"");
 
         // Create a Source node configured as a Flood (solid color) fill.
-        // Color is stored as a float4 property named "Color".
         static Graph::EffectNode CreateFloodSourceNode(
             const winrt::Windows::Foundation::Numerics::float4& color,
             const std::wstring& displayName = L"");
 
-        // Prepare a source node for evaluation: loads the image or creates
-        // the Flood effect, and sets the node's cachedOutput.
-        // Should be called once after the node is added to the graph
-        // (or when the source path / color changes).
+        // Create a Source node configured for video file playback.
+        static Graph::EffectNode CreateVideoSourceNode(
+            const std::wstring& filePath,
+            const std::wstring& displayName = L"");
+
+        // Returns true if the file extension indicates a video file.
+        static bool IsVideoFile(const std::wstring& filePath);
+
+        // Prepare a source node for evaluation: loads the image, creates
+        // the Flood effect, or advances the video frame.
         void PrepareSourceNode(
             Graph::EffectNode& node,
-            ID2D1DeviceContext5* dc);
+            ID2D1DeviceContext5* dc,
+            double deltaSeconds = 0.0);
 
-        // Release all cached bitmaps and flood effects (e.g., on device lost).
+        // Release all cached bitmaps, flood effects, and video providers.
         void ReleaseCache();
+
+        // Check if any video source is currently playing.
+        bool HasPlayingVideo() const;
+
+        // Get the video provider for a node (for UI controls).
+        VideoSourceProvider* GetVideoProvider(uint32_t nodeId);
 
     private:
         ImageLoader m_imageLoader;
 
-        // Cached loaded bitmaps: nodeId → bitmap. Avoids reloading every frame.
+        // Cached loaded bitmaps: nodeId → bitmap.
         std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Bitmap1>> m_bitmapCache;
 
         // Cached flood effects: nodeId → flood effect.
         std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Effect>> m_floodCache;
+
+        // Cached video providers: nodeId → video provider.
+        std::unordered_map<uint32_t, std::unique_ptr<VideoSourceProvider>> m_videoCache;
     };
 }

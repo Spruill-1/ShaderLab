@@ -327,6 +327,7 @@ namespace winrt::ShaderLab::implementation
 
         // Start render loop.
         m_fpsTimePoint = std::chrono::steady_clock::now();
+        m_lastRenderTick = m_fpsTimePoint;
         m_renderTimer = DispatcherQueue().CreateTimer();
         m_renderTimer.Interval(std::chrono::milliseconds(16));
         m_renderTimer.Tick({ this, &MainWindow::OnRenderTick });
@@ -860,6 +861,14 @@ namespace winrt::ShaderLab::implementation
             OnAddFloodSourceClicked(nullptr, nullptr);
         });
         sourceSubItem.Items().Append(floodSourceItem);
+
+        auto videoSourceItem = MUX::MenuFlyoutItem();
+        videoSourceItem.Text(L"\U0001F3AC Video Source");
+        videoSourceItem.Click([this](auto&&, auto&&)
+        {
+            BrowseVideoForSourceNode();
+        });
+        sourceSubItem.Items().Append(videoSourceItem);
 
         flyout.Items().Append(builtInGroup);
 
@@ -2309,8 +2318,18 @@ namespace winrt::ShaderLab::implementation
         }
 
         // ---- Image source: file path + Browse button ----
+        bool isVideoSource = false;
+        {
+            auto isVideoIt = node->properties.find(L"IsVideo");
+            if (isVideoIt != node->properties.end())
+            {
+                auto* bv = std::get_if<bool>(&isVideoIt->second);
+                if (bv && *bv) isVideoSource = true;
+            }
+        }
+
         if (node->type == ::ShaderLab::Graph::NodeType::Source &&
-            !(node->effectClsid.has_value()))
+            !(node->effectClsid.has_value()) && !isVideoSource)
         {
             auto pathLabel = Controls::TextBlock();
             pathLabel.Text(L"Image Path");
@@ -2341,6 +2360,147 @@ namespace winrt::ShaderLab::implementation
                 BrowseImageForSourceNode(capturedId);
             });
             panel.Children().Append(browseBtn);
+        }
+
+        // ---- Video source: playback controls ----
+        if (isVideoSource)
+        {
+            auto* videoProvider = m_sourceFactory.GetVideoProvider(capturedId);
+
+            auto pathLabel = Controls::TextBlock();
+            pathLabel.Text(L"Video File");
+            pathLabel.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            pathLabel.Margin({ 0, 4, 0, 2 });
+            panel.Children().Append(pathLabel);
+
+            auto pathText = Controls::TextBlock();
+            pathText.Text(node->shaderPath.has_value() && !node->shaderPath.value().empty()
+                ? winrt::hstring(std::filesystem::path(node->shaderPath.value()).filename().wstring())
+                : L"(no file)");
+            pathText.FontSize(12);
+            pathText.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::WrapWholeWords);
+            pathText.Margin({ 0, 0, 0, 4 });
+            panel.Children().Append(pathText);
+
+            if (videoProvider && videoProvider->IsOpen())
+            {
+                // Video info line.
+                auto infoText = Controls::TextBlock();
+                infoText.Text(std::format(L"{}×{} • {:.1f} fps • {:.1f}s",
+                    videoProvider->FrameWidth(), videoProvider->FrameHeight(),
+                    videoProvider->FrameRate(), videoProvider->Duration()));
+                infoText.FontSize(11);
+                infoText.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::Gray()));
+                infoText.Margin({ 0, 0, 0, 6 });
+                panel.Children().Append(infoText);
+
+                // Play/Pause button.
+                auto playBtn = Controls::Button();
+                bool isPlaying = videoProvider->IsPlaying();
+                playBtn.Content(winrt::box_value(isPlaying ? L"\u23F8 Pause" : L"\u25B6 Play"));
+                playBtn.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+                playBtn.Margin({ 0, 0, 0, 4 });
+                playBtn.Click([this, capturedId](auto&&, auto&&)
+                {
+                    auto* node = m_graph.FindNode(capturedId);
+                    if (!node) return;
+                    auto it = node->properties.find(L"IsPlaying");
+                    if (it != node->properties.end())
+                    {
+                        auto* bv = std::get_if<bool>(&it->second);
+                        if (bv) *bv = !*bv;
+                    }
+                    UpdatePropertiesPanel();
+                });
+                panel.Children().Append(playBtn);
+
+                // Seek slider.
+                auto seekLabel = Controls::TextBlock();
+                seekLabel.Text(std::format(L"Position: {:.1f}s / {:.1f}s",
+                    videoProvider->CurrentPosition(), videoProvider->Duration()));
+                seekLabel.FontSize(11);
+                seekLabel.Margin({ 0, 4, 0, 0 });
+                panel.Children().Append(seekLabel);
+
+                auto seekSlider = Controls::Slider();
+                seekSlider.Minimum(0.0);
+                seekSlider.Maximum(videoProvider->Duration());
+                seekSlider.Value(videoProvider->CurrentPosition());
+                seekSlider.StepFrequency(0.1);
+                seekSlider.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+                seekSlider.Margin({ 0, 0, 0, 4 });
+                seekSlider.ValueChanged([this, capturedId](auto&&, auto const& e)
+                {
+                    auto* vp = m_sourceFactory.GetVideoProvider(capturedId);
+                    if (vp)
+                    {
+                        vp->Seek(e.NewValue());
+                        m_graph.MarkAllDirty();
+                    }
+                });
+                panel.Children().Append(seekSlider);
+
+                // Speed selector.
+                auto speedLabel = Controls::TextBlock();
+                speedLabel.Text(L"Playback Speed");
+                speedLabel.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+                speedLabel.FontSize(12);
+                speedLabel.Margin({ 0, 4, 0, 2 });
+                panel.Children().Append(speedLabel);
+
+                auto speedBox = Controls::ComboBox();
+                speedBox.Items().Append(winrt::box_value(L"0.25x"));
+                speedBox.Items().Append(winrt::box_value(L"0.5x"));
+                speedBox.Items().Append(winrt::box_value(L"1x"));
+                speedBox.Items().Append(winrt::box_value(L"2x"));
+                speedBox.Items().Append(winrt::box_value(L"4x"));
+                float curSpeed = videoProvider->Speed();
+                int selIdx = 2;  // default 1x
+                if (curSpeed <= 0.25f) selIdx = 0;
+                else if (curSpeed <= 0.5f) selIdx = 1;
+                else if (curSpeed <= 1.0f) selIdx = 2;
+                else if (curSpeed <= 2.0f) selIdx = 3;
+                else selIdx = 4;
+                speedBox.SelectedIndex(selIdx);
+                speedBox.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+                speedBox.Margin({ 0, 0, 0, 4 });
+                speedBox.SelectionChanged([this, capturedId](auto&&, auto&&)
+                {
+                    // Read current selection from the source combo box.
+                    auto* node = m_graph.FindNode(capturedId);
+                    if (!node) return;
+                    auto* vp = m_sourceFactory.GetVideoProvider(capturedId);
+                    if (!vp) return;
+                    // Speed will be set from properties sync next frame.
+                });
+                speedBox.SelectionChanged([this, capturedId](auto&& sender, auto&&)
+                {
+                    auto combo = sender.as<Controls::ComboBox>();
+                    static const float speeds[] = { 0.25f, 0.5f, 1.0f, 2.0f, 4.0f };
+                    int idx = combo.SelectedIndex();
+                    if (idx >= 0 && idx < 5)
+                    {
+                        auto* node = m_graph.FindNode(capturedId);
+                        if (node)
+                            node->properties[L"PlaybackSpeed"] = speeds[idx];
+                    }
+                });
+                panel.Children().Append(speedBox);
+
+                // Loop toggle.
+                auto loopToggle = Controls::ToggleSwitch();
+                loopToggle.Header(winrt::box_value(L"Loop"));
+                loopToggle.IsOn(videoProvider->IsLooping());
+                loopToggle.Margin({ 0, 4, 0, 8 });
+                loopToggle.Toggled([this, capturedId](auto&& sender, auto&&)
+                {
+                    auto toggle = sender.as<Controls::ToggleSwitch>();
+                    auto* node = m_graph.FindNode(capturedId);
+                    if (node)
+                        node->properties[L"Loop"] = toggle.IsOn();
+                });
+                panel.Children().Append(loopToggle);
+            }
         }
 
         // ---- Look up metadata from registry ----
@@ -2396,6 +2556,9 @@ namespace winrt::ShaderLab::implementation
                     continue;
                 // Skip hidden properties (in cbuffer but not user-visible).
                 if (key.starts_with(L"Prim"))
+                    continue;
+                // Skip video source internal properties (managed by video UI controls).
+                if (key == L"IsVideo" || key == L"IsPlaying" || key == L"PlaybackSpeed" || key == L"Loop")
                     continue;
                 // Resolve metadata for this property.
                 const PropertyMetadata* meta = nullptr;
@@ -3656,6 +3819,48 @@ namespace winrt::ShaderLab::implementation
     }
 
     // -----------------------------------------------------------------------
+    // Video source file picker
+    // -----------------------------------------------------------------------
+
+    winrt::fire_and_forget MainWindow::BrowseVideoForSourceNode()
+    {
+        auto strong = get_strong();
+
+        winrt::Windows::Storage::Pickers::FileOpenPicker picker;
+        picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
+        picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::VideosLibrary);
+        picker.FileTypeFilter().Append(L".mp4");
+        picker.FileTypeFilter().Append(L".mkv");
+        picker.FileTypeFilter().Append(L".mov");
+        picker.FileTypeFilter().Append(L".avi");
+        picker.FileTypeFilter().Append(L".wmv");
+        picker.FileTypeFilter().Append(L".webm");
+        picker.FileTypeFilter().Append(L".m4v");
+        picker.FileTypeFilter().Append(L".ts");
+
+        auto file = co_await picker.PickSingleFileAsync();
+        if (!file) co_return;
+
+        auto filePath = std::wstring(file.Path().c_str());
+        auto fileName = std::wstring(file.Name().c_str());
+
+        auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(filePath, L"\U0001F3AC " + fileName);
+        auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
+        OnNodeAdded(nodeId);
+
+        // Prepare immediately so first frame is decoded.
+        auto* graphNode = m_graph.FindNode(nodeId);
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (graphNode && dc)
+            m_sourceFactory.PrepareSourceNode(*graphNode, dc);
+
+        m_graph.MarkAllDirty();
+        m_nodeGraphController.RebuildLayout();
+        PopulatePreviewNodeSelector();
+        FitPreviewToView();
+    }
+
+    // -----------------------------------------------------------------------
     // Column splitter
     // -----------------------------------------------------------------------
 
@@ -4074,11 +4279,22 @@ namespace winrt::ShaderLab::implementation
     {
         if (m_isShuttingDown) return;
 
+        // Compute frame delta time.
+        auto now = std::chrono::steady_clock::now();
+        double deltaSec = std::chrono::duration<double>(now - m_lastRenderTick).count();
+        m_lastRenderTick = now;
+        // Clamp to avoid huge jumps (e.g., after breakpoint or sleep).
+        if (deltaSec > 0.1) deltaSec = 0.016;
+
+        // Force evaluation when a video source is playing.
+        if (m_sourceFactory.HasPlayingVideo())
+            m_forceRender = true;
+
         // Only re-evaluate the graph when something changed.
         bool needsEval = m_graph.HasDirtyNodes() || m_needsFitPreview || m_forceRender;
         if (needsEval)
         {
-            RenderFrame();
+            RenderFrame(deltaSec);
             m_forceRender = false;
         }
 
@@ -4086,18 +4302,18 @@ namespace winrt::ShaderLab::implementation
 
         // Update FPS counter every second.
         m_frameCount++;
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_fpsTimePoint).count();
+        auto fpsNow = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(fpsNow - m_fpsTimePoint).count();
         if (elapsed >= 1000)
         {
             float fps = static_cast<float>(m_frameCount) * 1000.0f / static_cast<float>(elapsed);
             FpsText().Text(std::format(L"FPS: {:.0f}", fps));
             m_frameCount = 0;
-            m_fpsTimePoint = now;
+            m_fpsTimePoint = fpsNow;
         }
     }
 
-    void MainWindow::RenderFrame()
+    void MainWindow::RenderFrame(double deltaSeconds)
     {
         if (!m_renderEngine.IsInitialized())
             return;
@@ -4105,11 +4321,11 @@ namespace winrt::ShaderLab::implementation
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) return;
 
-        // Re-prepare dirty source nodes (e.g., Flood color changed in properties panel).
+        // Re-prepare dirty source nodes (e.g., Flood color changed, video frame advance).
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
         {
-            if (node.type == ::ShaderLab::Graph::NodeType::Source && node.dirty)
-                m_sourceFactory.PrepareSourceNode(node, dc);
+            if (node.type == ::ShaderLab::Graph::NodeType::Source && (node.dirty || m_sourceFactory.GetVideoProvider(node.id)))
+                m_sourceFactory.PrepareSourceNode(node, dc, deltaSeconds);
         }
 
         // Inject display primaries into Out-of-Gamut Highlight nodes.

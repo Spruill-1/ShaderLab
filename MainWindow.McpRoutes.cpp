@@ -4,6 +4,7 @@
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
 #include "Effects/ShaderLabEffects.h"
+#include "Effects/SourceNodeFactory.h"
 #include "Version.h"
 
 // Helper: narrow string from wide string.
@@ -501,7 +502,24 @@ namespace winrt::ShaderLab::implementation
                     }
 
                     auto* desc = ::ShaderLab::Effects::EffectRegistry::Instance().FindByName(name);
-                    if (!desc) return { 400, R"({"error":"Unknown effect name"})" };
+                    if (!desc)
+                    {
+                        // Check for special source types.
+                        std::wstring wname(name.begin(), name.end());
+                        if (wname == L"Video Source")
+                        {
+                            // Video Source requires a file path — create empty placeholder.
+                            auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(L"", L"Video Source");
+                            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                                auto id = m_graph.AddNode(std::move(node));
+                                m_graph.MarkAllDirty();
+                                m_nodeGraphController.AutoLayout();
+                                PopulatePreviewNodeSelector();
+                                return { 200, std::format("{{\"nodeId\":{}}}", id) };
+                            });
+                        }
+                        return { 400, R"({"error":"Unknown effect name"})" };
+                    }
                     auto node = ::ShaderLab::Effects::EffectRegistry::CreateNode(*desc);
                     return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                         auto id = m_graph.AddNode(std::move(node));
