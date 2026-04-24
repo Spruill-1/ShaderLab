@@ -160,6 +160,12 @@ namespace winrt::ShaderLab::implementation
         bool m_customEffectsRegistered{ false };
         bool m_isShuttingDown{ false };
 
+        // Video seek slider / position label (updated per-tick while playing).
+        winrt::Microsoft::UI::Xaml::Controls::Slider m_videoSeekSlider{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::TextBlock m_videoPositionLabel{ nullptr };
+        uint32_t m_videoSeekNodeId{ 0 };
+        bool m_videoSeekSuppressEvents{ false };
+
         // Per-node preview.
         uint32_t m_previewNodeId{ 0 };       // 0 = Output node (default)
         std::vector<uint32_t> m_topoOrder;   // cached for [ ] navigation

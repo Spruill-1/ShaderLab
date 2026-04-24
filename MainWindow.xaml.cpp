@@ -2221,6 +2221,11 @@ namespace winrt::ShaderLab::implementation
         auto panel = PropertiesPanel();
         panel.Children().Clear();
 
+        // Clear per-tick video slider references (will be re-set if video node selected).
+        m_videoSeekSlider = nullptr;
+        m_videoPositionLabel = nullptr;
+        m_videoSeekNodeId = 0;
+
         if (m_selectedNodeId == 0)
         {
             auto placeholder = Controls::TextBlock();
@@ -2446,6 +2451,7 @@ namespace winrt::ShaderLab::implementation
                 seekSlider.Margin({ 0, 0, 0, 4 });
                 seekSlider.ValueChanged([this, capturedId](auto&&, auto const& e)
                 {
+                    if (m_videoSeekSuppressEvents) return;
                     auto* vp = m_sourceFactory.GetVideoProvider(capturedId);
                     if (vp)
                     {
@@ -2454,6 +2460,11 @@ namespace winrt::ShaderLab::implementation
                     }
                 });
                 panel.Children().Append(seekSlider);
+
+                // Store references for per-tick position updates.
+                m_videoSeekSlider = seekSlider;
+                m_videoPositionLabel = seekLabel;
+                m_videoSeekNodeId = capturedId;
 
                 // Speed selector.
                 auto speedLabel = Controls::TextBlock();
@@ -4354,6 +4365,21 @@ namespace winrt::ShaderLab::implementation
         }
 
         RenderNodeGraph();
+
+        // Update video seek slider and position label while playing.
+        if (m_videoSeekSlider && m_videoSeekNodeId != 0)
+        {
+            auto* vp = m_sourceFactory.GetVideoProvider(m_videoSeekNodeId);
+            if (vp && vp->IsOpen())
+            {
+                double pos = vp->CurrentPosition();
+                m_videoSeekSuppressEvents = true;
+                m_videoSeekSlider.Value(pos);
+                m_videoSeekSuppressEvents = false;
+                if (m_videoPositionLabel)
+                    m_videoPositionLabel.Text(std::format(L"Position: {:.1f}s / {:.1f}s", pos, vp->Duration()));
+            }
+        }
 
         // Update FPS counter every second (counts output frames only).
         auto fpsNow = std::chrono::steady_clock::now();
