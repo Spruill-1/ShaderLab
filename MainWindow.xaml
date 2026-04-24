@@ -117,40 +117,17 @@
                 <RowDefinition Height="*" MinHeight="180" />
             </Grid.RowDefinitions>
 
-            <!-- Preview surface with toolbar and overlay -->
+            <!-- Viewport surface with overlay -->
             <Grid Grid.Row="0">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="*" />
-                </Grid.RowDefinitions>
-
-                <!-- Viewport toolbar: node selector -->
-                <Grid Grid.Row="0" Padding="6,4"
-                      Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
-                      BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                      BorderThickness="0,0,0,1">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <TextBlock Text="View:"
-                               VerticalAlignment="Center"
-                               Margin="0,0,8,0"
-                               Style="{StaticResource CaptionTextBlockStyle}" />
-                    <ComboBox x:Name="PreviewNodeSelector" Grid.Column="1"
-                              MinWidth="100" />
-                </Grid>
-
                 <!-- Swap chain panel -->
-                <SwapChainPanel x:Name="PreviewPanel" Grid.Row="2" />
+                <SwapChainPanel x:Name="PreviewPanel" />
 
                 <!-- Pixel trace crosshair overlay -->
-                <Canvas x:Name="CrosshairCanvas" Grid.Row="2"
+                <Canvas x:Name="CrosshairCanvas"
                         IsHitTestVisible="False" />
 
-                <!-- Preview overlay (node name when not on Output) -->
-                <Border Grid.Row="2"
+                <!-- Node name overlay -->
+                <Border
                         HorizontalAlignment="Left"
                         VerticalAlignment="Top"
                         Margin="8,8,0,0"

@@ -29,7 +29,6 @@ namespace winrt::ShaderLab::implementation
         PreviewPanel().PointerMoved({ this, &MainWindow::OnPreviewPointerMoved });
         PreviewPanel().KeyDown({ this, &MainWindow::OnPreviewKeyDown });
         PreviewPanel().IsTabStop(true);
-        PreviewNodeSelector().SelectionChanged({ this, &MainWindow::OnPreviewNodeSelectionChanged });
 
         PopulateDisplayProfileSelector();
         DisplayProfileSelector().SelectionChanged({ this, &MainWindow::OnDisplayProfileSelectionChanged });
@@ -295,8 +294,6 @@ namespace winrt::ShaderLab::implementation
         UpdateStatusBar();
 
         m_nodeGraphController.SetGraph(&m_graph);
-        m_nodeGraphController.EnsureOutputNode();
-        PopulatePreviewNodeSelector();
 
         if (m_renderEngine.D3DDevice())
         {
@@ -370,71 +367,9 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::PopulatePreviewNodeSelector()
     {
-        m_suppressSelectorEvent = true;
-        auto selector = PreviewNodeSelector();
-        selector.Items().Clear();
-
-        // Cache the topological order for navigation.
+        // Cache the topological order (used by graph evaluation and navigation).
         try { m_topoOrder = m_graph.TopologicalSort(); }
         catch (...) { m_topoOrder.clear(); }
-
-        uint32_t selectedIndex = 0;
-        uint32_t idx = 0;
-
-        for (uint32_t nodeId : m_topoOrder)
-        {
-            const auto* node = m_graph.FindNode(nodeId);
-            if (!node) continue;
-
-            auto label = node->name.empty()
-                ? std::format(L"Node {}", nodeId)
-                : node->name;
-            selector.Items().Append(winrt::box_value(winrt::hstring(label)));
-
-            if (nodeId == m_previewNodeId)
-                selectedIndex = idx;
-            idx++;
-        }
-
-        // If nothing selected or m_previewNodeId is 0, pick the Output node.
-        if (m_previewNodeId == 0 && !m_topoOrder.empty())
-        {
-            // Output node is typically the last in topo order.
-            m_previewNodeId = m_topoOrder.back();
-            selectedIndex = idx > 0 ? idx - 1 : 0;
-        }
-
-        if (selector.Items().Size() > 0)
-            selector.SelectedIndex(static_cast<int32_t>(selectedIndex));
-
-        m_suppressSelectorEvent = false;
-    }
-
-    void MainWindow::OnPreviewNodeSelectionChanged(
-        winrt::Windows::Foundation::IInspectable const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& /*args*/)
-    {
-        if (m_suppressSelectorEvent) return;
-
-        auto idx = PreviewNodeSelector().SelectedIndex();
-        if (idx >= 0 && static_cast<uint32_t>(idx) < m_topoOrder.size())
-        {
-            m_previewNodeId = m_topoOrder[static_cast<uint32_t>(idx)];
-            FitPreviewToView();
-        }
-
-        // Update overlay text.
-        const auto* node = m_graph.FindNode(m_previewNodeId);
-        bool isOutput = node && node->type == ::ShaderLab::Graph::NodeType::Output;
-        if (node && !isOutput)
-        {
-            PreviewOverlayText().Text(L"Previewing: " + winrt::hstring(node->name));
-            PreviewOverlayBorder().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
-        }
-        else
-        {
-            PreviewOverlayBorder().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
-        }
     }
 
     void MainWindow::OnPreviewKeyDown(
@@ -448,15 +383,37 @@ namespace winrt::ShaderLab::implementation
         constexpr auto vkCloseBracket = static_cast<winrt::Windows::System::VirtualKey>(221);  // ]
         if (key == vkOpenBracket || key == vkCloseBracket)
         {
-            auto idx = PreviewNodeSelector().SelectedIndex();
+            // Find current index in topo order.
+            int32_t curIdx = -1;
+            for (int32_t i = 0; i < static_cast<int32_t>(m_topoOrder.size()); ++i)
+            {
+                if (m_topoOrder[i] == m_previewNodeId)
+                { curIdx = i; break; }
+            }
+
             int32_t count = static_cast<int32_t>(m_topoOrder.size());
+            if (key == vkOpenBracket && curIdx > 0)
+                m_previewNodeId = m_topoOrder[curIdx - 1];
+            else if (key == vkCloseBracket && curIdx < count - 1)
+                m_previewNodeId = m_topoOrder[curIdx + 1];
 
-            if (key == vkOpenBracket && idx > 0)
-                PreviewNodeSelector().SelectedIndex(idx - 1);
-            else if (key == vkCloseBracket && idx < count - 1)
-                PreviewNodeSelector().SelectedIndex(idx + 1);
-
+            UpdatePreviewOverlay();
+            FitPreviewToView();
             args.Handled(true);
+        }
+    }
+
+    void MainWindow::UpdatePreviewOverlay()
+    {
+        const auto* node = m_graph.FindNode(m_previewNodeId);
+        if (node)
+        {
+            PreviewOverlayText().Text(winrt::hstring(node->name));
+            PreviewOverlayBorder().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
+        }
+        else
+        {
+            PreviewOverlayBorder().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
         }
     }
 
@@ -1937,85 +1894,24 @@ namespace winrt::ShaderLab::implementation
             BottomTabView().SelectedIndex(0);
             NodeGraphContainer().Focus(winrt::Microsoft::UI::Xaml::FocusState::Programmatic);
 
-            // For analysis effects (e.g., Histogram), keep the preview on the
-            // Output node since analysis effects don't produce viewable images.
+            // Preview the clicked node (skip histogram analysis effects).
             const auto* clickedNode = m_graph.FindNode(hitNodeId);
             bool isAnalysisEffect = clickedNode &&
                 clickedNode->effectClsid.has_value() &&
                 IsEqualGUID(clickedNode->effectClsid.value(), CLSID_D2D1Histogram);
 
-            if (isAnalysisEffect)
-            {
-                // Find the Output node for preview.
-                for (const auto& n : m_graph.Nodes())
-                {
-                    if (n.type == ::ShaderLab::Graph::NodeType::Output)
-                    {
-                        m_previewNodeId = n.id;
-                        break;
-                    }
-                }
-            }
-            else
-            {
+            if (!isAnalysisEffect)
                 m_previewNodeId = hitNodeId;
-            }
-            FitPreviewToView();
-            m_suppressSelectorEvent = true;
-            for (uint32_t i = 0; i < m_topoOrder.size(); ++i)
-            {
-                if (m_topoOrder[i] == m_previewNodeId)
-                {
-                    PreviewNodeSelector().SelectedIndex(static_cast<int32_t>(i));
-                    break;
-                }
-            }
-            m_suppressSelectorEvent = false;
 
-            const auto* previewNode = m_graph.FindNode(m_previewNodeId);
-            bool isOutputNode = previewNode && previewNode->type == ::ShaderLab::Graph::NodeType::Output;
-            if (previewNode && !isOutputNode)
-            {
-                PreviewOverlayText().Text(L"Previewing: " + winrt::hstring(previewNode->name));
-                PreviewOverlayBorder().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
-            }
-            else
-            {
-                PreviewOverlayBorder().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
-            }
+            FitPreviewToView();
+            UpdatePreviewOverlay();
         }
         else
         {
-            // Clicked empty space — deselect and reset preview to Output node.
+            // Clicked empty space — deselect, keep current preview.
             m_nodeGraphController.DeselectAll();
             m_selectedNodeId = 0;
             UpdatePropertiesPanel();
-
-            // Find the Output node and preview it.
-            uint32_t outputId = 0;
-            for (const auto& n : m_graph.Nodes())
-            {
-                if (n.type == ::ShaderLab::Graph::NodeType::Output)
-                {
-                    outputId = n.id;
-                    break;
-                }
-            }
-            if (outputId != 0)
-            {
-                m_previewNodeId = outputId;
-                m_suppressSelectorEvent = true;
-                for (uint32_t i = 0; i < m_topoOrder.size(); ++i)
-                {
-                    if (m_topoOrder[i] == outputId)
-                    {
-                        PreviewNodeSelector().SelectedIndex(static_cast<int32_t>(i));
-                        break;
-                    }
-                }
-                m_suppressSelectorEvent = false;
-            }
-            PreviewOverlayBorder().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
         }
         args.Handled(true);
     }

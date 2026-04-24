@@ -723,7 +723,7 @@ namespace winrt::ShaderLab::implementation
             return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                 m_graphEvaluator.ReleaseCache();
                 m_graph.Clear();
-                m_nodeGraphController.EnsureOutputNode();
+                m_previewNodeId = 0;
                 m_graph.MarkAllDirty();
                 m_nodeGraphController.AutoLayout();
                 PopulatePreviewNodeSelector();
@@ -1231,7 +1231,7 @@ namespace winrt::ShaderLab::implementation
 {"name":"graph_get_node","description":"Get detailed info about a node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
 {"name":"graph_save_json","description":"Serialize graph to JSON","inputSchema":{"type":"object","properties":{}}},
 {"name":"graph_load_json","description":"Load graph from JSON string","inputSchema":{"type":"object","properties":{"json":{"type":"string"}},"required":["json"]}},
-{"name":"graph_clear","description":"Clear the graph, keeping Output node","inputSchema":{"type":"object","properties":{}}},
+{"name":"graph_clear","description":"Clear the graph","inputSchema":{"type":"object","properties":{}}},
 {"name":"effect_compile","description":"Compile HLSL for a custom effect node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"hlsl":{"type":"string"}},"required":["nodeId","hlsl"]}},
 {"name":"set_preview_node","description":"Set which node is previewed","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
 {"name":"render_capture","description":"Capture preview as PNG. Note: HDR values clipped to SDR.","inputSchema":{"type":"object","properties":{}}},

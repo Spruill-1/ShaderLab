@@ -49,6 +49,7 @@ namespace winrt::ShaderLab::implementation
         void RegisterCustomEffects();
         void UpdateStatusBar();
         void PopulatePreviewNodeSelector();
+        void UpdatePreviewOverlay();
         void PopulateDisplayProfileSelector();
         ID2D1Image* GetPreviewImage();
         ID2D1Image* ResolveDisplayImage(uint32_t nodeId);
@@ -73,9 +74,6 @@ namespace winrt::ShaderLab::implementation
         void OnPreviewSizeChanged(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& args);
-        void OnPreviewNodeSelectionChanged(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
         void OnPreviewPointerMoved(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
@@ -162,9 +160,8 @@ namespace winrt::ShaderLab::implementation
         bool m_videoSeekSuppressEvents{ false };
 
         // Per-node preview.
-        uint32_t m_previewNodeId{ 0 };       // 0 = Output node (default)
+        uint32_t m_previewNodeId{ 0 };       // Tracks selected node for inline viewport
         std::vector<uint32_t> m_topoOrder;   // cached for [ ] navigation
-        bool m_suppressSelectorEvent{ false };
 
         // Display profile selection.
         std::vector<::ShaderLab::Rendering::DisplayProfile> m_displayPresets;
