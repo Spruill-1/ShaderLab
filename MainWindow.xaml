@@ -149,7 +149,7 @@
                         <x:String>Luminance Zones</x:String>
                         <x:String>Out of Gamut</x:String>
                     </ComboBox>
-                    <TextBlock Text="Display:"
+                    <TextBlock Text="Working Space:"
                                Grid.Column="4"
                                VerticalAlignment="Center"
                                Margin="12,0,8,0"

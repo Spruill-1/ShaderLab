@@ -4192,8 +4192,8 @@ namespace winrt::ShaderLab::implementation
         picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
         picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::PicturesLibrary);
         picker.SuggestedFileName(L"output");
-        picker.FileTypeChoices().Insert(L"PNG Image", winrt::single_threaded_vector<winrt::hstring>({ L".png" }));
-        picker.FileTypeChoices().Insert(L"JPEG Image", winrt::single_threaded_vector<winrt::hstring>({ L".jpg" }));
+        picker.FileTypeChoices().Insert(L"JPEG XR (HDR)", winrt::single_threaded_vector<winrt::hstring>({ L".jxr" }));
+        picker.FileTypeChoices().Insert(L"PNG Image (SDR)", winrt::single_threaded_vector<winrt::hstring>({ L".png" }));
 
         auto file = co_await picker.PickSaveFileAsync();
         if (!file) co_return;
@@ -4217,34 +4217,40 @@ namespace winrt::ShaderLab::implementation
             uint32_t h = static_cast<uint32_t>(bounds.bottom - bounds.top);
             if (w == 0 || h == 0) co_return;
 
-            // Render image to a bitmap.
+            auto fileExt = std::wstring(file.FileType().c_str());
+            bool isJxr = (fileExt == L".jxr" || fileExt == L".wdp");
+
+            // JXR: render in FP16 scRGB for full HDR fidelity.
+            // PNG: render in 8-bit BGRA (SDR clamp).
+            DXGI_FORMAT renderFormat = isJxr
+                ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                : DXGI_FORMAT_B8G8R8A8_UNORM;
+            D2D1_ALPHA_MODE alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+
             winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
             D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_TARGET,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+                D2D1::PixelFormat(renderFormat, alphaMode));
             dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bmpProps, renderBitmap.put());
 
             winrt::com_ptr<ID2D1Image> oldTarget;
             dc->GetTarget(oldTarget.put());
             dc->SetTarget(renderBitmap.get());
             dc->BeginDraw();
-            dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
+            dc->Clear(D2D1::ColorF(0, 0, 0, 1.0f));
             dc->DrawImage(previewImage);
             dc->EndDraw();
             dc->SetTarget(oldTarget.get());
 
-            // Use WIC to encode and save.
+            // WIC encode.
             winrt::com_ptr<IWICImagingFactory> wicFactory;
             winrt::check_hresult(CoCreateInstance(
                 CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                 IID_PPV_ARGS(wicFactory.put())));
 
             auto filePath = std::wstring(file.Path().c_str());
-            auto fileExt = std::wstring(file.FileType().c_str());
 
-            GUID containerFormat = GUID_ContainerFormatPng;
-            if (fileExt == L".jpg" || fileExt == L".jpeg")
-                containerFormat = GUID_ContainerFormatJpeg;
+            GUID containerFormat = isJxr ? GUID_ContainerFormatWmp : GUID_ContainerFormatPng;
 
             winrt::com_ptr<IWICStream> stream;
             winrt::check_hresult(wicFactory->CreateStream(stream.put()));
@@ -4255,18 +4261,43 @@ namespace winrt::ShaderLab::implementation
             winrt::check_hresult(encoder->Initialize(stream.get(), WICBitmapEncoderNoCache));
 
             winrt::com_ptr<IWICBitmapFrameEncode> frame;
-            winrt::check_hresult(encoder->CreateNewFrame(frame.put(), nullptr));
-            winrt::check_hresult(frame->Initialize(nullptr));
+            winrt::com_ptr<IPropertyBag2> encoderOptions;
+            winrt::check_hresult(encoder->CreateNewFrame(frame.put(), encoderOptions.put()));
+
+            if (isJxr && encoderOptions)
+            {
+                // Set lossless compression for JXR.
+                PROPBAG2 option{};
+                option.pstrName = const_cast<LPOLESTR>(L"Lossless");
+                VARIANT val{};
+                val.vt = VT_BOOL;
+                val.boolVal = VARIANT_TRUE;
+                encoderOptions->Write(1, &option, &val);
+            }
+
+            winrt::check_hresult(frame->Initialize(encoderOptions.get()));
             winrt::check_hresult(frame->SetSize(w, h));
 
-            WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat32bppBGRA;
+            WICPixelFormatGUID pixelFormat = isJxr
+                ? GUID_WICPixelFormat64bppRGBAHalf
+                : GUID_WICPixelFormat32bppBGRA;
             winrt::check_hresult(frame->SetPixelFormat(&pixelFormat));
 
-            // Map the D2D bitmap and write pixels.
+            // Set scRGB color context for JXR so readers know the color space.
+            if (isJxr)
+            {
+                winrt::com_ptr<IWICColorContext> colorCtx;
+                winrt::check_hresult(wicFactory->CreateColorContext(colorCtx.put()));
+                winrt::check_hresult(colorCtx->InitializeFromExifColorSpace(1)); // sRGB family
+                IWICColorContext* ctxArray[] = { colorCtx.get() };
+                frame->SetColorContexts(1, ctxArray);
+            }
+
+            // Read back pixels from GPU.
             winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
             D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+                D2D1::PixelFormat(renderFormat, alphaMode));
             dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, cpuProps, cpuBitmap.put());
             D2D1_POINT_2U destPoint = { 0, 0 };
             D2D1_RECT_U srcRect = { 0, 0, w, h };
@@ -4280,7 +4311,11 @@ namespace winrt::ShaderLab::implementation
             winrt::check_hresult(frame->Commit());
             winrt::check_hresult(encoder->Commit());
 
-            PipelineFormatText().Text(L"Image saved: " + file.Name());
+            auto sizeKB = std::filesystem::file_size(filePath) / 1024;
+            auto msg = isJxr
+                ? L"Saved scRGB FP16 JXR (" + std::to_wstring(w) + L"x" + std::to_wstring(h) + L", " + std::to_wstring(sizeKB) + L" KB): " + file.Name()
+                : L"Saved PNG (" + std::to_wstring(w) + L"x" + std::to_wstring(h) + L"): " + file.Name();
+            PipelineFormatText().Text(msg);
         }
         catch (...)
         {

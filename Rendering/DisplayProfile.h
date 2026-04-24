@@ -170,11 +170,33 @@ namespace ShaderLab::Rendering
         return p;
     }
 
+    inline DisplayProfile PresetAdobeRGB()
+    {
+        DisplayProfile p{};
+        p.caps.hdrEnabled = false;
+        p.caps.bitsPerColor = 8;
+        p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        p.caps.sdrWhiteLevelNits = 160.0f;
+        p.caps.maxLuminanceNits = 160.0f;
+        p.caps.minLuminanceNits = 0.5f;
+        p.caps.maxFullFrameLuminanceNits = 160.0f;
+        // Adobe RGB (1998) primaries
+        p.primaryRed   = { 0.6400f, 0.3300f };
+        p.primaryGreen = { 0.2100f, 0.7100f };
+        p.primaryBlue  = { 0.1500f, 0.0600f };
+        p.whitePoint   = { 0.3127f, 0.3290f };
+        p.gamut = GamutId::Custom;
+        p.profileName = L"Adobe RGB (1998)";
+        p.isSimulated = true;
+        return p;
+    }
+
     inline std::vector<DisplayProfile> AllPresets()
     {
         return {
             PresetSrgbSdr(),
             PresetSrgb270(),
+            PresetAdobeRGB(),
             PresetP3_600(),
             PresetP3_1000(),
             PresetBT2020_1000(),
