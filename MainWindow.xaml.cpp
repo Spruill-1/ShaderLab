@@ -4382,7 +4382,11 @@ namespace winrt::ShaderLab::implementation
             if (!window->IsReady())
                 continue;
 
-            // Resolve the node's output image (with tone mapping for Output nodes).
+            // Sync window title with node name.
+            auto* node = m_graph.FindNode(window->NodeId());
+            if (node)
+                window->SetTitle(node->name);
+
             auto* image = ResolveDisplayImage(window->NodeId());
             window->Present(dc, image);
         }
