@@ -440,6 +440,12 @@ namespace ShaderLab::Controls
         m_needsRedraw = true;
     }
 
+    void NodeGraphController::DeselectNode(uint32_t nodeId)
+    {
+        m_selection.selectedNodeIds.erase(nodeId);
+        m_needsRedraw = true;
+    }
+
     void NodeGraphController::DeselectAll()
     {
         m_selection.selectedNodeIds.clear();

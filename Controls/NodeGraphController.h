@@ -109,6 +109,7 @@ namespace ShaderLab::Controls
         // ---- Selection ----
 
         void SelectNode(uint32_t nodeId, bool addToSelection = false);
+        void DeselectNode(uint32_t nodeId);
         void DeselectAll();
         void SelectAll();
         const std::unordered_set<uint32_t>& SelectedNodes() const { return m_selection.selectedNodeIds; }

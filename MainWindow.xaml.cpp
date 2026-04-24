@@ -1994,7 +1994,25 @@ namespace winrt::ShaderLab::implementation
         uint32_t hitNodeId = m_nodeGraphController.HitTestNode(canvasPoint);
         if (hitNodeId != 0)
         {
-            m_nodeGraphController.SelectNode(hitNodeId);
+            // Check if Shift is held for multi-select.
+            auto shiftState = winrt::Microsoft::UI::Input::InputKeyboardSource::GetKeyStateForCurrentThread(
+                winrt::Windows::System::VirtualKey::Shift);
+            bool shiftDown = (static_cast<uint32_t>(shiftState) & static_cast<uint32_t>(winrt::Windows::UI::Core::CoreVirtualKeyStates::Down)) != 0;
+
+            if (shiftDown)
+            {
+                // Toggle: if already selected, deselect; otherwise add.
+                auto& sel = m_nodeGraphController.SelectedNodes();
+                if (sel.count(hitNodeId))
+                    m_nodeGraphController.DeselectNode(hitNodeId);
+                else
+                    m_nodeGraphController.SelectNode(hitNodeId, /*addToSelection*/ true);
+            }
+            else
+            {
+                m_nodeGraphController.SelectNode(hitNodeId);
+            }
+
             m_selectedNodeId = hitNodeId;
             m_nodeGraphController.BeginDragNodes(canvasPoint);
             m_isDraggingNode = true;
