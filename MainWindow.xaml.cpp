@@ -4408,43 +4408,64 @@ namespace winrt::ShaderLab::implementation
                 m_sourceFactory.PrepareSourceNode(node, dc, deltaSeconds, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
         }
 
-        // Inject display primaries into Gamut Highlight nodes.
+        // Inject display primaries into Gamut Highlight and CIE Chromaticity Plot nodes.
         // Only update when primaries actually change to avoid infinite dirty loops.
         {
             auto liveProfile = m_displayMonitor.LiveProfile();
             auto activeProfile = m_displayMonitor.ActiveProfile();
             for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
             {
-                if (node.name != L"Gamut Highlight") continue;
-                auto gamutIt = node.properties.find(L"TargetGamut");
-                if (gamutIt == node.properties.end()) continue;
-                float gamutVal = 0;
-                if (auto* f = std::get_if<float>(&gamutIt->second)) gamutVal = *f;
-
-                const ::ShaderLab::Rendering::DisplayProfile* src = nullptr;
-                if (gamutVal < 0.5f)        src = &liveProfile;   // Current Monitor
-                else if (gamutVal > 3.5f)   src = &activeProfile;  // Preview Mode
-
-                if (src)
+                if (node.name == L"Gamut Highlight")
                 {
-                    // Always write primaries (ensures correct values on first frame).
-                    // Only mark dirty when values actually changed to avoid loops.
+                    auto gamutIt = node.properties.find(L"TargetGamut");
+                    if (gamutIt == node.properties.end()) continue;
+                    float gamutVal = 0;
+                    if (auto* f = std::get_if<float>(&gamutIt->second)) gamutVal = *f;
+
+                    const ::ShaderLab::Rendering::DisplayProfile* src = nullptr;
+                    if (gamutVal < 0.5f)        src = &liveProfile;   // Current Monitor
+                    else if (gamutVal > 3.5f)   src = &activeProfile;  // Preview Mode
+
+                    if (src)
+                    {
+                        auto getF = [&](const std::wstring& k) -> float {
+                            auto it = node.properties.find(k);
+                            if (it != node.properties.end())
+                                if (auto* f = std::get_if<float>(&it->second)) return *f;
+                            return 0.0f;
+                        };
+                        bool changed = std::abs(getF(L"PrimRedX") - src->primaryRed.x) > 0.0001f
+                            || std::abs(getF(L"PrimGreenX") - src->primaryGreen.x) > 0.0001f
+                            || std::abs(getF(L"PrimBlueX") - src->primaryBlue.x) > 0.0001f;
+
+                        node.properties[L"PrimRedX"]   = src->primaryRed.x;
+                        node.properties[L"PrimRedY"]   = src->primaryRed.y;
+                        node.properties[L"PrimGreenX"] = src->primaryGreen.x;
+                        node.properties[L"PrimGreenY"] = src->primaryGreen.y;
+                        node.properties[L"PrimBlueX"]  = src->primaryBlue.x;
+                        node.properties[L"PrimBlueY"]  = src->primaryBlue.y;
+                        if (changed) node.dirty = true;
+                    }
+                }
+                else if (node.name == L"CIE Chromaticity Plot")
+                {
+                    const auto& src = liveProfile;
                     auto getF = [&](const std::wstring& k) -> float {
                         auto it = node.properties.find(k);
                         if (it != node.properties.end())
                             if (auto* f = std::get_if<float>(&it->second)) return *f;
                         return 0.0f;
                     };
-                    bool changed = std::abs(getF(L"PrimRedX") - src->primaryRed.x) > 0.0001f
-                        || std::abs(getF(L"PrimGreenX") - src->primaryGreen.x) > 0.0001f
-                        || std::abs(getF(L"PrimBlueX") - src->primaryBlue.x) > 0.0001f;
+                    bool changed = std::abs(getF(L"MonRedX") - src.primaryRed.x) > 0.0001f
+                        || std::abs(getF(L"MonGreenX") - src.primaryGreen.x) > 0.0001f
+                        || std::abs(getF(L"MonBlueX") - src.primaryBlue.x) > 0.0001f;
 
-                    node.properties[L"PrimRedX"]   = src->primaryRed.x;
-                    node.properties[L"PrimRedY"]   = src->primaryRed.y;
-                    node.properties[L"PrimGreenX"] = src->primaryGreen.x;
-                    node.properties[L"PrimGreenY"] = src->primaryGreen.y;
-                    node.properties[L"PrimBlueX"]  = src->primaryBlue.x;
-                    node.properties[L"PrimBlueY"]  = src->primaryBlue.y;
+                    node.properties[L"MonRedX"]   = src.primaryRed.x;
+                    node.properties[L"MonRedY"]   = src.primaryRed.y;
+                    node.properties[L"MonGreenX"] = src.primaryGreen.x;
+                    node.properties[L"MonGreenY"] = src.primaryGreen.y;
+                    node.properties[L"MonBlueX"]  = src.primaryBlue.x;
+                    node.properties[L"MonBlueY"]  = src.primaryBlue.y;
                     if (changed) node.dirty = true;
                 }
             }

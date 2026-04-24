@@ -432,6 +432,13 @@ cbuffer constants : register(b0) {
     uint ShowRec2020;   // 1=show gamut triangle
     float Brightness;   // scatter dot brightness (default 2.0)
     float DiagramSize;  // output size in pixels (default 512)
+    uint ShowMonitor;   // 1=show current monitor gamut triangle
+    float MonRedX;      // Monitor primary red x (auto-injected)
+    float MonRedY;
+    float MonGreenX;
+    float MonGreenY;
+    float MonBlueX;
+    float MonBlueY;
 };
 
 // CIE 1931 2-degree observer spectral locus (sampled at 5nm intervals, 380-700nm)
@@ -520,6 +527,13 @@ float4 main(
         float e = GamutTriangle(xy, GAMUT_2020_R, GAMUT_2020_G, GAMUT_2020_B, thickness);
         result.rgb = lerp(result.rgb, float3(0,0.5,1), e * 0.8);
     }
+    if (ShowMonitor > 0.5) {
+        float2 mR = float2(MonRedX, MonRedY);
+        float2 mG = float2(MonGreenX, MonGreenY);
+        float2 mB = float2(MonBlueX, MonBlueY);
+        float e = GamutTriangle(xy, mR, mG, mB, thickness);
+        result.rgb = lerp(result.rgb, float3(1, 0.8, 0), e * 0.9);
+    }
 
     // D65 white point marker
     float dw = length(xy - D65_WHITE);
@@ -573,6 +587,12 @@ float4 main(
                 { L"ShowRec2020",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"Brightness",   L"float", 2.0f,  0.1f, 10.0f, 0.1f },
                 { L"DiagramSize",  L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
+                { L"ShowMonitor",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
+            };
+            desc.hiddenDefaults = {
+                { L"MonRedX",   0.64f }, { L"MonRedY",   0.33f },
+                { L"MonGreenX", 0.30f }, { L"MonGreenY", 0.60f },
+                { L"MonBlueX",  0.15f }, { L"MonBlueY",  0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
