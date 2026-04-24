@@ -80,6 +80,14 @@
                         <TextBlock Text="Export MCP Config" />
                     </StackPanel>
                 </Button>
+                <AppBarSeparator />
+                <TextBlock Text="Working Space:"
+                           VerticalAlignment="Center"
+                           Margin="4,0,6,0"
+                           Style="{StaticResource CaptionTextBlockStyle}" />
+                <ComboBox x:Name="DisplayProfileSelector"
+                          MinWidth="180"
+                          ToolTipService.ToolTip="Reference color space for the entire pipeline (affects all output windows)" />
             </StackPanel>
         </Grid>
 
@@ -117,14 +125,12 @@
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
 
-                <!-- Viewport toolbar: node selector + working space -->
+                <!-- Viewport toolbar: node selector -->
                 <Grid Grid.Row="0" Padding="6,4"
                       Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
                       BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                       BorderThickness="0,0,0,1">
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
@@ -134,13 +140,6 @@
                                Style="{StaticResource CaptionTextBlockStyle}" />
                     <ComboBox x:Name="PreviewNodeSelector" Grid.Column="1"
                               MinWidth="100" />
-                    <TextBlock Text="Working Space:"
-                               Grid.Column="2"
-                               VerticalAlignment="Center"
-                               Margin="12,0,8,0"
-                               Style="{StaticResource CaptionTextBlockStyle}" />
-                    <ComboBox x:Name="DisplayProfileSelector" Grid.Column="3"
-                              MinWidth="180" />
                 </Grid>
 
                 <!-- Swap chain panel -->
