@@ -3,6 +3,7 @@
 
 #include <microsoft.ui.xaml.media.dxinterop.h>
 #include <winrt/Microsoft.UI.Windowing.h>
+#include <winrt/Microsoft.UI.Input.h>
 
 namespace ShaderLab::Controls
 {
@@ -24,17 +25,47 @@ namespace ShaderLab::Controls
         m_dxgiFactory = dxgiFactory;
         m_nodeId = nodeId;
         m_format = format;
+        m_fpsTime = std::chrono::steady_clock::now();
 
         try
         {
-            // Create WinUI 3 window.
-            m_window = winrt::Microsoft::UI::Xaml::Window();
+            namespace MUX = winrt::Microsoft::UI::Xaml;
+            namespace MUXC = MUX::Controls;
+
+            m_window = MUX::Window();
             m_window.Title(winrt::hstring(nodeName));
 
-            // Create SwapChainPanel as the window content.
-            m_panel = winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel();
+            // Build layout: SwapChainPanel + status bar.
+            auto rootGrid = MUXC::Grid();
+            auto row0 = MUX::GridLength{ 1.0, MUX::GridUnitType::Star };
+            auto row1 = MUX::GridLength{ 1.0, MUX::GridUnitType::Auto };
+            auto rowDef0 = MUXC::RowDefinition();
+            rowDef0.Height(row0);
+            auto rowDef1 = MUXC::RowDefinition();
+            rowDef1.Height(row1);
+            rootGrid.RowDefinitions().Append(rowDef0);
+            rootGrid.RowDefinitions().Append(rowDef1);
 
-            m_window.Content(m_panel);
+            m_panel = MUXC::SwapChainPanel();
+            MUXC::Grid::SetRow(m_panel, 0);
+            rootGrid.Children().Append(m_panel);
+
+            // Status bar with FPS.
+            auto statusBar = MUXC::Grid();
+            statusBar.Padding(MUX::ThicknessHelper::FromLengths(8, 2, 8, 2));
+            statusBar.Background(MUX::Media::SolidColorBrush(
+                winrt::Windows::UI::Color{ 255, 32, 32, 32 }));
+            MUXC::Grid::SetRow(statusBar, 1);
+
+            m_fpsText = MUXC::TextBlock();
+            m_fpsText.Text(L"0 FPS");
+            m_fpsText.Foreground(MUX::Media::SolidColorBrush(
+                winrt::Windows::UI::Color{ 255, 180, 180, 180 }));
+            m_fpsText.FontSize(11);
+            statusBar.Children().Append(m_fpsText);
+            rootGrid.Children().Append(statusBar);
+
+            m_window.Content(rootGrid);
 
             // Handle window close.
             m_closedToken = m_window.Closed([this](auto&&, auto&&)
@@ -42,7 +73,70 @@ namespace ShaderLab::Controls
                 m_isOpen = false;
             });
 
-            // Wait for the panel to be fully loaded before creating DXGI resources.
+            // Pointer events for pan/zoom.
+            m_panel.PointerWheelChanged([this](auto&&, MUX::Input::PointerRoutedEventArgs const& args)
+            {
+                auto point = args.GetCurrentPoint(m_panel);
+                int delta = point.Properties().MouseWheelDelta();
+                float cursorX = static_cast<float>(point.Position().X);
+                float cursorY = static_cast<float>(point.Position().Y);
+
+                float factor = (delta > 0) ? 1.1f : (1.0f / 1.1f);
+                float newZoom = std::clamp(m_zoom * factor, 0.01f, 100.0f);
+
+                m_panX = cursorX - (cursorX - m_panX) * (newZoom / m_zoom);
+                m_panY = cursorY - (cursorY - m_panY) * (newZoom / m_zoom);
+                m_zoom = newZoom;
+                args.Handled(true);
+            });
+
+            m_panel.PointerPressed([this](auto&&, MUX::Input::PointerRoutedEventArgs const& args)
+            {
+                auto point = args.GetCurrentPoint(m_panel);
+                // Middle button or right button to pan.
+                if (point.Properties().IsMiddleButtonPressed() ||
+                    point.Properties().IsRightButtonPressed())
+                {
+                    m_isPanning = true;
+                    m_panStartX = static_cast<float>(point.Position().X);
+                    m_panStartY = static_cast<float>(point.Position().Y);
+                    m_panOriginX = m_panX;
+                    m_panOriginY = m_panY;
+                    m_panel.as<MUX::UIElement>().CapturePointer(args.Pointer());
+                    args.Handled(true);
+                }
+            });
+
+            m_panel.PointerMoved([this](auto&&, MUX::Input::PointerRoutedEventArgs const& args)
+            {
+                if (m_isPanning)
+                {
+                    auto point = args.GetCurrentPoint(m_panel);
+                    float dx = static_cast<float>(point.Position().X) - m_panStartX;
+                    float dy = static_cast<float>(point.Position().Y) - m_panStartY;
+                    m_panX = m_panOriginX + dx;
+                    m_panY = m_panOriginY + dy;
+                    args.Handled(true);
+                }
+            });
+
+            m_panel.PointerReleased([this](auto&&, MUX::Input::PointerRoutedEventArgs const& args)
+            {
+                if (m_isPanning)
+                {
+                    m_isPanning = false;
+                    m_panel.as<MUX::UIElement>().ReleasePointerCapture(args.Pointer());
+                    args.Handled(true);
+                }
+            });
+
+            // Double-click to fit.
+            m_panel.DoubleTapped([this](auto&&, auto&&)
+            {
+                m_needsFit = true;
+            });
+
+            // Wait for panel Loaded before creating DXGI resources.
             m_panel.Loaded([this](auto&&, auto&&)
             {
                 try
@@ -57,7 +151,6 @@ namespace ShaderLab::Controls
                         CreateRenderTarget();
                     }
 
-                    // Now register SizeChanged for future resizes.
                     m_sizeChangedToken = m_panel.SizeChanged(
                         { this, &OutputWindow::OnPanelSizeChanged });
                 }
@@ -67,7 +160,6 @@ namespace ShaderLab::Controls
                 }
             });
 
-            // Activate the window.
             m_window.AppWindow().Resize(winrt::Windows::Graphics::SizeInt32{ 800, 600 });
             m_window.Activate();
             m_isOpen = true;
@@ -80,6 +172,26 @@ namespace ShaderLab::Controls
         }
     }
 
+    void OutputWindow::FitToView(ID2D1DeviceContext5* dc, ID2D1Image* image)
+    {
+        if (!image || m_width == 0 || m_height == 0)
+            return;
+
+        D2D1_RECT_F bounds{};
+        dc->GetImageLocalBounds(image, &bounds);
+        float imgW = bounds.right - bounds.left;
+        float imgH = bounds.bottom - bounds.top;
+        if (imgW <= 0 || imgH <= 0)
+            return;
+
+        float dpi = 96.0f * m_panel.CompositionScaleX();
+        float vpW = static_cast<float>(m_width) / (dpi / 96.0f);
+        float vpH = static_cast<float>(m_height) / (dpi / 96.0f);
+        m_zoom = (std::min)(vpW / imgW, vpH / imgH);
+        m_panX = (vpW - imgW * m_zoom) * 0.5f;
+        m_panY = (vpH - imgH * m_zoom) * 0.5f;
+    }
+
     void OutputWindow::Present(ID2D1DeviceContext5* dc, ID2D1Image* image)
     {
         if (!m_isOpen || !dc || !m_swapChain || !m_renderTarget)
@@ -87,82 +199,85 @@ namespace ShaderLab::Controls
 
         try
         {
-
-        // Handle pending resize.
-        if (m_needsResize)
-        {
-            m_needsResize = false;
-            ReleaseRenderTarget();
-
-            if (m_width > 0 && m_height > 0)
+            // Handle pending resize.
+            if (m_needsResize)
             {
-                HRESULT hr = m_swapChain->ResizeBuffers(0, m_width, m_height,
-                    DXGI_FORMAT_UNKNOWN, 0);
-                if (SUCCEEDED(hr))
-                    CreateRenderTarget();
+                m_needsResize = false;
+                ReleaseRenderTarget();
+
+                if (m_width > 0 && m_height > 0)
+                {
+                    HRESULT hr = m_swapChain->ResizeBuffers(0, m_width, m_height,
+                        DXGI_FORMAT_UNKNOWN, 0);
+                    if (SUCCEEDED(hr))
+                        CreateRenderTarget();
+                }
+
+                if (!m_renderTarget)
+                    return;
+
+                m_needsFit = true;
             }
 
-            if (!m_renderTarget)
-                return;
-        }
-
-        // Save the main window's render target and state.
-        winrt::com_ptr<ID2D1Image> oldTarget;
-        dc->GetTarget(oldTarget.put());
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
-        auto oldTransform = D2D1::Matrix3x2F::Identity();
-        dc->GetTransform(&oldTransform);
-
-        // Set our render target.
-        dc->SetTarget(m_renderTarget.get());
-        float dpi = 96.0f * m_panel.CompositionScaleX();
-        dc->SetDpi(dpi, dpi);
-        dc->SetTransform(D2D1::Matrix3x2F::Identity());
-
-        dc->BeginDraw();
-        dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-
-        if (image)
-        {
-            // Fit the image to the window, maintaining aspect ratio.
-            D2D1_RECT_F bounds{};
-            dc->GetImageLocalBounds(image, &bounds);
-            float imgW = bounds.right - bounds.left;
-            float imgH = bounds.bottom - bounds.top;
-
-            if (imgW > 0 && imgH > 0)
+            // Fit to view on first frame or double-click.
+            if (m_needsFit && image)
             {
-                float vpW = static_cast<float>(m_width) / (dpi / 96.0f);
-                float vpH = static_cast<float>(m_height) / (dpi / 96.0f);
-                float scale = (std::min)(vpW / imgW, vpH / imgH);
-                float offX = (vpW - imgW * scale) * 0.5f;
-                float offY = (vpH - imgH * scale) * 0.5f;
+                m_needsFit = false;
+                FitToView(dc, image);
+            }
 
+            // Save the main window's render target and state.
+            winrt::com_ptr<ID2D1Image> oldTarget;
+            dc->GetTarget(oldTarget.put());
+            float oldDpiX, oldDpiY;
+            dc->GetDpi(&oldDpiX, &oldDpiY);
+            auto oldTransform = D2D1::Matrix3x2F::Identity();
+            dc->GetTransform(&oldTransform);
+
+            // Set our render target.
+            dc->SetTarget(m_renderTarget.get());
+            float dpi = 96.0f * m_panel.CompositionScaleX();
+            dc->SetDpi(dpi, dpi);
+
+            dc->BeginDraw();
+            dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
+
+            if (image)
+            {
+                // Apply pan/zoom transform.
                 dc->SetTransform(
-                    D2D1::Matrix3x2F::Scale(scale, scale) *
-                    D2D1::Matrix3x2F::Translation(offX, offY));
+                    D2D1::Matrix3x2F::Scale(m_zoom, m_zoom) *
+                    D2D1::Matrix3x2F::Translation(m_panX, m_panY));
+                dc->DrawImage(image);
             }
 
-            dc->DrawImage(image);
-        }
+            dc->SetTransform(D2D1::Matrix3x2F::Identity());
+            HRESULT hr = dc->EndDraw();
+            if (FAILED(hr))
+            {
+                OutputDebugStringW(std::format(L"[OutputWindow] EndDraw error hr=0x{:08X}\n",
+                    static_cast<uint32_t>(hr)).c_str());
+            }
 
-        dc->SetTransform(D2D1::Matrix3x2F::Identity());
-        HRESULT hr = dc->EndDraw();
-        if (FAILED(hr))
-        {
-            OutputDebugStringW(std::format(L"[OutputWindow] EndDraw error hr=0x{:08X}\n",
-                static_cast<uint32_t>(hr)).c_str());
-        }
+            DXGI_PRESENT_PARAMETERS params{};
+            m_swapChain->Present1(1, 0, &params);
 
-        // Present this window's swap chain.
-        DXGI_PRESENT_PARAMETERS params{};
-        m_swapChain->Present1(1, 0, &params);
+            // Restore the main window's render target and state.
+            dc->SetTarget(oldTarget.get());
+            dc->SetDpi(oldDpiX, oldDpiY);
+            dc->SetTransform(&oldTransform);
 
-        // Restore the main window's render target and state.
-        dc->SetTarget(oldTarget.get());
-        dc->SetDpi(oldDpiX, oldDpiY);
-        dc->SetTransform(&oldTransform);
+            // Update FPS counter.
+            m_frameCount++;
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration<double>(now - m_fpsTime).count();
+            if (elapsed >= 1.0)
+            {
+                uint32_t fps = static_cast<uint32_t>(m_frameCount / elapsed);
+                m_fpsText.Text(std::to_wstring(fps) + L" FPS");
+                m_frameCount = 0;
+                m_fpsTime = now;
+            }
         }
         catch (const winrt::hresult_error& ex)
         {
@@ -182,7 +297,6 @@ namespace ShaderLab::Controls
         {
             try
             {
-                // Unregister events before closing.
                 if (m_panel && m_sizeChangedToken.value != 0)
                     m_panel.SizeChanged(m_sizeChangedToken);
                 m_window.Close();
@@ -192,6 +306,7 @@ namespace ShaderLab::Controls
         }
 
         m_panel = nullptr;
+        m_fpsText = nullptr;
     }
 
     void OutputWindow::SetTitle(const std::wstring& title)
@@ -233,11 +348,8 @@ namespace ShaderLab::Controls
         }
 
         m_swapChain = swapChain1.as<IDXGISwapChain3>();
-
-        // Set color space.
         m_swapChain->SetColorSpace1(m_format.colorSpace);
 
-        // Bind to the SwapChainPanel.
         auto panelNative = m_panel.as<ISwapChainPanelNative>();
         panelNative->SetSwapChain(m_swapChain.get());
     }
@@ -288,13 +400,11 @@ namespace ShaderLab::Controls
 
         if (!m_swapChain)
         {
-            // First size event — create the swap chain now.
             CreateSwapChain();
             CreateRenderTarget();
         }
         else
         {
-            // Defer resize to the next Present call (avoids mid-frame resize).
             m_needsResize = true;
         }
     }

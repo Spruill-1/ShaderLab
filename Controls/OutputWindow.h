@@ -7,13 +7,7 @@
 namespace ShaderLab::Controls
 {
     // A lightweight output window that presents a single graph node's output
-    // in its own OS window. Shares the D2D device context from the main
-    // RenderEngine but owns its own swap chain and render target.
-    //
-    // Lifecycle:
-    //   1. Create(renderEngine, nodeId, nodeName)
-    //   2. Per-frame: Present(dc, nodeOutput)  — called from main render loop
-    //   3. Close() or destroyed
+    // in its own OS window with pan/zoom controls and FPS ticker.
     class OutputWindow
     {
     public:
@@ -23,8 +17,6 @@ namespace ShaderLab::Controls
         OutputWindow(const OutputWindow&) = delete;
         OutputWindow& operator=(const OutputWindow&) = delete;
 
-        // Create the WinUI 3 window and swap chain panel.
-        // Swap chain creation is deferred until the panel is loaded.
         void Create(
             ID3D11Device5* d3dDevice,
             ID2D1DeviceContext5* dc,
@@ -33,24 +25,12 @@ namespace ShaderLab::Controls
             const std::wstring& nodeName,
             const Rendering::PipelineFormat& format);
 
-        // Render a node's output image to this window's swap chain.
-        // Must be called between the main window's EndDraw and before
-        // any other BeginDraw call (we temporarily retarget the shared DC).
         void Present(ID2D1DeviceContext5* dc, ID2D1Image* image);
-
-        // Close the window and release resources.
         void Close();
 
-        // Whether the window has been created and not closed.
         bool IsOpen() const { return m_isOpen; }
-
-        // Whether the swap chain is ready for rendering.
         bool IsReady() const { return m_swapChain != nullptr; }
-
-        // The graph node ID this window displays.
         uint32_t NodeId() const { return m_nodeId; }
-
-        // Update the title bar text.
         void SetTitle(const std::wstring& title);
 
     private:
@@ -60,6 +40,7 @@ namespace ShaderLab::Controls
         void OnPanelSizeChanged(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& args);
+        void FitToView(ID2D1DeviceContext5* dc, ID2D1Image* image);
 
         // Shared (non-owning).
         ID3D11Device5* m_d3dDevice{ nullptr };
@@ -69,6 +50,7 @@ namespace ShaderLab::Controls
         // Owned per-window resources.
         winrt::Microsoft::UI::Xaml::Window m_window{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel m_panel{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::TextBlock m_fpsText{ nullptr };
         winrt::com_ptr<IDXGISwapChain3> m_swapChain;
         winrt::com_ptr<ID2D1Bitmap1> m_renderTarget;
 
@@ -78,6 +60,21 @@ namespace ShaderLab::Controls
         uint32_t m_height{ 0 };
         bool m_isOpen{ false };
         bool m_needsResize{ false };
+        bool m_needsFit{ true };
+
+        // Pan / zoom state.
+        float m_zoom{ 1.0f };
+        float m_panX{ 0.0f };
+        float m_panY{ 0.0f };
+        bool m_isPanning{ false };
+        float m_panStartX{ 0.0f };
+        float m_panStartY{ 0.0f };
+        float m_panOriginX{ 0.0f };
+        float m_panOriginY{ 0.0f };
+
+        // FPS counter.
+        uint32_t m_frameCount{ 0 };
+        std::chrono::steady_clock::time_point m_fpsTime;
 
         // Event tokens for cleanup.
         winrt::event_token m_sizeChangedToken{};
