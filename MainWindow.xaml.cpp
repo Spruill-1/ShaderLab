@@ -690,14 +690,10 @@ namespace winrt::ShaderLab::implementation
         m_needsFitPreview = true;
         UpdateStatusBar();
 
-        // Reopen output windows for any additional Output nodes in the loaded graph.
+        // Reopen output windows for all Output nodes in the loaded graph.
         auto outputIds = m_graph.GetOutputNodeIds();
-        if (outputIds.size() > 1)
-        {
-            // Skip the first Output node (displayed in the main preview).
-            for (size_t i = 1; i < outputIds.size(); ++i)
-                OpenOutputWindow(outputIds[i]);
-        }
+        for (uint32_t id : outputIds)
+            OpenOutputWindow(id);
     }
 
     // -----------------------------------------------------------------------
