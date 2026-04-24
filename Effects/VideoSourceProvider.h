@@ -7,11 +7,9 @@ namespace ShaderLab::Effects
     // Decodes video frames using Media Foundation Source Reader and provides
     // them as D2D1Bitmap1 images for the effect graph.
     //
-    // Usage:
-    //   1. Open(filePath, dc) — initialize decoder and create persistent bitmap
-    //   2. Play() / Pause() / Seek(seconds)
-    //   3. AdvanceFrame(dc, deltaSeconds) — decode next frame, update bitmap
-    //   4. CurrentBitmap() — get the current frame as ID2D1Image*
+    // Decode + color conversion happen on a background thread.
+    // The UI thread calls UploadIfReady() to copy the latest decoded frame
+    // into the D2D bitmap — this is the only call that touches D2D.
     class VideoSourceProvider
     {
     public:
@@ -38,10 +36,13 @@ namespace ShaderLab::Effects
         // Seek to a position in seconds.
         void Seek(double seconds);
 
-        // Advance playback by deltaSeconds (wall clock time, scaled by speed).
-        // Decodes the next frame if needed and updates the persistent bitmap.
-        // Returns true if a new frame was produced.
-        bool AdvanceFrame(ID2D1DeviceContext5* dc, double deltaSeconds);
+        // Advance playback clock. Call each tick with wall-clock delta.
+        // Does NOT decode — the background thread handles that.
+        void Tick(double deltaSeconds);
+
+        // Upload the latest decoded frame to the D2D bitmap if one is ready.
+        // Returns true if a new frame was uploaded. Call on UI thread.
+        bool UploadIfReady(ID2D1DeviceContext5* dc);
 
         // Get the current frame bitmap (may be nullptr if no frame decoded yet).
         ID2D1Image* CurrentBitmap() const { return m_bitmap.get(); }
@@ -56,13 +57,19 @@ namespace ShaderLab::Effects
         const std::wstring& LastError() const { return m_lastError; }
 
     private:
-        bool ReadNextFrame(ID2D1DeviceContext5* dc);
+        void DecodeThreadFunc();
+        bool DecodeOneFrame();
         bool CreateBitmap(ID2D1DeviceContext5* dc);
+        void ConvertToScRGB(const BYTE* bgra, LONG pitch, std::vector<uint16_t>& outBuffer);
+        static uint16_t FloatToHalf(float f);
+
+        // Build PQ inverse LUT for fast conversion.
+        void BuildPQLUT();
 
         // MF objects.
         winrt::com_ptr<IMFSourceReader> m_reader;
 
-        // D2D persistent frame bitmap.
+        // D2D persistent frame bitmap (UI thread only).
         winrt::com_ptr<ID2D1Bitmap1> m_bitmap;
 
         // Video info.
@@ -71,26 +78,35 @@ namespace ShaderLab::Effects
         uint32_t m_stride{ 0 };
         double m_frameRate{ 0.0 };
         double m_durationSeconds{ 0.0 };
-        double m_currentPositionSeconds{ 0.0 };
-        double m_frameDuration{ 0.0 };    // seconds per frame
+        std::atomic<double> m_currentPositionSeconds{ 0.0 };
+        double m_frameDuration{ 0.0 };
         bool m_isHDR{ false };
 
         // Playback state.
-        bool m_playing{ false };
+        std::atomic<bool> m_playing{ false };
         bool m_loop{ true };
         float m_speed{ 1.0f };
-        double m_accumulatedTime{ 0.0 };  // time since last frame decode
-        bool m_endOfStream{ false };
+        double m_accumulatedTime{ 0.0 };
+        std::atomic<bool> m_endOfStream{ false };
         bool m_mfInitialized{ false };
         std::wstring m_lastError;
 
-        // CPU-side FP16 conversion buffer (width * height * 4 halfs = 8 bytes/pixel).
-        std::vector<uint16_t> m_fp16Buffer;
+        // Background decode thread.
+        std::jthread m_decodeThread;
+        std::mutex m_decodeMutex;
+        std::condition_variable m_decodeCV;
+        std::atomic<bool> m_frameNeeded{ false };
+        std::atomic<bool> m_seekPending{ false };
+        double m_seekTarget{ 0.0 };
 
-        // Convert BGRA8 frame to scRGB FP16 (handles both SDR sRGB and HDR PQ/BT.2020).
-        void ConvertToScRGB(const BYTE* bgra, LONG pitch);
+        // Double buffer: decode thread writes to m_backBuffer,
+        // UI thread reads from m_frontBuffer when m_frameReady is set.
+        std::vector<uint16_t> m_backBuffer;
+        std::vector<uint16_t> m_frontBuffer;
+        std::mutex m_bufferMutex;
+        std::atomic<bool> m_frameReady{ false };
 
-        // Half-float conversion.
-        static uint16_t FloatToHalf(float f);
+        // PQ inverse LUT (256 entries → linear nits).
+        std::array<float, 256> m_pqLUT{};
     };
 }

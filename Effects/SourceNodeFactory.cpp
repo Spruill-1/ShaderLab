@@ -168,12 +168,15 @@ namespace ShaderLab::Effects
                     if (lv) provider->SetLoop(*lv);
                 }
 
-                // Advance frame.
-                provider->AdvanceFrame(dc, deltaSeconds);
+                // Advance playback clock (cheap — just updates timer).
+                provider->Tick(deltaSeconds);
+
+                // Upload latest decoded frame to D2D bitmap (just a GPU memcpy).
+                provider->UploadIfReady(dc);
 
                 node.cachedOutput = provider->CurrentBitmap();
                 if (provider->IsPlaying())
-                    node.dirty = true;  // keep evaluating while playing
+                    node.dirty = true;
               }
               catch (...)
               {
