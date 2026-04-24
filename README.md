@@ -17,24 +17,26 @@ graph TB
         SE[Shader Editor]
         PI[Pixel Inspector]
         PROPS[Properties Panel]
+        EDW[Effect Designer Window]
     end
 
     subgraph Core["Core Engine"]
         EG[EffectGraph<br/>DAG Model]
         EVAL[Graph Evaluator<br/>Topological Sort]
-        PF[PipelineFormat<br/>Config]
+        PF[PipelineFormat<br/>scRGB FP16]
     end
 
     subgraph Rendering["Rendering Layer"]
         D3D[D3D11 Device]
         D2D[D2D1 Device Context]
-        SC[DXGI Swap Chain<br/>FP16 / HDR10 / sRGB]
+        SC[DXGI Swap Chain<br/>scRGB FP16]
         W2D[Win2D Interop]
     end
 
     subgraph Effects["Effect System"]
         SRC[Source Nodes<br/>WIC Images / Flood]
         BIN[Built-in D2D Effects]
+        SLE[ShaderLab Effects<br/>9 Built-in Analysis+Source]
         PS[Custom Pixel Shaders<br/>ID2D1DrawTransform]
         CS[Custom Compute Shaders<br/>ID2D1ComputeTransform]
     end
@@ -52,6 +54,7 @@ graph TB
     MW --> SE
     MW --> PI
     MW --> PROPS
+    MW --> EDW
     NGE --> EG
     EG --> EVAL
     EVAL --> D2D
@@ -62,6 +65,7 @@ graph TB
     W2D --> D2D
     SRC --> EG
     BIN --> EG
+    SLE --> EG
     PS --> EG
     CS --> EG
     DM --> HDR
@@ -71,32 +75,14 @@ graph TB
     DP --> PF
     SE -.->|Hot Reload| PS
     SE -.->|Hot Reload| CS
+    EDW -.->|Create/Update| PS
+    EDW -.->|Create/Update| CS
     PI -.->|Read Back| EVAL
 ```
 
 ## Pipeline Format Strategy
 
-The rendering pipeline format is configurable rather than hardwired. All render targets, the swap chain, and tone mapping adapt to the selected format.
-
-```mermaid
-graph LR
-    subgraph Formats["Available Pipeline Formats"]
-        F1["scRGB FP16 (Default)<br/>DXGI_FORMAT_R16G16B16A16_FLOAT<br/>DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709"]
-        F2["sRGB 8-bit<br/>DXGI_FORMAT_B8G8R8A8_UNORM<br/>DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709"]
-        F3["HDR10<br/>DXGI_FORMAT_R10G10B10A2_UNORM<br/>DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020"]
-        F4["Linear FP32<br/>DXGI_FORMAT_R32G32B32A32_FLOAT<br/>DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709"]
-    end
-
-    PF[PipelineFormat] --> F1
-    PF --> F2
-    PF --> F3
-    PF --> F4
-
-    F1 --> RT[Render Targets]
-    F1 --> SWP[Swap Chain]
-    F1 --> TM[Tone Mapper]
-    F1 --> INS[Pixel Inspector]
-```
+The rendering pipeline always uses **scRGB FP16** (`DXGI_FORMAT_R16G16B16A16_FLOAT` with `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`). Linear floating-point preserves full HDR range and precision; scRGB covers the full BT.2020 gamut including negative values. DWM/ACM handles the final display conversion.
 
 ## Effect Graph Model
 
@@ -318,6 +304,11 @@ flowchart TD
 | 24 | D2D built-in effects for tone mapping | WhiteLevelAdjustment for SDR↔HDR white scaling, HdrToneMap for HDR→SDR, ColorMatrix for exposure (2^stops). Five modes: None, Reinhard, ACES Filmic, Hable, SDR Clamp. Reference math implementations for custom shader fallback. | Day 3 |
 | 25 | DispatcherQueueTimer at 16ms for render loop | ~60 FPS render tick drives graph evaluation → tone mapping → swap chain present. FPS counter updated every second in status bar. Ctrl+Enter compiles shader from TextBox. Custom effects (pixel + compute) registered with D2D factory at startup. | Day 3 |
 | 26 | Display profile mocking with ICC parser | DisplayProfile wraps DisplayCapabilities with CIE xy chromaticities and gamut ID. Six presets cover sRGB→BT.2020 at various luminances. IccProfileParser reads binary ICC files (v2/v4) extracting rXYZ/gXYZ/bXYZ/wtpt/lumi/desc tags. DisplayMonitor.SetSimulatedProfile overrides live caps and fires existing callback, so the entire downstream pipeline (tone mapper, pipeline format) adapts without changes. | Day 4 |
+| 27 | ShaderLab effects library with embedded HLSL + shared color math | 9 built-in effects (4 analysis, 5 source) with HLSL embedded as string constants in ShaderLabEffects.cpp. Shared color math library (BT.709/BT.2020/P3 matrices, PQ/HLG transfer functions, CIE xy conversions) prepended to each shader. Auto-compiled at first use via ShaderCompiler. Categories: Analysis (Luminance Heatmap, OOG Highlight, CIE Chromaticity, Vectorscope) and Source (Gamut Source, Color Checker, Zone Plate, Gradient Generator, HDR Test Pattern). | Day 5 |
+| 28 | Per-component property bindings (Grasshopper-style) | Analysis output fields from compute shaders can be bound to downstream effect properties with per-component picking (float4.x → float). Visual orange diamond data pins on node graph. Bindings participate in topological sort and cycle detection. Bound values resolved every frame (bypass dirty logic). Authored properties never mutated — bindings build effective properties map at evaluation time. | Day 5 |
+| 29 | Versioning system (app + graph format) | Version.h defines app version (1.1.0) and graph format version (2). Both stored in saved graph JSON. Forward compatibility check on load — newer format version shows error dialog. Version displayed in status bar and title bar. | Day 5 |
+| 30 | Always scRGB FP16 pipeline (no fallback) | Removed sRGB/HDR10/FP32 pipeline format switching. Pipeline is always scRGB FP16. DWM/ACM handles final display conversion. Simplifies swap chain management, tone mapper, and render target creation. PipelineFormat.h retained but only one format used. | Day 5 |
+| 31 | MCP server for AI agent integration | Embedded Winsock2 HTTP server with JSON-RPC 2.0 on port 47808. 21 tools for graph manipulation, property control, HLSL compilation, render capture, analysis readback, pixel trace, effect listing, and display info. Enables AI agents (Copilot, Claude, etc.) to programmatically control ShaderLab. Routes in MainWindow.McpRoutes.cpp. | Day 5 |
 
 ---
 
@@ -355,35 +346,43 @@ ShaderLab/
 ├── packages.config             # NuGet package manifest
 ├── Package.appxmanifest        # MSIX app identity
 ├── app.manifest                # DPI awareness, heap type
+├── Version.h                   # App version 1.1.0, graph format version 2
 ├── README.md                   # This file
+├── CHANGELOG.md                # Version history
 │
 ├── pch.h / pch.cpp             # Precompiled header (WinRT, D2D, D3D, Win2D, STL)
 ├── App.xaml / .h / .cpp        # Application entry point
-├── MainWindow.xaml / .h / .cpp # Main window layout and initialization
+├── MainWindow.xaml / .h / .cpp # Main window layout and initialization (~4100 lines)
+├── MainWindow.McpRoutes.cpp    # MCP server routes (~1400 lines)
 ├── MainWindow.idl              # WinRT interface definition
+├── EffectDesignerWindow.xaml / .h / .cpp  # Effect Designer modal window
 │
 ├── Graph/                      # Effect graph data model
 │   ├── NodeType.h              # NodeType enum (Source, BuiltInEffect, PixelShader, ComputeShader, Output)
-│   ├── PropertyValue.h         # std::variant type for node properties (float, int, bool, float2-4, string)
-│   ├── EffectNode.h            # EffectNode struct (id, name, type, position, properties, pins, cached output)
+│   ├── PropertyValue.h         # std::variant type for node properties (float, int, bool, float2-4, string, matrix, vector)
+│   ├── EffectNode.h            # EffectNode struct, ParameterDefinition, PropertyBinding, AnalysisFieldDef
 │   ├── EffectEdge.h            # EffectEdge struct (source/dest node + pin IDs)
-│   ├── EffectGraph.h           # EffectGraph class declaration (DAG, topo sort, JSON)
+│   ├── EffectGraph.h           # EffectGraph class declaration (DAG, topo sort, JSON, versioning)
 │   └── EffectGraph.cpp         # EffectGraph implementation
 ├── Rendering/                  # D3D/D2D device management, swap chain, pipeline
-│   ├── DisplayInfo.h           # DisplayCapabilities struct (HDR flag, luminance, color space, SDR white level)
+│   ├── DisplayInfo.h           # DisplayCapabilities struct + monitor primaries
 │   ├── DisplayMonitor.h        # DisplayMonitor class (WM_DISPLAYCHANGE + adapter-changed event + simulated profile)
 │   ├── DisplayMonitor.cpp      # DisplayMonitor implementation
 │   ├── DisplayProfile.h        # DisplayProfile struct, ChromaticityXY, GamutId, preset factory functions
 │   ├── IccProfileParser.h      # IccProfileParser class + IccProfileData struct
 │   ├── IccProfileParser.cpp    # ICC binary format parsing (v2/v4), XYZ→xy conversion, gamut detection
-│   ├── PipelineFormat.h        # PipelineFormat struct + 4 predefined formats (scRGB FP16, sRGB 8-bit, HDR10, Linear FP32)
+│   ├── PipelineFormat.h        # PipelineFormat struct (scRGB FP16 always)
+│   ├── FalseColorOverlay.h     # False color rendering overlay
 │   ├── RenderEngine.h          # RenderEngine class (D3D11 + D2D1 + swap chain lifecycle)
-│   ├── RenderEngine.cpp        # RenderEngine implementation (device creation, resize, format switch, draw cycle)
-│   ├── GraphEvaluator.h        # GraphEvaluator class (topological walk, effect cache, property application)
+│   ├── RenderEngine.cpp        # RenderEngine implementation (device creation, resize, draw cycle)
+│   ├── GraphEvaluator.h        # GraphEvaluator class (topological walk, effect cache, dirty gating)
 │   ├── GraphEvaluator.cpp      # GraphEvaluator implementation (per-node evaluation loop)
 │   ├── ToneMapper.h            # Tone mapping modes (None, Reinhard, ACES, Hable, SDR Clamp)
 │   └── ToneMapper.cpp          # D2D WhiteLevelAdjustment + HdrToneMap + ColorMatrix exposure
 ├── Effects/                    # Built-in effect wrappers, custom effect base
+│   ├── ShaderLabEffects.h      # 9 ShaderLab built-in effects + shared color math HLSL library
+│   ├── ShaderLabEffects.cpp    # Effect registration, embedded HLSL, auto-compile
+│   ├── PropertyMetadata.h      # Effect property metadata for UI generation
 │   ├── ImageLoader.h           # WIC image loading class (HDR/SDR format detection)
 │   ├── ImageLoader.cpp         # WIC decode pipeline (file/stream → FormatConverter → D2D1Bitmap1)
 │   ├── SourceNodeFactory.h     # Source node creation (image file + flood fill)
@@ -414,6 +413,8 @@ ShaderLab/
 │
 ├── .github/
 │   └── copilot-instructions.md
+├── .context/
+│   └── resume.md               # Development resume point
 └── packages/                   # NuGet packages (restored)
 ```
 
@@ -467,7 +468,37 @@ void main(uint3 DTid : SV_DispatchThreadID) {
 }
 ```
 
-## Property Binding System (Grasshopper-style)
+## ShaderLab Built-in Effects
+
+ShaderLab ships with 9 built-in effects implemented in `Effects/ShaderLabEffects.h/.cpp`. Each effect has its HLSL embedded as a string constant, compiled at first use, and shares a common color math library (BT.709/BT.2020/P3 matrices, PQ/HLG transfer functions, CIE xy conversions).
+
+### Analysis Effects
+
+| Effect | Type | Description |
+|--------|------|-------------|
+| Luminance Heatmap | Pixel Shader | False-color overlay mapping BT.709 luminance to a heat gradient |
+| Out-of-Gamut Highlight | Compute Shader | Highlights pixels outside a target gamut (sRGB, P3, BT.2020, or current monitor) |
+| CIE Chromaticity Plot | Compute Shader | Plots image pixels on a CIE 1931 xy chromaticity diagram |
+| Vectorscope | Compute Shader | YCbCr vectorscope visualization with graticule |
+
+### Source Effects
+
+| Effect | Type | Description |
+|--------|------|-------------|
+| Gamut Source | Pixel Shader | Generates a full-gamut color sweep |
+| Color Checker | Pixel Shader | Macbeth ColorChecker pattern with accurate sRGB patches |
+| Zone Plate | Pixel Shader | Sine-wave zone plate for resolution/aliasing testing |
+| Gradient Generator | Pixel Shader | Configurable linear/radial gradient with HDR range |
+| HDR Test Pattern | Pixel Shader | Luminance step wedge from 0 to 10,000 nits |
+
+## Versioning
+
+ShaderLab uses a dual-version system defined in `Version.h`:
+
+- **App version** (`1.1.0`): Displayed in title bar and status bar. Stored in saved graph files as `appVersion`.
+- **Graph format version** (`2`): Stored in saved graph files as `formatVersion`. Used for forward compatibility — loading a graph with a newer format version than the running app shows an error dialog.
+
+Saved JSON graphs include both versions for traceability.
 
 Analysis output fields can be visually connected to downstream effect properties using **data pins** on the node graph canvas.
 
@@ -520,11 +551,11 @@ ShaderLab includes an embedded HTTP server implementing the **Model Context Prot
 - Transport: Streamable HTTP (`POST /` for JSON-RPC)
 - Enable: MCP toggle in toolbar, `--mcp` flag, or `config.json`
 
-### Tools (16 total)
+### Tools (21 total)
 
 | Tool | Description |
 |------|-------------|
-| `graph_add_node` | Add built-in or custom shader node |
+| `graph_add_node` | Add built-in D2D or ShaderLab effect |
 | `graph_remove_node` | Remove a node |
 | `graph_connect` | Connect image pins |
 | `graph_disconnect` | Disconnect image pins |
@@ -532,16 +563,23 @@ ShaderLab includes an embedded HTTP server implementing the **Model Context Prot
 | `graph_get_node` | Get node details + analysis results |
 | `graph_save_json` | Serialize graph to JSON |
 | `graph_load_json` | Load graph from JSON |
-| `graph_clear` | Clear entire graph |
+| `graph_clear` | Clear entire graph (keeps Output) |
 | `effect_compile` | Compile HLSL (+ optional analysisFields) |
 | `set_preview_node` | Set which node is previewed |
-| `render_capture` | Capture preview as PNG |
+| `render_capture` | Capture preview as PNG (HDR clipped to SDR) |
 | `registry_get_effect` | Get built-in effect metadata |
 | `graph_bind_property` | Bind property to analysis field |
 | `graph_unbind_property` | Remove binding |
-| `read_analysis_output` | Read typed analysis fields |
+| `read_analysis_output` | Read typed analysis fields from compute node |
+| `read_pixel_trace` | Pixel trace at normalized coords (per-node values) |
+| `list_effects` | List all effects by category |
+| `graph_overview` | Compact graph summary (nodes, edges, preview) |
+| `get_display_info` | Display caps, active profile, pipeline, version |
+| `graph_rename_node` | Rename a node |
 
 ### Known Limitations
 
 - **Compile-before-connect**: First-time compile of a compute shader node that's already connected to the render pipeline crashes D2D. Workaround: compile the shader while the node is disconnected, then wire it in. Recompiles of already-compiled nodes work fine.
 - **FP16 precision**: Analysis readback values show minor quantization (e.g., 0.1 → 0.099976) due to the D2D output buffer using 16-bit float precision.
+- **`uint` cbuffer params don't work in D2D pixel shaders**: Values pack correctly in the constant buffer but the shader never sees updates. Use `float` with threshold comparisons (`> 0.5`, `> 1.5`) instead.
+- **HLSL optimizer removes unreferenced cbuffer vars**: With `D3DCOMPILE_WARNINGS_ARE_ERRORS`, variables not referenced on ALL code paths are optimized out. Read all cbuffer vars at top of `main()` before branches.

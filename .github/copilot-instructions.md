@@ -26,13 +26,17 @@ ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, 
 MainWindow (WinUI 3 XAML)
   ├── RenderEngine        — D3D11 + D2D1 device stack, DXGI swap chain, BeginDraw/EndDraw/Present
   ├── DisplayMonitor      — HDR/SDR detection, WM_DISPLAYCHANGE + adapter-change jthread
-  ├── GraphEvaluator      — Topological walk of EffectGraph, per-node D2D effect cache
+  ├── GraphEvaluator      — Topological walk of EffectGraph, per-node D2D effect cache, dirty gating
   ├── ToneMapper          — D2D WhiteLevelAdjustment + HdrToneMap + ColorMatrix exposure chain
   ├── EffectGraph (DAG)   — Nodes, edges, Kahn's topo sort, JSON serialization (Windows.Data.Json)
   ├── SourceNodeFactory   — WIC image loading (HDR/SDR format split) + Flood fill sources
+  ├── ShaderLabEffects    — 9 built-in effects (analysis + source) with embedded HLSL + color math
   ├── ShaderEditorCtrl    — Live HLSL compile (D3DCompile), D3DReflect auto-property generation
   ├── NodeGraphController — D2D-rendered canvas: bezier edges, color-coded nodes, pan/zoom, hit-test
-  └── PixelInspectorCtrl  — GPU readback (1×1 D2D1Bitmap1), scRGB→sRGB/PQ/luminance conversions
+  ├── PixelInspectorCtrl  — GPU readback (1×1 D2D1Bitmap1), scRGB→sRGB/PQ/luminance conversions
+  ├── PixelTraceCtrl      — Recursive per-node pixel readback through effect graph
+  ├── FalseColorOverlay   — False color rendering overlay
+  └── EffectDesignerWindow — Modal window for creating/editing custom pixel/compute shader effects
 ```
 
 Render loop: `DispatcherQueueTimer` at 16ms → `GraphEvaluator.Evaluate()` → `ToneMapper.Apply()` → `BeginDraw` → `DrawImage` → `EndDraw` → `Present`.
@@ -74,7 +78,7 @@ All code lives under `ShaderLab::` with sub-namespaces matching directories:
 - **Anonymous namespaces** for file-local helpers (e.g., JSON serialization helpers in `EffectGraph.cpp`)
 
 ### Property System
-- Node properties stored as `std::map<std::wstring, PropertyValue>` where `PropertyValue = std::variant<float, int32_t, uint32_t, bool, std::wstring, float2, float3, float4>`
+- Node properties stored as `std::map<std::wstring, PropertyValue>` where `PropertyValue = std::variant<float, int32_t, uint32_t, bool, std::wstring, float2, float3, float4, D2D1_MATRIX_5X4_F, std::vector<float>>`
 - JSON serialization uses type tags (`"float"`, `"float4"`, etc.) for round-trip fidelity
 - Shader constant buffers packed from PropertyValue via D3DReflect offsets (byte-level memcpy)
 
@@ -99,11 +103,15 @@ The tone mapping system (`Rendering/ToneMapper.h/.cpp`) and color correction are
 
 ## Key Technical Context
 
-- **Pipeline format is configurable**: scRGB FP16 (default), sRGB 8-bit, HDR10 (PQ/BT.2020), Linear FP32. Format affects swap chain, render targets, tone mapper, and pixel inspector.
+- **Pipeline is always scRGB FP16**: `DXGI_FORMAT_R16G16B16A16_FLOAT` with `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`. No pipeline format switching — DWM/ACM handles final display conversion.
 - **Swap chain**: `CreateSwapChainForComposition` + `ISwapChainPanelNative` (WinUI 3 requirement). Color space set via `SetColorSpace1()`.
 - **Display monitoring**: Dual path — `WM_DISPLAYCHANGE` via hidden message-only HWND + `IDXGIFactory7::RegisterAdaptersChangedEvent` on a jthread.
 - **Graph serialization**: `Windows.Data.Json` (zero extra dependencies). GUID fields use `StringFromGUID2`/`CLSIDFromString`.
 - **Effect registry**: Singleton with 40+ built-in D2D effects across 9 categories. Case-insensitive name lookup.
+- **ShaderLab effects library**: 9 built-in effects (4 analysis, 5 source) in `Effects/ShaderLabEffects.h/.cpp`. Embedded HLSL with shared color math. Auto-compiled at first use.
+- **MCP server**: 21-tool JSON-RPC 2.0 server on port 47808 for AI agent integration. Routes in `MainWindow.McpRoutes.cpp`.
+- **Versioning**: `Version.h` defines app version (1.1.0) and graph format version (2). Both stored in saved graphs. Forward compatibility check on load.
+- **Dirty-gated render loop**: `DispatcherQueueTimer` at 16ms (~60 FPS). Skips evaluate when no nodes changed. Analysis readback only on dirty frames.
 - **Ctrl+Enter** compiles shader from the editor TextBox.
 
 ## Adding New Files
@@ -113,3 +121,44 @@ The tone mapping system (`Rendering/ToneMapper.h/.cpp`) and color correction are
 3. Add to `ShaderLab.vcxproj.filters` for VS Solution Explorer organization
 4. Use the matching `ShaderLab::SubNamespace` namespace
 5. `#include "pch.h"` as the first line in every `.cpp` file
+
+## D2D Custom Effect Gotchas
+
+These are critical lessons learned during development. Any AI agent generating or modifying D2D custom effect code **must** account for these:
+
+1. **`uint` cbuffer params DON'T WORK in D2D pixel shaders** — values pack correctly in the constant buffer but the shader never sees updates. Use `float` with threshold comparisons (`> 0.5`, `> 1.5`) instead.
+2. **HLSL compiler with `D3DCOMPILE_WARNINGS_ARE_ERRORS` optimizes out cbuffer variables** not referenced on ALL code paths. Read all cbuffer vars at top of `main()` before any branches.
+3. **D2D custom effects need TWO evaluation passes** for newly created effects — first creates/initializes, second produces correct output. Don't expect correct output on the first frame after creation.
+4. **`RegisterWithInputCount` requires `inputCount >= 1`**. Zero-input source effects must use a hidden dummy bitmap input.
+5. **`MapInputRectsToOutputRect` with `SetFixedOutputSize`** must check fixed size FIRST, before examining input rect. Getting this order wrong causes incorrect output sizing.
+6. **D2D `TEXCOORD` values are in pixel/scene space**, NOT normalized [0,1]. Always use `GetDimensions()` and divide to get normalized UVs.
+7. **D2D custom effect transforms must NOT pass through infinite input rects** in `MapInputRectsToOutputRect`. Infinite rects cause D2D to attempt unbounded rendering.
+8. **`ForceUploadConstantBuffer()` uploads cbuffer but doesn't invalidate cached output**. Need an input toggle trick (disconnect+reconnect dummy input) to force D2D to re-evaluate the effect.
+9. **Monitor gamut comes from `DXGI_OUTPUT_DESC1` primaries** — use `RedPrimary`, `GreenPrimary`, `BluePrimary`, `WhitePoint` fields. These are CIE xy chromaticity coordinates.
+10. **Always write primaries into OOG properties on every evaluate** (ensures correct values on first frame), but only mark dirty on actual change (prevents feedback loops between property writes and evaluation).
+
+## ShaderLab Effects Library
+
+The built-in effects library lives in `Effects/ShaderLabEffects.h/.cpp`:
+
+- **Embedded HLSL**: Each effect's shader code is stored as a `const char*` string constant. No external `.hlsl` files.
+- **Shared color math**: A common HLSL library (BT.709/BT.2020/P3 color matrices, PQ/HLG transfer functions, CIE XYZ↔xy conversions, luminance calculations) is prepended to each shader at compile time.
+- **Auto-compile**: Effects are compiled via `ShaderCompiler` at first use (when added to graph). Compiled bytecode is cached.
+- **Categories**:
+  - **Analysis** (4): Luminance Heatmap (PS), Out-of-Gamut Highlight (CS), CIE Chromaticity Plot (CS), Vectorscope (CS)
+  - **Source** (5): Gamut Source (PS), Color Checker (PS), Zone Plate (PS), Gradient Generator (PS), HDR Test Pattern (PS)
+- **Hidden defaults**: Host-managed properties (e.g., monitor primaries for OOG Highlight) are marked `isHidden = true` in `ParameterDefinition`. They don't appear in the Properties panel but are written by the host before each evaluate.
+- **Analysis outputs**: Compute shader analysis effects declare `AnalysisFieldDef` entries that describe their output fields (name, type, count). These are read back to CPU via `GraphEvaluator` and can be bound to downstream properties.
+
+## Effect Designer
+
+`EffectDesignerWindow.xaml/.h/.cpp` provides a dedicated modal window for creating custom effects:
+
+- **Shader types**: Pixel shader (`ps_5_0`) and compute shader (`cs_5_0`)
+- **Parameter definition**: Users define parameters with types: `float`, `float2`, `float3`, `float4`, `int`, `uint`, `bool`, `enum`
+  - **Enum params**: Comma-separated label definition (e.g., `"Off,Low,Medium,High"`) generates a dropdown in the Properties panel
+  - **Bool params**: Rendered as `ToggleSwitch` controls (not `NumberBox`)
+- **Analysis output fields**: For compute shaders, users can declare typed output fields that will be readable via `read_analysis_output`
+- **HLSL auto-formatting**: Basic indent/brace formatting applied on edit
+- **Scaffold generation**: Templates generate a starting HLSL shader with the declared parameters already in the cbuffer
+- **Graph integration**: "Add to Graph" creates a new node; "Update in Graph" recompiles and updates an existing node
