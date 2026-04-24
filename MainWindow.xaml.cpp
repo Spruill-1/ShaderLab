@@ -818,7 +818,7 @@ namespace winrt::ShaderLab::implementation
                 if (cat == L"Source")
                 {
                     auto videoSourceItem = MUX::MenuFlyoutItem();
-                    videoSourceItem.Text(L"\U0001F3AC Video Source");
+                    videoSourceItem.Text(L"Video Source");
                     videoSourceItem.Click([this](auto&&, auto&&)
                     {
                         BrowseVideoForSourceNode();
@@ -836,7 +836,7 @@ namespace winrt::ShaderLab::implementation
             flyout.Items().Append(sep);
 
             auto outputItem = MUX::MenuFlyoutItem();
-            outputItem.Text(L"\U0001F5BC Output Window");
+            outputItem.Text(L"Output Window");
             outputItem.Click([this](auto&&, auto&&)
             {
                 // Create a new Output node with auto-incrementing name.
@@ -2157,7 +2157,7 @@ namespace winrt::ShaderLab::implementation
 
             // Browse button to change video file.
             auto browseBtn = Controls::Button();
-            browseBtn.Content(winrt::box_value(L"\U0001F4C2 Browse..."));
+            browseBtn.Content(winrt::box_value(L"Browse..."));
             browseBtn.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
             browseBtn.Margin({ 0, 0, 0, 6 });
             browseBtn.Click([this, capturedId](auto&&, auto&&)
@@ -3625,7 +3625,7 @@ namespace winrt::ShaderLab::implementation
         auto filePath = std::wstring(file.Path().c_str());
         auto fileName = std::wstring(file.Name().c_str());
 
-        auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(filePath, L"\U0001F3AC " + fileName);
+        auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(filePath, fileName);
         auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
         OnNodeAdded(nodeId);
 
@@ -3669,7 +3669,7 @@ namespace winrt::ShaderLab::implementation
         // Update the node's path and name.
         node->shaderPath = filePath;
         node->properties[L"shaderPath"] = filePath;
-        node->name = L"\U0001F3AC " + fileName;
+        node->name = fileName;
         node->dirty = true;
 
         // Re-prepare to open the new video file.
