@@ -228,6 +228,7 @@ cbuffer constants : register(b0) {
     float OverlayG;
     float OverlayB;
     float OverlayStrength;
+    float Invert;
     // Primaries for modes 0 and 4 (auto-injected, not user-visible)
     float PrimRedX;
     float PrimRedY;
@@ -277,7 +278,8 @@ float4 main(
     }
 
     bool oog = (targetRGB.r < -0.001 || targetRGB.g < -0.001 || targetRGB.b < -0.001);
-    if (oog) {
+    bool highlight = (Invert > 0.5) ? !oog : oog;
+    if (highlight) {
         float3 overlay = float3(OverlayR, OverlayG, OverlayB);
         color.rgb = lerp(color.rgb, overlay, OverlayStrength);
     }
@@ -402,6 +404,7 @@ float4 main(
                 { L"OverlayG",        L"float", 0.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayB",        L"float", 1.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayStrength", L"float", 0.7f,  0.0f, 1.0f, 0.01f },
+                { L"Invert",          L"float", 0.0f,  0.0f, 1.0f, 1.0f, { L"Out-of-Gamut", L"In-Gamut" } },
             };
             // Hidden cbuffer properties: primaries auto-injected by host.
             desc.hiddenDefaults = {
