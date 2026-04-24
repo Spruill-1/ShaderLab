@@ -23,6 +23,15 @@ namespace ShaderLab::Graph
 
     void EffectGraph::RemoveNode(uint32_t nodeId)
     {
+        // Protect the last Output node — always keep at least one.
+        auto* target = FindNode(nodeId);
+        if (target && target->type == NodeType::Output)
+        {
+            auto outputIds = GetOutputNodeIds();
+            if (outputIds.size() <= 1)
+                return;  // Refuse to delete the last Output node.
+        }
+
         // Remove all edges referencing this node.
         std::erase_if(m_edges, [nodeId](const EffectEdge& e)
         {
@@ -128,6 +137,17 @@ namespace ShaderLab::Graph
                 result.push_back(&e);
         }
         return result;
+    }
+
+    std::vector<uint32_t> EffectGraph::GetOutputNodeIds() const
+    {
+        std::vector<uint32_t> ids;
+        for (const auto& node : m_nodes)
+        {
+            if (node.type == NodeType::Output)
+                ids.push_back(node.id);
+        }
+        return ids;
     }
 
     // -----------------------------------------------------------------------

@@ -207,6 +207,10 @@ namespace winrt::ShaderLab::implementation
 
         m_traceSwapChain = nullptr;
         m_traceSwatchTarget = nullptr;
+
+        // Close all output windows.
+        m_outputWindows.clear();
+
         m_falseColor.Release();
         m_toneMapper.Release();
         m_graphEvaluator.ReleaseCache();
@@ -915,6 +919,37 @@ namespace winrt::ShaderLab::implementation
             }
 
             flyout.Items().Append(slGroup);
+        }
+
+        // ---- Add Output Node ----
+        {
+            auto sep = winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutSeparator();
+            flyout.Items().Append(sep);
+
+            auto outputItem = MUX::MenuFlyoutItem();
+            outputItem.Text(L"\U0001F5BC Output Window");
+            outputItem.Click([this](auto&&, auto&&)
+            {
+                // Create a new Output node with auto-incrementing name.
+                auto outputIds = m_graph.GetOutputNodeIds();
+                std::wstring name = L"Output";
+                if (!outputIds.empty())
+                    name = L"Output " + std::to_wstring(outputIds.size() + 1);
+
+                ::ShaderLab::Graph::EffectNode outputNode;
+                outputNode.name = name;
+                outputNode.type = ::ShaderLab::Graph::NodeType::Output;
+                outputNode.inputPins = { { L"Input", 0 } };
+                auto nodeId = m_nodeGraphController.AddNode(std::move(outputNode), { 0.0f, 0.0f });
+
+                m_graph.MarkAllDirty();
+                m_nodeGraphController.RebuildLayout();
+                PopulatePreviewNodeSelector();
+
+                // Auto-open an output window for the new node.
+                OpenOutputWindow(nodeId);
+            });
+            flyout.Items().Append(outputItem);
         }
 
         // ---- Custom Effects (duplicate existing) ----
@@ -4601,6 +4636,9 @@ namespace winrt::ShaderLab::implementation
         m_renderEngine.EndDraw();
         m_renderEngine.Present();
 
+        // Present to any open output windows.
+        PresentOutputWindows();
+
         // Refresh pixel trace after graph evaluation (before next frame).
         if (m_traceActive)
         {
@@ -4609,5 +4647,63 @@ namespace winrt::ShaderLab::implementation
         }
         // Update crosshair position each frame (tracks with pan/zoom).
         UpdateCrosshairOverlay();
+    }
+
+    // -----------------------------------------------------------------------
+    // Output windows
+    // -----------------------------------------------------------------------
+
+    void MainWindow::OpenOutputWindow(uint32_t nodeId)
+    {
+        // Don't open duplicates.
+        for (const auto& w : m_outputWindows)
+        {
+            if (w->NodeId() == nodeId && w->IsOpen())
+                return;
+        }
+
+        auto* node = m_graph.FindNode(nodeId);
+        if (!node) return;
+
+        auto window = std::make_unique<::ShaderLab::Controls::OutputWindow>();
+        window->Create(
+            m_renderEngine.D3DDevice(),
+            m_renderEngine.D2DDeviceContext(),
+            m_renderEngine.DXGIFactory(),
+            nodeId,
+            node->name,
+            m_renderEngine.ActiveFormat());
+
+        m_outputWindows.push_back(std::move(window));
+    }
+
+    void MainWindow::CloseOutputWindow(uint32_t nodeId)
+    {
+        std::erase_if(m_outputWindows, [nodeId](const auto& w)
+        {
+            return w->NodeId() == nodeId;
+        });
+    }
+
+    void MainWindow::PresentOutputWindows()
+    {
+        if (m_outputWindows.empty())
+            return;
+
+        // Remove closed windows.
+        std::erase_if(m_outputWindows, [](const auto& w) { return !w->IsOpen(); });
+
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (!dc) return;
+
+        for (auto& window : m_outputWindows)
+        {
+            if (!window->IsReady())
+                continue;
+
+            // Resolve the node's output image (with tone mapping for Output nodes).
+            auto* image = ResolveDisplayImage(window->NodeId());
+            window->Present(dc, image);
+        }
     }
 }

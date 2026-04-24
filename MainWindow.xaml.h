@@ -15,6 +15,7 @@
 #include "Controls/NodeGraphController.h"
 #include "Controls/PixelInspectorController.h"
 #include "Controls/PixelTraceController.h"
+#include "Controls/OutputWindow.h"
 #include "EffectDesignerWindow.xaml.h"
 #include "ShaderLab/McpHttpServer.h"
 
@@ -149,6 +150,12 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Controls::NodeGraphController       m_nodeGraphController;
         ::ShaderLab::Controls::PixelInspectorController  m_pixelInspector;
         ::ShaderLab::Controls::PixelTraceController      m_pixelTrace;
+
+        // Output windows (one per additional Output node).
+        std::vector<std::unique_ptr<::ShaderLab::Controls::OutputWindow>> m_outputWindows;
+        void OpenOutputWindow(uint32_t nodeId);
+        void CloseOutputWindow(uint32_t nodeId);
+        void PresentOutputWindows();
 
         // Render loop timer.
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer m_renderTimer{ nullptr };

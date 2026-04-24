@@ -49,6 +49,9 @@ namespace ShaderLab::Graph
         // Throws std::logic_error if the graph contains a cycle.
         std::vector<uint32_t> TopologicalSort() const;
 
+        // Returns IDs of all Output nodes in the graph.
+        std::vector<uint32_t> GetOutputNodeIds() const;
+
         // Returns true if adding an edge from srcId to dstId would create a cycle.
         bool WouldCreateCycle(uint32_t srcId, uint32_t dstId) const;
 

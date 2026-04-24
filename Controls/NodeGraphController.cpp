@@ -457,9 +457,7 @@ namespace ShaderLab::Controls
         if (!m_graph) return;
         for (const auto& node : m_graph->Nodes())
         {
-            // Never select the Output node — it can't be deleted.
-            if (node.type != Graph::NodeType::Output)
-                m_selection.selectedNodeIds.insert(node.id);
+            m_selection.selectedNodeIds.insert(node.id);
         }
         m_needsRedraw = true;
     }
@@ -470,10 +468,7 @@ namespace ShaderLab::Controls
 
         for (uint32_t nodeId : m_selection.selectedNodeIds)
         {
-            // Protect the Output node from deletion.
-            auto* node = m_graph->FindNode(nodeId);
-            if (node && node->type == Graph::NodeType::Output)
-                continue;
+            // RemoveNode() already protects the last Output node.
             m_graph->RemoveNode(nodeId);
             m_visuals.erase(nodeId);
         }

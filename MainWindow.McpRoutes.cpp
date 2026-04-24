@@ -547,6 +547,7 @@ namespace winrt::ShaderLab::implementation
                 return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                     m_graph.RemoveNode(nodeId);
                     m_graphEvaluator.InvalidateNode(nodeId);
+                    CloseOutputWindow(nodeId);
                     m_graph.MarkAllDirty();
                     m_nodeGraphController.AutoLayout();
                     PopulatePreviewNodeSelector();
