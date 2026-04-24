@@ -772,6 +772,9 @@ namespace winrt::ShaderLab::implementation
         m_compareActive = false;
         m_compareNodeId = 0;
 
+        // Close all existing output windows.
+        m_outputWindows.clear();
+
         m_nodeGraphController.SetGraph(&m_graph);
         m_graph.MarkAllDirty();
         PopulatePreviewNodeSelector();
@@ -789,6 +792,15 @@ namespace winrt::ShaderLab::implementation
         // produces valid cachedOutput (image bounds aren't available yet).
         m_needsFitPreview = true;
         UpdateStatusBar();
+
+        // Reopen output windows for any additional Output nodes in the loaded graph.
+        auto outputIds = m_graph.GetOutputNodeIds();
+        if (outputIds.size() > 1)
+        {
+            // Skip the first Output node (displayed in the main preview).
+            for (size_t i = 1; i < outputIds.size(); ++i)
+                OpenOutputWindow(outputIds[i]);
+        }
     }
 
     // -----------------------------------------------------------------------
