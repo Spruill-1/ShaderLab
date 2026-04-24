@@ -25,36 +25,68 @@ namespace ShaderLab::Controls
         m_nodeId = nodeId;
         m_format = format;
 
-        // Create WinUI 3 window.
-        m_window = winrt::Microsoft::UI::Xaml::Window();
-        m_window.Title(winrt::hstring(nodeName));
-
-        // Create SwapChainPanel as the window content.
-        m_panel = winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel();
-        m_panel.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(
-            winrt::Windows::UI::Color{ 255, 0, 0, 0 }));
-
-        m_window.Content(m_panel);
-
-        // Defer swap chain creation until the panel has loaded and has a size.
-        m_sizeChangedToken = m_panel.SizeChanged({ this, &OutputWindow::OnPanelSizeChanged });
-
-        // Handle window close.
-        m_closedToken = m_window.Closed([this](auto&&, auto&&)
+        try
         {
-            m_isOpen = false;
-        });
+            // Create WinUI 3 window.
+            m_window = winrt::Microsoft::UI::Xaml::Window();
+            m_window.Title(winrt::hstring(nodeName));
 
-        // Set a default size and activate.
-        m_window.AppWindow().Resize(winrt::Windows::Graphics::SizeInt32{ 800, 600 });
-        m_window.Activate();
-        m_isOpen = true;
+            // Create SwapChainPanel as the window content.
+            m_panel = winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel();
+
+            m_window.Content(m_panel);
+
+            // Handle window close.
+            m_closedToken = m_window.Closed([this](auto&&, auto&&)
+            {
+                m_isOpen = false;
+            });
+
+            // Wait for the panel to be fully loaded before creating DXGI resources.
+            m_panel.Loaded([this](auto&&, auto&&)
+            {
+                try
+                {
+                    auto scale = static_cast<double>(m_panel.CompositionScaleX());
+                    m_width = static_cast<uint32_t>((std::max)(1.0, m_panel.ActualWidth() * scale));
+                    m_height = static_cast<uint32_t>((std::max)(1.0, m_panel.ActualHeight() * scale));
+
+                    if (m_width > 0 && m_height > 0)
+                    {
+                        CreateSwapChain();
+                        CreateRenderTarget();
+                    }
+
+                    // Now register SizeChanged for future resizes.
+                    m_sizeChangedToken = m_panel.SizeChanged(
+                        { this, &OutputWindow::OnPanelSizeChanged });
+                }
+                catch (...)
+                {
+                    OutputDebugStringW(L"[OutputWindow] Failed to create swap chain on Loaded\n");
+                }
+            });
+
+            // Activate the window.
+            m_window.AppWindow().Resize(winrt::Windows::Graphics::SizeInt32{ 800, 600 });
+            m_window.Activate();
+            m_isOpen = true;
+        }
+        catch (const winrt::hresult_error& ex)
+        {
+            OutputDebugStringW(std::format(L"[OutputWindow] Create failed: {}\n",
+                std::wstring_view(ex.message())).c_str());
+            m_isOpen = false;
+        }
     }
 
     void OutputWindow::Present(ID2D1DeviceContext5* dc, ID2D1Image* image)
     {
-        if (!m_isOpen || !m_swapChain || !m_renderTarget)
+        if (!m_isOpen || !dc || !m_swapChain || !m_renderTarget)
             return;
+
+        try
+        {
 
         // Handle pending resize.
         if (m_needsResize)
@@ -131,24 +163,35 @@ namespace ShaderLab::Controls
         dc->SetTarget(oldTarget.get());
         dc->SetDpi(oldDpiX, oldDpiY);
         dc->SetTransform(&oldTransform);
+        }
+        catch (const winrt::hresult_error& ex)
+        {
+            OutputDebugStringW(std::format(L"[OutputWindow] Present failed: {}\n",
+                std::wstring_view(ex.message())).c_str());
+        }
+        catch (...) {}
     }
 
     void OutputWindow::Close()
     {
-        if (!m_isOpen && !m_window)
-            return;
-
+        m_isOpen = false;
         ReleaseRenderTarget();
         m_swapChain = nullptr;
 
         if (m_window)
         {
-            try { m_window.Close(); } catch (...) {}
+            try
+            {
+                // Unregister events before closing.
+                if (m_panel && m_sizeChangedToken.value != 0)
+                    m_panel.SizeChanged(m_sizeChangedToken);
+                m_window.Close();
+            }
+            catch (...) {}
             m_window = nullptr;
         }
 
         m_panel = nullptr;
-        m_isOpen = false;
     }
 
     void OutputWindow::SetTitle(const std::wstring& title)
