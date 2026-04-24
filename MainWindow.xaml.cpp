@@ -95,12 +95,31 @@ namespace winrt::ShaderLab::implementation
         NodeGraphContainer().PointerWheelChanged({ this, &MainWindow::OnGraphPanelPointerWheel });
         NodeGraphContainer().KeyDown([this](auto&&, winrt::Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const& args)
         {
-            if (args.Key() == winrt::Windows::System::VirtualKey::Delete && m_selectedNodeId != 0)
+            auto key = args.Key();
+            auto ctrlState = winrt::Microsoft::UI::Input::InputKeyboardSource::GetKeyStateForCurrentThread(
+                winrt::Windows::System::VirtualKey::Control);
+            bool ctrlDown = (static_cast<uint32_t>(ctrlState) & static_cast<uint32_t>(winrt::Windows::UI::Core::CoreVirtualKeyStates::Down)) != 0;
+
+            // Ctrl+A: select all nodes (except Output).
+            if (ctrlDown && key == winrt::Windows::System::VirtualKey::A)
             {
-                // Protect the Output node from deletion.
-                const auto* node = m_graph.FindNode(m_selectedNodeId);
-                if (node && node->type == ::ShaderLab::Graph::NodeType::Output)
-                    return;
+                m_nodeGraphController.SelectAll();
+                args.Handled(true);
+                return;
+            }
+
+            // Delete: remove all selected nodes (or single selected node).
+            if (key == winrt::Windows::System::VirtualKey::Delete &&
+                (!m_nodeGraphController.SelectedNodes().empty() || m_selectedNodeId != 0))
+            {
+                // If only a single node is selected via click (not multi-select), select it for deletion.
+                if (m_nodeGraphController.SelectedNodes().empty() && m_selectedNodeId != 0)
+                {
+                    const auto* node = m_graph.FindNode(m_selectedNodeId);
+                    if (node && node->type == ::ShaderLab::Graph::NodeType::Output)
+                        return;
+                    m_nodeGraphController.SelectNode(m_selectedNodeId);
+                }
 
                 m_nodeGraphController.DeleteSelected();
                 m_selectedNodeId = 0;
