@@ -1174,5 +1174,299 @@ float4 main(
             };
             m_effects.push_back(std::move(desc));
         }
+
+        // ---- False Color Luminance Map ----
+        {
+            static const std::string falseColorHLSL = R"HLSL(
+// False Color Luminance Map — maps nit ranges to distinct colors
+
+cbuffer Constants : register(b0)
+{
+    float Opacity;  // Blend with original (1.0 = full false color)
+};
+
+Texture2D InputTexture : register(t0);
+SamplerState InputSampler : register(s0);
+
+float3 FalseColor(float nits) {
+    // Purple < 0.5 < Blue < 5 < Cyan < 20 < Green < 100 < Yellow < 400 < Orange < 1000 < Red < 4000 < White
+    if (nits < 0.5)   return float3(0.2, 0.0, 0.4);    // Purple — crushed blacks
+    if (nits < 5.0)   return float3(0.0, 0.0, 0.8);    // Blue — deep shadows
+    if (nits < 20.0)  return float3(0.0, 0.6, 0.8);    // Cyan — shadow detail
+    if (nits < 100.0) return float3(0.0, 0.7, 0.0);    // Green — mid-tones (SDR)
+    if (nits < 400.0) return float3(0.9, 0.9, 0.0);    // Yellow — highlights
+    if (nits < 1000.0) return float3(1.0, 0.5, 0.0);   // Orange — HDR specular
+    if (nits < 4000.0) return float3(1.0, 0.0, 0.0);   // Red — bright HDR
+    return float3(1.0, 1.0, 1.0);                       // White — peak HDR
+}
+
+float4 main(
+    float4 pos      : SV_POSITION,
+    float4 posScene : SCENE_POSITION,
+    float4 uv0      : TEXCOORD0
+) : SV_Target
+{
+    float4 color = InputTexture.Sample(InputSampler, uv0.xy);
+    float nits = ScRGBLuminanceNits(color.rgb);
+    float3 fc = FalseColor(nits);
+    float3 result = lerp(color.rgb, fc, Opacity);
+    return float4(result, 1.0);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"False Color";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + falseColorHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"Opacity", L"float", 1.0f, 0.0f, 1.0f, 0.05f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Waveform Monitor ----
+        {
+            static const std::string waveformHLSL = R"HLSL(
+// Waveform Monitor — RGB parade or luminance waveform
+// For each output pixel (x, y), samples the source column x and counts
+// how many source pixels have a value near the level represented by y.
+
+cbuffer Constants : register(b0)
+{
+    float WaveformSize;  // Output height in pixels
+    float Mode;          // 0 = Luma, 1 = RGB Parade, 2 = RGB Overlay
+    float Gain;          // Brightness gain for the waveform traces
+    float MaxNits;       // Max nits for the Y axis (default 1000)
+};
+
+Texture2D InputTexture : register(t0);
+SamplerState InputSampler : register(s0);
+
+float4 main(
+    float4 pos      : SV_POSITION,
+    float4 posScene : SCENE_POSITION,
+    float4 uv0      : TEXCOORD0
+) : SV_Target
+{
+    float2 dims;
+    InputTexture.GetDimensions(dims.x, dims.y);
+    if (dims.x < 1 || dims.y < 1)
+        return float4(0, 0, 0, 1);
+
+    float outW, outH;
+    uint mode = (uint)Mode;
+
+    // Output size: width matches source, height = WaveformSize
+    outW = dims.x;
+    if (mode == 1) outW = dims.x * 3.0; // RGB parade: 3x width
+    outH = WaveformSize;
+
+    // Current pixel in output space
+    float px = uv0.x * outW;
+    float py = uv0.y * outH;
+
+    // Y axis: 0 at bottom, maxNits at top
+    float level = (1.0 - py / outH);  // 0 at bottom, 1 at top
+
+    // Determine which source column and channel(s) to sample
+    float srcCol;
+    int channelMask = 7; // all RGB
+    if (mode == 1) {
+        // RGB Parade: left third = R, middle = G, right = B
+        float third = outW / 3.0;
+        if (px < third)      { srcCol = px; channelMask = 1; }
+        else if (px < 2*third) { srcCol = px - third; channelMask = 2; }
+        else                  { srcCol = px - 2*third; channelMask = 4; }
+    } else {
+        srcCol = px;
+    }
+
+    float u = (srcCol + 0.5) / dims.x;
+
+    // Sample source column and accumulate hits
+    float hitR = 0, hitG = 0, hitB = 0, hitL = 0;
+    float binSize = MaxNits / outH * 2.0; // Tolerance per bin (2 pixels)
+
+    uint samples = min((uint)dims.y, 512); // Cap for performance
+    float step = dims.y / (float)samples;
+
+    for (uint i = 0; i < samples; i++)
+    {
+        float v = ((float)i * step + 0.5) / dims.y;
+        float4 s = InputTexture.SampleLevel(InputSampler, float2(u, v), 0);
+
+        float nitsR = max(0, s.r) * 80.0;
+        float nitsG = max(0, s.g) * 80.0;
+        float nitsB = max(0, s.b) * 80.0;
+        float nitsL = ScRGBLuminanceNits(s.rgb);
+
+        float targetNits = level * MaxNits;
+
+        if (mode == 0) { // Luma
+            if (abs(nitsL - targetNits) < binSize) hitL += 1.0;
+        } else { // RGB
+            if (abs(nitsR - targetNits) < binSize) hitR += 1.0;
+            if (abs(nitsG - targetNits) < binSize) hitG += 1.0;
+            if (abs(nitsB - targetNits) < binSize) hitB += 1.0;
+        }
+    }
+
+    float scale = Gain / (float)samples * 40.0;
+    float3 color;
+
+    if (mode == 0) {
+        float lum = hitL * scale;
+        color = float3(lum, lum, lum);
+    } else if (mode == 1) {
+        // Parade: show only the relevant channel
+        if (channelMask == 1)      color = float3(hitR * scale, 0, 0);
+        else if (channelMask == 2) color = float3(0, hitG * scale, 0);
+        else                       color = float3(0, 0, hitB * scale);
+    } else {
+        // Overlay: all channels on top of each other
+        color = float3(hitR * scale, hitG * scale, hitB * scale);
+    }
+
+    // Draw horizontal reference lines at key nit levels
+    float lineAlpha = 0.0;
+    float nitsAtY = level * MaxNits;
+    float lineThick = MaxNits / outH * 0.5;
+    if (abs(nitsAtY - 80.0) < lineThick)   lineAlpha = 0.15; // SDR white
+    if (abs(nitsAtY - 203.0) < lineThick)  lineAlpha = 0.15; // HDR reference
+    if (abs(nitsAtY - 1000.0) < lineThick) lineAlpha = 0.15; // 1000 nits
+
+    color += float3(lineAlpha, lineAlpha, lineAlpha);
+
+    // Dark background
+    float bg = 0.02;
+    color = max(color, float3(bg, bg, bg));
+
+    return float4(color, 1.0);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Waveform Monitor";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + waveformHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"WaveformSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
+                { L"Mode",     L"uint", uint32_t(1), 0.0f, 2.0f, 1.0f, { L"Luminance", L"RGB Parade", L"RGB Overlay" } },
+                { L"Gain",     L"float", 1.0f, 0.1f, 10.0f, 0.1f },
+                { L"MaxNits",  L"float", 1000.0f, 80.0f, 10000.0f, 100.0f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Gamut Volume Coverage ----
+        {
+            static const std::string gamutCoverageHLSL = R"HLSL(
+// Gamut Volume Coverage — visualizes which gamut regions are occupied
+// Shows a CIE xy diagram with dots for occupied chromaticities
+
+cbuffer Constants : register(b0)
+{
+    float DiagramSize; // output size in pixels
+    float TargetGamut; // 0 = sRGB, 1 = DCI-P3, 2 = BT.2020
+};
+
+Texture2D InputTexture : register(t0);
+SamplerState InputSampler : register(s0);
+
+// Draw triangle outline
+float TriangleEdge(float2 p, float2 a, float2 b, float lineW) {
+    float2 ab = b - a;
+    float t = saturate(dot(p - a, ab) / dot(ab, ab));
+    float d = length(p - a - ab * t);
+    return smoothstep(lineW, 0.0, d);
+}
+
+float4 main(
+    float4 pos      : SV_POSITION,
+    float4 posScene : SCENE_POSITION,
+    float4 uv0      : TEXCOORD0
+) : SV_Target
+{
+    float2 dims;
+    InputTexture.GetDimensions(dims.x, dims.y);
+
+    float size = max(DiagramSize, 256.0);
+    float2 uv = uv0.xy * size;
+
+    // CIE xy mapping: x=[0,0.8], y=[0,0.9] (same as CIE plot)
+    float2 cie_xy = float2(uv.x / size * 0.8, (1.0 - uv.y / size) * 0.9);
+
+    float3 bg = float3(0.05, 0.05, 0.05);
+
+    // Draw target gamut triangle
+    float2 tR, tG, tB;
+    uint gamut = (uint)TargetGamut;
+    if (gamut == 1)      { tR = GAMUT_P3_R; tG = GAMUT_P3_G; tB = GAMUT_P3_B; }
+    else if (gamut == 2) { tR = GAMUT_2020_R; tG = GAMUT_2020_G; tB = GAMUT_2020_B; }
+    else                 { tR = GAMUT_709_R; tG = GAMUT_709_G; tB = GAMUT_709_B; }
+
+    float lineW = 0.003;
+    float edge = TriangleEdge(cie_xy, tR, tG, lineW)
+               + TriangleEdge(cie_xy, tG, tB, lineW)
+               + TriangleEdge(cie_xy, tB, tR, lineW);
+    bg += float3(0.3, 0.3, 0.3) * saturate(edge);
+
+    // Sample source image and scatter chromaticities
+    float hitInGamut = 0;
+    float hitOutGamut = 0;
+    uint sampleCount = min((uint)(dims.x * dims.y), 65536u);
+    uint sqrtSamples = (uint)ceil(sqrt((float)sampleCount));
+    float stepX = dims.x / (float)sqrtSamples;
+    float stepY = dims.y / (float)sqrtSamples;
+
+    float dotRadius = 0.004;
+
+    for (uint sy = 0; sy < sqrtSamples; sy++)
+    {
+        for (uint sx = 0; sx < sqrtSamples; sx++)
+        {
+            float2 suv = float2((sx * stepX + 0.5) / dims.x, (sy * stepY + 0.5) / dims.y);
+            float4 s = InputTexture.SampleLevel(InputSampler, suv, 0);
+            float3 xyz = ScRGBToXYZ(max(s.rgb, 0.0));
+            float sum = xyz.x + xyz.y + xyz.z;
+            if (sum < 1e-6) continue;
+            float2 sxy = float2(xyz.x / sum, xyz.y / sum);
+
+            float d = length(cie_xy - sxy);
+            if (d < dotRadius)
+            {
+                bool inGamut = PointInTriangle(sxy, tR, tG, tB);
+                if (inGamut) hitInGamut += 1.0;
+                else hitOutGamut += 1.0;
+            }
+        }
+    }
+
+    float3 color = bg;
+    if (hitInGamut > 0)
+        color += float3(0.0, 0.8, 0.0) * min(hitInGamut * 0.5, 1.0);
+    if (hitOutGamut > 0)
+        color += float3(1.0, 0.2, 0.0) * min(hitOutGamut * 0.5, 1.0);
+
+    return float4(color, 1.0);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Gamut Coverage";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + gamutCoverageHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"DiagramSize",  L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
+                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
+            };
+            m_effects.push_back(std::move(desc));
+        }
     }
 }
