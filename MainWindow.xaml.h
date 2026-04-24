@@ -5,7 +5,6 @@
 #include "Rendering/DisplayMonitor.h"
 #include "Rendering/GraphEvaluator.h"
 #include "Rendering/ToneMapper.h"
-#include "Rendering/FalseColorOverlay.h"
 #include "Graph/EffectGraph.h"
 #include "Effects/EffectRegistry.h"
 #include "Effects/SourceNodeFactory.h"
@@ -51,7 +50,6 @@ namespace winrt::ShaderLab::implementation
         void UpdateStatusBar();
         void PopulatePreviewNodeSelector();
         void PopulateDisplayProfileSelector();
-        void PopulateCompareNodeSelector();
         ID2D1Image* GetPreviewImage();
         ID2D1Image* ResolveDisplayImage(uint32_t nodeId);
 
@@ -84,9 +82,6 @@ namespace winrt::ShaderLab::implementation
         void OnPreviewKeyDown(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const& args);
-        void OnFalseColorSelectionChanged(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
         void OnDisplayProfileSelectionChanged(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
@@ -115,12 +110,6 @@ namespace winrt::ShaderLab::implementation
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
         void OnNodeAdded(uint32_t nodeId);
-        void OnCompareToggled(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
-        void OnCompareNodeSelectionChanged(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
         void OnPreviewPointerDragged(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
@@ -139,7 +128,6 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Rendering::DisplayMonitor     m_displayMonitor;
         ::ShaderLab::Rendering::GraphEvaluator     m_graphEvaluator;
         ::ShaderLab::Rendering::ToneMapper         m_toneMapper;
-        ::ShaderLab::Rendering::FalseColorOverlay  m_falseColor;
 
         // Effect graph.
         ::ShaderLab::Graph::EffectGraph         m_graph;
@@ -189,13 +177,6 @@ namespace winrt::ShaderLab::implementation
         uint32_t m_traceUnit{ 0 };          // 0=scRGB, 1=sRGB, 2=Nits, 3=PQ
         uint32_t m_lastTraceTopologyHash{ 0 };
         std::vector<winrt::Microsoft::UI::Xaml::Controls::Grid> m_traceRowCache;
-
-        // Split comparison.
-        bool m_compareActive{ false };
-        uint32_t m_compareNodeId{ 0 };
-        float m_splitPosition{ 0.5f };  // 0.0–1.0 within image bounds
-        bool m_isDraggingSplit{ false };
-        bool m_suppressCompareEvent{ false };
 
         // Node graph editor rendering.
         winrt::com_ptr<IDXGISwapChain1>     m_graphSwapChain;

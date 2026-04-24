@@ -30,8 +30,6 @@ namespace winrt::ShaderLab::implementation
         PreviewPanel().KeyDown({ this, &MainWindow::OnPreviewKeyDown });
         PreviewPanel().IsTabStop(true);
         PreviewNodeSelector().SelectionChanged({ this, &MainWindow::OnPreviewNodeSelectionChanged });
-        FalseColorSelector().SelectedIndex(0);
-        FalseColorSelector().SelectionChanged({ this, &MainWindow::OnFalseColorSelectionChanged });
 
         PopulateDisplayProfileSelector();
         DisplayProfileSelector().SelectionChanged({ this, &MainWindow::OnDisplayProfileSelectionChanged });
@@ -63,20 +61,9 @@ namespace winrt::ShaderLab::implementation
         // Populate the Add Node flyout with effects from the registry.
         PopulateAddNodeFlyout();
 
-        CompareToggle().Click({ this, &MainWindow::OnCompareToggled });
-        CompareNodeSelector().SelectionChanged({ this, &MainWindow::OnCompareNodeSelectionChanged });
-
-        // Compare and Pixel Trace are mutually exclusive.
         BottomTabView().SelectionChanged([this](auto&&, auto&&)
         {
             if (m_isShuttingDown) return;
-            if (BottomTabView().SelectedIndex() == 1 && m_compareActive)
-            {
-                // Switching to Pixel Trace → disable compare.
-                m_compareActive = false;
-                CompareToggle().IsChecked(false);
-                CompareToolbar().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
-            }
             UpdateCrosshairOverlay();
         });
 
@@ -211,7 +198,6 @@ namespace winrt::ShaderLab::implementation
         // Close all output windows.
         m_outputWindows.clear();
 
-        m_falseColor.Release();
         m_toneMapper.Release();
         m_graphEvaluator.ReleaseCache();
         m_displayMonitor.Shutdown();
@@ -255,7 +241,6 @@ namespace winrt::ShaderLab::implementation
                 auto caps = m_displayMonitor.CachedCapabilities();
                 m_toneMapper.SetDisplayMaxLuminance(caps.maxLuminanceNits);
                 m_toneMapper.SetSDRWhiteLevel(caps.sdrWhiteLevelNits);
-                m_falseColor.SetDisplayMaxLuminance(caps.maxLuminanceNits);
                 // Re-evaluate graph so effects using monitor gamut (e.g. OOG)
                 // pick up the new primaries.
                 m_graph.MarkAllDirty();
@@ -322,11 +307,9 @@ namespace winrt::ShaderLab::implementation
         if (m_renderEngine.D2DDeviceContext())
         {
             m_toneMapper.Initialize(m_renderEngine.D2DDeviceContext());
-            m_falseColor.Initialize(m_renderEngine.D2DDeviceContext());
             auto caps = m_displayMonitor.CachedCapabilities();
             m_toneMapper.SetDisplayMaxLuminance(caps.maxLuminanceNits);
             m_toneMapper.SetSDRWhiteLevel(caps.sdrWhiteLevelNits);
-            m_falseColor.SetDisplayMaxLuminance(caps.maxLuminanceNits);
         }
 
         // Start render loop.
@@ -485,21 +468,6 @@ namespace winrt::ShaderLab::implementation
         return nullptr;
     }
 
-    void MainWindow::OnFalseColorSelectionChanged(
-        winrt::Windows::Foundation::IInspectable const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& /*args*/)
-    {
-        auto idx = FalseColorSelector().SelectedIndex();
-        switch (idx)
-        {
-        case 0:  m_falseColor.SetMode(::ShaderLab::Rendering::FalseColorMode::None); break;
-        case 1:  m_falseColor.SetMode(::ShaderLab::Rendering::FalseColorMode::Clipping); break;
-        case 2:  m_falseColor.SetMode(::ShaderLab::Rendering::FalseColorMode::LuminanceZones); break;
-        case 3:  m_falseColor.SetMode(::ShaderLab::Rendering::FalseColorMode::OutOfGamut); break;
-        default: m_falseColor.SetMode(::ShaderLab::Rendering::FalseColorMode::None); break;
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Display profile selection
     // -----------------------------------------------------------------------
@@ -543,7 +511,6 @@ namespace winrt::ShaderLab::implementation
         auto caps = m_displayMonitor.CachedCapabilities();
         m_toneMapper.SetDisplayMaxLuminance(caps.maxLuminanceNits);
         m_toneMapper.SetSDRWhiteLevel(caps.sdrWhiteLevelNits);
-        m_falseColor.SetDisplayMaxLuminance(caps.maxLuminanceNits);
         m_graph.MarkAllDirty();
         m_forceRender = true;
         UpdateStatusBar();
@@ -555,7 +522,6 @@ namespace winrt::ShaderLab::implementation
         auto caps = m_displayMonitor.CachedCapabilities();
         m_toneMapper.SetDisplayMaxLuminance(caps.maxLuminanceNits);
         m_toneMapper.SetSDRWhiteLevel(caps.sdrWhiteLevelNits);
-        m_falseColor.SetDisplayMaxLuminance(caps.maxLuminanceNits);
         m_graph.MarkAllDirty();
         m_forceRender = true;
         UpdateStatusBar();
@@ -769,8 +735,6 @@ namespace winrt::ShaderLab::implementation
         m_traceActive = false;
         m_lastTraceTopologyHash = 0;
         m_traceRowCache.clear();
-        m_compareActive = false;
-        m_compareNodeId = 0;
 
         // Close all existing output windows.
         m_outputWindows.clear();
@@ -778,11 +742,6 @@ namespace winrt::ShaderLab::implementation
         m_nodeGraphController.SetGraph(&m_graph);
         m_graph.MarkAllDirty();
         PopulatePreviewNodeSelector();
-        PopulateCompareNodeSelector();
-
-        // Reset compare UI.
-        CompareToggle().IsChecked(false);
-        CompareToolbar().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
 
         // Reset trace UI.
         PixelTracePanel().Children().Clear();
@@ -1106,36 +1065,11 @@ namespace winrt::ShaderLab::implementation
         m_graph.MarkAllDirty();
         m_nodeGraphController.RebuildLayout();
         PopulatePreviewNodeSelector();
-        if (m_compareActive)
-            PopulateCompareNodeSelector();
     }
 
     // -----------------------------------------------------------------------
     // Split comparison
     // -----------------------------------------------------------------------
-
-    void MainWindow::PopulateCompareNodeSelector()
-    {
-        m_suppressCompareEvent = true;
-        auto selector = CompareNodeSelector();
-        selector.Items().Clear();
-
-        for (uint32_t nodeId : m_topoOrder)
-        {
-            const auto* node = m_graph.FindNode(nodeId);
-            if (!node) continue;
-
-            auto label = node->name.empty()
-                ? std::format(L"Node {}", nodeId)
-                : node->name;
-            selector.Items().Append(winrt::box_value(winrt::hstring(label)));
-        }
-
-        if (selector.Items().Size() > 0)
-            selector.SelectedIndex(0);
-
-        m_suppressCompareEvent = false;
-    }
 
     ID2D1Image* MainWindow::ResolveDisplayImage(uint32_t nodeId)
     {
@@ -1157,68 +1091,14 @@ namespace winrt::ShaderLab::implementation
         if (isOutput && m_toneMapper.IsActive())
             image = m_toneMapper.Apply(image);
 
-        // Apply false-color overlay if active.
-        if (m_falseColor.IsActive())
-            image = m_falseColor.Apply(image);
-
         return image;
-    }
-
-    void MainWindow::OnCompareToggled(
-        winrt::Windows::Foundation::IInspectable const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::RoutedEventArgs const& /*args*/)
-    {
-        m_compareActive = CompareToggle().IsChecked().GetBoolean();
-
-        if (m_compareActive)
-        {
-            PopulateCompareNodeSelector();
-            CompareToolbar().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
-            m_splitPosition = 0.5f;
-
-            // Set compare node from the selector (event was suppressed during populate).
-            auto idx = CompareNodeSelector().SelectedIndex();
-            if (idx >= 0 && static_cast<uint32_t>(idx) < m_topoOrder.size())
-                m_compareNodeId = m_topoOrder[static_cast<uint32_t>(idx)];
-
-            // Switch away from Pixel Trace tab (mutually exclusive).
-            if (BottomTabView().SelectedIndex() == 1)
-                BottomTabView().SelectedIndex(0);
-
-            m_traceActive = false;
-            UpdateCrosshairOverlay();
-        }
-        else
-        {
-            CompareToolbar().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
-        }
-    }
-
-    void MainWindow::OnCompareNodeSelectionChanged(
-        winrt::Windows::Foundation::IInspectable const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& /*args*/)
-    {
-        if (m_suppressCompareEvent) return;
-
-        auto idx = CompareNodeSelector().SelectedIndex();
-        if (idx >= 0 && static_cast<uint32_t>(idx) < m_topoOrder.size())
-            m_compareNodeId = m_topoOrder[static_cast<uint32_t>(idx)];
     }
 
     void MainWindow::OnPreviewPointerDragged(
         winrt::Windows::Foundation::IInspectable const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
+        winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& /*args*/)
     {
-        if (!m_isDraggingSplit || !m_compareActive) return;
-
-        auto point = args.GetCurrentPoint(PreviewPanel());
-        float px = static_cast<float>(point.Position().X);
-
-        float vpW = PreviewViewportDips().width;
-        if (vpW > 0.0f)
-            m_splitPosition = std::clamp(px / vpW, 0.0f, 1.0f);
-
-        args.Handled(true);
+        // Previously used for split comparison dragging — now a no-op.
     }
 
     void MainWindow::OnPreviewPointerReleased(
@@ -1265,11 +1145,6 @@ namespace winrt::ShaderLab::implementation
                     UpdateCrosshairOverlay();
                 }
             }
-        }
-        if (m_isDraggingSplit)
-        {
-            m_isDraggingSplit = false;
-            PreviewPanel().ReleasePointerCapture(args.Pointer());
         }
     }
 
@@ -1358,21 +1233,6 @@ namespace winrt::ShaderLab::implementation
     {
         auto point = args.GetCurrentPoint(PreviewPanel());
         bool isPixelTraceTab = (BottomTabView().SelectedIndex() == 1);
-
-        // Check for compare split line drag (only when compare is active and NOT on Pixel Trace tab).
-        if (m_compareActive && !isPixelTraceTab && point.Properties().IsLeftButtonPressed())
-        {
-            float px = static_cast<float>(point.Position().X);
-            auto vp = PreviewViewportDips();
-            float splitScreenX = vp.width * m_splitPosition;
-            if (std::abs(px - splitScreenX) < 10.0f)
-            {
-                m_isDraggingSplit = true;
-                PreviewPanel().CapturePointer(args.Pointer());
-                args.Handled(true);
-                return;
-            }
-        }
 
         // Left or middle button → start pan (click without drag triggers pixel trace on release).
         if (point.Properties().IsMiddleButtonPressed() || point.Properties().IsLeftButtonPressed())
@@ -1696,13 +1556,6 @@ namespace winrt::ShaderLab::implementation
     {
         if (!m_renderEngine.IsInitialized()) return;
 
-        // Handle compare split-line dragging (takes priority over pan).
-        if (m_isDraggingSplit && m_compareActive)
-        {
-            OnPreviewPointerDragged(sender, args);
-            return;
-        }
-
         // Handle preview pan.
         if (m_isPreviewPanning)
         {
@@ -1717,13 +1570,6 @@ namespace winrt::ShaderLab::implementation
             m_previewPanY = m_previewPanOriginY + dy;
             m_forceRender = true;
             args.Handled(true);
-            return;
-        }
-
-        // Handle split-line dragging.
-        if (m_isDraggingSplit && m_compareActive)
-        {
-            OnPreviewPointerDragged(sender, args);
             return;
         }
 
@@ -4590,57 +4436,9 @@ namespace winrt::ShaderLab::implementation
             D2D1::Matrix3x2F::Translation(m_previewPanX, m_previewPanY);
         drawDc->SetTransform(previewTransform);
 
-        if (m_compareActive && m_compareNodeId != 0)
-        {
-            // Split comparison mode: A on left, B on right.
-            auto* imageA = ResolveDisplayImage(m_previewNodeId);
-            auto* imageB = ResolveDisplayImage(m_compareNodeId);
-
-            // Split line in viewport coordinates (pre-transform).
-            drawDc->SetTransform(D2D1::Matrix3x2F::Identity());
-            auto vp = PreviewViewportDips();
-            float vpW = vp.width;
-            float vpH = vp.height;
-            float splitX = vpW * m_splitPosition;
-
-            if (imageA)
-            {
-                D2D1_RECT_F clipA = { 0, 0, splitX, vpH };
-                drawDc->PushAxisAlignedClip(clipA, D2D1_ANTIALIAS_MODE_ALIASED);
-                drawDc->SetTransform(previewTransform);
-                drawDc->DrawImage(imageA);
-                drawDc->SetTransform(D2D1::Matrix3x2F::Identity());
-                drawDc->PopAxisAlignedClip();
-            }
-
-            if (imageB)
-            {
-                D2D1_RECT_F clipB = { splitX, 0, vpW, vpH };
-                drawDc->PushAxisAlignedClip(clipB, D2D1_ANTIALIAS_MODE_ALIASED);
-                drawDc->SetTransform(previewTransform);
-                drawDc->DrawImage(imageB);
-                drawDc->SetTransform(D2D1::Matrix3x2F::Identity());
-                drawDc->PopAxisAlignedClip();
-            }
-
-            // Draw split line (no transform — viewport coords).
-            winrt::com_ptr<ID2D1SolidColorBrush> lineBrush;
-            drawDc->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White, 0.8f), lineBrush.put());
-            if (lineBrush)
-            {
-                drawDc->DrawLine(
-                    D2D1::Point2F(splitX, 0),
-                    D2D1::Point2F(splitX, vpH),
-                    lineBrush.get(), 2.0f);
-            }
-        }
-        else
-        {
-            // Normal single-image mode.
-            auto* previewImage = ResolveDisplayImage(m_previewNodeId);
-            if (previewImage)
-                drawDc->DrawImage(previewImage);
-        }
+        auto* previewImage = ResolveDisplayImage(m_previewNodeId);
+        if (previewImage)
+            drawDc->DrawImage(previewImage);
 
         drawDc->SetTransform(D2D1::Matrix3x2F::Identity());
         drawDc->SetDpi(oldDpiX, oldDpiY);
