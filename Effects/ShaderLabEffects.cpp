@@ -163,6 +163,30 @@ float3 TurboColormap(float t) {
     return float3(r, g, b);
 }
 
+// D65 reference white in XYZ
+static const float3 D65_XYZ = float3(0.95047, 1.00000, 1.08883);
+
+// CIE Lab helper
+float LabF(float t) {
+    return (t > 0.008856) ? pow(t, 1.0/3.0) : (7.787 * t + 16.0/116.0);
+}
+
+// CIE XYZ -> CIE L*a*b* (D65)
+float3 XYZToLab(float3 xyz) {
+    float fx = LabF(xyz.x / D65_XYZ.x);
+    float fy = LabF(xyz.y / D65_XYZ.y);
+    float fz = LabF(xyz.z / D65_XYZ.z);
+    float L = 116.0 * fy - 16.0;
+    float a = 500.0 * (fx - fy);
+    float b = 200.0 * (fy - fz);
+    return float3(L, a, b);
+}
+
+// scRGB -> CIE L*a*b*
+float3 ScRGBToLab(float3 rgb) {
+    return XYZToLab(ScRGBToXYZ(max(rgb, 0.0)));
+}
+
 // OKLab: linear sRGB -> OKLab
 float3 LinearToOKLab(float3 c) {
     float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
@@ -996,6 +1020,157 @@ float4 main(
             desc.parameters = {
                 { L"ScopeSize",  L"float", 256.0f, 64.0f, 1024.0f, 32.0f },
                 { L"Intensity",  L"float", 1.0f,   0.1f, 5.0f, 0.1f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Delta E Comparator ----
+        {
+            static const std::string deltaEHLSL = R"HLSL(
+// Delta E Comparator — per-pixel color difference between two inputs
+// Supports: CIE76, CIE94, CIEDE2000
+
+cbuffer Constants : register(b0)
+{
+    float Method;    // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000
+    float Scale;     // Multiplier for visualization (higher = more sensitive)
+    float MaxDeltaE; // Clamp for colormap (ΔE at this value = full red)
+};
+
+Texture2D InputTexture : register(t0);   // Reference
+Texture2D InputTexture1 : register(t1);  // Test
+SamplerState InputSampler : register(s0);
+
+// CIE76: simple Euclidean distance in L*a*b*
+float DeltaE76(float3 lab1, float3 lab2) {
+    float3 d = lab1 - lab2;
+    return sqrt(dot(d, d));
+}
+
+// CIE94 (graphic arts)
+float DeltaE94(float3 lab1, float3 lab2) {
+    float dL = lab1.x - lab2.x;
+    float C1 = sqrt(lab1.y * lab1.y + lab1.z * lab1.z);
+    float C2 = sqrt(lab2.y * lab2.y + lab2.z * lab2.z);
+    float dC = C1 - C2;
+    float da = lab1.y - lab2.y;
+    float db = lab1.z - lab2.z;
+    float dH2 = da * da + db * db - dC * dC;
+    float dH = sqrt(max(dH2, 0.0));
+    float SL = 1.0;
+    float SC = 1.0 + 0.045 * C1;
+    float SH = 1.0 + 0.015 * C1;
+    float t1 = dL / SL;
+    float t2 = dC / SC;
+    float t3 = dH / SH;
+    return sqrt(t1*t1 + t2*t2 + t3*t3);
+}
+
+// CIEDE2000
+float DeltaE2000(float3 lab1, float3 lab2) {
+    float L1 = lab1.x, a1 = lab1.y, b1 = lab1.z;
+    float L2 = lab2.x, a2 = lab2.y, b2 = lab2.z;
+
+    float Cab1 = sqrt(a1*a1 + b1*b1);
+    float Cab2 = sqrt(a2*a2 + b2*b2);
+    float Cab_avg = (Cab1 + Cab2) * 0.5;
+    float Cab_avg7 = pow(Cab_avg, 7.0);
+    float G = 0.5 * (1.0 - sqrt(Cab_avg7 / (Cab_avg7 + 6103515625.0))); // 25^7
+
+    float a1p = a1 * (1.0 + G);
+    float a2p = a2 * (1.0 + G);
+    float C1p = sqrt(a1p*a1p + b1*b1);
+    float C2p = sqrt(a2p*a2p + b2*b2);
+
+    float h1p = atan2(b1, a1p);
+    if (h1p < 0.0) h1p += 6.28318530718;
+    float h2p = atan2(b2, a2p);
+    if (h2p < 0.0) h2p += 6.28318530718;
+
+    float dLp = L2 - L1;
+    float dCp = C2p - C1p;
+
+    float dhp;
+    if (C1p * C2p < 1e-10) dhp = 0.0;
+    else {
+        dhp = h2p - h1p;
+        if (dhp > 3.14159265359) dhp -= 6.28318530718;
+        else if (dhp < -3.14159265359) dhp += 6.28318530718;
+    }
+    float dHp = 2.0 * sqrt(C1p * C2p) * sin(dhp * 0.5);
+
+    float Lp_avg = (L1 + L2) * 0.5;
+    float Cp_avg = (C1p + C2p) * 0.5;
+
+    float hp_avg;
+    if (C1p * C2p < 1e-10) hp_avg = h1p + h2p;
+    else {
+        hp_avg = (h1p + h2p) * 0.5;
+        if (abs(h1p - h2p) > 3.14159265359) hp_avg += 3.14159265359;
+    }
+
+    float T = 1.0
+        - 0.17 * cos(hp_avg - 0.52359877559)       // 30°
+        + 0.24 * cos(2.0 * hp_avg)
+        + 0.32 * cos(3.0 * hp_avg + 0.10471975512)  // 6°
+        - 0.20 * cos(4.0 * hp_avg - 1.09955742876);  // 63°
+
+    float Lp50sq = (Lp_avg - 50.0) * (Lp_avg - 50.0);
+    float SL = 1.0 + 0.015 * Lp50sq / sqrt(20.0 + Lp50sq);
+    float SC = 1.0 + 0.045 * Cp_avg;
+    float SH = 1.0 + 0.015 * Cp_avg * T;
+
+    float Cp_avg7 = pow(Cp_avg, 7.0);
+    float RC = 2.0 * sqrt(Cp_avg7 / (Cp_avg7 + 6103515625.0));
+    float hp_deg = hp_avg * 57.29577951; // rad to deg
+    float dtheta = 30.0 * exp(-((hp_deg - 275.0) / 25.0) * ((hp_deg - 275.0) / 25.0));
+    float RT = -sin(2.0 * dtheta * 0.01745329252) * RC;
+
+    float t1 = dLp / SL;
+    float t2 = dCp / SC;
+    float t3 = dHp / SH;
+    return sqrt(t1*t1 + t2*t2 + t3*t3 + RT * t2 * t3);
+}
+
+float4 main(
+    float4 pos      : SV_POSITION,
+    float4 posScene : SCENE_POSITION,
+    float4 uv0      : TEXCOORD0,
+    float4 uv1      : TEXCOORD1
+) : SV_Target
+{
+    float4 ref  = InputTexture.Sample(InputSampler, uv0.xy);
+    float4 test = InputTexture1.Sample(InputSampler, uv1.xy);
+
+    float3 labRef  = ScRGBToLab(ref.rgb);
+    float3 labTest = ScRGBToLab(test.rgb);
+
+    float dE;
+    uint method = (uint)Method;
+    if (method == 1)      dE = DeltaE94(labRef, labTest);
+    else if (method == 2) dE = DeltaE2000(labRef, labTest);
+    else                  dE = DeltaE76(labRef, labTest);
+
+    dE *= Scale;
+
+    // Map to Turbo colormap: 0 = no difference (dark blue), MaxDeltaE = max (red)
+    float t = saturate(dE / max(MaxDeltaE, 0.01));
+    float3 color = TurboColormap(t);
+
+    return float4(color, 1.0);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Delta E Comparator";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + deltaEHLSL;
+            desc.inputNames = { L"Reference", L"Test" };
+            desc.parameters = {
+                { L"Method",    L"uint", uint32_t(2), 0.0f, 2.0f, 1.0f, { L"CIE76", L"CIE94", L"CIEDE2000" } },
+                { L"Scale",     L"float", 1.0f, 0.1f, 10.0f, 0.1f },
+                { L"MaxDeltaE", L"float", 10.0f, 1.0f, 100.0f, 1.0f },
             };
             m_effects.push_back(std::move(desc));
         }
