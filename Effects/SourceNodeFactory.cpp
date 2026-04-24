@@ -84,7 +84,9 @@ namespace ShaderLab::Effects
     void SourceNodeFactory::PrepareSourceNode(
         EffectNode& node,
         ID2D1DeviceContext5* dc,
-        double deltaSeconds)
+        double deltaSeconds,
+        ID3D11Device* d3dDevice,
+        ID3D11DeviceContext* d3dContext)
     {
         if (!dc || node.type != NodeType::Source)
             return;
@@ -118,17 +120,17 @@ namespace ShaderLab::Effects
 
                 auto& provider = m_videoCache[node.id];
 
-                // If the path changed, re-open.
-                if (provider && provider->IsOpen())
+                // If the path changed, close old provider so it re-opens.
+                if (provider && provider->IsOpen() && provider->FilePath() != videoPath)
                 {
-                    // Keep existing provider.
+                    provider.reset();
                 }
 
                 if (!provider)
                 {
                     provider = std::make_unique<VideoSourceProvider>();
                     OutputDebugStringW(std::format(L"[VideoSource] Opening: {}\n", videoPath).c_str());
-                    if (!provider->Open(videoPath, dc))
+                    if (!provider->Open(videoPath, dc, d3dDevice, d3dContext))
                     {
                         node.runtimeError = L"Failed to open video: " + provider->LastError();
                         OutputDebugStringW(std::format(L"[VideoSource] {}\n", node.runtimeError).c_str());
@@ -168,15 +170,9 @@ namespace ShaderLab::Effects
                     if (lv) provider->SetLoop(*lv);
                 }
 
-                // Advance playback clock (cheap — just updates timer).
-                provider->Tick(deltaSeconds);
-
-                // Upload latest decoded frame to D2D bitmap (just a GPU memcpy).
-                provider->UploadIfReady(dc);
-
+                // Tick/Upload now handled by TickAndUploadVideos() — called before graph eval.
+                // Just ensure cachedOutput is set.
                 node.cachedOutput = provider->CurrentBitmap();
-                if (provider->IsPlaying())
-                    node.dirty = true;
               }
               catch (...)
               {
@@ -263,6 +259,34 @@ namespace ShaderLab::Effects
                 return true;
         }
         return false;
+    }
+
+    bool SourceNodeFactory::TickAndUploadVideos(
+        std::vector<Graph::EffectNode>& nodes,
+        ID2D1DeviceContext5* dc,
+        double deltaSeconds)
+    {
+        bool anyNewFrame = false;
+        for (auto& [id, provider] : m_videoCache)
+        {
+            if (!provider || !provider->IsOpen()) continue;
+            provider->Tick(deltaSeconds);
+            if (provider->UploadIfReady(dc))
+            {
+                anyNewFrame = true;
+                // Mark the corresponding node as dirty.
+                for (auto& node : nodes)
+                {
+                    if (node.id == id)
+                    {
+                        node.cachedOutput = provider->CurrentBitmap();
+                        node.dirty = true;
+                        break;
+                    }
+                }
+            }
+        }
+        return anyNewFrame;
     }
 
     VideoSourceProvider* SourceNodeFactory::GetVideoProvider(uint32_t nodeId)

@@ -1030,7 +1030,7 @@ namespace winrt::ShaderLab::implementation
         auto* graphNode = m_graph.FindNode(nodeId);
         if (graphNode && m_renderEngine.D2DDeviceContext())
         {
-            m_sourceFactory.PrepareSourceNode(*graphNode, m_renderEngine.D2DDeviceContext());
+            m_sourceFactory.PrepareSourceNode(*graphNode, m_renderEngine.D2DDeviceContext(), 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
         }
 
         OnNodeAdded(nodeId);
@@ -1048,7 +1048,7 @@ namespace winrt::ShaderLab::implementation
         auto* graphNode = m_graph.FindNode(nodeId);
         if (graphNode && m_renderEngine.D2DDeviceContext())
         {
-            m_sourceFactory.PrepareSourceNode(*graphNode, m_renderEngine.D2DDeviceContext());
+            m_sourceFactory.PrepareSourceNode(*graphNode, m_renderEngine.D2DDeviceContext(), 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
         }
 
         OnNodeAdded(nodeId);
@@ -2383,14 +2383,25 @@ namespace winrt::ShaderLab::implementation
                 : L"(no file)");
             pathText.FontSize(12);
             pathText.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::WrapWholeWords);
-            pathText.Margin({ 0, 0, 0, 4 });
+            pathText.Margin({ 0, 0, 0, 2 });
             panel.Children().Append(pathText);
+
+            // Browse button to change video file.
+            auto browseBtn = Controls::Button();
+            browseBtn.Content(winrt::box_value(L"\U0001F4C2 Browse..."));
+            browseBtn.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+            browseBtn.Margin({ 0, 0, 0, 6 });
+            browseBtn.Click([this, capturedId](auto&&, auto&&)
+            {
+                BrowseVideoForExistingNode(capturedId);
+            });
+            panel.Children().Append(browseBtn);
 
             if (videoProvider && videoProvider->IsOpen())
             {
                 // Video info line.
                 auto infoText = Controls::TextBlock();
-                infoText.Text(std::format(L"{}×{} • {:.1f} fps • {:.1f}s",
+                infoText.Text(std::format(L"{}x{} - {:.1f} fps - {:.1f}s",
                     videoProvider->FrameWidth(), videoProvider->FrameHeight(),
                     videoProvider->FrameRate(), videoProvider->Duration()));
                 infoText.FontSize(11);
@@ -2468,15 +2479,6 @@ namespace winrt::ShaderLab::implementation
                 speedBox.SelectedIndex(selIdx);
                 speedBox.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
                 speedBox.Margin({ 0, 0, 0, 4 });
-                speedBox.SelectionChanged([this, capturedId](auto&&, auto&&)
-                {
-                    // Read current selection from the source combo box.
-                    auto* node = m_graph.FindNode(capturedId);
-                    if (!node) return;
-                    auto* vp = m_sourceFactory.GetVideoProvider(capturedId);
-                    if (!vp) return;
-                    // Speed will be set from properties sync next frame.
-                });
                 speedBox.SelectionChanged([this, capturedId](auto&& sender, auto&&)
                 {
                     auto combo = sender.as<Controls::ComboBox>();
@@ -3813,7 +3815,7 @@ namespace winrt::ShaderLab::implementation
         // Prepare the source (load the image bitmap).
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (dc)
-            m_sourceFactory.PrepareSourceNode(*node, dc);
+            m_sourceFactory.PrepareSourceNode(*node, dc, 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
 
         m_graph.MarkAllDirty();
         m_nodeGraphController.RebuildLayout();
@@ -3856,12 +3858,54 @@ namespace winrt::ShaderLab::implementation
         auto* graphNode = m_graph.FindNode(nodeId);
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (graphNode && dc)
-            m_sourceFactory.PrepareSourceNode(*graphNode, dc);
+            m_sourceFactory.PrepareSourceNode(*graphNode, dc, 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
 
         m_graph.MarkAllDirty();
         m_nodeGraphController.RebuildLayout();
         PopulatePreviewNodeSelector();
         FitPreviewToView();
+    }
+
+    winrt::fire_and_forget MainWindow::BrowseVideoForExistingNode(uint32_t nodeId)
+    {
+        auto strong = get_strong();
+
+        winrt::Windows::Storage::Pickers::FileOpenPicker picker;
+        picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
+        picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::VideosLibrary);
+        picker.FileTypeFilter().Append(L".mp4");
+        picker.FileTypeFilter().Append(L".mkv");
+        picker.FileTypeFilter().Append(L".mov");
+        picker.FileTypeFilter().Append(L".avi");
+        picker.FileTypeFilter().Append(L".wmv");
+        picker.FileTypeFilter().Append(L".webm");
+        picker.FileTypeFilter().Append(L".m4v");
+        picker.FileTypeFilter().Append(L".ts");
+
+        auto file = co_await picker.PickSingleFileAsync();
+        if (!file) co_return;
+
+        auto filePath = std::wstring(file.Path().c_str());
+        auto fileName = std::wstring(file.Name().c_str());
+
+        auto* node = m_graph.FindNode(nodeId);
+        if (!node) co_return;
+
+        // Update the node's path and name.
+        node->shaderPath = filePath;
+        node->properties[L"shaderPath"] = filePath;
+        node->name = L"\U0001F3AC " + fileName;
+        node->dirty = true;
+
+        // Re-prepare to open the new video file.
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (dc)
+            m_sourceFactory.PrepareSourceNode(*node, dc, 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+
+        m_graph.MarkAllDirty();
+        m_nodeGraphController.RebuildLayout();
+        PopulatePreviewNodeSelector();
+        UpdatePropertiesPanel();
     }
 
     // -----------------------------------------------------------------------
@@ -4290,9 +4334,15 @@ namespace winrt::ShaderLab::implementation
         // Clamp to avoid huge jumps (e.g., after breakpoint or sleep).
         if (deltaSec > 0.1) deltaSec = 0.016;
 
-        // Force evaluation when a video source is playing.
-        if (m_sourceFactory.HasPlayingVideo())
-            m_forceRender = true;
+        // Tick video sources and upload new frames BEFORE checking dirty state.
+        // This marks video nodes dirty only when a new decoded frame is available.
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (dc)
+        {
+            m_sourceFactory.TickAndUploadVideos(
+                const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()),
+                dc, deltaSec);
+        }
 
         // Only re-evaluate the graph when something changed.
         bool needsEval = m_graph.HasDirtyNodes() || m_needsFitPreview || m_forceRender;
@@ -4300,12 +4350,12 @@ namespace winrt::ShaderLab::implementation
         {
             RenderFrame(deltaSec);
             m_forceRender = false;
+            m_frameCount++;
         }
 
         RenderNodeGraph();
 
-        // Update FPS counter every second.
-        m_frameCount++;
+        // Update FPS counter every second (counts output frames only).
         auto fpsNow = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(fpsNow - m_fpsTimePoint).count();
         if (elapsed >= 1000)
@@ -4329,7 +4379,7 @@ namespace winrt::ShaderLab::implementation
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
         {
             if (node.type == ::ShaderLab::Graph::NodeType::Source && (node.dirty || m_sourceFactory.GetVideoProvider(node.id)))
-                m_sourceFactory.PrepareSourceNode(node, dc, deltaSeconds);
+                m_sourceFactory.PrepareSourceNode(node, dc, deltaSeconds, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
         }
 
         // Inject display primaries into Out-of-Gamut Highlight nodes.

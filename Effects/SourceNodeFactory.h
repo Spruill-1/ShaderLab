@@ -44,13 +44,23 @@ namespace ShaderLab::Effects
         void PrepareSourceNode(
             Graph::EffectNode& node,
             ID2D1DeviceContext5* dc,
-            double deltaSeconds = 0.0);
+            double deltaSeconds = 0.0,
+            ID3D11Device* d3dDevice = nullptr,
+            ID3D11DeviceContext* d3dContext = nullptr);
 
         // Release all cached bitmaps, flood effects, and video providers.
         void ReleaseCache();
 
         // Check if any video source is currently playing.
         bool HasPlayingVideo() const;
+
+        // Tick all video sources and upload new frames.
+        // Marks nodes dirty only when a new frame is actually uploaded.
+        // Call BEFORE checking HasDirtyNodes. Returns true if any new frame was uploaded.
+        bool TickAndUploadVideos(
+            std::vector<Graph::EffectNode>& nodes,
+            ID2D1DeviceContext5* dc,
+            double deltaSeconds);
 
         // Get the video provider for a node (for UI controls).
         VideoSourceProvider* GetVideoProvider(uint32_t nodeId);

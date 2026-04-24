@@ -7,9 +7,9 @@ namespace ShaderLab::Effects
     // Decodes video frames using Media Foundation Source Reader and provides
     // them as D2D1Bitmap1 images for the effect graph.
     //
-    // Decode + color conversion happen on a background thread.
-    // The UI thread calls UploadIfReady() to copy the latest decoded frame
-    // into the D2D bitmap — this is the only call that touches D2D.
+    // Decode happens on a background thread (raw byte copy only).
+    // Color conversion (YCbCr→RGB→PQ→linear→gamut→scRGB) runs on GPU
+    // via a D3D11 compute shader during UploadIfReady().
     class VideoSourceProvider
     {
     public:
@@ -17,7 +17,9 @@ namespace ShaderLab::Effects
         ~VideoSourceProvider();
 
         // Open a video file. Returns true on success.
-        bool Open(const std::wstring& filePath, ID2D1DeviceContext5* dc);
+        // Requires D3D11 device + context for GPU conversion shader setup.
+        bool Open(const std::wstring& filePath, ID2D1DeviceContext5* dc,
+                  ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext);
 
         // Close and release all resources.
         void Close();
@@ -37,10 +39,9 @@ namespace ShaderLab::Effects
         void Seek(double seconds);
 
         // Advance playback clock. Call each tick with wall-clock delta.
-        // Does NOT decode — the background thread handles that.
         void Tick(double deltaSeconds);
 
-        // Upload the latest decoded frame to the D2D bitmap if one is ready.
+        // Upload the latest decoded frame to GPU and run conversion shader.
         // Returns true if a new frame was uploaded. Call on UI thread.
         bool UploadIfReady(ID2D1DeviceContext5* dc);
 
@@ -55,22 +56,40 @@ namespace ShaderLab::Effects
         double FrameRate() const { return m_frameRate; }
         bool IsHDR() const { return m_isHDR; }
         const std::wstring& LastError() const { return m_lastError; }
+        const std::wstring& FilePath() const { return m_filePath; }
 
     private:
+        // Output format from MF Source Reader.
+        enum class OutputFormat { RGB32, NV12, P010 };
+
         void DecodeThreadFunc();
         bool DecodeOneFrame();
-        bool CreateBitmap(ID2D1DeviceContext5* dc);
-        void ConvertToScRGB(const BYTE* bgra, LONG pitch, std::vector<uint16_t>& outBuffer);
+        bool CreateGPUResources(ID2D1DeviceContext5* dc, ID3D11Device* d3dDevice);
+        bool CompileConversionShader(ID3D11Device* d3dDevice);
+        void RunConversionShader(ID3D11DeviceContext* ctx);
         static uint16_t FloatToHalf(float f);
-
-        // Build PQ inverse LUT for fast conversion.
-        void BuildPQLUT();
 
         // MF objects.
         winrt::com_ptr<IMFSourceReader> m_reader;
 
-        // D2D persistent frame bitmap (UI thread only).
+        // D2D output bitmap (shared with D3D11 output texture).
         winrt::com_ptr<ID2D1Bitmap1> m_bitmap;
+
+        // D3D11 GPU conversion resources.
+        ID3D11Device* m_d3dDevice{ nullptr };           // Non-owning, from render engine.
+        ID3D11DeviceContext* m_d3dContext{ nullptr };    // Non-owning, from render engine.
+        winrt::com_ptr<ID3D11ComputeShader> m_csP010;
+        winrt::com_ptr<ID3D11ComputeShader> m_csNV12;
+        winrt::com_ptr<ID3D11ComputeShader> m_csRGB32;
+        winrt::com_ptr<ID3D11Texture2D> m_texY;        // Y plane input
+        winrt::com_ptr<ID3D11Texture2D> m_texUV;       // UV plane input
+        winrt::com_ptr<ID3D11Texture2D> m_texRGB;      // RGB32 input
+        winrt::com_ptr<ID3D11Texture2D> m_texOutput;    // scRGB FP16 output
+        winrt::com_ptr<ID3D11ShaderResourceView> m_srvY;
+        winrt::com_ptr<ID3D11ShaderResourceView> m_srvUV;
+        winrt::com_ptr<ID3D11ShaderResourceView> m_srvRGB;
+        winrt::com_ptr<ID3D11UnorderedAccessView> m_uavOutput;
+        winrt::com_ptr<ID3D11Buffer> m_cbParams;       // Constant buffer for dimensions
 
         // Video info.
         uint32_t m_width{ 0 };
@@ -81,6 +100,9 @@ namespace ShaderLab::Effects
         std::atomic<double> m_currentPositionSeconds{ 0.0 };
         double m_frameDuration{ 0.0 };
         bool m_isHDR{ false };
+        OutputFormat m_outputFormat{ OutputFormat::RGB32 };
+        bool m_bottomUp{ false };
+        bool m_firstFrameLogged{ false };
 
         // Playback state.
         std::atomic<bool> m_playing{ false };
@@ -90,6 +112,7 @@ namespace ShaderLab::Effects
         std::atomic<bool> m_endOfStream{ false };
         bool m_mfInitialized{ false };
         std::wstring m_lastError;
+        std::wstring m_filePath;
 
         // Background decode thread.
         std::jthread m_decodeThread;
@@ -99,14 +122,12 @@ namespace ShaderLab::Effects
         std::atomic<bool> m_seekPending{ false };
         double m_seekTarget{ 0.0 };
 
-        // Double buffer: decode thread writes to m_backBuffer,
+        // Double buffer: decode thread writes raw bytes to m_backBuffer,
         // UI thread reads from m_frontBuffer when m_frameReady is set.
-        std::vector<uint16_t> m_backBuffer;
-        std::vector<uint16_t> m_frontBuffer;
+        std::vector<BYTE> m_backBuffer;
+        std::vector<BYTE> m_frontBuffer;
+        LONG m_lastPitch{ 0 };           // Pitch from last decoded frame.
         std::mutex m_bufferMutex;
         std::atomic<bool> m_frameReady{ false };
-
-        // PQ inverse LUT (256 entries → linear nits).
-        std::array<float, 256> m_pqLUT{};
     };
 }

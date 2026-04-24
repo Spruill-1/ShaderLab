@@ -216,6 +216,7 @@ namespace winrt::ShaderLab::implementation
         void ShowCurveEditorDialog(uint32_t nodeId, const std::wstring& propertyKey, std::function<void()> markDirty);
         winrt::fire_and_forget BrowseImageForSourceNode(uint32_t nodeId);
         winrt::fire_and_forget BrowseVideoForSourceNode();
+        winrt::fire_and_forget BrowseVideoForExistingNode(uint32_t nodeId);
         void OnSaveImageClicked(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
