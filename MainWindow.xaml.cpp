@@ -862,14 +862,6 @@ namespace winrt::ShaderLab::implementation
         });
         sourceSubItem.Items().Append(floodSourceItem);
 
-        auto videoSourceItem = MUX::MenuFlyoutItem();
-        videoSourceItem.Text(L"\U0001F3AC Video Source");
-        videoSourceItem.Click([this](auto&&, auto&&)
-        {
-            BrowseVideoForSourceNode();
-        });
-        sourceSubItem.Items().Append(videoSourceItem);
-
         flyout.Items().Append(builtInGroup);
 
         // ---- ShaderLab effects ----
@@ -909,6 +901,15 @@ namespace winrt::ShaderLab::implementation
 
                 slGroup.Items().Append(subItem);
             }
+
+            // Video Source — ShaderLab-specific source (not a built-in D2D effect).
+            auto videoSourceItem = MUX::MenuFlyoutItem();
+            videoSourceItem.Text(L"\U0001F3AC Video Source");
+            videoSourceItem.Click([this](auto&&, auto&&)
+            {
+                BrowseVideoForSourceNode();
+            });
+            slGroup.Items().Append(videoSourceItem);
 
             flyout.Items().Append(slGroup);
         }
