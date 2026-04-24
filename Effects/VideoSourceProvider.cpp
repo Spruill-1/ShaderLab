@@ -643,6 +643,22 @@ void main(uint3 id : SV_DispatchThreadID)
     void VideoSourceProvider::Tick(double deltaSeconds)
     {
         if (!m_reader || !m_playing) return;
+
+        // Handle end-of-stream looping.
+        if (m_endOfStream)
+        {
+            if (m_loop)
+            {
+                Seek(0.0);
+                m_playing = true;
+            }
+            else
+            {
+                m_playing = false;
+            }
+            return;
+        }
+
         m_accumulatedTime += deltaSeconds * m_speed;
         if (m_accumulatedTime >= m_frameDuration)
         {
@@ -708,10 +724,6 @@ void main(uint3 id : SV_DispatchThreadID)
             std::lock_guard lock(m_bufferMutex);
             m_frontBuffer.swap(uploadBuf);
         }
-
-        // Handle end of stream with loop.
-        if (m_endOfStream && m_loop && m_playing) { Seek(0.0); m_playing = true; }
-        else if (m_endOfStream && !m_loop) { m_playing = false; }
 
         return true;
     }
