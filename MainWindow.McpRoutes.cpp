@@ -1222,7 +1222,7 @@ namespace winrt::ShaderLab::implementation
                 if (method == "tools/list")
                 {
                     std::string tools = R"JSON({"tools":[
-{"name":"graph_add_node","description":"Add a built-in D2D effect node by name, or a ShaderLab analysis/source effect (e.g. Luminance Heatmap, CIE Chromaticity Plot, Out-of-Gamut Highlight, Vectorscope, Gamut Source, Color Checker, Zone Plate, Gradient Generator, HDR Test Pattern)","inputSchema":{"type":"object","properties":{"effectName":{"type":"string","description":"Effect name e.g. Gaussian Blur"}},"required":["effectName"]}},
+{"name":"graph_add_node","description":"Add a built-in D2D effect node by name, or a ShaderLab analysis/source effect (e.g. Luminance Heatmap, CIE Chromaticity Plot, Gamut Highlight, Vectorscope, Gamut Source, Color Checker, Zone Plate, Gradient Generator, HDR Test Pattern)","inputSchema":{"type":"object","properties":{"effectName":{"type":"string","description":"Effect name e.g. Gaussian Blur"}},"required":["effectName"]}},
 {"name":"graph_remove_node","description":"Remove a node by ID","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
 {"name":"graph_connect","description":"Connect output pin to input pin","inputSchema":{"type":"object","properties":{"srcId":{"type":"number"},"srcPin":{"type":"number"},"dstId":{"type":"number"},"dstPin":{"type":"number"}},"required":["srcId","srcPin","dstId","dstPin"]}},
 {"name":"graph_disconnect","description":"Disconnect an edge","inputSchema":{"type":"object","properties":{"srcId":{"type":"number"},"srcPin":{"type":"number"},"dstId":{"type":"number"},"dstPin":{"type":"number"}},"required":["srcId","srcPin","dstId","dstPin"]}},

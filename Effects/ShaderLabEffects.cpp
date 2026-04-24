@@ -213,7 +213,7 @@ float4 main(
 )HLSL";
 
     static const std::string s_outOfGamutHLSL = R"HLSL(
-// Out-of-Gamut Highlight
+// Gamut Highlight
 // TargetGamut modes:
 //   0 = Current Monitor (primaries injected by host)
 //   1 = Rec.709
@@ -228,7 +228,7 @@ cbuffer constants : register(b0) {
     float OverlayG;
     float OverlayB;
     float OverlayStrength;
-    float Invert;
+    float Mode;
     // Primaries for modes 0 and 4 (auto-injected, not user-visible)
     float PrimRedX;
     float PrimRedY;
@@ -278,7 +278,7 @@ float4 main(
     }
 
     bool oog = (targetRGB.r < -0.001 || targetRGB.g < -0.001 || targetRGB.b < -0.001);
-    bool highlight = (Invert > 0.5) ? !oog : oog;
+    bool highlight = (Mode > 0.5) ? !oog : oog;
     if (highlight) {
         float3 overlay = float3(OverlayR, OverlayG, OverlayB);
         color.rgb = lerp(color.rgb, overlay, OverlayStrength);
@@ -390,10 +390,10 @@ float4 main(
             m_effects.push_back(std::move(desc));
         }
 
-        // ---- Out-of-Gamut Highlight ----
+        // ---- Gamut Highlight ----
         {
             ShaderLabEffectDescriptor desc;
-            desc.name = L"Out-of-Gamut Highlight";
+            desc.name = L"Gamut Highlight";
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + s_outOfGamutHLSL;
@@ -404,7 +404,7 @@ float4 main(
                 { L"OverlayG",        L"float", 0.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayB",        L"float", 1.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayStrength", L"float", 0.7f,  0.0f, 1.0f, 0.01f },
-                { L"Invert",          L"float", 0.0f,  0.0f, 1.0f, 1.0f, { L"Out-of-Gamut", L"In-Gamut" } },
+                { L"Mode",            L"float", 0.0f,  0.0f, 1.0f, 1.0f, { L"Out-of-Gamut", L"In-Gamut" } },
             };
             // Hidden cbuffer properties: primaries auto-injected by host.
             desc.hiddenDefaults = {
@@ -631,7 +631,7 @@ float4 main(
     float3 rgb = XYZToScRGB(xyz);
     // Preserve negative scRGB values — they represent colors outside Rec.709
     // that are valid in wider gamuts (P3, Rec.2020). Downstream effects like
-    // Out-of-Gamut Highlight rely on these negative components.
+    // Gamut Highlight rely on these negative components.
 
     return float4(rgb, 1.0);
 }

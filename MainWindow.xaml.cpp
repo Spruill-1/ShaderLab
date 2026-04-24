@@ -4408,14 +4408,14 @@ namespace winrt::ShaderLab::implementation
                 m_sourceFactory.PrepareSourceNode(node, dc, deltaSeconds, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
         }
 
-        // Inject display primaries into Out-of-Gamut Highlight nodes.
+        // Inject display primaries into Gamut Highlight nodes.
         // Only update when primaries actually change to avoid infinite dirty loops.
         {
             auto liveProfile = m_displayMonitor.LiveProfile();
             auto activeProfile = m_displayMonitor.ActiveProfile();
             for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
             {
-                if (node.name != L"Out-of-Gamut Highlight") continue;
+                if (node.name != L"Gamut Highlight") continue;
                 auto gamutIt = node.properties.find(L"TargetGamut");
                 if (gamutIt == node.properties.end()) continue;
                 float gamutVal = 0;
