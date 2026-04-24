@@ -277,7 +277,7 @@ float4 main(
         targetRGB = inside ? float3(1, 1, 1) : float3(-1, -1, -1);
     }
 
-    bool oog = (targetRGB.r < -0.001 || targetRGB.g < -0.001 || targetRGB.b < -0.001);
+    bool oog = (targetRGB.r < 0.0 || targetRGB.g < 0.0 || targetRGB.b < 0.0);
     bool highlight = (Mode > 0.5) ? !oog : oog;
     if (highlight) {
         float3 overlay = float3(OverlayR, OverlayG, OverlayB);
