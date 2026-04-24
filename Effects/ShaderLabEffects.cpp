@@ -586,7 +586,7 @@ float4 main(
                 { L"ShowP3",       L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"ShowRec2020",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"Brightness",   L"float", 2.0f,  0.1f, 10.0f, 0.1f },
-                { L"DiagramSize",  L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
+                { L"DiagramSize",  L"float", 1024.0f, 128.0f, 2048.0f, 64.0f },
                 { L"ShowMonitor",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
             };
             desc.hiddenDefaults = {

@@ -87,17 +87,18 @@ namespace ShaderLab::Controls
                 m_panX = cursorX - (cursorX - m_panX) * (newZoom / m_zoom);
                 m_panY = cursorY - (cursorY - m_panY) * (newZoom / m_zoom);
                 m_zoom = newZoom;
+                m_autoFit = false;
                 args.Handled(true);
             });
 
             m_panel.PointerPressed([this](auto&&, MUX::Input::PointerRoutedEventArgs const& args)
             {
                 auto point = args.GetCurrentPoint(m_panel);
-                // Middle button or right button to pan.
                 if (point.Properties().IsMiddleButtonPressed() ||
                     point.Properties().IsRightButtonPressed())
                 {
                     m_isPanning = true;
+                    m_autoFit = false;
                     m_panStartX = static_cast<float>(point.Position().X);
                     m_panStartY = static_cast<float>(point.Position().Y);
                     m_panOriginX = m_panX;
@@ -134,6 +135,7 @@ namespace ShaderLab::Controls
             m_panel.DoubleTapped([this](auto&&, auto&&)
             {
                 m_needsFit = true;
+                m_autoFit = true;
             });
 
             // Wait for panel Loaded before creating DXGI resources.
@@ -219,8 +221,8 @@ namespace ShaderLab::Controls
                 m_needsFit = true;
             }
 
-            // Fit to view on first frame or double-click.
-            if (m_needsFit && image)
+            // Auto-fit: scale to fill window until user manually pans/zooms.
+            if ((m_needsFit || m_autoFit) && image)
             {
                 m_needsFit = false;
                 FitToView(dc, image);

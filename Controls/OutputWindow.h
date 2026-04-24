@@ -61,6 +61,7 @@ namespace ShaderLab::Controls
         bool m_isOpen{ false };
         bool m_needsResize{ false };
         bool m_needsFit{ true };
+        bool m_autoFit{ true };  // Auto-fit until user zooms/pans
 
         // Pan / zoom state.
         float m_zoom{ 1.0f };
