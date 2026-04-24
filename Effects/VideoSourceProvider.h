@@ -53,6 +53,7 @@ namespace ShaderLab::Effects
         uint32_t FrameHeight() const { return m_height; }
         double FrameRate() const { return m_frameRate; }
         bool IsHDR() const { return m_isHDR; }
+        const std::wstring& LastError() const { return m_lastError; }
 
     private:
         bool ReadNextFrame(ID2D1DeviceContext5* dc);
@@ -81,5 +82,15 @@ namespace ShaderLab::Effects
         double m_accumulatedTime{ 0.0 };  // time since last frame decode
         bool m_endOfStream{ false };
         bool m_mfInitialized{ false };
+        std::wstring m_lastError;
+
+        // CPU-side FP16 conversion buffer (width * height * 4 halfs = 8 bytes/pixel).
+        std::vector<uint16_t> m_fp16Buffer;
+
+        // Convert BGRA8 frame to scRGB FP16 (handles both SDR sRGB and HDR PQ/BT.2020).
+        void ConvertToScRGB(const BYTE* bgra, LONG pitch);
+
+        // Half-float conversion.
+        static uint16_t FloatToHalf(float f);
     };
 }

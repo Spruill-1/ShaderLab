@@ -676,6 +676,14 @@ namespace winrt::ShaderLab::implementation
                     }
                     node->dirty = true;
                     m_graph.MarkAllDirty();
+
+                    // Sync shaderPath property to the dedicated node field (for source/shader nodes).
+                    if (key == L"shaderPath")
+                    {
+                        auto* sv = std::get_if<std::wstring>(&node->properties[key]);
+                        if (sv) node->shaderPath = *sv;
+                    }
+
                     return { 200, R"({"ok":true})" };
                 });
             }

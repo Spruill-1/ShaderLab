@@ -2562,7 +2562,7 @@ namespace winrt::ShaderLab::implementation
                 if (key.starts_with(L"Prim"))
                     continue;
                 // Skip video source internal properties (managed by video UI controls).
-                if (key == L"IsVideo" || key == L"IsPlaying" || key == L"PlaybackSpeed" || key == L"Loop")
+                if (key == L"IsVideo" || key == L"IsPlaying" || key == L"PlaybackSpeed" || key == L"Loop" || key == L"shaderPath")
                     continue;
                 // Resolve metadata for this property.
                 const PropertyMetadata* meta = nullptr;

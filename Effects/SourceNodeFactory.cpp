@@ -94,19 +94,52 @@ namespace ShaderLab::Effects
         if (isVideoIt != node.properties.end())
         {
             auto* boolVal = std::get_if<bool>(&isVideoIt->second);
-            if (boolVal && *boolVal && node.shaderPath.has_value())
+            if (boolVal && *boolVal)
             {
+              try
+              {
+                // Resolve video file path from node.shaderPath or properties map.
+                std::wstring videoPath;
+                if (node.shaderPath.has_value() && !node.shaderPath.value().empty())
+                    videoPath = node.shaderPath.value();
+                // Also check properties (MCP sets path here).
+                auto pathIt = node.properties.find(L"shaderPath");
+                if (pathIt != node.properties.end())
+                {
+                    auto* sv = std::get_if<std::wstring>(&pathIt->second);
+                    if (sv && !sv->empty())
+                    {
+                        videoPath = *sv;
+                        node.shaderPath = videoPath;
+                    }
+                }
+                if (videoPath.empty())
+                    return;
+
                 auto& provider = m_videoCache[node.id];
+
+                // If the path changed, re-open.
+                if (provider && provider->IsOpen())
+                {
+                    // Keep existing provider.
+                }
+
                 if (!provider)
                 {
                     provider = std::make_unique<VideoSourceProvider>();
-                    if (!provider->Open(node.shaderPath.value(), dc))
+                    OutputDebugStringW(std::format(L"[VideoSource] Opening: {}\n", videoPath).c_str());
+                    if (!provider->Open(videoPath, dc))
                     {
-                        node.runtimeError = L"Failed to open video file";
+                        node.runtimeError = L"Failed to open video: " + provider->LastError();
+                        OutputDebugStringW(std::format(L"[VideoSource] {}\n", node.runtimeError).c_str());
                         m_videoCache.erase(node.id);
                         return;
                     }
                     node.runtimeError.clear();
+                    OutputDebugStringW(std::format(L"[VideoSource] Opened: {}x{} @ {:.1f}fps, {:.1f}s, HDR={}\n",
+                        provider->FrameWidth(), provider->FrameHeight(),
+                        provider->FrameRate(), provider->Duration(),
+                        provider->IsHDR()).c_str());
                 }
 
                 // Sync playback state from properties.
@@ -141,7 +174,13 @@ namespace ShaderLab::Effects
                 node.cachedOutput = provider->CurrentBitmap();
                 if (provider->IsPlaying())
                     node.dirty = true;  // keep evaluating while playing
-                return;
+              }
+              catch (...)
+              {
+                node.runtimeError = L"Video source exception";
+                OutputDebugStringW(L"[VideoSource] Exception in PrepareSourceNode\n");
+              }
+              return;
             }
         }
 

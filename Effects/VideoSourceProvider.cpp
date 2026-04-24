@@ -3,6 +3,19 @@
 
 namespace ShaderLab::Effects
 {
+    // Global MF initialization (reference counted — safe to call multiple times).
+    static std::atomic<int> s_mfRefCount{ 0 };
+    static void EnsureMFInitialized()
+    {
+        if (s_mfRefCount.fetch_add(1) == 0)
+            MFStartup(MF_VERSION);
+    }
+    static void ReleaseMF()
+    {
+        if (s_mfRefCount.fetch_sub(1) == 1)
+            MFShutdown();
+    }
+
     VideoSourceProvider::VideoSourceProvider() = default;
 
     VideoSourceProvider::~VideoSourceProvider()
@@ -13,25 +26,47 @@ namespace ShaderLab::Effects
     bool VideoSourceProvider::Open(const std::wstring& filePath, ID2D1DeviceContext5* dc)
     {
         Close();
+        m_lastError.clear();
 
-        // Initialize Media Foundation.
-        HRESULT hr = MFStartup(MF_VERSION);
-        if (FAILED(hr))
+        if (filePath.empty())
+        {
+            m_lastError = L"Empty file path";
             return false;
+        }
+
+        // Initialize Media Foundation (global ref-counted).
+        EnsureMFInitialized();
         m_mfInitialized = true;
 
-        // Create Source Reader.
-        winrt::com_ptr<IMFAttributes> attrs;
-        hr = MFCreateAttributes(attrs.put(), 1);
-        if (FAILED(hr))
-            return false;
+        HRESULT hr;
 
-        // Enable video processing (format conversion).
+        // Create Source Reader with video processing enabled.
+        winrt::com_ptr<IMFAttributes> attrs;
+        hr = MFCreateAttributes(attrs.put(), 2);
+        if (FAILED(hr))
+        {
+            m_lastError = std::format(L"MFCreateAttributes failed: 0x{:08X}", static_cast<uint32_t>(hr));
+            return false;
+        }
+
+        // Enable video processing (format conversion by the pipeline).
         attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+        // Enable advanced video processing for HDR content.
+        attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
 
         hr = MFCreateSourceReaderFromURL(filePath.c_str(), attrs.get(), m_reader.put());
         if (FAILED(hr))
+        {
+            m_lastError = std::format(L"MFCreateSourceReaderFromURL failed: 0x{:08X}", static_cast<uint32_t>(hr));
+            Close();
             return false;
+        }
+
+        // Select only the first video stream, deselect everything else.
+        m_reader->SetStreamSelection(
+            static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+        m_reader->SetStreamSelection(
+            static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), TRUE);
 
         // Get native media type to detect HDR and frame info.
         winrt::com_ptr<IMFMediaType> nativeType;
@@ -39,6 +74,7 @@ namespace ShaderLab::Effects
             static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, nativeType.put());
         if (FAILED(hr))
         {
+            m_lastError = std::format(L"GetNativeMediaType failed: 0x{:08X}", static_cast<uint32_t>(hr));
             Close();
             return false;
         }
@@ -57,6 +93,7 @@ namespace ShaderLab::Effects
         hr = MFGetAttributeSize(nativeType.get(), MF_MT_FRAME_SIZE, &width, &height);
         if (FAILED(hr))
         {
+            m_lastError = std::format(L"MFGetAttributeSize (frame size) failed: 0x{:08X}", static_cast<uint32_t>(hr));
             Close();
             return false;
         }
@@ -84,39 +121,64 @@ namespace ShaderLab::Effects
             static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE), MF_PD_DURATION, &var);
         if (SUCCEEDED(hr))
         {
-            // Duration is in 100-nanosecond units.
             m_durationSeconds = static_cast<double>(var.uhVal.QuadPart) / 10'000'000.0;
             PropVariantClear(&var);
         }
 
-        // Configure output format: request BGRA (8-bit) or ABGR16F (HDR).
+        // Configure output format.
+        // Request RGB32 from MF — we'll handle PQ→scRGB conversion ourselves for HDR.
         winrt::com_ptr<IMFMediaType> outputType;
         hr = MFCreateMediaType(outputType.put());
-        if (FAILED(hr)) { Close(); return false; }
+        if (FAILED(hr)) { m_lastError = L"MFCreateMediaType failed"; Close(); return false; }
 
         outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-
-        // Always request BGRA 8-bit — reliable across all decoders.
-        // HDR content will be tone-mapped by the decoder or handled downstream.
-        outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_ARGB32);
+        outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        MFSetAttributeSize(outputType.get(), MF_MT_FRAME_SIZE, m_width, m_height);
         m_stride = m_width * 4;
-
-        hr = MFSetAttributeSize(outputType.get(), MF_MT_FRAME_SIZE, m_width, m_height);
-        if (FAILED(hr)) { Close(); return false; }
 
         hr = m_reader->SetCurrentMediaType(
             static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, outputType.get());
-        if (FAILED(hr)) { Close(); return false; }
+        if (FAILED(hr))
+        {
+            outputType = nullptr;
+            MFCreateMediaType(outputType.put());
+            outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+            outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_ARGB32);
+            MFSetAttributeSize(outputType.get(), MF_MT_FRAME_SIZE, m_width, m_height);
 
-        // Select only the video stream.
-        m_reader->SetStreamSelection(
-            static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
-        m_reader->SetStreamSelection(
-            static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), TRUE);
+            hr = m_reader->SetCurrentMediaType(
+                static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, outputType.get());
+        }
+        if (FAILED(hr))
+        {
+            m_lastError = std::format(L"SetCurrentMediaType failed: 0x{:08X} ({}x{}, HDR={})",
+                static_cast<uint32_t>(hr), m_width, m_height, m_isHDR);
+            Close();
+            return false;
+        }
+
+        // Re-read the actual output type to get the correct stride.
+        winrt::com_ptr<IMFMediaType> actualType;
+        hr = m_reader->GetCurrentMediaType(
+            static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), actualType.put());
+        if (SUCCEEDED(hr))
+        {
+            UINT32 actualStride = 0;
+            hr = actualType->GetUINT32(MF_MT_DEFAULT_STRIDE, &actualStride);
+            if (SUCCEEDED(hr) && actualStride > 0)
+                m_stride = actualStride;
+
+            // Log the actual subtype for diagnostics.
+            GUID subtype{};
+            actualType->GetGUID(MF_MT_SUBTYPE, &subtype);
+            OutputDebugStringW(std::format(L"[VideoSource] Actual output format: stride={}, HDR={}\n",
+                m_stride, m_isHDR).c_str());
+        }
 
         // Create the persistent D2D bitmap.
         if (!CreateBitmap(dc))
         {
+            m_lastError = L"Failed to create D2D bitmap";
             Close();
             return false;
         }
@@ -147,7 +209,7 @@ namespace ShaderLab::Effects
 
         if (m_mfInitialized)
         {
-            MFShutdown();
+            ReleaseMF();
             m_mfInitialized = false;
         }
     }
@@ -249,7 +311,11 @@ namespace ShaderLab::Effects
             0, &streamIndex, &flags, &timestamp, sample.put());
 
         if (FAILED(hr))
+        {
+            OutputDebugStringW(std::format(L"[VideoSource] ReadSample failed: 0x{:08X}\n",
+                static_cast<uint32_t>(hr)).c_str());
             return false;
+        }
 
         if (flags & MF_SOURCE_READERF_ENDOFSTREAM)
         {
@@ -263,25 +329,173 @@ namespace ShaderLab::Effects
         // Update position from timestamp (100ns units → seconds).
         m_currentPositionSeconds = static_cast<double>(timestamp) / 10'000'000.0;
 
-        // Get the buffer.
+        // Get the buffer — prefer IMF2DBuffer for correct stride.
         winrt::com_ptr<IMFMediaBuffer> buffer;
         hr = sample->ConvertToContiguousBuffer(buffer.put());
         if (FAILED(hr))
             return false;
 
+        // Try 2D buffer interface for proper stride handling.
+        winrt::com_ptr<IMF2DBuffer> buffer2D;
+        buffer.try_as(buffer2D);
+
         BYTE* data = nullptr;
-        DWORD maxLen = 0, curLen = 0;
-        hr = buffer->Lock(&data, &maxLen, &curLen);
-        if (FAILED(hr))
-            return false;
+        LONG pitch = 0;
+        bool locked2D = false;
 
-        // Copy frame data into the persistent D2D bitmap.
+        if (buffer2D)
+        {
+            hr = buffer2D->Lock2D(&data, &pitch);
+            locked2D = SUCCEEDED(hr);
+        }
+
+        if (!locked2D)
+        {
+            DWORD maxLen = 0, curLen = 0;
+            hr = buffer->Lock(&data, &maxLen, &curLen);
+            if (FAILED(hr))
+                return false;
+            pitch = static_cast<LONG>(m_stride);
+        }
+
+        // Handle negative stride (bottom-up bitmap).
+        if (pitch < 0)
+        {
+            data = data + static_cast<LONG>(m_height - 1) * pitch;
+            pitch = -pitch;
+        }
+
+        // Convert BGRA8 → scRGB FP16 and copy into the D2D bitmap.
+        ConvertToScRGB(data, pitch);
         D2D1_RECT_U destRect = { 0, 0, m_width, m_height };
-        hr = m_bitmap->CopyFromMemory(&destRect, data, m_stride);
+        UINT32 fp16Stride = m_width * 4 * sizeof(uint16_t);
+        hr = m_bitmap->CopyFromMemory(&destRect,
+            reinterpret_cast<const BYTE*>(m_fp16Buffer.data()), fp16Stride);
 
-        buffer->Unlock();
+        if (locked2D)
+            buffer2D->Unlock2D();
+        else
+            buffer->Unlock();
 
         return SUCCEEDED(hr);
+    }
+
+    // -----------------------------------------------------------------------
+    // Color conversion: BGRA8 → scRGB FP16
+    // -----------------------------------------------------------------------
+
+    // Inverse PQ (ST.2084) EOTF: electrical → optical (0–10000 nits).
+    static float InversePQ(float N)
+    {
+        // N is normalized [0,1] electrical signal.
+        constexpr float m1 = 0.1593017578125f;
+        constexpr float m2 = 78.84375f;
+        constexpr float c1 = 0.8359375f;
+        constexpr float c2 = 18.8515625f;
+        constexpr float c3 = 18.6875f;
+
+        float Np = std::pow((std::max)(N, 0.0f), 1.0f / m2);
+        float num = (std::max)(Np - c1, 0.0f);
+        float den = c2 - c3 * Np;
+        if (den <= 0.0f) return 0.0f;
+        // Returns linear light in [0, 10000] nits.
+        return 10000.0f * std::pow(num / den, 1.0f / m1);
+    }
+
+    // sRGB EOTF: electrical → linear light.
+    static float SRGBToLinear(float s)
+    {
+        if (s <= 0.04045f)
+            return s / 12.92f;
+        return std::pow((s + 0.055f) / 1.055f, 2.4f);
+    }
+
+    // BT.2020 → BT.709 (sRGB) color matrix (3×3, row-major).
+    // Converts linear BT.2020 RGB to linear BT.709 RGB.
+    static void BT2020ToBT709(float r2020, float g2020, float b2020,
+                               float& r709, float& g709, float& b709)
+    {
+        r709 =  1.6605f * r2020 - 0.5877f * g2020 - 0.0728f * b2020;
+        g709 = -0.1246f * r2020 + 1.1330f * g2020 - 0.0084f * b2020;
+        b709 = -0.0182f * r2020 - 0.1006f * g2020 + 1.1187f * b2020;
+    }
+
+    uint16_t VideoSourceProvider::FloatToHalf(float f)
+    {
+        // IEEE 754 float → half conversion.
+        uint32_t fi;
+        std::memcpy(&fi, &f, 4);
+        uint32_t sign = (fi >> 16) & 0x8000;
+        int32_t exponent = ((fi >> 23) & 0xFF) - 127 + 15;
+        uint32_t mantissa = fi & 0x007FFFFF;
+
+        if (exponent <= 0)
+        {
+            if (exponent < -10) return static_cast<uint16_t>(sign);
+            mantissa = (mantissa | 0x00800000) >> (1 - exponent);
+            return static_cast<uint16_t>(sign | (mantissa >> 13));
+        }
+        if (exponent == 0xFF - 127 + 15)
+        {
+            return static_cast<uint16_t>(sign | 0x7C00 | (mantissa ? (mantissa >> 13) : 0));
+        }
+        if (exponent > 30)
+        {
+            return static_cast<uint16_t>(sign | 0x7C00);  // infinity
+        }
+        return static_cast<uint16_t>(sign | (exponent << 10) | (mantissa >> 13));
+    }
+
+    void VideoSourceProvider::ConvertToScRGB(const BYTE* bgra, LONG pitch)
+    {
+        size_t pixelCount = static_cast<size_t>(m_width) * m_height;
+        m_fp16Buffer.resize(pixelCount * 4);
+
+        for (uint32_t y = 0; y < m_height; ++y)
+        {
+            const BYTE* row = bgra + y * pitch;
+            uint16_t* outRow = m_fp16Buffer.data() + y * m_width * 4;
+
+            for (uint32_t x = 0; x < m_width; ++x)
+            {
+                // MF RGB32 layout: B G R X (or A).
+                float b = row[x * 4 + 0] / 255.0f;
+                float g = row[x * 4 + 1] / 255.0f;
+                float r = row[x * 4 + 2] / 255.0f;
+
+                float linR, linG, linB;
+
+                if (m_isHDR)
+                {
+                    // MF decoded HDR10: values are PQ-encoded BT.2020.
+                    // Step 1: Inverse PQ → linear nits (0–10000).
+                    float nitsR = InversePQ(r);
+                    float nitsG = InversePQ(g);
+                    float nitsB = InversePQ(b);
+
+                    // Step 2: BT.2020 → BT.709 gamut conversion.
+                    float r709, g709, b709;
+                    BT2020ToBT709(nitsR, nitsG, nitsB, r709, g709, b709);
+
+                    // Step 3: Nits → scRGB (1.0 = 80 nits SDR white).
+                    linR = r709 / 80.0f;
+                    linG = g709 / 80.0f;
+                    linB = b709 / 80.0f;
+                }
+                else
+                {
+                    // SDR: sRGB gamma → linear scRGB.
+                    linR = SRGBToLinear(r);
+                    linG = SRGBToLinear(g);
+                    linB = SRGBToLinear(b);
+                }
+
+                outRow[x * 4 + 0] = FloatToHalf(linR);
+                outRow[x * 4 + 1] = FloatToHalf(linG);
+                outRow[x * 4 + 2] = FloatToHalf(linB);
+                outRow[x * 4 + 3] = FloatToHalf(1.0f);  // alpha
+            }
+        }
     }
 
     bool VideoSourceProvider::CreateBitmap(ID2D1DeviceContext5* dc)
@@ -290,7 +504,9 @@ namespace ShaderLab::Effects
             return false;
 
         D2D1_BITMAP_PROPERTIES1 bitmapProps = {};
-        bitmapProps.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        // Always output scRGB FP16 — matches the pipeline format.
+        // SDR content: sRGB→linear. HDR content: PQ BT.2020→scRGB linear.
+        bitmapProps.pixelFormat.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         bitmapProps.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
         bitmapProps.dpiX = 96.0f;
         bitmapProps.dpiY = 96.0f;
