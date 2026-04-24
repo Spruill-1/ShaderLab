@@ -2001,16 +2001,26 @@ namespace winrt::ShaderLab::implementation
 
             if (shiftDown)
             {
-                // Toggle: if already selected, deselect; otherwise add.
                 auto& sel = m_nodeGraphController.SelectedNodes();
                 if (sel.count(hitNodeId))
-                    m_nodeGraphController.DeselectNode(hitNodeId);
+                {
+                    // Already selected — just start dragging the group, don't toggle.
+                }
                 else
+                {
+                    // Add to selection.
                     m_nodeGraphController.SelectNode(hitNodeId, /*addToSelection*/ true);
+                }
             }
             else
             {
-                m_nodeGraphController.SelectNode(hitNodeId);
+                // Without Shift: clicking a node in an existing multi-selection
+                // keeps the group (for dragging). Clicking outside the selection
+                // replaces it with the clicked node.
+                auto& sel = m_nodeGraphController.SelectedNodes();
+                if (!sel.count(hitNodeId))
+                    m_nodeGraphController.SelectNode(hitNodeId);
+                // else: already selected, keep group intact for drag.
             }
 
             m_selectedNodeId = hitNodeId;
