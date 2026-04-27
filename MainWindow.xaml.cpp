@@ -24,6 +24,16 @@ namespace winrt::ShaderLab::implementation
 
         m_hwnd = GetWindowHandle();
 
+        // Close all output windows and exit the process when the main window closes.
+        this->Closed([this](auto&&, auto&&)
+        {
+            m_isShuttingDown = true;
+            m_outputWindows.clear();
+            // WinUI 3 keeps the process alive while any Window exists.
+            // Force exit so output windows don't keep us running.
+            ::PostQuitMessage(0);
+        });
+
         // Wire up event handlers (safe before panel is loaded).
         PreviewPanel().SizeChanged({ this, &MainWindow::OnPreviewSizeChanged });
         PreviewPanel().PointerMoved({ this, &MainWindow::OnPreviewPointerMoved });
