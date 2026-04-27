@@ -1598,13 +1598,13 @@ float4 main(
         wireframe = min(wireframe, DrawLine3D(screenPos, b3, r3, rot, lineW * 0.6));
     }
 
-    float3 bgColor = float3(0.04, 0.04, 0.04);
-    float3 wireColor = float3(0.4, 0.4, 0.4);
+    float3 bgColor = float3(0.0, 0.0, 0.0);  // True black background
+    float3 wireColor = float3(0.15, 0.15, 0.15);
     float3 color = lerp(wireColor, bgColor, wireframe);
 
     // ---- Semi-transparent gamut shell ----
     // Sample the prism at multiple luminance slices and test if this pixel
-    // falls inside the projected triangle. Accumulates a subtle tinted fill.
+    // falls inside the projected triangle. Accumulates a tinted fill.
     {
         float shellAlpha = 0.0;
         float3 shellColor = float3(0, 0, 0);
@@ -1633,7 +1633,7 @@ float4 main(
             if (u >= 0 && v >= 0 && u + v <= 1.0)
             {
                 // Tint based on barycentric position (R/G/B near primaries).
-                float3 tint = float3(1.0 - u - v, v, u) * 0.3 + 0.1;
+                float3 tint = float3(1.0 - u - v, v, u) * 0.5 + 0.05;
                 shellColor += tint;
                 shellAlpha += 1.0;
             }
@@ -1642,7 +1642,8 @@ float4 main(
         if (shellAlpha > 0)
         {
             shellColor /= shellAlpha;
-            float opacity = min(shellAlpha / (float)shellSlices * 0.15, 0.12);
+            // More visible opacity — scales with how many slices overlap.
+            float opacity = shellAlpha / (float)shellSlices * 0.3;
             color = color + shellColor * opacity;
         }
     }
