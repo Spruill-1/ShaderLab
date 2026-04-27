@@ -187,6 +187,67 @@ float3 ScRGBToLab(float3 rgb) {
     return XYZToLab(ScRGBToXYZ(max(rgb, 0.0)));
 }
 
+// ---- ICtCp (BT.2100) ----
+// Pipeline: scRGB -> XYZ -> LMS (BT.2124 cross-talk) -> PQ encode -> ICtCp
+
+// XYZ to LMS (BT.2124 / Hunt-Pointer-Estévez with cross-talk)
+static const float3x3 XYZ_TO_LMS_ICTCP = float3x3(
+     0.3592832, 0.6976051, -0.0358916,
+    -0.1920808, 1.1004768,  0.0753741,
+     0.0070797, 0.0748262,  0.8433009
+);
+
+// LMS to XYZ (inverse)
+static const float3x3 LMS_TO_XYZ_ICTCP = float3x3(
+     2.0701800, -1.3264569,  0.2066510,
+     0.3649882,  0.6805541, -0.0453723,
+    -0.0496570, -0.0492033,  1.1880720
+);
+
+// PQ-encoded LMS to ICtCp
+static const float3x3 PQLMS_TO_ICTCP = float3x3(
+    2048.0/4096.0,  2048.0/4096.0,     0.0/4096.0,
+    6610.0/4096.0, -13613.0/4096.0,  7003.0/4096.0,
+   17933.0/4096.0, -17390.0/4096.0,  -543.0/4096.0
+);
+
+// ICtCp to PQ-encoded LMS (inverse)
+static const float3x3 ICTCP_TO_PQLMS = float3x3(
+    1.0,  0.008609037,  0.111029625,
+    1.0, -0.008609037, -0.111029625,
+    1.0,  0.560031336, -0.320627175
+);
+
+// scRGB -> ICtCp
+float3 ScRGBToICtCp(float3 rgb) {
+    // scRGB (1.0 = 80 nits) -> absolute luminance XYZ
+    float3 xyz = ScRGBToXYZ(max(rgb, 0.0));
+    // Scale to absolute nits for PQ (XYZ Y=1 = 80 nits in scRGB)
+    xyz *= 80.0;
+    float3 lms = mul(XYZ_TO_LMS_ICTCP, xyz);
+    lms = max(lms, 0.0);
+    // PQ encode each LMS component (input in nits, output [0,1])
+    float3 pqLms = float3(
+        PQ_InvEOTF(lms.x),
+        PQ_InvEOTF(lms.y),
+        PQ_InvEOTF(lms.z));
+    return mul(PQLMS_TO_ICTCP, pqLms);
+}
+
+// ICtCp -> scRGB
+float3 ICtCpToScRGB(float3 ictcp) {
+    float3 pqLms = mul(ICTCP_TO_PQLMS, ictcp);
+    // PQ decode to nits
+    float3 lms = float3(
+        PQ_EOTF(pqLms.x),
+        PQ_EOTF(pqLms.y),
+        PQ_EOTF(pqLms.z));
+    float3 xyz = mul(LMS_TO_XYZ_ICTCP, lms);
+    // Scale back from nits to scRGB (80 nits = 1.0)
+    xyz /= 80.0;
+    return XYZToScRGB(xyz);
+}
+
 // OKLab: linear sRGB -> OKLab
 float3 LinearToOKLab(float3 c) {
     float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
@@ -1632,6 +1693,241 @@ float4 main(
                 { L"Mode",        L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"Clip", L"Nearest Point", L"Compress to White" } },
                 { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Perceptual Gamut Map (ICtCp) ----
+        {
+            static const std::string perceptualGamutMapHLSL = R"HLSL(
+// Perceptual Gamut Map — gamut mapping in ICtCp space.
+// Samples the target gamut boundary as a polygon in the Ct/Cp plane
+// at the pixel's intensity level, then maps out-of-gamut pixels.
+
+cbuffer Constants : register(b0)
+{
+    float Mode;          // 0=Nearest on Shell, 1=Compress to Neutral
+    float TargetGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020
+    float Strength;      // 0=bypass, 1=full
+};
+
+Texture2D InputTexture : register(t0);
+SamplerState InputSampler : register(s0);
+
+#define NBP 24
+
+void SampleBoundary(float2 gR, float2 gG, float2 gB, float iVal, out float2 bnd[NBP])
+{
+    float nits = PQ_EOTF(iVal);
+    float Ys = max(nits / 80.0, 0.0001);
+    uint ppe = NBP / 3;
+    for (uint i = 0; i < NBP; i++)
+    {
+        float2 xy;
+        uint e = i / ppe;
+        float t = (float)(i % ppe) / (float)ppe;
+        if (e == 0)      xy = lerp(gR, gG, t);
+        else if (e == 1) xy = lerp(gG, gB, t);
+        else             xy = lerp(gB, gR, t);
+        float X = (xy.y > 1e-6) ? xy.x * Ys / xy.y : 0;
+        float Z = (xy.y > 1e-6) ? (1.0 - xy.x - xy.y) * Ys / xy.y : 0;
+        float3 ic = ScRGBToICtCp(XYZToScRGB(float3(X, Ys, Z)));
+        bnd[i] = float2(ic.y, ic.z);
+    }
+}
+
+bool PtInPoly(float2 p, float2 poly[NBP])
+{
+    bool inside = false;
+    for (uint i = 0, j = NBP - 1; i < NBP; j = i++)
+    {
+        if (((poly[i].y > p.y) != (poly[j].y > p.y)) &&
+            (p.x < (poly[j].x - poly[i].x) * (p.y - poly[i].y) / (poly[j].y - poly[i].y) + poly[i].x))
+            inside = !inside;
+    }
+    return inside;
+}
+
+float2 NearestOnPoly(float2 p, float2 poly[NBP])
+{
+    float bestD2 = 1e10;
+    float2 bestPt = p;
+    for (uint i = 0; i < NBP; i++)
+    {
+        uint j = (i + 1) % NBP;
+        float2 ab = poly[j] - poly[i];
+        float t = saturate(dot(p - poly[i], ab) / max(dot(ab, ab), 1e-10));
+        float2 proj = poly[i] + ab * t;
+        float d2 = dot(p - proj, p - proj);
+        if (d2 < bestD2) { bestD2 = d2; bestPt = proj; }
+    }
+    return bestPt;
+}
+
+float2 CompressNeutral(float2 p, float2 poly[NBP])
+{
+    float lo = 0, hi = 1;
+    for (int it = 0; it < 12; it++)
+    {
+        float mid = (lo + hi) * 0.5;
+        if (PtInPoly(lerp(p, float2(0,0), mid), poly)) hi = mid;
+        else lo = mid;
+    }
+    return lerp(p, float2(0,0), hi);
+}
+
+float4 main(
+    float4 pos : SV_POSITION, float4 ps : SCENE_POSITION, float4 uv0 : TEXCOORD0
+) : SV_Target
+{
+    float4 color = InputTexture.Sample(InputSampler, uv0.xy);
+    if (Strength < 0.001) return color;
+
+    float2 gR, gG, gB;
+    uint g = (uint)TargetGamut;
+    if (g == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
+    else if (g == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
+    else             { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
+
+    float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
+    float2 ctcp = float2(ictcp.y, ictcp.z);
+
+    float2 bnd[NBP];
+    SampleBoundary(gR, gG, gB, ictcp.x, bnd);
+
+    if (!PtInPoly(ctcp, bnd))
+    {
+        float2 mapped = ((uint)Mode == 1)
+            ? CompressNeutral(ctcp, bnd)
+            : NearestOnPoly(ctcp, bnd);
+        ctcp = lerp(ctcp, mapped, Strength);
+        color.rgb = ICtCpToScRGB(float3(ictcp.x, ctcp.x, ctcp.y));
+    }
+    return color;
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Perceptual Gamut Map";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + perceptualGamutMapHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"Mode",        L"uint", uint32_t(0), 0.0f, 1.0f, 1.0f, { L"Nearest on Shell", L"Compress to Neutral" } },
+                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
+                { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- ICtCp Boundary Viewer ----
+        {
+            static const std::string ictcpBoundaryHLSL = R"HLSL(
+// ICtCp Boundary Viewer — visualizes the gamut boundary in ICtCp Ct/Cp space
+// at multiple intensity (I) levels.
+
+cbuffer Constants : register(b0)
+{
+    float DiagramSize;
+    float TargetGamut;
+    float Intensity;   // Which I level to highlight (PQ domain, 0-1)
+};
+
+Texture2D InputTexture : register(t0);
+SamplerState InputSampler : register(s0);
+
+#define NBP 24
+
+void SampleBnd(float2 gR, float2 gG, float2 gB, float iVal, out float2 bnd[NBP])
+{
+    float nits = PQ_EOTF(iVal);
+    float Ys = max(nits / 80.0, 0.0001);
+    uint ppe = NBP / 3;
+    for (uint i = 0; i < NBP; i++)
+    {
+        float2 xy;
+        uint e = i / ppe;
+        float t = (float)(i % ppe) / (float)ppe;
+        if (e == 0)      xy = lerp(gR, gG, t);
+        else if (e == 1) xy = lerp(gG, gB, t);
+        else             xy = lerp(gB, gR, t);
+        float X = (xy.y > 1e-6) ? xy.x * Ys / xy.y : 0;
+        float Z = (xy.y > 1e-6) ? (1.0 - xy.x - xy.y) * Ys / xy.y : 0;
+        float3 ic = ScRGBToICtCp(XYZToScRGB(float3(X, Ys, Z)));
+        bnd[i] = float2(ic.y, ic.z);
+    }
+}
+
+float4 main(
+    float4 pos : SV_POSITION, float4 ps : SCENE_POSITION, float4 uv0 : TEXCOORD0
+) : SV_Target
+{
+    float size = max(DiagramSize, 256.0);
+    float2 ctcp = (uv0.xy - 0.5) * 1.0;
+
+    float2 gR, gG, gB;
+    uint g = (uint)TargetGamut;
+    if (g == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
+    else if (g == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
+    else             { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
+
+    float3 color = float3(0.01, 0.01, 0.01);
+    float lineW = 1.5 / size;
+    float dotR = 3.0 / size;
+
+    // Draw boundaries at 5 fixed I levels + the user-selected one
+    float iLevels[6] = { 0.15, 0.3, 0.45, 0.6, 0.75, Intensity };
+    float3 lColors[6] = {
+        float3(0.15, 0.05, 0.05),
+        float3(0.15, 0.1, 0.05),
+        float3(0.05, 0.15, 0.05),
+        float3(0.05, 0.1, 0.15),
+        float3(0.1, 0.05, 0.15),
+        float3(0.4, 0.4, 0.0)   // User-selected level in yellow
+    };
+
+    for (int lv = 0; lv < 6; lv++)
+    {
+        float2 bnd[NBP];
+        SampleBnd(gR, gG, gB, iLevels[lv], bnd);
+
+        for (uint i = 0; i < NBP; i++)
+        {
+            uint j = (i + 1) % NBP;
+            float2 ab = bnd[j] - bnd[i];
+            float t = saturate(dot(ctcp - bnd[i], ab) / max(dot(ab, ab), 1e-10));
+            float d = length(ctcp - bnd[i] - ab * t);
+            if (d < lineW)
+                color = max(color, lColors[lv] * (1.0 - d / lineW));
+
+            if (length(ctcp - bnd[i]) < dotR)
+                color = max(color, lColors[lv] * 1.5);
+        }
+    }
+
+    // Axes
+    if (abs(ctcp.x) < 0.4 / size || abs(ctcp.y) < 0.4 / size)
+        color = max(color, float3(0.08, 0.08, 0.08));
+
+    // Center dot (neutral)
+    if (length(ctcp) < dotR * 1.5)
+        color = float3(0.3, 0.3, 0.3);
+
+    return float4(color, 1.0);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"ICtCp Boundary";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + ictcpBoundaryHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"DiagramSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
+                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
+                { L"Intensity",   L"float", 0.5f, 0.05f, 0.95f, 0.05f },
             };
             m_effects.push_back(std::move(desc));
         }
