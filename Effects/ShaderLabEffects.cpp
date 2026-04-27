@@ -1468,5 +1468,211 @@ float4 main(
             };
             m_effects.push_back(std::move(desc));
         }
+
+        // ---- 3D Gamut Volume ----
+        {
+            static const std::string gamut3dHLSL = R"HLSL(
+// 3D Gamut Volume — rotatable CIE xyY point cloud with log luminance axis
+
+cbuffer Constants : register(b0)
+{
+    float DiagramSize;
+    float Azimuth;     // degrees
+    float Elevation;   // degrees
+    float PointSize;
+    float MaxNits;
+    float MinNits;
+    float ShowGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020
+    float Brightness;
+};
+
+Texture2D InputTexture : register(t0);
+SamplerState InputSampler : register(s0);
+
+static const float PI = 3.14159265359;
+
+// Build rotation matrix: rotate around Y (azimuth) then X (elevation)
+float3x3 BuildRotation(float azDeg, float elDeg) {
+    float az = azDeg * PI / 180.0;
+    float el = elDeg * PI / 180.0;
+    float ca = cos(az), sa = sin(az);
+    float ce = cos(el), se = sin(el);
+    // Y rotation (azimuth)
+    float3x3 Ry = float3x3(
+         ca, 0, sa,
+          0, 1,  0,
+        -sa, 0, ca);
+    // X rotation (elevation)
+    float3x3 Rx = float3x3(
+        1,   0,  0,
+        0,  ce, -se,
+        0,  se,  ce);
+    return mul(Rx, Ry);
+}
+
+// Map nits to normalized Z [0,1] using log scale
+float NitsToZ(float nits) {
+    float logMin = log10(max(MinNits, 0.001));
+    float logMax = log10(max(MaxNits, 1.0));
+    float logN = log10(max(nits, MinNits));
+    return saturate((logN - logMin) / (logMax - logMin));
+}
+
+// Convert CIE xyY to a 3D point in [0,1]^3
+float3 xyYTo3D(float2 xy, float nits) {
+    return float3(xy.x / 0.8, xy.y / 0.9, NitsToZ(nits));
+}
+
+// Project 3D point to 2D with rotation (orthographic, centered)
+float2 Project(float3 p, float3x3 rot) {
+    // Center the volume at origin
+    float3 centered = p - float3(0.5, 0.5, 0.5);
+    float3 rotated = mul(rot, centered);
+    // Orthographic: just take x and y, scale to fill
+    return rotated.xy + float2(0.5, 0.5);
+}
+
+// Draw a 3D line segment projected to 2D
+float DrawLine3D(float2 screenPos, float3 a, float3 b, float3x3 rot, float lineW) {
+    float2 pa = Project(a, rot);
+    float2 pb = Project(b, rot);
+    float2 ab = pb - pa;
+    float t = saturate(dot(screenPos - pa, ab) / max(dot(ab, ab), 1e-10));
+    float d = length(screenPos - pa - ab * t);
+    return smoothstep(lineW, lineW * 0.3, d);
+}
+
+// Convert CIE xy to approximate RGB for point coloring
+float3 xyToRGB(float2 xy) {
+    // Reconstruct XYZ with Y=1, then convert to sRGB
+    float Y = 0.5;
+    float X = (xy.y > 0.001) ? xy.x * Y / xy.y : 0;
+    float Z = (xy.y > 0.001) ? (1.0 - xy.x - xy.y) * Y / xy.y : 0;
+    float3 rgb = mul(XYZ_TO_REC709, float3(X, Y, Z));
+    // Normalize to max component to get saturated color
+    float m = max(max(rgb.r, rgb.g), max(rgb.b, 0.001));
+    return saturate(rgb / m);
+}
+
+float4 main(
+    float4 pos      : SV_POSITION,
+    float4 posScene : SCENE_POSITION,
+    float4 uv0      : TEXCOORD0
+) : SV_Target
+{
+    float2 dims;
+    InputTexture.GetDimensions(dims.x, dims.y);
+
+    float size = max(DiagramSize, 256.0);
+    float2 screenPos = uv0.xy; // [0,1]
+
+    float3x3 rot = BuildRotation(Azimuth, Elevation);
+    float lineW = 1.5 / size;
+
+    // ---- Draw reference gamut wireframe ----
+    float2 gR, gG, gB;
+    uint gamut = (uint)ShowGamut;
+    if (gamut == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
+    else if (gamut == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
+    else                 { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
+
+    float wireframe = 1.0;
+    // Vertical edges (primaries from bottom to top)
+    float3 rBot = xyYTo3D(gR, MinNits), rTop = xyYTo3D(gR, MaxNits);
+    float3 gBot = xyYTo3D(gG, MinNits), gTop = xyYTo3D(gG, MaxNits);
+    float3 bBot = xyYTo3D(gB, MinNits), bTop = xyYTo3D(gB, MaxNits);
+    wireframe = min(wireframe, DrawLine3D(screenPos, rBot, rTop, rot, lineW));
+    wireframe = min(wireframe, DrawLine3D(screenPos, gBot, gTop, rot, lineW));
+    wireframe = min(wireframe, DrawLine3D(screenPos, bBot, bTop, rot, lineW));
+
+    // Horizontal triangles at key luminance levels
+    float nitLevels[4] = { 1.0, 10.0, 100.0, 1000.0 };
+    for (int lvl = 0; lvl < 4; lvl++) {
+        float n = nitLevels[lvl];
+        if (n < MinNits || n > MaxNits) continue;
+        float3 r3 = xyYTo3D(gR, n);
+        float3 g3 = xyYTo3D(gG, n);
+        float3 b3 = xyYTo3D(gB, n);
+        wireframe = min(wireframe, DrawLine3D(screenPos, r3, g3, rot, lineW * 0.6));
+        wireframe = min(wireframe, DrawLine3D(screenPos, g3, b3, rot, lineW * 0.6));
+        wireframe = min(wireframe, DrawLine3D(screenPos, b3, r3, rot, lineW * 0.6));
+    }
+
+    // Also draw white point vertical line
+    float3 wpBot = xyYTo3D(D65_WHITE, MinNits);
+    float3 wpTop = xyYTo3D(D65_WHITE, MaxNits);
+    wireframe = min(wireframe, DrawLine3D(screenPos, wpBot, wpTop, rot, lineW * 0.4));
+
+    float3 bgColor = float3(0.04, 0.04, 0.04);
+    float3 wireColor = float3(0.3, 0.3, 0.3);
+    float3 color = lerp(wireColor, bgColor, wireframe);
+
+    // ---- Sample source and accumulate point cloud ----
+    uint maxSamples = 192;
+    float stepX = max(dims.x / (float)maxSamples, 1.0);
+    float stepY = max(dims.y / (float)maxSamples, 1.0);
+
+    float3 accum = float3(0, 0, 0);
+    float totalHits = 0;
+
+    for (float sy = 0.5; sy < dims.y; sy += stepY)
+    {
+        for (float sx = 0.5; sx < dims.x; sx += stepX)
+        {
+            float2 suv = float2(sx / dims.x, sy / dims.y);
+            float4 s = InputTexture.SampleLevel(InputSampler, suv, 0);
+
+            float3 xyz = ScRGBToXYZ(max(s.rgb, 0.0));
+            float sum = xyz.x + xyz.y + xyz.z;
+            if (sum < 1e-6) continue;
+
+            float2 sxy = float2(xyz.x / sum, xyz.y / sum);
+            float nits = max(xyz.y * 80.0, 0.001);
+
+            if (nits < MinNits || nits > MaxNits) continue;
+
+            float3 p3d = xyYTo3D(sxy, nits);
+            float2 proj = Project(p3d, rot);
+
+            float d = length(screenPos - proj);
+            if (d < PointSize)
+            {
+                float falloff = 1.0 - d / PointSize;
+                float3 pointColor = xyToRGB(sxy);
+                accum += pointColor * falloff * Brightness;
+                totalHits += falloff;
+            }
+        }
+    }
+
+    if (totalHits > 0)
+    {
+        float intensity = min(totalHits * 0.15 * Brightness, 3.0);
+        float3 avgColor = accum / max(totalHits, 0.001);
+        color = max(color, avgColor * intensity);
+    }
+
+    return float4(color, 1.0);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"3D Gamut Volume";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + gamut3dHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"DiagramSize", L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
+                { L"Azimuth",    L"float", 45.0f, 0.0f, 360.0f, 5.0f },
+                { L"Elevation",  L"float", 30.0f, -90.0f, 90.0f, 5.0f },
+                { L"PointSize",  L"float", 0.005f, 0.001f, 0.02f, 0.001f },
+                { L"MaxNits",    L"float", 10000.0f, 100.0f, 10000.0f, 100.0f },
+                { L"MinNits",    L"float", 0.1f, 0.001f, 10.0f, 0.01f },
+                { L"ShowGamut",  L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
+                { L"Brightness", L"float", 1.0f, 0.1f, 5.0f, 0.1f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
     }
 }
