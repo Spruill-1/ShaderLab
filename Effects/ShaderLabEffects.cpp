@@ -1608,36 +1608,52 @@ float4 main(
     float3 color = lerp(wireColor, bgColor, wireframe);
 
     // ---- Sample source and accumulate point cloud ----
-    uint maxSamples = 192;
+    // Use fewer samples for performance (critical for video playback).
+    // Each sample is projected to 2D and checked against the current pixel.
+    uint maxSamples = 96;
     float stepX = max(dims.x / (float)maxSamples, 1.0);
     float stepY = max(dims.y / (float)maxSamples, 1.0);
+
+    // Use larger effective point size for splatting (cheaper hit detection).
+    float ps = PointSize;
 
     float3 accum = float3(0, 0, 0);
     float totalHits = 0;
 
+    // Pre-compute inverse for the tight loop.
+    float invDimX = 1.0 / dims.x;
+    float invDimY = 1.0 / dims.y;
+    float psInv = 1.0 / ps;
+
     for (float sy = 0.5; sy < dims.y; sy += stepY)
     {
+        float v = sy * invDimY;
         for (float sx = 0.5; sx < dims.x; sx += stepX)
         {
-            float2 suv = float2(sx / dims.x, sy / dims.y);
-            float4 s = InputTexture.SampleLevel(InputSampler, suv, 0);
+            float4 s = InputTexture.SampleLevel(InputSampler, float2(sx * invDimX, v), 0);
+
+            // Fast luminance pre-check (skip very dark pixels).
+            float Y = dot(s.rgb, float3(0.2126, 0.7152, 0.0722));
+            if (Y < MinNits / 80.0 || Y <= 0.0) continue;
+
+            float nits = Y * 80.0;
+            if (nits > MaxNits) continue;
 
             float3 xyz = ScRGBToXYZ(max(s.rgb, 0.0));
             float sum = xyz.x + xyz.y + xyz.z;
             if (sum < 1e-6) continue;
 
             float2 sxy = float2(xyz.x / sum, xyz.y / sum);
-            float nits = max(xyz.y * 80.0, 0.001);
-
-            if (nits < MinNits || nits > MaxNits) continue;
-
             float3 p3d = xyYTo3D(sxy, nits);
             float2 proj = Project(p3d, rot);
 
-            float d = length(screenPos - proj);
-            if (d < PointSize)
+            // Fast squared distance check before sqrt.
+            float2 delta = screenPos - proj;
+            float d2 = dot(delta, delta);
+            if (d2 < ps * ps)
             {
-                float falloff = 1.0 - d / PointSize;
+                float d = sqrt(d2);
+                float falloff = 1.0 - d * psInv;
                 float3 pointColor = xyToRGB(sxy);
                 accum += pointColor * falloff * Brightness;
                 totalHits += falloff;
@@ -1663,14 +1679,14 @@ float4 main(
             desc.hlslSource = colorMath + gamut3dHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"DiagramSize", L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
+                { L"DiagramSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
                 { L"Azimuth",    L"float", 45.0f, 0.0f, 360.0f, 5.0f },
                 { L"Elevation",  L"float", 30.0f, -90.0f, 90.0f, 5.0f },
-                { L"PointSize",  L"float", 0.005f, 0.001f, 0.02f, 0.001f },
+                { L"PointSize",  L"float", 0.008f, 0.002f, 0.03f, 0.001f },
                 { L"MaxNits",    L"float", 10000.0f, 100.0f, 10000.0f, 100.0f },
                 { L"MinNits",    L"float", 0.1f, 0.001f, 10.0f, 0.01f },
                 { L"ShowGamut",  L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
-                { L"Brightness", L"float", 1.0f, 0.1f, 5.0f, 0.1f },
+                { L"Brightness", L"float", 1.5f, 0.1f, 5.0f, 0.1f },
             };
             m_effects.push_back(std::move(desc));
         }
