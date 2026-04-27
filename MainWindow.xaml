@@ -203,8 +203,7 @@
                                 <ColumnDefinition Width="28" />
                                 <ColumnDefinition Width="*" />
                             </Grid.ColumnDefinitions>
-                            <SwapChainPanel x:Name="TraceSwatchPanel" Grid.Column="0"
-                                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" />
+                            <SwapChainPanel x:Name="TraceSwatchPanel" Grid.Column="0" />
                             <ScrollViewer Grid.Column="1" Padding="4">
                                 <StackPanel x:Name="PixelTracePanel" Spacing="2" />
                             </ScrollViewer>
