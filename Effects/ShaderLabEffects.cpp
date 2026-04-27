@@ -1468,5 +1468,172 @@ float4 main(
             };
             m_effects.push_back(std::move(desc));
         }
+
+        // ---- Gamut Map ----
+        {
+            static const std::string gamutMapHLSL = R"HLSL(
+// Gamut Map — constrains input colors to a target gamut.
+// Three modes:
+//   0: Clip — hard clamp RGB components to [0,1] in target space
+//   1: Nearest — project out-of-gamut CIE xy to nearest point on gamut triangle
+//   2: Compress to White — move out-of-gamut xy toward D65 white until inside
+
+cbuffer Constants : register(b0)
+{
+    float Mode;       // 0=Clip, 1=Nearest, 2=Compress to White
+    float TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020
+    float Strength;    // 0=bypass, 1=full mapping
+};
+
+Texture2D InputTexture : register(t0);
+SamplerState InputSampler : register(s0);
+
+// Nearest point on line segment AB to point P
+float2 NearestOnSegment(float2 p, float2 a, float2 b) {
+    float2 ab = b - a;
+    float t = saturate(dot(p - a, ab) / max(dot(ab, ab), 1e-10));
+    return a + ab * t;
+}
+
+// Find the nearest point on triangle (a,b,c) boundary to point p
+float2 NearestOnTriangle(float2 p, float2 a, float2 b, float2 c) {
+    float2 p0 = NearestOnSegment(p, a, b);
+    float2 p1 = NearestOnSegment(p, b, c);
+    float2 p2 = NearestOnSegment(p, c, a);
+    float d0 = dot(p - p0, p - p0);
+    float d1 = dot(p - p1, p - p1);
+    float d2 = dot(p - p2, p - p2);
+    if (d0 <= d1 && d0 <= d2) return p0;
+    if (d1 <= d2) return p1;
+    return p2;
+}
+
+// Line-segment intersection: find t where ray from P toward Q crosses segment AB.
+// Returns t in [0,1] if intersection found, -1 otherwise.
+float RaySegmentIntersect(float2 p, float2 dir, float2 a, float2 b) {
+    float2 ab = b - a;
+    float denom = dir.x * ab.y - dir.y * ab.x;
+    if (abs(denom) < 1e-10) return -1.0;
+    float2 pa = a - p;
+    float t = (pa.x * ab.y - pa.y * ab.x) / denom;
+    float u = (pa.x * dir.y - pa.y * dir.x) / denom;
+    if (t > 0.0 && u >= 0.0 && u <= 1.0) return t;
+    return -1.0;
+}
+
+// Move point toward white (D65) until it hits the gamut triangle boundary
+float2 CompressToWhite(float2 p, float2 a, float2 b, float2 c) {
+    float2 white = float2(0.3127, 0.3290);
+    float2 dir = white - p;
+
+    // Find intersection of ray from p toward white with triangle edges
+    float tMin = 1e10;
+    float t;
+    t = RaySegmentIntersect(p, dir, a, b);
+    if (t > 0 && t < tMin) tMin = t;
+    t = RaySegmentIntersect(p, dir, b, c);
+    if (t > 0 && t < tMin) tMin = t;
+    t = RaySegmentIntersect(p, dir, c, a);
+    if (t > 0 && t < tMin) tMin = t;
+
+    if (tMin < 1.0)
+        return p + dir * tMin;  // Hit the boundary before reaching white
+    return white;  // Already inside or very close to white
+}
+
+float4 main(
+    float4 pos      : SV_POSITION,
+    float4 posScene : SCENE_POSITION,
+    float4 uv0      : TEXCOORD0
+) : SV_Target
+{
+    float4 color = InputTexture.Sample(InputSampler, uv0.xy);
+    if (Strength < 0.001) return color;
+
+    // Get target gamut primaries
+    float2 gR, gG, gB;
+    uint gamut = (uint)TargetGamut;
+    if (gamut == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
+    else if (gamut == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
+    else                 { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
+
+    uint mode = (uint)Mode;
+
+    if (mode == 0)
+    {
+        // Clip mode: transform to target gamut RGB, clamp, transform back.
+        // For sRGB (gamut 0), the pipeline is already in Rec.709, so just clamp.
+        float3 rgb = color.rgb;
+
+        if (gamut == 0) {
+            // sRGB = Rec.709 primaries = scRGB primaries. Just clamp negatives.
+            float3 clamped = max(rgb, 0.0);
+            color.rgb = lerp(rgb, clamped, Strength);
+        }
+        else if (gamut == 1) {
+            // scRGB -> XYZ -> P3 -> clamp -> XYZ -> scRGB
+            float3 xyz = ScRGBToXYZ(rgb);
+            float3 p3 = mul(XYZ_TO_P3D65, xyz);
+            float3 clamped = max(p3, 0.0);
+            float3 xyzBack = mul(P3D65_TO_XYZ, clamped);
+            float3 result = XYZToScRGB(xyzBack);
+            color.rgb = lerp(rgb, result, Strength);
+        }
+        else {
+            // scRGB -> XYZ -> BT.2020 -> clamp -> XYZ -> scRGB
+            float3 xyz = ScRGBToXYZ(rgb);
+            float3 bt2020 = mul(XYZ_TO_REC2020, xyz);
+            float3 clamped = max(bt2020, 0.0);
+            float3 xyzBack = mul(REC2020_TO_XYZ, clamped);
+            float3 result = XYZToScRGB(xyzBack);
+            color.rgb = lerp(rgb, result, Strength);
+        }
+    }
+    else
+    {
+        // Chromaticity-based mapping (modes 1 and 2).
+        float3 xyz = ScRGBToXYZ(max(color.rgb, 0.0));
+        float sum = xyz.x + xyz.y + xyz.z;
+        if (sum < 1e-6) return color;
+
+        float2 xy = float2(xyz.x / sum, xyz.y / sum);
+        float Y = xyz.y;  // Preserve luminance
+
+        // Check if inside gamut triangle
+        bool inside = PointInTriangle(xy, gR, gG, gB);
+        if (!inside)
+        {
+            float2 mapped;
+            if (mode == 1)
+                mapped = NearestOnTriangle(xy, gR, gG, gB);
+            else
+                mapped = CompressToWhite(xy, gR, gG, gB);
+
+            xy = lerp(xy, mapped, Strength);
+        }
+
+        // Reconstruct XYZ from mapped xy + original Y
+        float X = (xy.y > 1e-6) ? xy.x * Y / xy.y : 0.0;
+        float Z = (xy.y > 1e-6) ? (1.0 - xy.x - xy.y) * Y / xy.y : 0.0;
+        color.rgb = XYZToScRGB(float3(X, Y, Z));
+    }
+
+    return color;
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Gamut Map";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + gamutMapHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"Mode",        L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"Clip", L"Nearest Point", L"Compress to White" } },
+                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
+                { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
     }
 }
