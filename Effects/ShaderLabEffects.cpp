@@ -589,7 +589,7 @@ float4 main(
     float3 xyY = float3(xy.x, xy.y, 0.5);
     float3 xyz = xyYToXYZ(xyY);
     float3 rgb = XYZToScRGB(xyz);
-    // Normalize to visible range — dim for HDR compatibility
+    // Normalize to visible range - dim for HDR compatibility
     float maxC = max(max(rgb.r, rgb.g), max(rgb.b, 0.001));
     rgb = rgb / maxC * 0.15 * Brightness;
 
@@ -732,7 +732,7 @@ float4 main(
     float3 xyY_val = float3(xy.x, xy.y, Y);
     float3 xyz = xyYToXYZ(xyY_val);
     float3 rgb = XYZToScRGB(xyz);
-    // Preserve negative scRGB values — they represent colors outside Rec.709
+    // Preserve negative scRGB values - they represent colors outside Rec.709
     // that are valid in wider gamuts (P3, Rec.2020). Downstream effects like
     // Gamut Highlight rely on these negative components.
 
@@ -1086,7 +1086,7 @@ float4 main(
         // ---- Delta E Comparator ----
         {
             static const std::string deltaEHLSL = R"HLSL(
-// Delta E Comparator — per-pixel color difference between two inputs
+// Delta E Comparator - per-pixel color difference between two inputs
 // Supports: CIE76, CIE94, CIEDE2000
 
 cbuffer Constants : register(b0)
@@ -1237,7 +1237,7 @@ float4 main(
         // ---- False Color Luminance Map ----
         {
             static const std::string falseColorHLSL = R"HLSL(
-// False Color Luminance Map — maps nit ranges to distinct colors
+// False Color Luminance Map - maps nit ranges to distinct colors
 
 cbuffer Constants : register(b0)
 {
@@ -1249,14 +1249,14 @@ SamplerState InputSampler : register(s0);
 
 float3 FalseColor(float nits) {
     // Purple < 0.5 < Blue < 5 < Cyan < 20 < Green < 100 < Yellow < 400 < Orange < 1000 < Red < 4000 < White
-    if (nits < 0.5)   return float3(0.2, 0.0, 0.4);    // Purple — crushed blacks
-    if (nits < 5.0)   return float3(0.0, 0.0, 0.8);    // Blue — deep shadows
-    if (nits < 20.0)  return float3(0.0, 0.6, 0.8);    // Cyan — shadow detail
-    if (nits < 100.0) return float3(0.0, 0.7, 0.0);    // Green — mid-tones (SDR)
-    if (nits < 400.0) return float3(0.9, 0.9, 0.0);    // Yellow — highlights
-    if (nits < 1000.0) return float3(1.0, 0.5, 0.0);   // Orange — HDR specular
-    if (nits < 4000.0) return float3(1.0, 0.0, 0.0);   // Red — bright HDR
-    return float3(1.0, 1.0, 1.0);                       // White — peak HDR
+    if (nits < 0.5)   return float3(0.2, 0.0, 0.4);    // Purple - crushed blacks
+    if (nits < 5.0)   return float3(0.0, 0.0, 0.8);    // Blue - deep shadows
+    if (nits < 20.0)  return float3(0.0, 0.6, 0.8);    // Cyan - shadow detail
+    if (nits < 100.0) return float3(0.0, 0.7, 0.0);    // Green - mid-tones (SDR)
+    if (nits < 400.0) return float3(0.9, 0.9, 0.0);    // Yellow - highlights
+    if (nits < 1000.0) return float3(1.0, 0.5, 0.0);   // Orange - HDR specular
+    if (nits < 4000.0) return float3(1.0, 0.0, 0.0);   // Red - bright HDR
+    return float3(1.0, 1.0, 1.0);                       // White - peak HDR
 }
 
 float4 main(
@@ -1288,7 +1288,7 @@ float4 main(
         // ---- Waveform Monitor ----
         {
             static const std::string waveformHLSL = R"HLSL(
-// Waveform Monitor — RGB parade or luminance waveform
+// Waveform Monitor - RGB parade or luminance waveform
 // For each output pixel (x, y), samples the source column x and counts
 // how many source pixels have a value near the level represented by y.
 
@@ -1424,7 +1424,7 @@ float4 main(
         // ---- Gamut Volume Coverage ----
         {
             static const std::string gamutCoverageHLSL = R"HLSL(
-// Gamut Volume Coverage — visualizes which gamut regions are occupied
+// Gamut Volume Coverage - visualizes which gamut regions are occupied
 // Shows a CIE xy diagram with dots for occupied chromaticities
 
 cbuffer Constants : register(b0)
@@ -1531,11 +1531,11 @@ float4 main(
         // ---- Gamut Map ----
         {
             static const std::string gamutMapHLSL = R"HLSL(
-// Gamut Map — constrains input colors to a target gamut.
+// Gamut Map - constrains input colors to a target gamut.
 // Three modes:
-//   0: Clip — hard clamp RGB components to [0,1] in target space
-//   1: Nearest — project out-of-gamut CIE xy to nearest point on gamut triangle
-//   2: Compress to White — move out-of-gamut xy toward D65 white until inside
+//   0: Clip - hard clamp RGB components to [0,1] in target space
+//   1: Nearest - project out-of-gamut CIE xy to nearest point on gamut triangle
+//   2: Compress to White - move out-of-gamut xy toward D65 white until inside
 
 cbuffer Constants : register(b0)
 {
@@ -1698,7 +1698,7 @@ float4 main(
         // ---- Perceptual Gamut Map (ICtCp) ----
         {
             static const std::string perceptualGamutMapHLSL = R"HLSL(
-// Perceptual Gamut Map — gamut mapping in ICtCp space.
+// Perceptual Gamut Map - gamut mapping in ICtCp space.
 // Samples the target gamut boundary as a polygon in the Ct/Cp plane
 // at the pixel's intensity level, then maps out-of-gamut pixels.
 
@@ -1822,7 +1822,7 @@ float4 main(
         // ---- ICtCp Boundary Viewer ----
         {
             static const std::string ictcpBoundaryHLSL = R"HLSL(
-// ICtCp Boundary Viewer — visualizes the gamut boundary in ICtCp Ct/Cp space
+// ICtCp Boundary Viewer - visualizes the gamut boundary in ICtCp Ct/Cp space
 // at multiple intensity (I) levels.
 
 cbuffer Constants : register(b0)
