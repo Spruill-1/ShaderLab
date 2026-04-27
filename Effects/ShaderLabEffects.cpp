@@ -1469,135 +1469,28 @@ float4 main(
             m_effects.push_back(std::move(desc));
         }
 
-        // ---- Gamut Mapper (compute shader — bins pixels into 3D voxel grid) ----
+        // ---- Gamut Mapper (compute shader — projects pixels into 2D scatter plot) ----
         {
             static const std::string gamutMapperHLSL = R"HLSL(
-// Gamut Mapper — bins source pixels into a CIE xy × log-luminance voxel grid.
-// Output: 2D texture where each pixel stores the count/color of samples
-// that fall into that voxel. The grid is GridW × GridH pixels, laid out as
-// a flattened 3D array: X = CIE x bin, Y = (CIE y bin * zSlices + z bin).
+// Gamut Mapper — projects source pixels into a rotated 3D scatter plot.
+// Each thread processes one source pixel: transforms to CIE xyY,
+// applies 3D rotation, and writes the projected color to the output.
 
 cbuffer Constants : register(b0)
 {
-    float GridW;    // Bins along CIE x axis (default 64)
-    float GridH;    // Total output height = yBins * zSlices
-    float ZSlices;  // Bins along luminance axis (default 32)
+    int2 _TileOffset;
+    float Azimuth;
+    float Elevation;
     float MaxNits;
     float MinNits;
+    float Brightness;
+    float PointSize;   // Not used in compute — just for param matching
 };
 
 Texture2D<float4> InputTexture : register(t0);
 RWTexture2D<float4> OutputTexture : register(u0);
 
-[numthreads(16, 16, 1)]
-void main(uint3 dtid : SV_DispatchThreadID)
-{
-    uint2 dims;
-    InputTexture.GetDimensions(dims.x, dims.y);
-    if (dtid.x >= dims.x || dtid.y >= dims.y) return;
-
-    float4 s = InputTexture.Load(int3(dtid.xy, 0));
-    float Y = dot(s.rgb, float3(0.2126, 0.7152, 0.0722));
-    if (Y <= 0.0) return;
-
-    float nits = Y * 80.0;
-    if (nits < MinNits || nits > MaxNits) return;
-
-    float3 xyz = mul(float3x3(
-        0.4123908, 0.3575843, 0.1804808,
-        0.2126390, 0.7151687, 0.0721923,
-        0.0193308, 0.1191950, 0.9505322), max(s.rgb, 0.0));
-    float sum = xyz.x + xyz.y + xyz.z;
-    if (sum < 1e-6) return;
-
-    float cx = xyz.x / sum;  // CIE x [0, ~0.8]
-    float cy = xyz.y / sum;  // CIE y [0, ~0.9]
-
-    float logMin = log10(max(MinNits, 0.001));
-    float logMax = log10(max(MaxNits, 1.0));
-    float zNorm = saturate((log10(nits) - logMin) / (logMax - logMin));
-
-    uint bx = (uint)(cx / 0.8 * GridW);
-    uint yBins = (uint)(GridH / ZSlices);
-    uint by = (uint)(cy / 0.9 * (float)yBins);
-    uint bz = (uint)(zNorm * ZSlices);
-
-    bx = min(bx, (uint)GridW - 1);
-    by = min(by, yBins - 1);
-    bz = min(bz, (uint)ZSlices - 1);
-
-    // Flatten: output Y = by * zSlices + bz
-    uint2 outPos = uint2(bx, by * (uint)ZSlices + bz);
-
-    // Accumulate: RGB = sum of chromaticity colors, A = count.
-    // Reconstruct approximate display color from CIE xy.
-    float3 xyzRecon = float3(cx / max(cy, 0.001) * 0.5, 0.5, (1.0 - cx - cy) / max(cy, 0.001) * 0.5);
-    float3 rgb = mul(float3x3(
-         3.2409699, -1.5373832, -0.4986108,
-        -0.9692436,  1.8759675,  0.0415551,
-         0.0556301, -0.2039770,  1.0569715), xyzRecon);
-    float m = max(max(rgb.r, rgb.g), max(rgb.b, 0.001));
-    rgb = saturate(rgb / m);
-
-    // Atomic-like accumulation via InterlockedAdd isn't available on float UAV,
-    // so we just write the color. Multiple writes to the same pixel will race,
-    // but for visualization this is acceptable — it gives a stochastic sample.
-    float4 existing = OutputTexture[outPos];
-    OutputTexture[outPos] = float4(existing.rgb + rgb * 0.01, existing.a + 0.01);
-}
-)HLSL";
-
-            ShaderLabEffectDescriptor desc;
-            desc.name = L"Gamut Mapper";
-            desc.category = L"Analysis";
-            desc.shaderType = Graph::CustomShaderType::ComputeShader;
-            desc.hlslSource = gamutMapperHLSL;  // No color math prefix needed — self-contained
-            desc.inputNames = { L"Source" };
-            desc.parameters = {
-                { L"GridW",    L"float", 64.0f, 16.0f, 256.0f, 16.0f },
-                { L"GridH",    L"float", 2048.0f, 256.0f, 8192.0f, 256.0f },
-                { L"ZSlices",  L"float", 32.0f, 8.0f, 128.0f, 8.0f },
-                { L"MaxNits",  L"float", 10000.0f, 100.0f, 10000.0f, 100.0f },
-                { L"MinNits",  L"float", 0.1f, 0.001f, 10.0f, 0.01f },
-            };
-            desc.threadGroupX = 16;
-            desc.threadGroupY = 16;
-            desc.threadGroupZ = 1;
-            m_effects.push_back(std::move(desc));
-        }
-
-        // ---- Gamut Viewer (pixel shader — renders the voxel grid as 3D projection) ----
-        {
-            static const std::string gamutViewerHLSL = R"HLSL(
-// Gamut Viewer — renders a Gamut Mapper voxel grid as a rotatable 3D projection.
-// Input: the voxel grid texture from Gamut Mapper.
-// Grid layout: X = CIE x bin, Y = (CIE y bin * ZSlices + z bin).
-
-cbuffer Constants : register(b0)
-{
-    float DiagramSize;
-    float Azimuth;
-    float Elevation;
-    float PointSize;
-    float ShowGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020
-    float Brightness;
-    float GridW;       // Must match Gamut Mapper
-    float ZSlices;     // Must match Gamut Mapper
-};
-
-Texture2D InputTexture : register(t0);
-SamplerState InputSampler : register(s0);
-
 static const float PI = 3.14159265359;
-static const float2 GAMUT_709_R  = float2(0.64, 0.33);
-static const float2 GAMUT_709_G  = float2(0.30, 0.60);
-static const float2 GAMUT_709_B  = float2(0.15, 0.06);
-static const float2 GAMUT_P3_R   = float2(0.680, 0.320);
-static const float2 GAMUT_P3_G   = float2(0.265, 0.690);
-static const float2 GAMUT_P3_B   = float2(0.150, 0.060);
-static const float2 GAMUT_2020_R = float2(0.708, 0.292);
-static const float2 GAMUT_2020_G = float2(0.170, 0.797);
-static const float2 GAMUT_2020_B = float2(0.131, 0.046);
 
 float3x3 BuildRotation(float azDeg, float elDeg) {
     float az = azDeg * PI / 180.0;
@@ -1609,110 +1502,181 @@ float3x3 BuildRotation(float azDeg, float elDeg) {
     return mul(Rx, Ry);
 }
 
-float2 Project(float3 p, float3x3 rot) {
-    float3 c = p - float3(0.5, 0.5, 0.5);
-    float3 r = mul(rot, c);
-    return r.xy + float2(0.5, 0.5);
-}
+[numthreads(16, 16, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
+{
+    uint2 srcDims;
+    InputTexture.GetDimensions(srcDims.x, srcDims.y);
+    if (dtid.x >= srcDims.x || dtid.y >= srcDims.y) return;
 
-float DrawLine3D(float2 sp, float3 a, float3 b, float3x3 rot, float lw) {
-    float2 pa = Project(a, rot), pb = Project(b, rot);
-    float2 ab = pb - pa;
-    float t = saturate(dot(sp - pa, ab) / max(dot(ab, ab), 1e-10));
-    return smoothstep(lw, lw * 0.3, length(sp - pa - ab * t));
+    float4 s = InputTexture.Load(int3(dtid.xy, 0));
+    float Y = dot(s.rgb, float3(0.2126, 0.7152, 0.0722));
+    if (Y <= 0.0) return;
+
+    float nits = Y * 80.0;
+    if (nits < MinNits || nits > MaxNits) return;
+
+    // scRGB -> XYZ -> CIE xy
+    float3 xyz = mul(float3x3(
+        0.4123908, 0.3575843, 0.1804808,
+        0.2126390, 0.7151687, 0.0721923,
+        0.0193308, 0.1191950, 0.9505322), max(s.rgb, 0.0));
+    float sum = xyz.x + xyz.y + xyz.z;
+    if (sum < 1e-6) return;
+
+    float cx = xyz.x / sum;
+    float cy = xyz.y / sum;
+
+    // Normalize to [0,1]^3
+    float logMin = log10(max(MinNits, 0.001));
+    float logMax = log10(max(MaxNits, 1.0));
+    float zNorm = saturate((log10(nits) - logMin) / (logMax - logMin));
+    float3 p3d = float3(cx / 0.8, cy / 0.9, zNorm);
+
+    // 3D rotation + orthographic projection
+    float3x3 rot = BuildRotation(Azimuth, Elevation);
+    float3 centered = p3d - float3(0.5, 0.5, 0.5);
+    float3 rotated = mul(rot, centered);
+    float2 proj = rotated.xy + float2(0.5, 0.5);
+
+    // Map to output pixel coordinates
+    uint2 outDims;
+    OutputTexture.GetDimensions(outDims.x, outDims.y);
+    int2 outPos = int2(proj * float2(outDims));
+
+    if (outPos.x < 0 || outPos.y < 0 ||
+        outPos.x >= (int)outDims.x || outPos.y >= (int)outDims.y) return;
+
+    // Approximate display color from CIE xy
+    float3 xyzRecon = float3(cx / max(cy, 0.001) * 0.5, 0.5,
+                             (1.0 - cx - cy) / max(cy, 0.001) * 0.5);
+    float3 rgb = mul(float3x3(
+         3.2409699, -1.5373832, -0.4986108,
+        -0.9692436,  1.8759675,  0.0415551,
+         0.0556301, -0.2039770,  1.0569715), xyzRecon);
+    float m = max(max(rgb.r, rgb.g), max(rgb.b, 0.001));
+    rgb = saturate(rgb / m) * Brightness * 0.02;
+
+    // Additive scatter (races are acceptable for visualization)
+    float4 existing = OutputTexture[outPos];
+    OutputTexture[outPos] = float4(existing.rgb + rgb, existing.a + 0.02);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Gamut Mapper";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::ComputeShader;
+            desc.hlslSource = gamutMapperHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"Azimuth",    L"float", 45.0f, 0.0f, 360.0f, 5.0f },
+                { L"Elevation",  L"float", 30.0f, -90.0f, 90.0f, 5.0f },
+                { L"MaxNits",    L"float", 10000.0f, 100.0f, 10000.0f, 100.0f },
+                { L"MinNits",    L"float", 0.1f, 0.001f, 10.0f, 0.01f },
+                { L"Brightness", L"float", 1.5f, 0.1f, 5.0f, 0.1f },
+                { L"PointSize",  L"float", 0.01f, 0.002f, 0.05f, 0.002f },
+            };
+            desc.threadGroupX = 16;
+            desc.threadGroupY = 16;
+            desc.threadGroupZ = 1;
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Gamut Viewer (pixel shader — overlays wireframe on Gamut Mapper output) ----
+        {
+            static const std::string gamutViewerHLSL = R"HLSL(
+// Gamut Viewer — overlays gamut wireframe and bounding box on Gamut Mapper scatter plot.
+
+cbuffer Constants : register(b0)
+{
+    float DiagramSize;
+    float Azimuth;
+    float Elevation;
+    float ShowGamut;
+    float Brightness;
+};
+
+Texture2D InputTexture : register(t0);
+SamplerState InputSampler : register(s0);
+
+static const float PI = 3.14159265359;
+static const float2 G709R = float2(0.64, 0.33), G709G = float2(0.30, 0.60), G709B = float2(0.15, 0.06);
+static const float2 GP3R  = float2(0.680, 0.320), GP3G = float2(0.265, 0.690), GP3B = float2(0.150, 0.060);
+static const float2 G20R  = float2(0.708, 0.292), G20G = float2(0.170, 0.797), G20B = float2(0.131, 0.046);
+
+float3x3 BuildRot(float az, float el) {
+    float a = az*PI/180, e = el*PI/180;
+    float ca=cos(a),sa=sin(a),ce=cos(e),se=sin(e);
+    return mul(float3x3(1,0,0,0,ce,-se,0,se,ce), float3x3(ca,0,sa,0,1,0,-sa,0,ca));
+}
+float2 Proj(float3 p, float3x3 r) {
+    return mul(r, p - 0.5).xy + 0.5;
+}
+float Line3D(float2 sp, float3 a, float3 b, float3x3 r, float w) {
+    float2 pa=Proj(a,r), pb=Proj(b,r), ab=pb-pa;
+    float t=saturate(dot(sp-pa,ab)/max(dot(ab,ab),1e-10));
+    return smoothstep(w, w*0.3, length(sp-pa-ab*t));
 }
 
 float4 main(
-    float4 pos      : SV_POSITION,
-    float4 posScene : SCENE_POSITION,
-    float4 uv0      : TEXCOORD0
+    float4 pos : SV_POSITION, float4 ps : SCENE_POSITION, float4 uv0 : TEXCOORD0
 ) : SV_Target
 {
-    float size = max(DiagramSize, 256.0);
-    float2 screenPos = uv0.xy;
-    float3x3 rot = BuildRotation(Azimuth, Elevation);
-    float lineW = 1.5 / size;
+    float2 sp = uv0.xy;
+    float3x3 rot = BuildRot(Azimuth, Elevation);
+    float lw = 1.5 / max(DiagramSize, 256.0);
 
-    // ---- Gamut wireframe ----
+    // Read scatter plot from Gamut Mapper
+    float4 scatter = InputTexture.Sample(InputSampler, uv0.xy);
+    float3 color = float3(0, 0, 0);
+
+    // Render scatter points
+    if (scatter.a > 0.005) {
+        float3 avgColor = scatter.rgb / max(scatter.a, 0.001);
+        float intensity = min(scatter.a * 5.0 * Brightness, 2.0);
+        color = avgColor * intensity;
+    }
+
+    // Gamut wireframe
     float2 gR, gG, gB;
-    uint gamut = (uint)ShowGamut;
-    if (gamut == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
-    else if (gamut == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
-    else                 { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
+    uint g = (uint)ShowGamut;
+    if (g==1) { gR=GP3R; gG=GP3G; gB=GP3B; }
+    else if (g==2) { gR=G20R; gG=G20G; gB=G20B; }
+    else { gR=G709R; gG=G709G; gB=G709B; }
 
-    // Gamut prism vertices in normalized [0,1]^3
-    float3 rB = float3(gR.x/0.8, gR.y/0.9, 0), rT = float3(gR.x/0.8, gR.y/0.9, 1);
-    float3 gBt = float3(gG.x/0.8, gG.y/0.9, 0), gTp = float3(gG.x/0.8, gG.y/0.9, 1);
-    float3 bB = float3(gB.x/0.8, gB.y/0.9, 0), bT = float3(gB.x/0.8, gB.y/0.9, 1);
+    float3 rB=float3(gR.x/0.8,gR.y/0.9,0), rT=float3(gR.x/0.8,gR.y/0.9,1);
+    float3 gBt=float3(gG.x/0.8,gG.y/0.9,0), gTp=float3(gG.x/0.8,gG.y/0.9,1);
+    float3 bB=float3(gB.x/0.8,gB.y/0.9,0), bT=float3(gB.x/0.8,gB.y/0.9,1);
 
     float wf = 1.0;
-    wf = min(wf, DrawLine3D(screenPos, rB, rT, rot, lineW));
-    wf = min(wf, DrawLine3D(screenPos, gBt, gTp, rot, lineW));
-    wf = min(wf, DrawLine3D(screenPos, bB, bT, rot, lineW));
-    wf = min(wf, DrawLine3D(screenPos, rB, gBt, rot, lineW * 0.6));
-    wf = min(wf, DrawLine3D(screenPos, gBt, bB, rot, lineW * 0.6));
-    wf = min(wf, DrawLine3D(screenPos, bB, rB, rot, lineW * 0.6));
-    wf = min(wf, DrawLine3D(screenPos, rT, gTp, rot, lineW * 0.6));
-    wf = min(wf, DrawLine3D(screenPos, gTp, bT, rot, lineW * 0.6));
-    wf = min(wf, DrawLine3D(screenPos, bT, rT, rot, lineW * 0.6));
+    wf = min(wf, Line3D(sp, rB, rT, rot, lw));
+    wf = min(wf, Line3D(sp, gBt, gTp, rot, lw));
+    wf = min(wf, Line3D(sp, bB, bT, rot, lw));
+    wf = min(wf, Line3D(sp, rB, gBt, rot, lw*0.6));
+    wf = min(wf, Line3D(sp, gBt, bB, rot, lw*0.6));
+    wf = min(wf, Line3D(sp, bB, rB, rot, lw*0.6));
+    wf = min(wf, Line3D(sp, rT, gTp, rot, lw*0.6));
+    wf = min(wf, Line3D(sp, gTp, bT, rot, lw*0.6));
+    wf = min(wf, Line3D(sp, bT, rT, rot, lw*0.6));
 
-    float3 color = lerp(float3(0.2, 0.2, 0.2), float3(0, 0, 0), wf);
+    color = max(color, float3(0.2, 0.2, 0.2) * (1.0 - wf));
 
-    // ---- Bounding box ----
-    float axW = lineW * 0.5;
-    float axV = 0.0;
-    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,0,0), float3(1,0,0), rot, axW));
-    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,0,0), float3(0,1,0), rot, axW));
-    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,0,0), float3(0,0,1), rot, axW));
-    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(1,0,0), float3(1,1,0), rot, axW));
-    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,1,0), float3(1,1,0), rot, axW));
-    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(1,0,0), float3(1,0,1), rot, axW));
-    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,1,0), float3(0,1,1), rot, axW));
-    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,0,1), float3(1,0,1), rot, axW));
-    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,0,1), float3(0,1,1), rot, axW));
-    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(1,1,0), float3(1,1,1), rot, axW));
-    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(1,0,1), float3(1,1,1), rot, axW));
-    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,1,1), float3(1,1,1), rot, axW));
-    color += float3(0.07, 0.07, 0.07) * axV;
-
-    // ---- Read voxel grid and render point cloud ----
-    float2 gridDims;
-    InputTexture.GetDimensions(gridDims.x, gridDims.y);
-    uint gw = (uint)GridW;
-    uint zs = (uint)ZSlices;
-    uint yBins = (uint)(gridDims.y / max(ZSlices, 1.0));
-    float ps = PointSize;
-
-    for (uint bx = 0; bx < gw; bx++)
-    {
-        for (uint by = 0; by < yBins; by++)
-        {
-            for (uint bz = 0; bz < zs; bz++)
-            {
-                uint2 texPos = uint2(bx, by * zs + bz);
-                float4 voxel = InputTexture.Load(int3(texPos, 0));
-                if (voxel.a < 0.005) continue;  // Empty voxel
-
-                // Reconstruct 3D position from bin indices
-                float3 p3d = float3(
-                    ((float)bx + 0.5) / (float)gw,
-                    ((float)by + 0.5) / (float)yBins,
-                    ((float)bz + 0.5) / (float)zs);
-                float2 proj = Project(p3d, rot);
-
-                float2 delta = screenPos - proj;
-                float d2 = dot(delta, delta);
-                if (d2 < ps * ps)
-                {
-                    float d = sqrt(d2);
-                    float falloff = 1.0 - d / ps;
-                    float3 voxelColor = voxel.rgb / max(voxel.a, 0.001);
-                    float intensity = min(voxel.a * 10.0 * Brightness, 3.0);
-                    color = max(color, voxelColor * falloff * intensity);
-                }
-            }
-        }
-    }
+    // Bounding box
+    float ax = 0.0, aw = lw * 0.5;
+    ax = max(ax, 1.0-Line3D(sp, float3(0,0,0),float3(1,0,0),rot,aw));
+    ax = max(ax, 1.0-Line3D(sp, float3(0,0,0),float3(0,1,0),rot,aw));
+    ax = max(ax, 1.0-Line3D(sp, float3(0,0,0),float3(0,0,1),rot,aw));
+    ax = max(ax, 1.0-Line3D(sp, float3(1,0,0),float3(1,1,0),rot,aw));
+    ax = max(ax, 1.0-Line3D(sp, float3(0,1,0),float3(1,1,0),rot,aw));
+    ax = max(ax, 1.0-Line3D(sp, float3(1,0,0),float3(1,0,1),rot,aw));
+    ax = max(ax, 1.0-Line3D(sp, float3(0,1,0),float3(0,1,1),rot,aw));
+    ax = max(ax, 1.0-Line3D(sp, float3(0,0,1),float3(1,0,1),rot,aw));
+    ax = max(ax, 1.0-Line3D(sp, float3(0,0,1),float3(0,1,1),rot,aw));
+    ax = max(ax, 1.0-Line3D(sp, float3(1,1,0),float3(1,1,1),rot,aw));
+    ax = max(ax, 1.0-Line3D(sp, float3(1,0,1),float3(1,1,1),rot,aw));
+    ax = max(ax, 1.0-Line3D(sp, float3(0,1,1),float3(1,1,1),rot,aw));
+    color = max(color, float3(0.07, 0.07, 0.07) * ax);
 
     return float4(color, 1.0);
 }
@@ -1722,17 +1686,14 @@ float4 main(
             desc.name = L"Gamut Viewer";
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
-            desc.hlslSource = gamutViewerHLSL;  // Self-contained — no color math prefix needed
-            desc.inputNames = { L"Voxel Grid" };
+            desc.hlslSource = gamutViewerHLSL;
+            desc.inputNames = { L"Scatter Plot" };
             desc.parameters = {
                 { L"DiagramSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
                 { L"Azimuth",    L"float", 45.0f, 0.0f, 360.0f, 5.0f },
                 { L"Elevation",  L"float", 30.0f, -90.0f, 90.0f, 5.0f },
-                { L"PointSize",  L"float", 0.01f, 0.002f, 0.05f, 0.002f },
                 { L"ShowGamut",  L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
                 { L"Brightness", L"float", 1.5f, 0.1f, 5.0f, 0.1f },
-                { L"GridW",      L"float", 64.0f, 16.0f, 256.0f, 16.0f },
-                { L"ZSlices",    L"float", 32.0f, 8.0f, 128.0f, 8.0f },
             };
             m_effects.push_back(std::move(desc));
         }
