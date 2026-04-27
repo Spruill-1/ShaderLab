@@ -1469,89 +1469,157 @@ float4 main(
             m_effects.push_back(std::move(desc));
         }
 
-        // ---- 3D Gamut Volume ----
+        // ---- Gamut Mapper (compute shader — bins pixels into 3D voxel grid) ----
         {
-            static const std::string gamut3dHLSL = R"HLSL(
-// 3D Gamut Volume — rotatable CIE xyY point cloud with log luminance axis
+            static const std::string gamutMapperHLSL = R"HLSL(
+// Gamut Mapper — bins source pixels into a CIE xy × log-luminance voxel grid.
+// Output: 2D texture where each pixel stores the count/color of samples
+// that fall into that voxel. The grid is GridW × GridH pixels, laid out as
+// a flattened 3D array: X = CIE x bin, Y = (CIE y bin * zSlices + z bin).
+
+cbuffer Constants : register(b0)
+{
+    float GridW;    // Bins along CIE x axis (default 64)
+    float GridH;    // Total output height = yBins * zSlices
+    float ZSlices;  // Bins along luminance axis (default 32)
+    float MaxNits;
+    float MinNits;
+};
+
+Texture2D<float4> InputTexture : register(t0);
+RWTexture2D<float4> OutputTexture : register(u0);
+
+[numthreads(16, 16, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
+{
+    uint2 dims;
+    InputTexture.GetDimensions(dims.x, dims.y);
+    if (dtid.x >= dims.x || dtid.y >= dims.y) return;
+
+    float4 s = InputTexture.Load(int3(dtid.xy, 0));
+    float Y = dot(s.rgb, float3(0.2126, 0.7152, 0.0722));
+    if (Y <= 0.0) return;
+
+    float nits = Y * 80.0;
+    if (nits < MinNits || nits > MaxNits) return;
+
+    float3 xyz = mul(float3x3(
+        0.4123908, 0.3575843, 0.1804808,
+        0.2126390, 0.7151687, 0.0721923,
+        0.0193308, 0.1191950, 0.9505322), max(s.rgb, 0.0));
+    float sum = xyz.x + xyz.y + xyz.z;
+    if (sum < 1e-6) return;
+
+    float cx = xyz.x / sum;  // CIE x [0, ~0.8]
+    float cy = xyz.y / sum;  // CIE y [0, ~0.9]
+
+    float logMin = log10(max(MinNits, 0.001));
+    float logMax = log10(max(MaxNits, 1.0));
+    float zNorm = saturate((log10(nits) - logMin) / (logMax - logMin));
+
+    uint bx = (uint)(cx / 0.8 * GridW);
+    uint yBins = (uint)(GridH / ZSlices);
+    uint by = (uint)(cy / 0.9 * (float)yBins);
+    uint bz = (uint)(zNorm * ZSlices);
+
+    bx = min(bx, (uint)GridW - 1);
+    by = min(by, yBins - 1);
+    bz = min(bz, (uint)ZSlices - 1);
+
+    // Flatten: output Y = by * zSlices + bz
+    uint2 outPos = uint2(bx, by * (uint)ZSlices + bz);
+
+    // Accumulate: RGB = sum of chromaticity colors, A = count.
+    // Reconstruct approximate display color from CIE xy.
+    float3 xyzRecon = float3(cx / max(cy, 0.001) * 0.5, 0.5, (1.0 - cx - cy) / max(cy, 0.001) * 0.5);
+    float3 rgb = mul(float3x3(
+         3.2409699, -1.5373832, -0.4986108,
+        -0.9692436,  1.8759675,  0.0415551,
+         0.0556301, -0.2039770,  1.0569715), xyzRecon);
+    float m = max(max(rgb.r, rgb.g), max(rgb.b, 0.001));
+    rgb = saturate(rgb / m);
+
+    // Atomic-like accumulation via InterlockedAdd isn't available on float UAV,
+    // so we just write the color. Multiple writes to the same pixel will race,
+    // but for visualization this is acceptable — it gives a stochastic sample.
+    float4 existing = OutputTexture[outPos];
+    OutputTexture[outPos] = float4(existing.rgb + rgb * 0.01, existing.a + 0.01);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Gamut Mapper";
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::ComputeShader;
+            desc.hlslSource = gamutMapperHLSL;  // No color math prefix needed — self-contained
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"GridW",    L"float", 64.0f, 16.0f, 256.0f, 16.0f },
+                { L"GridH",    L"float", 2048.0f, 256.0f, 8192.0f, 256.0f },
+                { L"ZSlices",  L"float", 32.0f, 8.0f, 128.0f, 8.0f },
+                { L"MaxNits",  L"float", 10000.0f, 100.0f, 10000.0f, 100.0f },
+                { L"MinNits",  L"float", 0.1f, 0.001f, 10.0f, 0.01f },
+            };
+            desc.threadGroupX = 16;
+            desc.threadGroupY = 16;
+            desc.threadGroupZ = 1;
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Gamut Viewer (pixel shader — renders the voxel grid as 3D projection) ----
+        {
+            static const std::string gamutViewerHLSL = R"HLSL(
+// Gamut Viewer — renders a Gamut Mapper voxel grid as a rotatable 3D projection.
+// Input: the voxel grid texture from Gamut Mapper.
+// Grid layout: X = CIE x bin, Y = (CIE y bin * ZSlices + z bin).
 
 cbuffer Constants : register(b0)
 {
     float DiagramSize;
-    float Azimuth;     // degrees
-    float Elevation;   // degrees
+    float Azimuth;
+    float Elevation;
     float PointSize;
-    float MaxNits;
-    float MinNits;
     float ShowGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020
     float Brightness;
+    float GridW;       // Must match Gamut Mapper
+    float ZSlices;     // Must match Gamut Mapper
 };
 
 Texture2D InputTexture : register(t0);
 SamplerState InputSampler : register(s0);
 
 static const float PI = 3.14159265359;
+static const float2 GAMUT_709_R  = float2(0.64, 0.33);
+static const float2 GAMUT_709_G  = float2(0.30, 0.60);
+static const float2 GAMUT_709_B  = float2(0.15, 0.06);
+static const float2 GAMUT_P3_R   = float2(0.680, 0.320);
+static const float2 GAMUT_P3_G   = float2(0.265, 0.690);
+static const float2 GAMUT_P3_B   = float2(0.150, 0.060);
+static const float2 GAMUT_2020_R = float2(0.708, 0.292);
+static const float2 GAMUT_2020_G = float2(0.170, 0.797);
+static const float2 GAMUT_2020_B = float2(0.131, 0.046);
 
-// Build rotation matrix: rotate around Y (azimuth) then X (elevation)
 float3x3 BuildRotation(float azDeg, float elDeg) {
     float az = azDeg * PI / 180.0;
     float el = elDeg * PI / 180.0;
     float ca = cos(az), sa = sin(az);
     float ce = cos(el), se = sin(el);
-    // Y rotation (azimuth)
-    float3x3 Ry = float3x3(
-         ca, 0, sa,
-          0, 1,  0,
-        -sa, 0, ca);
-    // X rotation (elevation)
-    float3x3 Rx = float3x3(
-        1,   0,  0,
-        0,  ce, -se,
-        0,  se,  ce);
+    float3x3 Ry = float3x3(ca,0,sa, 0,1,0, -sa,0,ca);
+    float3x3 Rx = float3x3(1,0,0, 0,ce,-se, 0,se,ce);
     return mul(Rx, Ry);
 }
 
-// Map nits to normalized Z [0,1] using log scale
-float NitsToZ(float nits) {
-    float logMin = log10(max(MinNits, 0.001));
-    float logMax = log10(max(MaxNits, 1.0));
-    float logN = log10(max(nits, MinNits));
-    return saturate((logN - logMin) / (logMax - logMin));
-}
-
-// Convert CIE xyY to a 3D point in [0,1]^3
-float3 xyYTo3D(float2 xy, float nits) {
-    return float3(xy.x / 0.8, xy.y / 0.9, NitsToZ(nits));
-}
-
-// Project 3D point to 2D with rotation (orthographic, centered)
 float2 Project(float3 p, float3x3 rot) {
-    // Center the volume at origin
-    float3 centered = p - float3(0.5, 0.5, 0.5);
-    float3 rotated = mul(rot, centered);
-    // Orthographic: just take x and y, scale to fill
-    return rotated.xy + float2(0.5, 0.5);
+    float3 c = p - float3(0.5, 0.5, 0.5);
+    float3 r = mul(rot, c);
+    return r.xy + float2(0.5, 0.5);
 }
 
-// Draw a 3D line segment projected to 2D
-float DrawLine3D(float2 screenPos, float3 a, float3 b, float3x3 rot, float lineW) {
-    float2 pa = Project(a, rot);
-    float2 pb = Project(b, rot);
+float DrawLine3D(float2 sp, float3 a, float3 b, float3x3 rot, float lw) {
+    float2 pa = Project(a, rot), pb = Project(b, rot);
     float2 ab = pb - pa;
-    float t = saturate(dot(screenPos - pa, ab) / max(dot(ab, ab), 1e-10));
-    float d = length(screenPos - pa - ab * t);
-    return smoothstep(lineW, lineW * 0.3, d);
-}
-
-// Convert CIE xy to approximate RGB for point coloring
-float3 xyToRGB(float2 xy) {
-    // Reconstruct XYZ with Y=1, then convert to sRGB
-    float Y = 0.5;
-    float X = (xy.y > 0.001) ? xy.x * Y / xy.y : 0;
-    float Z = (xy.y > 0.001) ? (1.0 - xy.x - xy.y) * Y / xy.y : 0;
-    float3 rgb = mul(XYZ_TO_REC709, float3(X, Y, Z));
-    // Normalize to max component to get saturated color
-    float m = max(max(rgb.r, rgb.g), max(rgb.b, 0.001));
-    return saturate(rgb / m);
+    float t = saturate(dot(sp - pa, ab) / max(dot(ab, ab), 1e-10));
+    return smoothstep(lw, lw * 0.3, length(sp - pa - ab * t));
 }
 
 float4 main(
@@ -1560,153 +1628,90 @@ float4 main(
     float4 uv0      : TEXCOORD0
 ) : SV_Target
 {
-    float2 dims;
-    InputTexture.GetDimensions(dims.x, dims.y);
-
     float size = max(DiagramSize, 256.0);
-    float2 screenPos = uv0.xy; // [0,1]
-
+    float2 screenPos = uv0.xy;
     float3x3 rot = BuildRotation(Azimuth, Elevation);
     float lineW = 1.5 / size;
 
-    // ---- Draw reference gamut wireframe ----
+    // ---- Gamut wireframe ----
     float2 gR, gG, gB;
     uint gamut = (uint)ShowGamut;
     if (gamut == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
     else if (gamut == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
     else                 { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
 
-    float wireframe = 1.0;
-    // Vertical edges (primaries from bottom to top)
-    float3 rBot = xyYTo3D(gR, MinNits), rTop = xyYTo3D(gR, MaxNits);
-    float3 gBot = xyYTo3D(gG, MinNits), gTop = xyYTo3D(gG, MaxNits);
-    float3 bBot = xyYTo3D(gB, MinNits), bTop = xyYTo3D(gB, MaxNits);
-    wireframe = min(wireframe, DrawLine3D(screenPos, rBot, rTop, rot, lineW));
-    wireframe = min(wireframe, DrawLine3D(screenPos, gBot, gTop, rot, lineW));
-    wireframe = min(wireframe, DrawLine3D(screenPos, bBot, bTop, rot, lineW));
+    // Gamut prism vertices in normalized [0,1]^3
+    float3 rB = float3(gR.x/0.8, gR.y/0.9, 0), rT = float3(gR.x/0.8, gR.y/0.9, 1);
+    float3 gBt = float3(gG.x/0.8, gG.y/0.9, 0), gTp = float3(gG.x/0.8, gG.y/0.9, 1);
+    float3 bB = float3(gB.x/0.8, gB.y/0.9, 0), bT = float3(gB.x/0.8, gB.y/0.9, 1);
 
-    // Horizontal triangles at key luminance levels
-    float nitLevels[4] = { 1.0, 10.0, 100.0, 1000.0 };
-    for (int lvl = 0; lvl < 4; lvl++) {
-        float n = nitLevels[lvl];
-        if (n < MinNits || n > MaxNits) continue;
-        float3 r3 = xyYTo3D(gR, n);
-        float3 g3 = xyYTo3D(gG, n);
-        float3 b3 = xyYTo3D(gB, n);
-        wireframe = min(wireframe, DrawLine3D(screenPos, r3, g3, rot, lineW * 0.6));
-        wireframe = min(wireframe, DrawLine3D(screenPos, g3, b3, rot, lineW * 0.6));
-        wireframe = min(wireframe, DrawLine3D(screenPos, b3, r3, rot, lineW * 0.6));
-    }
+    float wf = 1.0;
+    wf = min(wf, DrawLine3D(screenPos, rB, rT, rot, lineW));
+    wf = min(wf, DrawLine3D(screenPos, gBt, gTp, rot, lineW));
+    wf = min(wf, DrawLine3D(screenPos, bB, bT, rot, lineW));
+    wf = min(wf, DrawLine3D(screenPos, rB, gBt, rot, lineW * 0.6));
+    wf = min(wf, DrawLine3D(screenPos, gBt, bB, rot, lineW * 0.6));
+    wf = min(wf, DrawLine3D(screenPos, bB, rB, rot, lineW * 0.6));
+    wf = min(wf, DrawLine3D(screenPos, rT, gTp, rot, lineW * 0.6));
+    wf = min(wf, DrawLine3D(screenPos, gTp, bT, rot, lineW * 0.6));
+    wf = min(wf, DrawLine3D(screenPos, bT, rT, rot, lineW * 0.6));
 
-    float3 bgColor = float3(0.0, 0.0, 0.0);  // True black background
-    float3 wireColor = float3(0.15, 0.15, 0.15);
-    float3 color = lerp(wireColor, bgColor, wireframe);
+    float3 color = lerp(float3(0.2, 0.2, 0.2), float3(0, 0, 0), wf);
 
-    // ---- Semi-transparent gamut shell ----
-    // Sample the prism at multiple luminance slices and test if this pixel
-    // falls inside the projected triangle. Accumulates a tinted fill.
-    {
-        float shellAlpha = 0.0;
-        float3 shellColor = float3(0, 0, 0);
-        uint shellSlices = 16;
-        float logMin = log10(max(MinNits, 0.001));
-        float logMax = log10(max(MaxNits, 1.0));
+    // ---- Bounding box ----
+    float axW = lineW * 0.5;
+    float axV = 0.0;
+    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,0,0), float3(1,0,0), rot, axW));
+    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,0,0), float3(0,1,0), rot, axW));
+    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,0,0), float3(0,0,1), rot, axW));
+    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(1,0,0), float3(1,1,0), rot, axW));
+    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,1,0), float3(1,1,0), rot, axW));
+    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(1,0,0), float3(1,0,1), rot, axW));
+    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,1,0), float3(0,1,1), rot, axW));
+    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,0,1), float3(1,0,1), rot, axW));
+    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,0,1), float3(0,1,1), rot, axW));
+    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(1,1,0), float3(1,1,1), rot, axW));
+    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(1,0,1), float3(1,1,1), rot, axW));
+    axV = max(axV, 1.0 - DrawLine3D(screenPos, float3(0,1,1), float3(1,1,1), rot, axW));
+    color += float3(0.07, 0.07, 0.07) * axV;
 
-        for (uint sl = 0; sl < shellSlices; sl++)
-        {
-            float t = ((float)sl + 0.5) / (float)shellSlices;
-            float logN = logMin + t * (logMax - logMin);
-            float nits = pow(10.0, logN);
-
-            float2 pR = Project(xyYTo3D(gR, nits), rot);
-            float2 pG = Project(xyYTo3D(gG, nits), rot);
-            float2 pB = Project(xyYTo3D(gB, nits), rot);
-
-            // Check if screenPos is inside this projected triangle.
-            float2 v0 = pB - pR, v1 = pG - pR, v2 = screenPos - pR;
-            float d00 = dot(v0, v0), d01 = dot(v0, v1), d02 = dot(v0, v2);
-            float d11 = dot(v1, v1), d12 = dot(v1, v2);
-            float inv = 1.0 / (d00 * d11 - d01 * d01);
-            float u = (d11 * d02 - d01 * d12) * inv;
-            float v = (d00 * d12 - d01 * d02) * inv;
-
-            if (u >= 0 && v >= 0 && u + v <= 1.0)
-            {
-                // Tint based on barycentric position (R/G/B near primaries).
-                float3 tint = float3(1.0 - u - v, v, u) * 0.5 + 0.05;
-                shellColor += tint;
-                shellAlpha += 1.0;
-            }
-        }
-
-        if (shellAlpha > 0)
-        {
-            shellColor /= shellAlpha;
-            // More visible opacity — scales with how many slices overlap.
-            float opacity = shellAlpha / (float)shellSlices * 0.3;
-            color = color + shellColor * opacity;
-        }
-    }
-
-    // ---- Sample source and accumulate point cloud ----
-    // Use fewer samples for performance (critical for video playback).
-    // Each sample is projected to 2D and checked against the current pixel.
-    uint maxSamples = 96;
-    float stepX = max(dims.x / (float)maxSamples, 1.0);
-    float stepY = max(dims.y / (float)maxSamples, 1.0);
-
-    // Use larger effective point size for splatting (cheaper hit detection).
+    // ---- Read voxel grid and render point cloud ----
+    float2 gridDims;
+    InputTexture.GetDimensions(gridDims.x, gridDims.y);
+    uint gw = (uint)GridW;
+    uint zs = (uint)ZSlices;
+    uint yBins = (uint)(gridDims.y / max(ZSlices, 1.0));
     float ps = PointSize;
 
-    float3 accum = float3(0, 0, 0);
-    float totalHits = 0;
-
-    // Pre-compute inverse for the tight loop.
-    float invDimX = 1.0 / dims.x;
-    float invDimY = 1.0 / dims.y;
-    float psInv = 1.0 / ps;
-
-    for (float sy = 0.5; sy < dims.y; sy += stepY)
+    for (uint bx = 0; bx < gw; bx++)
     {
-        float v = sy * invDimY;
-        for (float sx = 0.5; sx < dims.x; sx += stepX)
+        for (uint by = 0; by < yBins; by++)
         {
-            float4 s = InputTexture.SampleLevel(InputSampler, float2(sx * invDimX, v), 0);
-
-            // Fast luminance pre-check (skip very dark pixels).
-            float Y = dot(s.rgb, float3(0.2126, 0.7152, 0.0722));
-            if (Y < MinNits / 80.0 || Y <= 0.0) continue;
-
-            float nits = Y * 80.0;
-            if (nits > MaxNits) continue;
-
-            float3 xyz = ScRGBToXYZ(max(s.rgb, 0.0));
-            float sum = xyz.x + xyz.y + xyz.z;
-            if (sum < 1e-6) continue;
-
-            float2 sxy = float2(xyz.x / sum, xyz.y / sum);
-            float3 p3d = xyYTo3D(sxy, nits);
-            float2 proj = Project(p3d, rot);
-
-            // Fast squared distance check before sqrt.
-            float2 delta = screenPos - proj;
-            float d2 = dot(delta, delta);
-            if (d2 < ps * ps)
+            for (uint bz = 0; bz < zs; bz++)
             {
-                float d = sqrt(d2);
-                float falloff = 1.0 - d * psInv;
-                float3 pointColor = xyToRGB(sxy);
-                accum += pointColor * falloff * Brightness;
-                totalHits += falloff;
+                uint2 texPos = uint2(bx, by * zs + bz);
+                float4 voxel = InputTexture.Load(int3(texPos, 0));
+                if (voxel.a < 0.005) continue;  // Empty voxel
+
+                // Reconstruct 3D position from bin indices
+                float3 p3d = float3(
+                    ((float)bx + 0.5) / (float)gw,
+                    ((float)by + 0.5) / (float)yBins,
+                    ((float)bz + 0.5) / (float)zs);
+                float2 proj = Project(p3d, rot);
+
+                float2 delta = screenPos - proj;
+                float d2 = dot(delta, delta);
+                if (d2 < ps * ps)
+                {
+                    float d = sqrt(d2);
+                    float falloff = 1.0 - d / ps;
+                    float3 voxelColor = voxel.rgb / max(voxel.a, 0.001);
+                    float intensity = min(voxel.a * 10.0 * Brightness, 3.0);
+                    color = max(color, voxelColor * falloff * intensity);
+                }
             }
         }
-    }
-
-    if (totalHits > 0)
-    {
-        float intensity = min(totalHits * 0.15 * Brightness, 3.0);
-        float3 avgColor = accum / max(totalHits, 0.001);
-        color = max(color, avgColor * intensity);
     }
 
     return float4(color, 1.0);
@@ -1714,20 +1719,20 @@ float4 main(
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
-            desc.name = L"3D Gamut Volume";
+            desc.name = L"Gamut Viewer";
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
-            desc.hlslSource = colorMath + gamut3dHLSL;
-            desc.inputNames = { L"Source" };
+            desc.hlslSource = gamutViewerHLSL;  // Self-contained — no color math prefix needed
+            desc.inputNames = { L"Voxel Grid" };
             desc.parameters = {
                 { L"DiagramSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
                 { L"Azimuth",    L"float", 45.0f, 0.0f, 360.0f, 5.0f },
                 { L"Elevation",  L"float", 30.0f, -90.0f, 90.0f, 5.0f },
-                { L"PointSize",  L"float", 0.008f, 0.002f, 0.03f, 0.001f },
-                { L"MaxNits",    L"float", 10000.0f, 100.0f, 10000.0f, 100.0f },
-                { L"MinNits",    L"float", 0.1f, 0.001f, 10.0f, 0.01f },
+                { L"PointSize",  L"float", 0.01f, 0.002f, 0.05f, 0.002f },
                 { L"ShowGamut",  L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
                 { L"Brightness", L"float", 1.5f, 0.1f, 5.0f, 0.1f },
+                { L"GridW",      L"float", 64.0f, 16.0f, 256.0f, 16.0f },
+                { L"ZSlices",    L"float", 32.0f, 8.0f, 128.0f, 8.0f },
             };
             m_effects.push_back(std::move(desc));
         }
