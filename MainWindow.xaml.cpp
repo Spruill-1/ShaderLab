@@ -395,6 +395,7 @@ namespace winrt::ShaderLab::implementation
                 m_previewNodeId = m_topoOrder[curIdx + 1];
 
             UpdatePreviewOverlay();
+            m_forceRender = true;
             FitPreviewToView();
             args.Handled(true);
         }
@@ -1884,6 +1885,7 @@ namespace winrt::ShaderLab::implementation
             if (!isAnalysisEffect)
                 m_previewNodeId = hitNodeId;
 
+            m_forceRender = true;
             FitPreviewToView();
             UpdatePreviewOverlay();
         }
