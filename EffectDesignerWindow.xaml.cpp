@@ -174,14 +174,44 @@ namespace winrt::ShaderLab::implementation
     {
         auto panel = ParamsPanel();
 
-        auto row = Controls::StackPanel();
-        row.Orientation(Controls::Orientation::Horizontal);
-        row.Spacing(4);
+        // Each parameter is a compact grid: 
+        // Row 0: Name | Type | Remove
+        // Row 1: Default/Min/Max values (or Labels for enum)
+        auto card = Controls::Grid();
+        card.Padding(winrt::Microsoft::UI::Xaml::ThicknessHelper::FromLengths(8, 6, 8, 6));
+        card.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(
+            winrt::Windows::UI::Color{ 255, 40, 40, 40 }));
+        card.CornerRadius(winrt::Microsoft::UI::Xaml::CornerRadiusHelper::FromRadii(4, 4, 4, 4));
+        card.RowSpacing(4);
+        card.ColumnSpacing(8);
 
+        auto rowDef0 = Controls::RowDefinition();
+        rowDef0.Height(winrt::Microsoft::UI::Xaml::GridLengthHelper::FromValueAndType(1, winrt::Microsoft::UI::Xaml::GridUnitType::Auto));
+        auto rowDef1 = Controls::RowDefinition();
+        rowDef1.Height(winrt::Microsoft::UI::Xaml::GridLengthHelper::FromValueAndType(1, winrt::Microsoft::UI::Xaml::GridUnitType::Auto));
+        card.RowDefinitions().Append(rowDef0);
+        card.RowDefinitions().Append(rowDef1);
+
+        auto colDef0 = Controls::ColumnDefinition();
+        colDef0.Width(winrt::Microsoft::UI::Xaml::GridLengthHelper::FromValueAndType(1, winrt::Microsoft::UI::Xaml::GridUnitType::Auto));
+        auto colDef1 = Controls::ColumnDefinition();
+        colDef1.Width(winrt::Microsoft::UI::Xaml::GridLengthHelper::FromValueAndType(1, winrt::Microsoft::UI::Xaml::GridUnitType::Auto));
+        auto colDef2 = Controls::ColumnDefinition();
+        colDef2.Width(winrt::Microsoft::UI::Xaml::GridLengthHelper::FromValueAndType(1, winrt::Microsoft::UI::Xaml::GridUnitType::Star));
+        auto colDef3 = Controls::ColumnDefinition();
+        colDef3.Width(winrt::Microsoft::UI::Xaml::GridLengthHelper::FromValueAndType(1, winrt::Microsoft::UI::Xaml::GridUnitType::Auto));
+        card.ColumnDefinitions().Append(colDef0);
+        card.ColumnDefinitions().Append(colDef1);
+        card.ColumnDefinitions().Append(colDef2);
+        card.ColumnDefinitions().Append(colDef3);
+
+        // Row 0: Name + Type + Remove
         auto nameBox = Controls::TextBox();
         nameBox.PlaceholderText(L"Name");
         nameBox.MinWidth(120);
-        row.Children().Append(nameBox);
+        Controls::Grid::SetRow(nameBox, 0);
+        Controls::Grid::SetColumn(nameBox, 0);
+        card.Children().Append(nameBox);
 
         auto typeCombo = Controls::ComboBox();
         typeCombo.Items().Append(box_value(L"float"));
@@ -194,35 +224,66 @@ namespace winrt::ShaderLab::implementation
         typeCombo.Items().Append(box_value(L"enum"));
         typeCombo.SelectedIndex(0);
         typeCombo.MinWidth(90);
-        row.Children().Append(typeCombo);
+        Controls::Grid::SetRow(typeCombo, 0);
+        Controls::Grid::SetColumn(typeCombo, 1);
+        card.Children().Append(typeCombo);
 
-        // Default value container -- rebuilds when type changes.
-        auto defContainer = Controls::StackPanel();
-        defContainer.Orientation(Controls::Orientation::Horizontal);
-        defContainer.Spacing(2);
-        row.Children().Append(defContainer);
+        auto removeBtn = Controls::Button();
+        removeBtn.Content(box_value(L"X"));
+        removeBtn.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Top);
+        Controls::Grid::SetRow(removeBtn, 0);
+        Controls::Grid::SetColumn(removeBtn, 3);
+        removeBtn.Click([card, panel](auto&&, auto&&) {
+            uint32_t i = 0;
+            if (panel.Children().IndexOf(card, i))
+                panel.Children().RemoveAt(i);
+        });
+        card.Children().Append(removeBtn);
 
-        // Helper to rebuild default fields based on type.
-        auto rebuildDefaults = [defContainer](int typeIdx)
+        // Row 1: Value fields container (spans columns 0-2)
+        auto valRow = Controls::StackPanel();
+        valRow.Orientation(Controls::Orientation::Horizontal);
+        valRow.Spacing(8);
+        Controls::Grid::SetRow(valRow, 1);
+        Controls::Grid::SetColumn(valRow, 0);
+        Controls::Grid::SetColumnSpan(valRow, 3);
+        card.Children().Append(valRow);
+
+        // Helper to rebuild value fields based on type.
+        auto rebuildDefaults = [valRow](int typeIdx)
         {
-            defContainer.Children().Clear();
+            valRow.Children().Clear();
 
             if (typeIdx == 6) // bool
             {
                 auto toggle = Controls::ToggleSwitch();
                 toggle.Header(box_value(L"Default"));
                 toggle.IsOn(false);
-                defContainer.Children().Append(toggle);
+                valRow.Children().Append(toggle);
                 return;
             }
 
             if (typeIdx == 7) // enum
             {
                 auto labelsBox = Controls::TextBox();
-                labelsBox.PlaceholderText(L"Label1, Label2, Label3");
+                labelsBox.PlaceholderText(L"Label1, Label2, ...");
                 labelsBox.Header(box_value(L"Labels (comma-separated)"));
                 labelsBox.MinWidth(200);
-                defContainer.Children().Append(labelsBox);
+                valRow.Children().Append(labelsBox);
+
+                auto minBox = Controls::NumberBox();
+                minBox.Header(box_value(L"Min"));
+                minBox.Value(0.0);
+                minBox.Width(70);
+                minBox.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
+                valRow.Children().Append(minBox);
+
+                auto maxBox = Controls::NumberBox();
+                maxBox.Header(box_value(L"Max"));
+                maxBox.Value(1.0);
+                maxBox.Width(70);
+                maxBox.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
+                valRow.Children().Append(maxBox);
                 return;
             }
 
@@ -244,10 +305,24 @@ namespace winrt::ShaderLab::implementation
                     static const wchar_t* compLabels[] = { L"X", L"Y", L"Z", L"W" };
                     nb.Header(box_value(winrt::hstring(compLabels[i])));
                 }
-                defContainer.Children().Append(nb);
+                valRow.Children().Append(nb);
             }
+
+            auto minBox = Controls::NumberBox();
+            minBox.Header(box_value(L"Min"));
+            minBox.Value(0.0);
+            minBox.Width(70);
+            minBox.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
+            valRow.Children().Append(minBox);
+
+            auto maxBox = Controls::NumberBox();
+            maxBox.Header(box_value(L"Max"));
+            maxBox.Value(1.0);
+            maxBox.Width(70);
+            maxBox.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
+            valRow.Children().Append(maxBox);
         };
-        rebuildDefaults(0);  // Initial: float = 1 box.
+        rebuildDefaults(0);
 
         typeCombo.SelectionChanged([rebuildDefaults](auto&& sender, auto&&)
         {
@@ -255,31 +330,7 @@ namespace winrt::ShaderLab::implementation
             rebuildDefaults(combo.SelectedIndex());
         });
 
-        auto minBox = Controls::NumberBox();
-        minBox.Header(box_value(L"Min"));
-        minBox.Value(0.0);
-        minBox.Width(80);
-        minBox.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
-        row.Children().Append(minBox);
-
-        auto maxBox = Controls::NumberBox();
-        maxBox.Header(box_value(L"Max"));
-        maxBox.Value(1.0);
-        maxBox.Width(80);
-        maxBox.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
-        row.Children().Append(maxBox);
-
-        auto removeBtn = Controls::Button();
-        removeBtn.Content(box_value(L"\xE711"));
-        removeBtn.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Segoe Fluent Icons"));
-        removeBtn.Click([row, panel](auto&&, auto&&) {
-            uint32_t i = 0;
-            if (panel.Children().IndexOf(row, i))
-                panel.Children().RemoveAt(i);
-        });
-        row.Children().Append(removeBtn);
-
-        panel.Children().Append(row);
+        panel.Children().Append(card);
     }
 
     ::ShaderLab::Graph::CustomEffectDefinition EffectDesignerWindow::BuildDefinition()
@@ -306,74 +357,99 @@ namespace winrt::ShaderLab::implementation
         auto paramPanel = ParamsPanel();
         for (uint32_t i = 0; i < paramPanel.Children().Size(); ++i)
         {
-            auto row = paramPanel.Children().GetAt(i).as<Controls::StackPanel>();
-            if (row.Children().Size() < 6) continue;
+            auto card = paramPanel.Children().GetAt(i).try_as<Controls::Grid>();
+            if (!card) continue;
 
-            auto nameBox = row.Children().GetAt(0).as<Controls::TextBox>();
-            auto typeCombo = row.Children().GetAt(1).as<Controls::ComboBox>();
-            auto defContainer = row.Children().GetAt(2).as<Controls::StackPanel>();
-            auto minBox = row.Children().GetAt(3).as<Controls::NumberBox>();
-            auto maxBox = row.Children().GetAt(4).as<Controls::NumberBox>();
+            // Find children by type: nameBox (TextBox), typeCombo (ComboBox), valRow (StackPanel in row 1)
+            Controls::TextBox nameBox{ nullptr };
+            Controls::ComboBox typeCombo{ nullptr };
+            Controls::StackPanel valRow{ nullptr };
+
+            for (uint32_t c = 0; c < card.Children().Size(); ++c)
+            {
+                auto child = card.Children().GetAt(c);
+                int row = Controls::Grid::GetRow(child.as<winrt::Microsoft::UI::Xaml::FrameworkElement>());
+                if (row == 0)
+                {
+                    if (auto tb = child.try_as<Controls::TextBox>()) nameBox = tb;
+                    else if (auto cb = child.try_as<Controls::ComboBox>()) typeCombo = cb;
+                }
+                else if (row == 1)
+                {
+                    if (auto sp = child.try_as<Controls::StackPanel>()) valRow = sp;
+                }
+            }
+
+            if (!nameBox || !typeCombo || !valRow) continue;
 
             ::ShaderLab::Graph::ParameterDefinition param;
             param.name = std::wstring(nameBox.Text());
             param.typeName = std::wstring(unbox_value<hstring>(typeCombo.SelectedItem()));
 
-            param.minValue = static_cast<float>(minBox.Value());
-            param.maxValue = static_cast<float>(maxBox.Value());
+            // valRow children: [default value(s)...] [Min NumberBox] [Max NumberBox]
+            // Min and Max are the last two NumberBoxes (except for bool which has no min/max).
+            uint32_t numChildren = valRow.Children().Size();
 
-            // Read default values from the NumberBox(es) in the container.
-            uint32_t numBoxes = defContainer.Children().Size();
-            if (param.typeName == L"float" && numBoxes >= 1)
+            // Find min/max (last two NumberBoxes for non-bool types).
+            if (param.typeName != L"bool" && numChildren >= 2)
+            {
+                auto minNb = valRow.Children().GetAt(numChildren - 2).try_as<Controls::NumberBox>();
+                auto maxNb = valRow.Children().GetAt(numChildren - 1).try_as<Controls::NumberBox>();
+                if (minNb) param.minValue = static_cast<float>(minNb.Value());
+                if (maxNb) param.maxValue = static_cast<float>(maxNb.Value());
+            }
+
+            // Read default values.
+            if (param.typeName == L"float" && numChildren >= 3)
             {
                 param.defaultValue = static_cast<float>(
-                    defContainer.Children().GetAt(0).as<Controls::NumberBox>().Value());
+                    valRow.Children().GetAt(0).as<Controls::NumberBox>().Value());
             }
-            else if (param.typeName == L"float2" && numBoxes >= 2)
+            else if (param.typeName == L"float2" && numChildren >= 4)
             {
                 namespace Num = winrt::Windows::Foundation::Numerics;
                 param.defaultValue = Num::float2{
-                    static_cast<float>(defContainer.Children().GetAt(0).as<Controls::NumberBox>().Value()),
-                    static_cast<float>(defContainer.Children().GetAt(1).as<Controls::NumberBox>().Value()) };
+                    static_cast<float>(valRow.Children().GetAt(0).as<Controls::NumberBox>().Value()),
+                    static_cast<float>(valRow.Children().GetAt(1).as<Controls::NumberBox>().Value()) };
             }
-            else if (param.typeName == L"float3" && numBoxes >= 3)
+            else if (param.typeName == L"float3" && numChildren >= 5)
             {
                 namespace Num = winrt::Windows::Foundation::Numerics;
                 param.defaultValue = Num::float3{
-                    static_cast<float>(defContainer.Children().GetAt(0).as<Controls::NumberBox>().Value()),
-                    static_cast<float>(defContainer.Children().GetAt(1).as<Controls::NumberBox>().Value()),
-                    static_cast<float>(defContainer.Children().GetAt(2).as<Controls::NumberBox>().Value()) };
+                    static_cast<float>(valRow.Children().GetAt(0).as<Controls::NumberBox>().Value()),
+                    static_cast<float>(valRow.Children().GetAt(1).as<Controls::NumberBox>().Value()),
+                    static_cast<float>(valRow.Children().GetAt(2).as<Controls::NumberBox>().Value()) };
             }
-            else if (param.typeName == L"float4" && numBoxes >= 4)
+            else if (param.typeName == L"float4" && numChildren >= 6)
             {
                 namespace Num = winrt::Windows::Foundation::Numerics;
                 param.defaultValue = Num::float4{
-                    static_cast<float>(defContainer.Children().GetAt(0).as<Controls::NumberBox>().Value()),
-                    static_cast<float>(defContainer.Children().GetAt(1).as<Controls::NumberBox>().Value()),
-                    static_cast<float>(defContainer.Children().GetAt(2).as<Controls::NumberBox>().Value()),
-                    static_cast<float>(defContainer.Children().GetAt(3).as<Controls::NumberBox>().Value()) };
+                    static_cast<float>(valRow.Children().GetAt(0).as<Controls::NumberBox>().Value()),
+                    static_cast<float>(valRow.Children().GetAt(1).as<Controls::NumberBox>().Value()),
+                    static_cast<float>(valRow.Children().GetAt(2).as<Controls::NumberBox>().Value()),
+                    static_cast<float>(valRow.Children().GetAt(3).as<Controls::NumberBox>().Value()) };
             }
-            else if (param.typeName == L"int" && numBoxes >= 1)
+            else if (param.typeName == L"int" && numChildren >= 3)
             {
                 param.defaultValue = static_cast<int32_t>(
-                    defContainer.Children().GetAt(0).as<Controls::NumberBox>().Value());
+                    valRow.Children().GetAt(0).as<Controls::NumberBox>().Value());
             }
-            else if (param.typeName == L"uint" && numBoxes >= 1)
+            else if (param.typeName == L"uint" && numChildren >= 3)
             {
                 param.defaultValue = static_cast<uint32_t>(
-                    defContainer.Children().GetAt(0).as<Controls::NumberBox>().Value());
+                    valRow.Children().GetAt(0).as<Controls::NumberBox>().Value());
             }
-            else if (param.typeName == L"bool" && numBoxes >= 1)
+            else if (param.typeName == L"bool" && numChildren >= 1)
             {
-                // DefContainer has a ToggleSwitch for bool.
-                auto toggle = defContainer.Children().GetAt(0).try_as<Controls::ToggleSwitch>();
+                // valRow has a ToggleSwitch for bool.
+                auto toggle = valRow.Children().GetAt(0).try_as<Controls::ToggleSwitch>();
                 param.defaultValue = toggle ? toggle.IsOn() : false;
             }
             else if (param.typeName == L"enum")
             {
                 // Enum: stored as float in HLSL cbuffer. Labels in the TextBox.
                 param.typeName = L"float";  // HLSL type is float
-                auto labelsBox = defContainer.Children().GetAt(0).try_as<Controls::TextBox>();
+                auto labelsBox = valRow.Children().GetAt(0).try_as<Controls::TextBox>();
                 if (labelsBox)
                 {
                     auto text = std::wstring(labelsBox.Text());
@@ -935,24 +1011,24 @@ namespace winrt::ShaderLab::implementation
             }
 
             // Restore default/min/max values.
-            // Row layout: [NameBox, TypeCombo, DefContainer(StackPanel), MinBox, MaxBox, DeleteBtn]
-            // Default NumberBoxes are INSIDE DefContainer, not direct row children.
+            // Row layout: [NameBox, TypeCombo, valRow(StackPanel), MinBox, MaxBox, DeleteBtn]
+            // Default NumberBoxes are INSIDE valRow, not direct row children.
             
-            // Find DefContainer (the StackPanel child of the row).
-            Controls::StackPanel defContainer{ nullptr };
+            // Find valRow (the StackPanel child of the row).
+            Controls::StackPanel valRow{ nullptr };
             for (uint32_t ci = 0; ci < lastRow.Children().Size(); ++ci)
             {
                 auto sp = lastRow.Children().GetAt(ci).try_as<Controls::StackPanel>();
-                if (sp) { defContainer = sp; break; }
+                if (sp) { valRow = sp; break; }
             }
 
-            // Set default value in DefContainer.
-            if (defContainer)
+            // Set default value in valRow.
+            if (valRow)
             {
                 // Handle enum: restore labels into TextBox.
                 if (!p.enumLabels.empty())
                 {
-                    auto labelsBox = defContainer.Children().GetAt(0).try_as<Controls::TextBox>();
+                    auto labelsBox = valRow.Children().GetAt(0).try_as<Controls::TextBox>();
                     if (labelsBox)
                     {
                         std::wstring labels;
@@ -967,7 +1043,7 @@ namespace winrt::ShaderLab::implementation
                 // Handle bool: restore ToggleSwitch.
                 else if (p.typeName == L"bool")
                 {
-                    auto toggle = defContainer.Children().GetAt(0).try_as<Controls::ToggleSwitch>();
+                    auto toggle = valRow.Children().GetAt(0).try_as<Controls::ToggleSwitch>();
                     if (toggle)
                     {
                         std::visit([&toggle](const auto& v) {
@@ -980,9 +1056,9 @@ namespace winrt::ShaderLab::implementation
                 {
                     // Numeric types: restore NumberBoxes.
                     std::vector<Controls::NumberBox> defBoxes;
-                    for (uint32_t ci = 0; ci < defContainer.Children().Size(); ++ci)
+                    for (uint32_t ci = 0; ci < valRow.Children().Size(); ++ci)
                     {
-                        auto nb = defContainer.Children().GetAt(ci).try_as<Controls::NumberBox>();
+                        auto nb = valRow.Children().GetAt(ci).try_as<Controls::NumberBox>();
                         if (nb) defBoxes.push_back(nb);
                     }
 
@@ -1023,7 +1099,7 @@ namespace winrt::ShaderLab::implementation
                 } // end numeric types else block
             }
 
-            // Set Min and Max (direct NumberBox children of row, after DefContainer).
+            // Set Min and Max (direct NumberBox children of row, after valRow).
             std::vector<Controls::NumberBox> rowBoxes;
             for (uint32_t ci = 0; ci < lastRow.Children().Size(); ++ci)
             {
