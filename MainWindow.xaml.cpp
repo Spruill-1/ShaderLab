@@ -117,6 +117,10 @@ namespace winrt::ShaderLab::implementation
                     m_nodeGraphController.SelectNode(m_selectedNodeId);
                 }
 
+                // Close output windows for nodes being deleted.
+                for (uint32_t nodeId : m_nodeGraphController.SelectedNodes())
+                    CloseOutputWindow(nodeId);
+
                 m_nodeGraphController.DeleteSelected();
                 m_selectedNodeId = 0;
                 m_graph.MarkAllDirty();
@@ -4379,8 +4383,19 @@ namespace winrt::ShaderLab::implementation
         if (m_outputWindows.empty())
             return;
 
-        // Remove closed windows.
-        std::erase_if(m_outputWindows, [](const auto& w) { return !w->IsOpen(); });
+        // Remove closed windows and their corresponding graph nodes.
+        std::vector<uint32_t> closedNodeIds;
+        std::erase_if(m_outputWindows, [&closedNodeIds](const auto& w) {
+            if (!w->IsOpen()) { closedNodeIds.push_back(w->NodeId()); return true; }
+            return false;
+        });
+        for (uint32_t nodeId : closedNodeIds)
+        {
+            m_graph.RemoveNode(nodeId);
+            m_graphEvaluator.InvalidateNode(nodeId);
+            m_nodeGraphController.RebuildLayout();
+            PopulatePreviewNodeSelector();
+        }
 
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) return;

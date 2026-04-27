@@ -723,6 +723,7 @@ namespace winrt::ShaderLab::implementation
             return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                 m_graphEvaluator.ReleaseCache();
                 m_graph.Clear();
+                m_outputWindows.clear();
                 m_previewNodeId = 0;
                 m_graph.MarkAllDirty();
                 m_nodeGraphController.AutoLayout();
