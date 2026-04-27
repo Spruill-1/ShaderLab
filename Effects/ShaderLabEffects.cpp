@@ -583,15 +583,15 @@ float4 main(
     float size = max(DiagramSize, 128.0);
     float2 xy = float2(pixPos.x / size * 0.8, (1.0 - pixPos.y / size) * 0.9);
 
-    float4 result = float4(0.15, 0.15, 0.15, 1.0); // dark background
+    float4 result = float4(0.0, 0.0, 0.0, 1.0); // black background
 
     // Render the visible gamut region with approximate spectral colors
     float3 xyY = float3(xy.x, xy.y, 0.5);
     float3 xyz = xyYToXYZ(xyY);
     float3 rgb = XYZToScRGB(xyz);
-    // Normalize to visible range and clamp
+    // Normalize to visible range — dim for HDR compatibility
     float maxC = max(max(rgb.r, rgb.g), max(rgb.b, 0.001));
-    rgb = rgb / maxC * 0.5; // dim background
+    rgb = rgb / maxC * 0.15 * Brightness;
 
     if (rgb.r >= -0.01 && rgb.g >= -0.01 && rgb.b >= -0.01 && xy.y > 0.01) {
         rgb = max(rgb, 0.0);
@@ -600,37 +600,35 @@ float4 main(
 
     // Gamut triangles
     float thickness = 0.003;
+    float lineBright = 0.4 * Brightness;
     if (ShowRec709 > 0.5) {
         float e = GamutTriangle(xy, GAMUT_709_R, GAMUT_709_G, GAMUT_709_B, thickness);
-        result.rgb = lerp(result.rgb, float3(1,1,1), e * 0.8);
+        result.rgb = lerp(result.rgb, float3(1,1,1) * lineBright, e * 0.8);
     }
     if (ShowP3 > 0.5) {
         float e = GamutTriangle(xy, GAMUT_P3_R, GAMUT_P3_G, GAMUT_P3_B, thickness);
-        result.rgb = lerp(result.rgb, float3(0,1,0), e * 0.8);
+        result.rgb = lerp(result.rgb, float3(0,1,0) * lineBright, e * 0.8);
     }
     if (ShowRec2020 > 0.5) {
         float e = GamutTriangle(xy, GAMUT_2020_R, GAMUT_2020_G, GAMUT_2020_B, thickness);
-        result.rgb = lerp(result.rgb, float3(0,0.5,1), e * 0.8);
+        result.rgb = lerp(result.rgb, float3(0,0.5,1) * lineBright, e * 0.8);
     }
     if (ShowMonitor > 0.5) {
         float2 mR = float2(MonRedX, MonRedY);
         float2 mG = float2(MonGreenX, MonGreenY);
         float2 mB = float2(MonBlueX, MonBlueY);
         float e = GamutTriangle(xy, mR, mG, mB, thickness);
-        result.rgb = lerp(result.rgb, float3(1, 0.8, 0), e * 0.9);
+        result.rgb = lerp(result.rgb, float3(1, 0.8, 0) * lineBright, e * 0.9);
     }
 
     // D65 white point marker
     float dw = length(xy - D65_WHITE);
-    if (dw < 0.008) result.rgb = float3(1, 1, 1);
+    if (dw < 0.008) result.rgb = float3(0.5, 0.5, 0.5) * Brightness;
 
     // Scatter source image pixels onto the diagram
     uint srcW, srcH;
     Source.GetDimensions(srcW, srcH);
     if (srcW > 0 && srcH > 0) {
-        // Sample source pixels and check if they map near this xy position
-        // (reverse scatter: for each diagram pixel, check if any source pixel maps here)
-        // This is approximate - sample a grid of source pixels
         float bestDist = 1e10;
         float3 bestColor = float3(0,0,0);
 
@@ -651,7 +649,7 @@ float4 main(
         }
 
         if (bestDist < 0.01) {
-            float intensity = saturate(1.0 - bestDist / 0.01) * Brightness;
+            float intensity = saturate(1.0 - bestDist / 0.01) * Brightness * 0.4;
             result.rgb += intensity * float3(1, 1, 1);
         }
     }
