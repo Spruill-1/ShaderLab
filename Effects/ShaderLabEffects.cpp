@@ -1274,7 +1274,7 @@ float4 main(
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
-            desc.name = L"False Color";
+            desc.name = L"Nit Map";
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + falseColorHLSL;
