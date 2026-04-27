@@ -1602,6 +1602,51 @@ float4 main(
     float3 wireColor = float3(0.4, 0.4, 0.4);
     float3 color = lerp(wireColor, bgColor, wireframe);
 
+    // ---- Semi-transparent gamut shell ----
+    // Sample the prism at multiple luminance slices and test if this pixel
+    // falls inside the projected triangle. Accumulates a subtle tinted fill.
+    {
+        float shellAlpha = 0.0;
+        float3 shellColor = float3(0, 0, 0);
+        uint shellSlices = 16;
+        float logMin = log10(max(MinNits, 0.001));
+        float logMax = log10(max(MaxNits, 1.0));
+
+        for (uint sl = 0; sl < shellSlices; sl++)
+        {
+            float t = ((float)sl + 0.5) / (float)shellSlices;
+            float logN = logMin + t * (logMax - logMin);
+            float nits = pow(10.0, logN);
+
+            float2 pR = Project(xyYTo3D(gR, nits), rot);
+            float2 pG = Project(xyYTo3D(gG, nits), rot);
+            float2 pB = Project(xyYTo3D(gB, nits), rot);
+
+            // Check if screenPos is inside this projected triangle.
+            float2 v0 = pB - pR, v1 = pG - pR, v2 = screenPos - pR;
+            float d00 = dot(v0, v0), d01 = dot(v0, v1), d02 = dot(v0, v2);
+            float d11 = dot(v1, v1), d12 = dot(v1, v2);
+            float inv = 1.0 / (d00 * d11 - d01 * d01);
+            float u = (d11 * d02 - d01 * d12) * inv;
+            float v = (d00 * d12 - d01 * d02) * inv;
+
+            if (u >= 0 && v >= 0 && u + v <= 1.0)
+            {
+                // Tint based on barycentric position (R/G/B near primaries).
+                float3 tint = float3(1.0 - u - v, v, u) * 0.3 + 0.1;
+                shellColor += tint;
+                shellAlpha += 1.0;
+            }
+        }
+
+        if (shellAlpha > 0)
+        {
+            shellColor /= shellAlpha;
+            float opacity = min(shellAlpha / (float)shellSlices * 0.15, 0.12);
+            color = color + shellColor * opacity;
+        }
+    }
+
     // ---- Sample source and accumulate point cloud ----
     // Use fewer samples for performance (critical for video playback).
     // Each sample is projected to 2D and checked against the current pixel.
