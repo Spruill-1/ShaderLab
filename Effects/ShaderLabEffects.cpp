@@ -1598,13 +1598,8 @@ float4 main(
         wireframe = min(wireframe, DrawLine3D(screenPos, b3, r3, rot, lineW * 0.6));
     }
 
-    // Also draw white point vertical line
-    float3 wpBot = xyYTo3D(D65_WHITE, MinNits);
-    float3 wpTop = xyYTo3D(D65_WHITE, MaxNits);
-    wireframe = min(wireframe, DrawLine3D(screenPos, wpBot, wpTop, rot, lineW * 0.4));
-
     float3 bgColor = float3(0.04, 0.04, 0.04);
-    float3 wireColor = float3(0.3, 0.3, 0.3);
+    float3 wireColor = float3(0.4, 0.4, 0.4);
     float3 color = lerp(wireColor, bgColor, wireframe);
 
     // ---- Sample source and accumulate point cloud ----
