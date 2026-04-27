@@ -988,44 +988,49 @@ namespace winrt::ShaderLab::implementation
         for (const auto& p : def.parameters)
         {
             OnAddParam(nullptr, nullptr);
-            auto lastRow = ParamsPanel().Children().GetAt(ParamsPanel().Children().Size() - 1)
-                .as<Controls::StackPanel>();
-            lastRow.Children().GetAt(0).as<Controls::TextBox>().Text(winrt::hstring(p.name));
-            // Set type combo — detect enum (float with enumLabels) and bool specially.
-            auto combo = lastRow.Children().GetAt(1).as<Controls::ComboBox>();
-            if (!p.enumLabels.empty())
+            auto lastCard = ParamsPanel().Children().GetAt(ParamsPanel().Children().Size() - 1)
+                .as<Controls::Grid>();
+
+            // Find children by type in the card Grid.
+            Controls::TextBox nameBox{ nullptr };
+            Controls::ComboBox combo{ nullptr };
+            Controls::StackPanel valRow{ nullptr };
+
+            for (uint32_t ci = 0; ci < lastCard.Children().Size(); ++ci)
             {
-                // Select "enum" (index 7).
-                combo.SelectedIndex(7);
-            }
-            else
-            {
-                for (int32_t i = 0; i < static_cast<int32_t>(combo.Items().Size()); ++i)
+                auto child = lastCard.Children().GetAt(ci);
+                int gridRow = Controls::Grid::GetRow(child.as<winrt::Microsoft::UI::Xaml::FrameworkElement>());
+                if (gridRow == 0)
                 {
-                    if (unbox_value<hstring>(combo.Items().GetAt(i)) == p.typeName)
+                    if (auto tb = child.try_as<Controls::TextBox>()) nameBox = tb;
+                    else if (auto cb = child.try_as<Controls::ComboBox>()) combo = cb;
+                }
+                else if (gridRow == 1)
+                {
+                    if (auto sp = child.try_as<Controls::StackPanel>()) valRow = sp;
+                }
+            }
+
+            if (nameBox) nameBox.Text(winrt::hstring(p.name));
+
+            // Set type combo.
+            if (combo)
+            {
+                if (!p.enumLabels.empty())
+                    combo.SelectedIndex(7); // enum
+                else
+                {
+                    for (int32_t i = 0; i < static_cast<int32_t>(combo.Items().Size()); ++i)
                     {
-                        combo.SelectedIndex(i);
-                        break;
+                        if (unbox_value<hstring>(combo.Items().GetAt(i)) == p.typeName)
+                        { combo.SelectedIndex(i); break; }
                     }
                 }
             }
 
-            // Restore default/min/max values.
-            // Row layout: [NameBox, TypeCombo, valRow(StackPanel), MinBox, MaxBox, DeleteBtn]
-            // Default NumberBoxes are INSIDE valRow, not direct row children.
-            
-            // Find valRow (the StackPanel child of the row).
-            Controls::StackPanel valRow{ nullptr };
-            for (uint32_t ci = 0; ci < lastRow.Children().Size(); ++ci)
-            {
-                auto sp = lastRow.Children().GetAt(ci).try_as<Controls::StackPanel>();
-                if (sp) { valRow = sp; break; }
-            }
-
-            // Set default value in valRow.
+            // Restore values in valRow.
             if (valRow)
             {
-                // Handle enum: restore labels into TextBox.
                 if (!p.enumLabels.empty())
                 {
                     auto labelsBox = valRow.Children().GetAt(0).try_as<Controls::TextBox>();
@@ -1040,7 +1045,6 @@ namespace winrt::ShaderLab::implementation
                         labelsBox.Text(winrt::hstring(labels));
                     }
                 }
-                // Handle bool: restore ToggleSwitch.
                 else if (p.typeName == L"bool")
                 {
                     auto toggle = valRow.Children().GetAt(0).try_as<Controls::ToggleSwitch>();
@@ -1054,63 +1058,56 @@ namespace winrt::ShaderLab::implementation
                 }
                 else
                 {
-                    // Numeric types: restore NumberBoxes.
-                    std::vector<Controls::NumberBox> defBoxes;
+                    // Collect all NumberBoxes in valRow.
+                    std::vector<Controls::NumberBox> allBoxes;
                     for (uint32_t ci = 0; ci < valRow.Children().Size(); ++ci)
                     {
                         auto nb = valRow.Children().GetAt(ci).try_as<Controls::NumberBox>();
-                        if (nb) defBoxes.push_back(nb);
+                        if (nb) allBoxes.push_back(nb);
                     }
 
-                std::visit([&defBoxes](const auto& v)
+                    // Last two are Min/Max, rest are default values.
+                    if (allBoxes.size() >= 2)
+                    {
+                        allBoxes[allBoxes.size() - 2].Value(p.minValue);
+                        allBoxes[allBoxes.size() - 1].Value(p.maxValue);
+                    }
+
+                    // Set default values (all boxes except last 2).
+                    size_t defCount = allBoxes.size() >= 2 ? allBoxes.size() - 2 : 0;
+                    std::visit([&allBoxes, defCount](const auto& v)
+                    {
+                        using T = std::decay_t<decltype(v)>;
+                        if constexpr (std::is_same_v<T, float>)
+                        { if (defCount >= 1) allBoxes[0].Value(v); }
+                        else if constexpr (std::is_same_v<T, int32_t>)
+                        { if (defCount >= 1) allBoxes[0].Value(static_cast<double>(v)); }
+                        else if constexpr (std::is_same_v<T, uint32_t>)
+                        { if (defCount >= 1) allBoxes[0].Value(static_cast<double>(v)); }
+                        else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
+                        { if (defCount >= 1) allBoxes[0].Value(v.x); if (defCount >= 2) allBoxes[1].Value(v.y); }
+                        else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
+                        { if (defCount >= 1) allBoxes[0].Value(v.x); if (defCount >= 2) allBoxes[1].Value(v.y); if (defCount >= 3) allBoxes[2].Value(v.z); }
+                        else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
+                        { if (defCount >= 1) allBoxes[0].Value(v.x); if (defCount >= 2) allBoxes[1].Value(v.y); if (defCount >= 3) allBoxes[2].Value(v.z); if (defCount >= 4) allBoxes[3].Value(v.w); }
+                    }, p.defaultValue);
+                }
+
+                // For enum, set min/max on the last two NumberBoxes in valRow.
+                if (!p.enumLabels.empty())
                 {
-                    using T = std::decay_t<decltype(v)>;
-                    if constexpr (std::is_same_v<T, float>)
+                    std::vector<Controls::NumberBox> enumBoxes;
+                    for (uint32_t ci = 0; ci < valRow.Children().Size(); ++ci)
                     {
-                        if (defBoxes.size() >= 1) defBoxes[0].Value(v);
+                        auto nb = valRow.Children().GetAt(ci).try_as<Controls::NumberBox>();
+                        if (nb) enumBoxes.push_back(nb);
                     }
-                    else if constexpr (std::is_same_v<T, int32_t>)
+                    if (enumBoxes.size() >= 2)
                     {
-                        if (defBoxes.size() >= 1) defBoxes[0].Value(static_cast<double>(v));
+                        enumBoxes[enumBoxes.size() - 2].Value(p.minValue);
+                        enumBoxes[enumBoxes.size() - 1].Value(p.maxValue);
                     }
-                    else if constexpr (std::is_same_v<T, uint32_t>)
-                    {
-                        if (defBoxes.size() >= 1) defBoxes[0].Value(static_cast<double>(v));
-                    }
-                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
-                    {
-                        if (defBoxes.size() >= 1) defBoxes[0].Value(v.x);
-                        if (defBoxes.size() >= 2) defBoxes[1].Value(v.y);
-                    }
-                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
-                    {
-                        if (defBoxes.size() >= 1) defBoxes[0].Value(v.x);
-                        if (defBoxes.size() >= 2) defBoxes[1].Value(v.y);
-                        if (defBoxes.size() >= 3) defBoxes[2].Value(v.z);
-                    }
-                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
-                    {
-                        if (defBoxes.size() >= 1) defBoxes[0].Value(v.x);
-                        if (defBoxes.size() >= 2) defBoxes[1].Value(v.y);
-                        if (defBoxes.size() >= 3) defBoxes[2].Value(v.z);
-                        if (defBoxes.size() >= 4) defBoxes[3].Value(v.w);
-                    }
-                }, p.defaultValue);
-                } // end numeric types else block
-            }
-
-            // Set Min and Max (direct NumberBox children of row, after valRow).
-            std::vector<Controls::NumberBox> rowBoxes;
-            for (uint32_t ci = 0; ci < lastRow.Children().Size(); ++ci)
-            {
-                auto nb = lastRow.Children().GetAt(ci).try_as<Controls::NumberBox>();
-                if (nb) rowBoxes.push_back(nb);
-            }
-            // rowBoxes = [MinBox, MaxBox]
-            if (rowBoxes.size() >= 2)
-            {
-                rowBoxes[0].Value(p.minValue);
-                rowBoxes[1].Value(p.maxValue);
+                }
             }
         }
 
