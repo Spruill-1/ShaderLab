@@ -80,6 +80,13 @@
                         <TextBlock Text="Effect Designer" />
                     </StackPanel>
                 </Button>
+                <Button x:Name="UpdateAllEffectsButton" Visibility="Collapsed"
+                        ToolTipService.ToolTip="Update all outdated ShaderLab effects to latest version">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <FontIcon Glyph="&#xE777;" FontSize="14" />
+                        <TextBlock x:Name="UpdateAllEffectsText" Text="Update Effects" />
+                    </StackPanel>
+                </Button>
                 <AppBarSeparator />
                 <ToggleButton x:Name="McpServerToggle" IsChecked="False"
                               ToolTipService.ToolTip="Start/stop MCP server for AI assistant integration">

@@ -48,6 +48,7 @@ namespace winrt::ShaderLab::implementation
         void RegisterCustomEffects();
         void UpdateStatusBar();
         void PopulatePreviewNodeSelector();
+        void UpdateOutdatedEffectsButton();
         void UpdatePreviewOverlay();
         void PopulateDisplayProfileSelector();
         ID2D1Image* GetPreviewImage();

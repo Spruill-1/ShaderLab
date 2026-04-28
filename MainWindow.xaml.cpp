@@ -91,6 +91,41 @@ namespace winrt::ShaderLab::implementation
             m_nodeGraphController.AutoLayout();
             m_forceRender = true;
         });
+        UpdateAllEffectsButton().Click([this](auto&&, auto&&)
+        {
+            auto& registry = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+            {
+                if (!node.customEffect.has_value() || node.customEffect->shaderLabEffectId.empty())
+                    continue;
+                auto* desc = registry.FindById(node.customEffect->shaderLabEffectId);
+                if (!desc || desc->effectVersion <= node.customEffect->shaderLabEffectVersion)
+                    continue;
+
+                auto savedProps = node.properties;
+                auto freshNode = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*desc);
+                if (!freshNode.customEffect.has_value()) continue;
+
+                node.customEffect = std::move(freshNode.customEffect.value());
+                node.inputPins = std::move(freshNode.inputPins);
+                node.outputPins = std::move(freshNode.outputPins);
+                node.isAnimatable = freshNode.isAnimatable;
+                node.properties = std::move(freshNode.properties);
+                for (const auto& [key, val] : savedProps)
+                {
+                    auto it = node.properties.find(key);
+                    if (it != node.properties.end())
+                        it->second = val;
+                }
+                node.dirty = true;
+                m_graphEvaluator.InvalidateNode(node.id);
+            }
+            m_graph.MarkAllDirty();
+            m_nodeGraphController.RebuildLayout();
+            PopulatePreviewNodeSelector();
+            UpdatePropertiesPanel();
+            UpdateOutdatedEffectsButton();
+        });
         // Populate the Add Node flyout with effects from the registry.
         PopulateAddNodeFlyout();
 
@@ -487,6 +522,31 @@ namespace winrt::ShaderLab::implementation
         AnimPlayPauseToggle().Visibility(hasAnimatable
             ? winrt::Microsoft::UI::Xaml::Visibility::Visible
             : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
+
+        UpdateOutdatedEffectsButton();
+    }
+
+    void MainWindow::UpdateOutdatedEffectsButton()
+    {
+        auto& registry = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+        uint32_t outdatedCount = 0;
+        for (const auto& node : m_graph.Nodes())
+        {
+            if (!node.customEffect.has_value() || node.customEffect->shaderLabEffectId.empty())
+                continue;
+            auto* desc = registry.FindById(node.customEffect->shaderLabEffectId);
+            if (desc && desc->effectVersion > node.customEffect->shaderLabEffectVersion)
+                outdatedCount++;
+        }
+        if (outdatedCount > 0)
+        {
+            UpdateAllEffectsText().Text(std::format(L"Update Effects ({})", outdatedCount));
+            UpdateAllEffectsButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
+        }
+        else
+        {
+            UpdateAllEffectsButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
+        }
     }
 
     void MainWindow::OnPreviewKeyDown(
