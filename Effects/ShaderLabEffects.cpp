@@ -1562,42 +1562,41 @@ float2 NearestOnTriangle(float2 p, float2 a, float2 b, float2 c) {
     float d0 = dot(p - p0, p - p0);
     float d1 = dot(p - p1, p - p1);
     float d2 = dot(p - p2, p - p2);
-    if (d0 <= d1 && d0 <= d2) return p0;
-    if (d1 <= d2) return p1;
-    return p2;
+    float2 best = p0;
+    float bestD = d0;
+    if (d1 < bestD) { best = p1; bestD = d1; }
+    if (d2 < bestD) { best = p2; }
+    return best;
 }
 
-// Line-segment intersection: find t where ray from P toward Q crosses segment AB.
-// Returns t in [0,1] if intersection found, -1 otherwise.
+// Line-segment intersection: find t where ray from P in direction dir crosses segment AB.
 float RaySegmentIntersect(float2 p, float2 dir, float2 a, float2 b) {
     float2 ab = b - a;
     float denom = dir.x * ab.y - dir.y * ab.x;
-    if (abs(denom) < 1e-10) return -1.0;
-    float2 pa = a - p;
-    float t = (pa.x * ab.y - pa.y * ab.x) / denom;
-    float u = (pa.x * dir.y - pa.y * dir.x) / denom;
-    if (t > 0.0 && u >= 0.0 && u <= 1.0) return t;
-    return -1.0;
+    float result = -1.0;
+    if (abs(denom) >= 1e-10)
+    {
+        float2 pa = a - p;
+        float t = (pa.x * ab.y - pa.y * ab.x) / denom;
+        float u = (pa.x * dir.y - pa.y * dir.x) / denom;
+        if (t > 0.0 && u >= 0.0 && u <= 1.0)
+            result = t;
+    }
+    return result;
 }
 
 // Move point toward white (D65) until it hits the gamut triangle boundary
 float2 CompressToWhite(float2 p, float2 a, float2 b, float2 c) {
     float2 white = float2(0.3127, 0.3290);
     float2 dir = white - p;
-
-    // Find intersection of ray from p toward white with triangle edges
     float tMin = 1e10;
-    float t;
-    t = RaySegmentIntersect(p, dir, a, b);
-    if (t > 0 && t < tMin) tMin = t;
-    t = RaySegmentIntersect(p, dir, b, c);
-    if (t > 0 && t < tMin) tMin = t;
-    t = RaySegmentIntersect(p, dir, c, a);
-    if (t > 0 && t < tMin) tMin = t;
-
-    if (tMin < 1.0)
-        return p + dir * tMin;  // Hit the boundary before reaching white
-    return white;  // Already inside or very close to white
+    float t0 = RaySegmentIntersect(p, dir, a, b);
+    float t1 = RaySegmentIntersect(p, dir, b, c);
+    float t2 = RaySegmentIntersect(p, dir, c, a);
+    if (t0 > 0 && t0 < tMin) tMin = t0;
+    if (t1 > 0 && t1 < tMin) tMin = t1;
+    if (t2 > 0 && t2 < tMin) tMin = t2;
+    return (tMin < 1.0) ? p + dir * tMin : white;
 }
 
 float4 main(
