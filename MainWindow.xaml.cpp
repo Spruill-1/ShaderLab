@@ -3869,20 +3869,13 @@ namespace winrt::ShaderLab::implementation
         float oldDpiX, oldDpiY;
         dc->GetDpi(&oldDpiX, &oldDpiY);
         dc->SetDpi(96.0f, 96.0f);
+        dc->SetTransform(D2D1::Matrix3x2F::Identity());
 
-        // Get the swap chain dimensions as the capture size.
-        // This matches what the user sees in the preview panel.
-        uint32_t w = m_renderEngine.BackBufferWidth();
-        uint32_t h = m_renderEngine.BackBufferHeight();
-
-        // If no swap chain, fall back to image bounds.
-        if (w == 0 || h == 0)
-        {
-            D2D1_RECT_F bounds{};
-            dc->GetImageLocalBounds(image, &bounds);
-            w = static_cast<uint32_t>(bounds.right - bounds.left);
-            h = static_cast<uint32_t>(bounds.bottom - bounds.top);
-        }
+        // Use the raw image bounds (not swap chain dimensions).
+        D2D1_RECT_F bounds{};
+        dc->GetImageLocalBounds(image, &bounds);
+        uint32_t w = static_cast<uint32_t>(bounds.right - bounds.left);
+        uint32_t h = static_cast<uint32_t>(bounds.bottom - bounds.top);
 
         dc->SetDpi(oldDpiX, oldDpiY);
 
@@ -3903,13 +3896,8 @@ namespace winrt::ShaderLab::implementation
             dc->SetTarget(renderBitmap.get());
             dc->BeginDraw();
             dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-            // Apply same pan/zoom as preview so capture matches what user sees.
-            D2D1_MATRIX_3X2_F transform =
-                D2D1::Matrix3x2F::Scale(m_previewZoom, m_previewZoom) *
-                D2D1::Matrix3x2F::Translation(m_previewPanX, m_previewPanY);
-            dc->SetTransform(transform);
-            dc->DrawImage(image);
             dc->SetTransform(D2D1::Matrix3x2F::Identity());
+            dc->DrawImage(image);
             dc->EndDraw();
             dc->SetTarget(oldTarget.get());
 
@@ -3967,7 +3955,15 @@ namespace winrt::ShaderLab::implementation
         winrt::Windows::Storage::Pickers::FileSavePicker picker;
         picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
         picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::PicturesLibrary);
-        picker.SuggestedFileName(L"output");
+
+        // Use the previewed node's name as suggested filename.
+        auto* previewNode = m_graph.FindNode(m_previewNodeId);
+        std::wstring suggestedName = previewNode ? previewNode->name : L"output";
+        // Sanitize for filename
+        for (auto& ch : suggestedName)
+            if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' || ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|')
+                ch = L'_';
+        picker.SuggestedFileName(winrt::hstring(suggestedName));
         picker.FileTypeChoices().Insert(L"JPEG XR (HDR)", winrt::single_threaded_vector<winrt::hstring>({ L".jxr" }));
         picker.FileTypeChoices().Insert(L"PNG Image (SDR)", winrt::single_threaded_vector<winrt::hstring>({ L".png" }));
 
@@ -3986,11 +3982,19 @@ namespace winrt::ShaderLab::implementation
 
         try
         {
+            // Reset DPI/transform to ensure clean bounds measurement.
+            float oldDpiX, oldDpiY;
+            dc->GetDpi(&oldDpiX, &oldDpiY);
+            dc->SetDpi(96.0f, 96.0f);
+            dc->SetTransform(D2D1::Matrix3x2F::Identity());
+
             // Get image bounds to determine size.
             D2D1_RECT_F bounds{};
             dc->GetImageLocalBounds(previewImage, &bounds);
             uint32_t w = static_cast<uint32_t>(bounds.right - bounds.left);
             uint32_t h = static_cast<uint32_t>(bounds.bottom - bounds.top);
+
+            dc->SetDpi(oldDpiX, oldDpiY);
             if (w == 0 || h == 0) co_return;
 
             auto fileExt = std::wstring(file.FileType().c_str());
