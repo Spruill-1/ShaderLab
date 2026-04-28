@@ -168,7 +168,10 @@ static const float3 D65_XYZ = float3(0.95047, 1.00000, 1.08883);
 
 // CIE Lab helper
 float LabF(float t) {
-    return (t > 0.008856) ? pow(t, 1.0/3.0) : (7.787 * t + 16.0/116.0);
+    // Signed extension: handle negative XYZ values from out-of-gamut scRGB.
+    float at = abs(t);
+    float ft = (at > 0.008856) ? pow(at, 1.0/3.0) : (7.787 * at + 16.0/116.0);
+    return (t < 0.0) ? -ft : ft;
 }
 
 // CIE XYZ -> CIE L*a*b* (D65)
@@ -184,7 +187,7 @@ float3 XYZToLab(float3 xyz) {
 
 // scRGB -> CIE L*a*b*
 float3 ScRGBToLab(float3 rgb) {
-    return XYZToLab(ScRGBToXYZ(max(rgb, 0.0)));
+    return XYZToLab(ScRGBToXYZ(rgb));
 }
 
 // ---- ICtCp (BT.2100) ----
