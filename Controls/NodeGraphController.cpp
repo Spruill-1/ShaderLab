@@ -278,6 +278,14 @@ namespace ShaderLab::Controls
                 for (auto& p : vit->second.outputPinPositions) { p.x += ddx; p.y += ddy; }
                 for (auto& p : vit->second.dataInputPinPositions)  { p.x += ddx; p.y += ddy; }
                 for (auto& p : vit->second.dataOutputPinPositions) { p.x += ddx; p.y += ddy; }
+                // Update slider rect for parameter nodes.
+                if (vit->second.isParameterNode)
+                {
+                    vit->second.sliderRect.left += ddx;
+                    vit->second.sliderRect.right += ddx;
+                    vit->second.sliderRect.top += ddy;
+                    vit->second.sliderRect.bottom += ddy;
+                }
             }
         }
 
