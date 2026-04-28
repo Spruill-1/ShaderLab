@@ -1711,7 +1711,7 @@ cbuffer Constants : register(b0)
 Texture2D InputTexture : register(t0);
 SamplerState InputSampler : register(s0);
 
-#define NBP 24
+#define NBP 36
 
 void SampleBoundary(float2 gR, float2 gG, float2 gB, float iVal, out float2 bnd[NBP])
 {
@@ -1788,6 +1788,7 @@ float4 main(
 
     float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
     float2 ctcp = float2(ictcp.y, ictcp.z);
+    float origY = dot(max(color.rgb, 0.0), float3(0.2126, 0.7152, 0.0722));
 
     float2 bnd[NBP];
     SampleBoundary(gR, gG, gB, ictcp.x, bnd);
@@ -1798,7 +1799,12 @@ float4 main(
             ? CompressNeutral(ctcp, bnd)
             : NearestOnPoly(ctcp, bnd);
         ctcp = lerp(ctcp, mapped, Strength);
-        color.rgb = ICtCpToScRGB(float3(ictcp.x, ctcp.x, ctcp.y));
+        float3 mappedRGB = ICtCpToScRGB(float3(ictcp.x, ctcp.x, ctcp.y));
+        // Preserve original luminance (ICtCp round-trip introduces small Y shift)
+        float mappedY = dot(max(mappedRGB, 0.0), float3(0.2126, 0.7152, 0.0722));
+        if (mappedY > 1e-6)
+            mappedRGB *= origY / mappedY;
+        color.rgb = mappedRGB;
     }
     return color;
 }
