@@ -2458,7 +2458,10 @@ namespace winrt::ShaderLab::implementation
                 if (key == L"analysisFields" || key == L"propertyBindings")
                     continue;
                 // Skip hidden properties (in cbuffer but not user-visible).
-                if (key.starts_with(L"Prim"))
+                if (key.starts_with(L"Prim") || key.starts_with(L"Ws"))
+                    continue;
+                // Skip monitor primaries injected into CIE plots.
+                if (key.starts_with(L"Mon"))
                     continue;
                 // Skip video source internal properties (managed by video UI controls).
                 if (key == L"IsVideo" || key == L"IsPlaying" || key == L"PlaybackSpeed" || key == L"Loop" || key == L"shaderPath")
