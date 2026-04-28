@@ -85,6 +85,32 @@ namespace ShaderLab::Rendering
             case NodeType::PixelShader:
             case NodeType::ComputeShader:
             {
+                // Parameter nodes: no HLSL, just expose property values as analysis output.
+                if (node->customEffect.has_value() &&
+                    node->customEffect->hlslSource.empty() &&
+                    node->customEffect->analysisOutputType == AnalysisOutputType::Typed &&
+                    !node->customEffect->analysisFields.empty())
+                {
+                    node->analysisOutput.type = AnalysisOutputType::Typed;
+                    node->analysisOutput.fields.clear();
+                    for (const auto& fd : node->customEffect->analysisFields)
+                    {
+                        AnalysisFieldValue fv;
+                        fv.name = fd.name;
+                        fv.type = fd.type;
+                        auto propIt = node->properties.find(fd.name);
+                        if (propIt != node->properties.end())
+                        {
+                            if (auto* f = std::get_if<float>(&propIt->second))
+                                fv.components[0] = *f;
+                        }
+                        node->analysisOutput.fields.push_back(std::move(fv));
+                    }
+                    node->cachedOutput = nullptr;
+                    node->dirty = false;
+                    break;
+                }
+
                 // Auto-compile ShaderLab effects that have HLSL but no bytecode.
                 if (node->customEffect.has_value() &&
                     !node->customEffect->isCompiled() &&

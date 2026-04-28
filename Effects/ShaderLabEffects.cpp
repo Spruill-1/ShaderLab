@@ -435,7 +435,10 @@ float4 main(
         node.name = desc.name;
         node.type = (desc.shaderType == CustomShaderType::ComputeShader)
             ? NodeType::ComputeShader : NodeType::PixelShader;
-        node.outputPins.push_back({ L"Output", 0 });
+
+        // Parameter nodes (no HLSL) have no image output pin.
+        if (!desc.hlslSource.empty())
+            node.outputPins.push_back({ L"Output", 0 });
 
         CustomEffectDefinition def;
         def.shaderType = desc.shaderType;
@@ -2382,6 +2385,79 @@ float4 main(
                 { L"Median",  Graph::AnalysisFieldType::Float },
                 { L"P95",     Graph::AnalysisFieldType::Float },
                 { L"Samples", Graph::AnalysisFieldType::Float },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Parameter: Float Slider ----
+        {
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Float Parameter";
+            desc.effectId = L"Float Parameter"; desc.effectVersion = 1;
+            desc.category = L"Parameter";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            // No HLSL — evaluator handles parameter nodes directly.
+            desc.parameters = {
+                { L"Value", L"float", 0.5f, 0.0f, 1.0f, 0.01f },
+                { L"Min",   L"float", 0.0f, -10000.0f, 10000.0f, 0.1f },
+                { L"Max",   L"float", 1.0f, -10000.0f, 10000.0f, 0.1f },
+            };
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                { L"Value", Graph::AnalysisFieldType::Float },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Parameter: Integer Slider ----
+        {
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Integer Parameter";
+            desc.effectId = L"Integer Parameter"; desc.effectVersion = 1;
+            desc.category = L"Parameter";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.parameters = {
+                { L"Value", L"float", 0.0f, 0.0f, 10.0f, 1.0f },
+                { L"Min",   L"float", 0.0f, -10000.0f, 10000.0f, 1.0f },
+                { L"Max",   L"float", 10.0f, -10000.0f, 10000.0f, 1.0f },
+            };
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                { L"Value", Graph::AnalysisFieldType::Float },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Parameter: Toggle ----
+        {
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Toggle Parameter";
+            desc.effectId = L"Toggle Parameter"; desc.effectVersion = 1;
+            desc.category = L"Parameter";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.parameters = {
+                { L"Value", L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Off", L"On" } },
+            };
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                { L"Value", Graph::AnalysisFieldType::Float },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Parameter: Gamut Selector ----
+        {
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Gamut Parameter";
+            desc.effectId = L"Gamut Parameter"; desc.effectVersion = 1;
+            desc.category = L"Parameter";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.parameters = {
+                { L"Value", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+            };
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                { L"Value", Graph::AnalysisFieldType::Float },
             };
             m_effects.push_back(std::move(desc));
         }
