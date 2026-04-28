@@ -1288,9 +1288,9 @@ float4 main(
 
     dE *= Scale;
 
-    // Map to Turbo colormap: 0 = no difference (dark blue), MaxDeltaE = max (red)
+    // Map to colormap: 0 = black (exact match), MaxDeltaE = full red.
     float t = saturate(dE / max(MaxDeltaE, 0.01));
-    float3 color = TurboColormap(t);
+    float3 color = TurboColormap(t) * smoothstep(0.0, 0.02, t);
 
     return float4(color, 1.0);
 }
