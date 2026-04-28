@@ -591,7 +591,7 @@ namespace ShaderLab::Controls
                 case Graph::AnalysisFieldType::Float3Array:  typeTag = L"float3[]"; break;
                 case Graph::AnalysisFieldType::Float4Array:  typeTag = L"float4[]"; break;
                 }
-                v.dataOutputPinLabels.push_back(fd.name + L" (" + typeTag + L")");
+                v.dataOutputPinLabels.push_back(fd.name);
             }
         }
 
@@ -628,15 +628,7 @@ namespace ShaderLab::Controls
         if (isDataOnlyEffect)
             imageBodyHeight = 4.0f;
 
-        // Add space for inline analysis output field display.
-        float analysisDisplayHeight = 0.0f;
-        uint32_t analysisFieldCount = 0;
-        if (node.analysisOutput.type == Graph::AnalysisOutputType::Typed)
-            analysisFieldCount = static_cast<uint32_t>(node.analysisOutput.fields.size());
-        if (analysisFieldCount > 0 && (isDataOnlyEffect || v.isParameterNode))
-            analysisDisplayHeight = 4.0f + analysisFieldCount * 16.0f;
-
-        float totalHeight = v.headerHeight + imageBodyHeight + sliderHeight + analysisDisplayHeight + dataBodyHeight;
+        float totalHeight = v.headerHeight + imageBodyHeight + sliderHeight + dataBodyHeight;
 
         v.bounds = {
             node.position.x,
@@ -662,8 +654,8 @@ namespace ShaderLab::Controls
             });
         }
 
-        // Compute data pin positions (below image pins + slider + analysis display).
-        float dataStartY = node.position.y + v.headerHeight + imageBodyHeight + sliderHeight + analysisDisplayHeight + 4.0f;
+        // Compute data pin positions (below image pins + slider).
+        float dataStartY = node.position.y + v.headerHeight + imageBodyHeight + sliderHeight + 4.0f;
 
         // Slider rect for parameter nodes.
         if (v.isParameterNode)
@@ -977,13 +969,28 @@ namespace ShaderLab::Controls
             // Input pins (image).
             if (m_brushPin)
             {
-                for (const auto& p : visual.inputPinPositions)
+                for (uint32_t i = 0; i < visual.inputPinPositions.size(); ++i)
                 {
+                    auto& p = visual.inputPinPositions[i];
                     dc->FillEllipse({ p, PinRadius, PinRadius }, m_brushPin.get());
+                    // Label from customEffect input names.
+                    if (m_pinLabelFormat && node->customEffect.has_value() &&
+                        i < node->customEffect->inputNames.size())
+                    {
+                        auto& label = node->customEffect->inputNames[i];
+                        D2D1_RECT_F labelRect = {
+                            p.x + PinRadius + 3.0f, p.y - 7.0f,
+                            visual.bounds.right - 4.0f, p.y + 7.0f
+                        };
+                        m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                        dc->DrawText(label.c_str(), static_cast<UINT32>(label.size()),
+                            m_pinLabelFormat.get(), labelRect, m_brushPin.get());
+                    }
                 }
                 // Output pins (image).
-                for (const auto& p : visual.outputPinPositions)
+                for (uint32_t i = 0; i < visual.outputPinPositions.size(); ++i)
                 {
+                    auto& p = visual.outputPinPositions[i];
                     dc->FillEllipse({ p, PinRadius, PinRadius }, m_brushPin.get());
                 }
             }
@@ -1134,48 +1141,37 @@ namespace ShaderLab::Controls
             }
 
             // Inline analysis field values for data-only nodes.
+            // Render values next to data output pin labels (right-aligned).
             if (node->analysisOutput.type == Graph::AnalysisOutputType::Typed &&
                 !node->analysisOutput.fields.empty() &&
                 (visual.isParameterNode || node->outputPins.empty()))
             {
                 if (m_pinLabelFormat)
                 {
-                    float fieldY = visual.bounds.top + visual.headerHeight + 4.0f;
-                    // Skip past image body and slider area.
-                    if (visual.isParameterNode)
-                        fieldY = visual.sliderRect.bottom + 14.0f;
-                    else
-                        fieldY += 4.0f; // minimal image body
-
-                    winrt::com_ptr<ID2D1SolidColorBrush> labelBrush;
-                    dc->CreateSolidColorBrush(D2D1::ColorF(0x90CAF9), labelBrush.put());
                     winrt::com_ptr<ID2D1SolidColorBrush> valueBrush;
-                    dc->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF), valueBrush.put());
+                    dc->CreateSolidColorBrush(D2D1::ColorF(0xE0E0E0), valueBrush.put());
 
-                    for (const auto& fv : node->analysisOutput.fields)
+                    // Match values to data output pins by field name.
+                    for (uint32_t i = 0; i < visual.dataOutputPinPositions.size() && i < visual.dataOutputPinNames.size(); ++i)
                     {
-                        // Label on left, value on right.
-                        D2D1_RECT_F labelRect = {
-                            visual.bounds.left + 8.0f, fieldY,
-                            visual.bounds.left + 70.0f, fieldY + 14.0f
-                        };
-                        D2D1_RECT_F valRect = {
-                            visual.bounds.left + 72.0f, fieldY,
-                            visual.bounds.right - 8.0f, fieldY + 14.0f
-                        };
-
-                        m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                        if (labelBrush)
-                            dc->DrawText(fv.name.c_str(), static_cast<UINT32>(fv.name.size()),
-                                m_pinLabelFormat.get(), labelRect, labelBrush.get());
-
-                        std::wstring valStr = std::format(L"{:.4g}", fv.components[0]);
-                        m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                        if (valueBrush)
-                            dc->DrawText(valStr.c_str(), static_cast<UINT32>(valStr.size()),
-                                m_pinLabelFormat.get(), valRect, valueBrush.get());
-
-                        fieldY += 16.0f;
+                        for (const auto& fv : node->analysisOutput.fields)
+                        {
+                            if (fv.name == visual.dataOutputPinNames[i])
+                            {
+                                std::wstring valStr = std::format(L"= {:.4g}", fv.components[0]);
+                                D2D1_RECT_F valRect = {
+                                    visual.bounds.left + 8.0f,
+                                    visual.dataOutputPinPositions[i].y - 7.0f,
+                                    visual.bounds.right - PinRadius - 6.0f,
+                                    visual.dataOutputPinPositions[i].y + 7.0f
+                                };
+                                m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                                if (valueBrush)
+                                    dc->DrawText(valStr.c_str(), static_cast<UINT32>(valStr.size()),
+                                        m_pinLabelFormat.get(), valRect, valueBrush.get());
+                                break;
+                            }
+                        }
                     }
                 }
             }
