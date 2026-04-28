@@ -33,6 +33,10 @@ namespace ShaderLab::Effects
         // Hidden default properties (in cbuffer but not shown in Properties panel).
         // Set on node creation; auto-updated by the evaluator for dynamic values.
         std::map<std::wstring, Graph::PropertyValue> hiddenDefaults;
+
+        // Animatable effects receive Phase auto-advance from the render tick.
+        // Must declare a "Phase" property (float, 0-1) and "Speed" property.
+        bool isAnimatable{ false };
     };
 
     // Registry of all ShaderLab pre-built effects.

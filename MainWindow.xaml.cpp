@@ -65,6 +65,19 @@ namespace winrt::ShaderLab::implementation
         TraceUnitSelector().SelectedIndex(0);
         TraceUnitSelector().SelectionChanged({ this, &MainWindow::OnTraceUnitSelectionChanged });
 
+        // Animation play/pause toggle.
+        AnimPlayPauseToggle().Click([this](auto&&, auto&&)
+        {
+            bool playing = AnimPlayPauseToggle().IsChecked().GetBoolean();
+            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+            {
+                if (node.isAnimatable)
+                    node.isPlaying = playing;
+            }
+            AnimPlayText().Text(playing ? L"Pause" : L"Play");
+            AnimPlayIcon().Glyph(playing ? L"\xE769" : L"\xE768");
+        });
+
         SaveGraphButton().Click({ this, &MainWindow::OnSaveGraphClicked });
         LoadGraphButton().Click({ this, &MainWindow::OnLoadGraphClicked });
         // Populate the Add Node flyout with effects from the registry.
@@ -438,6 +451,16 @@ namespace winrt::ShaderLab::implementation
         // Cache the topological order (used by graph evaluation and navigation).
         try { m_topoOrder = m_graph.TopologicalSort(); }
         catch (...) { m_topoOrder.clear(); }
+
+        // Show/hide the animation play/pause button based on animatable nodes.
+        bool hasAnimatable = false;
+        for (const auto& node : m_graph.Nodes())
+        {
+            if (node.isAnimatable) { hasAnimatable = true; break; }
+        }
+        AnimPlayPauseToggle().Visibility(hasAnimatable
+            ? winrt::Microsoft::UI::Xaml::Visibility::Visible
+            : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
     }
 
     void MainWindow::OnPreviewKeyDown(
@@ -4228,13 +4251,32 @@ namespace winrt::ShaderLab::implementation
         if (deltaSec > 0.1) deltaSec = 0.016;
 
         // Tick video sources and upload new frames BEFORE checking dirty state.
-        // This marks video nodes dirty only when a new decoded frame is available.
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (dc)
         {
             m_sourceFactory.TickAndUploadVideos(
                 const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()),
                 dc, deltaSec);
+        }
+
+        // Tick animatable nodes: advance Phase by Speed * deltaSeconds.
+        for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+        {
+            if (node.isAnimatable && node.isPlaying)
+            {
+                auto phaseIt = node.properties.find(L"Phase");
+                auto speedIt = node.properties.find(L"Speed");
+                if (phaseIt != node.properties.end() && speedIt != node.properties.end())
+                {
+                    float phase = 0.0f, speed = 0.1f;
+                    if (auto* f = std::get_if<float>(&phaseIt->second)) phase = *f;
+                    if (auto* f = std::get_if<float>(&speedIt->second)) speed = *f;
+                    phase += speed * static_cast<float>(deltaSec);
+                    if (phase > 1.0f) phase -= 1.0f;
+                    phaseIt->second = phase;
+                    node.dirty = true;
+                }
+            }
         }
 
         // Only re-evaluate the graph when something changed.

@@ -248,7 +248,12 @@ namespace ShaderLab::Graph
         // Runtime error message (e.g., effect creation failure). Not serialized.
         std::wstring runtimeError;
 
-        // Dirty flag — set when properties change, cleared after evaluation.
+        // Dirty flag -- set when properties change, cleared after evaluation.
         bool dirty{ true };
+
+        // Animatable flag -- when true, the render tick auto-advances the
+        // "Phase" property and marks this node dirty each frame.
+        bool isAnimatable{ false };
+        bool isPlaying{ false };
     };
 }

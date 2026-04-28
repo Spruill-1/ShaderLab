@@ -452,6 +452,7 @@ float4 main(
             node.properties[key] = val;
 
         node.customEffect = std::move(def);
+        node.isAnimatable = desc.isAnimatable;
         return node;
     }
 
@@ -813,6 +814,7 @@ float4 main(
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + animGamutHLSL;
             desc.inputNames = {};
+            desc.isAnimatable = true;
             desc.parameters = {
                 { L"Gamut",      L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020" } },
                 { L"MinNits",   L"float", 0.1f, 0.001f, 100.0f, 0.1f },
@@ -820,6 +822,7 @@ float4 main(
                 { L"Phase",     L"float", 0.0f, 0.0f, 1.0f, 0.01f },
                 { L"OutputSize", L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
                 { L"LogScale",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Linear", L"Logarithmic" } },
+                { L"Speed",     L"float", 0.1f, 0.01f, 2.0f, 0.01f },
             };
             m_effects.push_back(std::move(desc));
         }
