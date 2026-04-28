@@ -1318,13 +1318,13 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Delta E Comparator";
-            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 1;
+            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + deltaEHLSL;
             desc.inputNames = { L"Reference", L"Test" };
             desc.parameters = {
-                { L"Method",    L"uint", uint32_t(2), 0.0f, 2.0f, 1.0f, { L"CIE76", L"CIE94", L"CIEDE2000" } },
+                { L"Method",    L"float", 2.0f, 0.0f, 2.0f, 1.0f, { L"CIE76", L"CIE94", L"CIEDE2000" } },
                 { L"Scale",     L"float", 1.0f, 0.1f, 10.0f, 0.1f },
                 { L"MaxDeltaE", L"float", 10.0f, 1.0f, 100.0f, 1.0f },
             };
@@ -1506,14 +1506,14 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Waveform Monitor";
-            desc.effectId = L"Waveform Monitor"; desc.effectVersion = 1;
+            desc.effectId = L"Waveform Monitor"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + waveformHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"WaveformSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
-                { L"Mode",     L"uint", uint32_t(1), 0.0f, 2.0f, 1.0f, { L"Luminance", L"RGB Parade", L"RGB Overlay" } },
+                { L"Mode",     L"float", 1.0f, 0.0f, 2.0f, 1.0f, { L"Luminance", L"RGB Parade", L"RGB Overlay" } },
                 { L"Gain",     L"float", 1.0f, 0.1f, 10.0f, 0.1f },
                 { L"MaxNits",  L"float", 1000.0f, 80.0f, 10000.0f, 100.0f },
             };
@@ -1627,7 +1627,7 @@ float4 main(
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"DiagramSize",  L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
-                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+                { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
             };
             desc.hiddenDefaults = {
                 { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },
@@ -2086,10 +2086,10 @@ float4 main(
             desc.hlslSource = colorMath + perceptualGamutMapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"Mode",        L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"Nearest on Shell", L"Compress to Neutral", L"Fit to Shell" } },
-                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+                { L"Mode",        L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Nearest on Shell", L"Compress to Neutral", L"Fit to Shell" } },
+                { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
-                { L"SourceGamut", L"uint", uint32_t(2), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" }, L"Mode == 2" },
+                { L"SourceGamut", L"float", 2.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" }, L"Mode == 2" },
             };
             desc.hiddenDefaults = {
                 { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },
@@ -2209,7 +2209,7 @@ float4 main(
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"DiagramSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
-                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+                { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
                 { L"Intensity",   L"float", 0.5f, 0.05f, 0.95f, 0.05f },
             };
             desc.hiddenDefaults = {
