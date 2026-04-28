@@ -2234,7 +2234,8 @@ float4 main(
 cbuffer Constants : register(b0)
 {
     float OutputSize;
-    float Channel; // 0=Luminance(R), 1=R, 2=G, 3=B, 4=Alpha
+    float Channel;      // 0=Luminance, 1=R, 2=G, 3=B, 4=Alpha
+    float NonzeroOnly;  // 0=All pixels, 1=Nonzero only
 };
 
 Texture2D InputTexture : register(t0);
@@ -2270,6 +2271,7 @@ float4 main(
     float vMax = -1e10;
     float vSum = 0;
     uint totalSamples = 0;
+    uint totalScanned = 0;
     uint nonzeroCount = 0;
 
     float histMax = 100.0;
@@ -2287,11 +2289,16 @@ float4 main(
             float2 suv = float2((sx * stepX + 0.5) / dims.x, (sy * stepY + 0.5) / dims.y);
             float4 pix = InputTexture.SampleLevel(InputSampler, suv, 0);
             float v = GetChannel(pix, ch);
+            totalScanned++;
+            bool isNonzero = abs(v) > 0.0001;
+            if (isNonzero) nonzeroCount++;
+
+            if (NonzeroOnly > 0.5 && !isNonzero) continue;
+
             vMin = min(vMin, v);
             vMax = max(vMax, v);
             vSum += v;
             totalSamples++;
-            if (abs(v) > 0.0001) nonzeroCount++;
 
             float normalized = saturate(v / max(histMax, 0.001));
             uint bin = min((uint)(normalized * 255.0), 255u);
@@ -2334,7 +2341,7 @@ float4 main(
     if (outPx.x < 4.0) return float4(vMedian, 0, 0, 1);
     if (outPx.x < 5.0) return float4(vP95, 0, 0, 1);
     if (outPx.x < 6.0) return float4((float)totalSamples, 0, 0, 1);
-    if (outPx.x < 7.0) return float4((totalSamples > 0) ? (float)nonzeroCount / (float)totalSamples : 0.0, 0, 0, 1);
+    if (outPx.x < 7.0) return float4((totalScanned > 0) ? (float)nonzeroCount / (float)totalScanned : 0.0, 0, 0, 1);
     return float4(0, 0, 0, 1);
 }
 )HLSL";
@@ -2348,8 +2355,9 @@ float4 main(
             desc.dataOnly = true;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"OutputSize", L"float", 8.0f, 8.0f, 64.0f, 8.0f },
-                { L"Channel",   L"float", 0.0f, 0.0f, 4.0f, 1.0f, { L"Luminance", L"Red", L"Green", L"Blue", L"Alpha" } },
+                { L"OutputSize",   L"float", 8.0f, 8.0f, 64.0f, 8.0f },
+                { L"Channel",     L"float", 0.0f, 0.0f, 4.0f, 1.0f, { L"Luminance", L"Red", L"Green", L"Blue", L"Alpha" } },
+                { L"NonzeroOnly", L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"All Pixels", L"Nonzero Only" } },
             };
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
             desc.analysisFields = {
