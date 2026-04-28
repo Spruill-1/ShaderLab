@@ -1608,16 +1608,18 @@ float4 main(
         {
             static const std::string gamutMapHLSL = R"HLSL(
 // Gamut Map - constrains input colors to a target gamut.
-// Three modes:
+// Four modes:
 //   0: Clip - hard clamp RGB components to [0,1] in target space
 //   1: Nearest - project out-of-gamut CIE xy to nearest point on gamut triangle
 //   2: Compress to White - move out-of-gamut xy toward D65 white until inside
+//   3: Fit Gamut - uniformly scale all chromaticities to fit source gamut inside target
 
 cbuffer Constants : register(b0)
 {
-    float Mode;       // 0=Clip, 1=Nearest, 2=Compress to White
+    float Mode;        // 0=Clip, 1=Nearest, 2=Compress, 3=Fit Gamut
     float TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020
     float Strength;    // 0=bypass, 1=full mapping
+    float SourceGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020 (for Fit mode)
 };
 
 Texture2D InputTexture : register(t0);
@@ -1675,6 +1677,31 @@ float2 CompressToWhite(float2 p, float2 a, float2 b, float2 c) {
     return (tMin < 1.0) ? p + dir * tMin : white;
 }
 
+// Compute how far a primary extends beyond the target boundary (ratio > 1 = outside)
+float PrimaryExcursion(float2 primary, float2 white, float2 tR, float2 tG, float2 tB) {
+    float2 dir = primary - white;
+    float tMin = 1e10;
+    float t0 = RaySegmentIntersect(white, dir, tR, tG);
+    float t1 = RaySegmentIntersect(white, dir, tG, tB);
+    float t2 = RaySegmentIntersect(white, dir, tB, tR);
+    if (t0 > 0 && t0 < tMin) tMin = t0;
+    if (t1 > 0 && t1 < tMin) tMin = t1;
+    if (t2 > 0 && t2 < tMin) tMin = t2;
+    // tMin is where ray hits boundary; primary is at t=1. Ratio = 1/tMin.
+    return (tMin > 0 && tMin < 1e9) ? 1.0 / tMin : 1.0;
+}
+
+// Compute uniform scale factor to fit source gamut inside target gamut
+float ComputeFitScale(float2 sR, float2 sG, float2 sB,
+                      float2 tR, float2 tG, float2 tB) {
+    float2 white = float2(0.3127, 0.3290);
+    float maxExcursion = max(max(
+        PrimaryExcursion(sR, white, tR, tG, tB),
+        PrimaryExcursion(sG, white, tR, tG, tB)),
+        PrimaryExcursion(sB, white, tR, tG, tB));
+    return (maxExcursion > 1.0) ? 1.0 / maxExcursion : 1.0;
+}
+
 float4 main(
     float4 pos      : SV_POSITION,
     float4 posScene : SCENE_POSITION,
@@ -1723,9 +1750,35 @@ float4 main(
             color.rgb = lerp(rgb, result, Strength);
         }
     }
+    else if (mode == 3)
+    {
+        // Fit Gamut: uniformly scale all chromaticities toward D65 white.
+        float2 sR, sG, sB;
+        uint sg = (uint)SourceGamut;
+        if (sg == 1)      { sR = GAMUT_P3_R; sG = GAMUT_P3_G; sB = GAMUT_P3_B; }
+        else if (sg == 2) { sR = GAMUT_2020_R; sG = GAMUT_2020_G; sB = GAMUT_2020_B; }
+        else              { sR = GAMUT_709_R; sG = GAMUT_709_G; sB = GAMUT_709_B; }
+
+        float scale = ComputeFitScale(sR, sG, sB, gR, gG, gB);
+        if (scale >= 1.0) return color;
+
+        float3 xyz = ScRGBToXYZ(color.rgb);
+        float sum = xyz.x + xyz.y + xyz.z;
+        if (sum < 1e-6) return color;
+
+        float2 xy = float2(xyz.x / sum, xyz.y / sum);
+        float Y = max(xyz.y, 0.0);
+        float2 white = float2(0.3127, 0.3290);
+
+        float s = lerp(1.0, scale, Strength);
+        xy = white + (xy - white) * s;
+
+        float X = (xy.y > 1e-6) ? xy.x * Y / xy.y : 0.0;
+        float Z = (xy.y > 1e-6) ? (1.0 - xy.x - xy.y) * Y / xy.y : 0.0;
+        color.rgb = XYZToScRGB(float3(X, Y, Z));
+    }
     else
     {
-        // Chromaticity-based mapping (modes 1 and 2).
         // Use raw scRGB (with negatives) for XYZ to preserve true chromaticity.
         float3 xyz = ScRGBToXYZ(color.rgb);
         float sum = xyz.x + xyz.y + xyz.z;
@@ -1763,9 +1816,10 @@ float4 main(
             desc.hlslSource = colorMath + gamutMapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"Mode",        L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Clip", L"Nearest Point", L"Compress to White" } },
+                { L"Mode",        L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Clip", L"Nearest Point", L"Compress to White", L"Fit Gamut" } },
                 { L"TargetGamut", L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
+                { L"SourceGamut", L"float", 2.0f, 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1779,9 +1833,10 @@ float4 main(
 
 cbuffer Constants : register(b0)
 {
-    float Mode;          // 0=Nearest on Shell, 1=Compress to Neutral
+    float Mode;          // 0=Nearest on Shell, 1=Compress to Neutral, 2=Fit to Shell
     float TargetGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020
     float Strength;      // 0=bypass, 1=full
+    float SourceGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020 (for Fit mode)
 };
 
 Texture2D InputTexture : register(t0);
@@ -1859,6 +1914,41 @@ float2 CompressNeutral(float2 p, float2 poly[NBP])
     return (bestT < 1.0) ? p + dir * bestT : float2(0, 0);
 }
 
+// Compute uniform ICtCp scale factor: for each source boundary vertex,
+// find how far it extends beyond the target boundary (ray from neutral).
+float ComputeICtCpFitScale(float2 srcBnd[NBP], float2 tgtBnd[NBP])
+{
+    float maxRatio = 1.0;
+    for (uint i = 0; i < NBP; i++)
+    {
+        float2 p = srcBnd[i];
+        float distSrc = length(p);
+        if (distSrc < 1e-8) continue;
+
+        // Ray from neutral (0,0) through source boundary point
+        float2 dir = p;
+        float bestT = 1e10;
+        for (uint j = 0; j < NBP; j++)
+        {
+            uint k = (j + 1) % NBP;
+            float2 a = tgtBnd[j], b = tgtBnd[k];
+            float2 ab = b - a;
+            float denom = dir.x * ab.y - dir.y * ab.x;
+            if (abs(denom) < 1e-10) continue;
+            float2 pa = a; // a - origin(0,0)
+            float t = (pa.x * ab.y - pa.y * ab.x) / denom;
+            float u = (pa.x * dir.y - pa.y * dir.x) / denom;
+            if (t > 0.0 && u >= 0.0 && u <= 1.0 && t < bestT)
+                bestT = t;
+        }
+        // Target boundary is at t*dir from neutral; source vertex is at 1.0*dir.
+        // Ratio = 1/bestT: if bestT < 1, source extends beyond target.
+        if (bestT > 0 && bestT < 1e9)
+            maxRatio = max(maxRatio, 1.0 / bestT);
+    }
+    return (maxRatio > 1.0) ? 1.0 / maxRatio : 1.0;
+}
+
 float4 main(
     float4 pos : SV_POSITION, float4 ps : SCENE_POSITION, float4 uv0 : TEXCOORD0
 ) : SV_Target
@@ -1878,26 +1968,62 @@ float4 main(
     float xyzSum = xyz.x + xyz.y + xyz.z;
     if (xyzSum < 1e-6) return color;
     float2 cieXY = float2(xyz.x / xyzSum, xyz.y / xyzSum);
-    bool insideGamut = PointInTriangle(cieXY, gR, gG, gB);
 
-    if (!insideGamut)
+    uint mode = (uint)Mode;
+
+    if (mode == 2)
     {
+        // Fit to Shell: uniformly scale all Ct/Cp toward neutral axis.
+        float2 sR, sG, sB;
+        uint sg = (uint)SourceGamut;
+        if (sg == 1)      { sR = GAMUT_P3_R; sG = GAMUT_P3_G; sB = GAMUT_P3_B; }
+        else if (sg == 2) { sR = GAMUT_2020_R; sG = GAMUT_2020_G; sB = GAMUT_2020_B; }
+        else              { sR = GAMUT_709_R; sG = GAMUT_709_G; sB = GAMUT_709_B; }
+
         float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
-        float2 ctcp = float2(ictcp.y, ictcp.z);
         float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
 
-        float2 bnd[NBP];
-        SampleBoundary(gR, gG, gB, ictcp.x, bnd);
+        // Sample both source and target boundaries at this I level
+        float2 srcBnd[NBP], tgtBnd[NBP];
+        SampleBoundary(sR, sG, sB, ictcp.x, srcBnd);
+        SampleBoundary(gR, gG, gB, ictcp.x, tgtBnd);
 
-        float2 mapped = ((uint)Mode == 1)
-            ? CompressNeutral(ctcp, bnd)
-            : NearestOnPoly(ctcp, bnd);
-        ctcp = lerp(ctcp, mapped, Strength);
+        float scale = ComputeICtCpFitScale(srcBnd, tgtBnd);
+        if (scale >= 1.0) return color;
+
+        float2 ctcp = float2(ictcp.y, ictcp.z);
+        float s = lerp(1.0, scale, Strength);
+        ctcp *= s;
+
         float3 mappedRGB = ICtCpToScRGB(float3(ictcp.x, ctcp.x, ctcp.y));
         float mappedY = dot(max(mappedRGB, 0.0), float3(0.2126, 0.7152, 0.0722));
         if (mappedY > 1e-6)
             mappedRGB *= origY / mappedY;
         color.rgb = mappedRGB;
+    }
+    else
+    {
+        // Modes 0 and 1: per-pixel nearest/compress (only out-of-gamut pixels)
+        bool insideGamut = PointInTriangle(cieXY, gR, gG, gB);
+        if (!insideGamut)
+        {
+            float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
+            float2 ctcp = float2(ictcp.y, ictcp.z);
+            float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+
+            float2 bnd[NBP];
+            SampleBoundary(gR, gG, gB, ictcp.x, bnd);
+
+            float2 mapped = (mode == 1)
+                ? CompressNeutral(ctcp, bnd)
+                : NearestOnPoly(ctcp, bnd);
+            ctcp = lerp(ctcp, mapped, Strength);
+            float3 mappedRGB = ICtCpToScRGB(float3(ictcp.x, ctcp.x, ctcp.y));
+            float mappedY = dot(max(mappedRGB, 0.0), float3(0.2126, 0.7152, 0.0722));
+            if (mappedY > 1e-6)
+                mappedRGB *= origY / mappedY;
+            color.rgb = mappedRGB;
+        }
     }
     return color;
 }
@@ -1910,9 +2036,10 @@ float4 main(
             desc.hlslSource = colorMath + perceptualGamutMapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"Mode",        L"uint", uint32_t(0), 0.0f, 1.0f, 1.0f, { L"Nearest on Shell", L"Compress to Neutral" } },
+                { L"Mode",        L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"Nearest on Shell", L"Compress to Neutral", L"Fit to Shell" } },
                 { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
+                { L"SourceGamut", L"uint", uint32_t(2), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
             };
             m_effects.push_back(std::move(desc));
         }
