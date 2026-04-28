@@ -1232,6 +1232,7 @@ namespace ShaderLab::Controls
 
         propIt->second = newVal;
         node->dirty = true;
+        m_needsRedraw = true;
         return true;
     }
 
