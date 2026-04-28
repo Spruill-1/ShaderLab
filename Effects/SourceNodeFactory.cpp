@@ -72,6 +72,8 @@ namespace ShaderLab::Effects
         node.properties[L"IsPlaying"] = true;
         node.properties[L"PlaybackSpeed"] = 1.0f;
         node.properties[L"Loop"] = true;
+        node.isAnimatable = true;
+        node.isPlaying = true;
 
         node.outputPins.push_back({ L"Frame", 0 });
         return node;

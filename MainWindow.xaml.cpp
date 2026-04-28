@@ -72,7 +72,13 @@ namespace winrt::ShaderLab::implementation
             for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
             {
                 if (node.isAnimatable)
+                {
                     node.isPlaying = playing;
+                    // Sync video source IsPlaying property.
+                    auto it = node.properties.find(L"IsPlaying");
+                    if (it != node.properties.end())
+                        it->second = playing;
+                }
             }
             AnimPlayText().Text(playing ? L"Pause" : L"Play");
             AnimPlayIcon().Glyph(playing ? L"\xE769" : L"\xE768");
@@ -2294,7 +2300,7 @@ namespace winrt::ShaderLab::implementation
                     if (it != node->properties.end())
                     {
                         auto* bv = std::get_if<bool>(&it->second);
-                        if (bv) *bv = !*bv;
+                        if (bv) { *bv = !*bv; node->isPlaying = *bv; }
                     }
                     UpdatePropertiesPanel();
                 });
