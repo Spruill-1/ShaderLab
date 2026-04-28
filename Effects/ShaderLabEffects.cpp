@@ -190,7 +190,7 @@ float3 ScRGBToLab(float3 rgb) {
 // ---- ICtCp (BT.2100) ----
 // Pipeline: scRGB -> XYZ -> LMS (BT.2124 cross-talk) -> PQ encode -> ICtCp
 
-// XYZ to LMS (BT.2124 / Hunt-Pointer-Estévez with cross-talk)
+// XYZ to LMS (BT.2124 / Hunt-Pointer-Estevez with cross-talk)
 static const float3x3 XYZ_TO_LMS_ICTCP = float3x3(
      0.3592832, 0.6976051, -0.0358916,
     -0.1920808, 1.1004768,  0.0753741,
@@ -713,11 +713,11 @@ float4 main(
     float2 center = D65_WHITE; // (0.3127, 0.3290)
 
     // Rec.2020 spans roughly x:[0.131, 0.708], y:[0.046, 0.797]
-    // Max distance from D65 in any direction ≈ 0.47
+    // Max distance from D65 in any direction ~ 0.47
     // Use a uniform half-extent with padding.
     float halfExtent = 0.50;
 
-    // Map pixel [0, size] → CIE xy centered on D65
+    // Map pixel [0, size] -> CIE xy centered on D65
     float2 uv = uv0.xy / size;
     float2 xy;
     xy.x = center.x + (uv.x - 0.5) * 2.0 * halfExtent;
@@ -1093,7 +1093,7 @@ cbuffer Constants : register(b0)
 {
     float Method;    // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000
     float Scale;     // Multiplier for visualization (higher = more sensitive)
-    float MaxDeltaE; // Clamp for colormap (ΔE at this value = full red)
+    float MaxDeltaE; // Clamp for colormap (dE at this value = full red)
 };
 
 Texture2D InputTexture : register(t0);   // Reference
@@ -1169,10 +1169,10 @@ float DeltaE2000(float3 lab1, float3 lab2) {
     }
 
     float T = 1.0
-        - 0.17 * cos(hp_avg - 0.52359877559)       // 30°
+        - 0.17 * cos(hp_avg - 0.52359877559)       // 30 deg
         + 0.24 * cos(2.0 * hp_avg)
-        + 0.32 * cos(3.0 * hp_avg + 0.10471975512)  // 6°
-        - 0.20 * cos(4.0 * hp_avg - 1.09955742876);  // 63°
+        + 0.32 * cos(3.0 * hp_avg + 0.10471975512)  // 6 deg
+        - 0.20 * cos(4.0 * hp_avg - 1.09955742876);  // 63 deg
 
     float Lp50sq = (Lp_avg - 50.0) * (Lp_avg - 50.0);
     float SL = 1.0 + 0.015 * Lp50sq / sqrt(20.0 + Lp50sq);
