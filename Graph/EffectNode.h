@@ -33,7 +33,66 @@ namespace ShaderLab::Graph
         // Named labels for uint enum values (index → display name).
         // When non-empty, the Properties panel renders a ComboBox instead of a NumberBox.
         std::vector<std::wstring> enumLabels;
+
+        // Conditional visibility: "ParamName == value" hides this parameter
+        // unless the condition is met. Empty = always visible.
+        // Supports ==, !=, <, <=, >, >= with numeric comparison.
+        std::wstring visibleWhen;
     };
+
+    // Evaluate a visibleWhen condition against current property values.
+    // Returns true (visible) if the condition is empty, unparseable, or satisfied.
+    inline bool EvaluateVisibleWhen(
+        const std::wstring& condition,
+        const std::map<std::wstring, PropertyValue>& props)
+    {
+        if (condition.empty()) return true;
+
+        // Parse: "ParamName op value"
+        // Find operator position
+        size_t opPos = std::wstring::npos;
+        size_t opLen = 0;
+        struct { const wchar_t* str; size_t len; } ops[] = {
+            { L"==", 2 }, { L"!=", 2 }, { L"<=", 2 }, { L">=", 2 }, { L"<", 1 }, { L">", 1 }
+        };
+        for (auto& op : ops)
+        {
+            size_t p = condition.find(op.str);
+            if (p != std::wstring::npos) { opPos = p; opLen = op.len; break; }
+        }
+        if (opPos == std::wstring::npos) return true; // Unparseable, fail open.
+
+        // Extract param name (trim spaces).
+        std::wstring paramName = condition.substr(0, opPos);
+        while (!paramName.empty() && paramName.back() == L' ') paramName.pop_back();
+        std::wstring op = condition.substr(opPos, opLen);
+
+        // Extract value (trim spaces).
+        std::wstring valStr = condition.substr(opPos + opLen);
+        while (!valStr.empty() && valStr.front() == L' ') valStr.erase(valStr.begin());
+
+        float rhs = 0;
+        try { rhs = std::stof(valStr); } catch (...) { return true; }
+
+        // Look up the property value.
+        auto it = props.find(paramName);
+        if (it == props.end()) return true; // Missing param, fail open.
+
+        float lhs = 0;
+        if (auto* f = std::get_if<float>(&it->second)) lhs = *f;
+        else if (auto* i = std::get_if<int32_t>(&it->second)) lhs = static_cast<float>(*i);
+        else if (auto* u = std::get_if<uint32_t>(&it->second)) lhs = static_cast<float>(*u);
+        else if (auto* b = std::get_if<bool>(&it->second)) lhs = *b ? 1.0f : 0.0f;
+        else return true; // Non-numeric, fail open.
+
+        if (op == L"==") return std::abs(lhs - rhs) < 0.001f;
+        if (op == L"!=") return std::abs(lhs - rhs) >= 0.001f;
+        if (op == L"<")  return lhs < rhs;
+        if (op == L"<=") return lhs <= rhs;
+        if (op == L">")  return lhs > rhs;
+        if (op == L">=") return lhs >= rhs;
+        return true;
+    }
 
     // Identifies the type of non-image data produced by analysis/compute effects.
     enum class AnalysisOutputType

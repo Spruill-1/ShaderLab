@@ -1849,7 +1849,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Map";
-            desc.effectId = L"Gamut Map"; desc.effectVersion = 2;
+            desc.effectId = L"Gamut Map"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutMapHLSL;
@@ -1858,7 +1858,7 @@ float4 main(
                 { L"Mode",        L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Clip", L"Nearest Point", L"Compress to White", L"Fit Gamut" } },
                 { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
-                { L"SourceGamut", L"float", 2.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+                { L"SourceGamut", L"float", 2.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" }, L"Mode == 3" },
             };
             desc.hiddenDefaults = {
                 { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },
@@ -2080,7 +2080,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Perceptual Gamut Map";
-            desc.effectId = L"Perceptual Gamut Map"; desc.effectVersion = 2;
+            desc.effectId = L"Perceptual Gamut Map"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + perceptualGamutMapHLSL;
@@ -2089,7 +2089,7 @@ float4 main(
                 { L"Mode",        L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"Nearest on Shell", L"Compress to Neutral", L"Fit to Shell" } },
                 { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
-                { L"SourceGamut", L"uint", uint32_t(2), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+                { L"SourceGamut", L"uint", uint32_t(2), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" }, L"Mode == 2" },
             };
             desc.hiddenDefaults = {
                 { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },

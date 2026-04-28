@@ -544,6 +544,20 @@ namespace ShaderLab::Controls
             // Skip hidden properties (internal cbuffer plumbing).
             if (key.size() > 7 && key.ends_with(L"_hidden"))
                 continue;
+            // Skip conditionally hidden parameters.
+            if (node.customEffect.has_value())
+            {
+                bool condHidden = false;
+                for (const auto& p : node.customEffect->parameters)
+                {
+                    if (p.name == key && !p.visibleWhen.empty())
+                    {
+                        condHidden = !Graph::EvaluateVisibleWhen(p.visibleWhen, node.properties);
+                        break;
+                    }
+                }
+                if (condHidden) continue;
+            }
             if (Graph::EffectGraph::IsBindablePropertyType(val))
             {
                 v.dataInputPinNames.push_back(key);

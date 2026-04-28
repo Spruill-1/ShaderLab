@@ -2460,6 +2460,20 @@ namespace winrt::ShaderLab::implementation
                 // Skip hidden properties (convention: name ends with _hidden).
                 if (key.size() > 7 && key.ends_with(L"_hidden"))
                     continue;
+                // Skip parameters hidden by conditional visibility.
+                if (node->customEffect.has_value())
+                {
+                    bool condHidden = false;
+                    for (const auto& p : node->customEffect->parameters)
+                    {
+                        if (p.name == key && !p.visibleWhen.empty())
+                        {
+                            condHidden = !::ShaderLab::Graph::EvaluateVisibleWhen(p.visibleWhen, node->properties);
+                            break;
+                        }
+                    }
+                    if (condHidden) continue;
+                }
                 // Skip video source internal properties (managed by video UI controls).
                 if (key == L"IsVideo" || key == L"IsPlaying" || key == L"PlaybackSpeed" || key == L"Loop" || key == L"shaderPath")
                     continue;
@@ -2727,14 +2741,27 @@ namespace winrt::ShaderLab::implementation
                     auto* n = m_graph.FindNode(capturedId);
                     if (n) { n->dirty = true; m_graph.MarkAllDirty(); }
 
-                    // For analysis effects, schedule a properties panel refresh
-                    // after the next evaluation computes new output data.
-                    if (n && n->effectClsid.has_value() &&
-                        IsEqualGUID(n->effectClsid.value(), CLSID_D2D1Histogram))
+                    // Rebuild properties panel and node layout when a property change
+                    // might affect conditional visibility of other parameters.
+                    bool hasVisibleWhen = false;
+                    if (n && n->customEffect.has_value())
+                    {
+                        for (const auto& p : n->customEffect->parameters)
+                            if (!p.visibleWhen.empty()) { hasVisibleWhen = true; break; }
+                    }
+
+                    if (hasVisibleWhen || (n && n->effectClsid.has_value() &&
+                        IsEqualGUID(n->effectClsid.value(), CLSID_D2D1Histogram)))
                     {
                         this->DispatcherQueue().TryEnqueue(
                             winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low,
-                            [this]() { if (!m_isShuttingDown) UpdatePropertiesPanel(); });
+                            [this]() {
+                                if (!m_isShuttingDown)
+                                {
+                                    UpdatePropertiesPanel();
+                                    m_nodeGraphController.RebuildLayout();
+                                }
+                            });
                     }
                 };
 

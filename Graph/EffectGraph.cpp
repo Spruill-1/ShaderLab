@@ -708,6 +708,8 @@ namespace ShaderLab::Graph
                             labels.Append(WDJ::JsonValue::CreateStringValue(label));
                         po.SetNamedValue(L"enumLabels", labels);
                     }
+                    if (!p.visibleWhen.empty())
+                        po.SetNamedValue(L"visibleWhen", WDJ::JsonValue::CreateStringValue(p.visibleWhen));
                     params.Append(po);
                 }
                 ced.SetNamedValue(L"parameters", params);
@@ -949,6 +951,8 @@ namespace ShaderLab::Graph
                         for (uint32_t j = 0; j < labels.Size(); ++j)
                             pd.enumLabels.push_back(std::wstring(labels.GetStringAt(j)));
                     }
+                    if (po.HasKey(L"visibleWhen"))
+                        pd.visibleWhen = std::wstring(po.GetNamedString(L"visibleWhen"));
                     def.parameters.push_back(std::move(pd));
                 }
 
