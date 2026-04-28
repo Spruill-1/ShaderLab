@@ -51,6 +51,12 @@
                         <MenuFlyout x:Name="AddNodeFlyout" />
                     </DropDownButton.Flyout>
                 </DropDownButton>
+                <Button x:Name="AutoArrangeButton" ToolTipService.ToolTip="Auto-arrange graph layout (Ctrl+L)">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <FontIcon Glyph="&#xE8CB;" FontSize="14" />
+                        <TextBlock Text="Arrange" />
+                    </StackPanel>
+                </Button>
                 <AppBarSeparator />
                 <Button x:Name="SaveImageButton" ToolTipService.ToolTip="Save preview as image">
                     <StackPanel Orientation="Horizontal" Spacing="6">

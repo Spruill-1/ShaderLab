@@ -86,6 +86,11 @@ namespace winrt::ShaderLab::implementation
 
         SaveGraphButton().Click({ this, &MainWindow::OnSaveGraphClicked });
         LoadGraphButton().Click({ this, &MainWindow::OnLoadGraphClicked });
+        AutoArrangeButton().Click([this](auto&&, auto&&)
+        {
+            m_nodeGraphController.AutoLayout();
+            m_forceRender = true;
+        });
         // Populate the Add Node flyout with effects from the registry.
         PopulateAddNodeFlyout();
 
@@ -186,6 +191,15 @@ namespace winrt::ShaderLab::implementation
                 m_graph.MarkAllDirty();
                 m_nodeGraphController.RebuildLayout();
                 PopulatePreviewNodeSelector();
+                args.Handled(true);
+                return;
+            }
+
+            // Ctrl+L: auto-arrange graph layout.
+            if (ctrlDown && key == winrt::Windows::System::VirtualKey::L)
+            {
+                m_nodeGraphController.AutoLayout();
+                m_forceRender = true;
                 args.Handled(true);
                 return;
             }
