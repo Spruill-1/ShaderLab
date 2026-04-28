@@ -1711,7 +1711,7 @@ cbuffer Constants : register(b0)
 Texture2D InputTexture : register(t0);
 SamplerState InputSampler : register(s0);
 
-#define NBP 36
+#define NBP 48
 
 void SampleBoundary(float2 gR, float2 gG, float2 gB, float iVal, out float2 bnd[NBP])
 {
@@ -1763,14 +1763,24 @@ float2 NearestOnPoly(float2 p, float2 poly[NBP])
 
 float2 CompressNeutral(float2 p, float2 poly[NBP])
 {
-    float lo = 0, hi = 1;
-    for (int it = 0; it < 12; it++)
+    // Analytically intersect ray from p toward (0,0) with each polygon edge.
+    float2 dir = float2(0,0) - p;
+    float bestT = 1e10;
+    for (uint i = 0; i < NBP; i++)
     {
-        float mid = (lo + hi) * 0.5;
-        if (PtInPoly(lerp(p, float2(0,0), mid), poly)) hi = mid;
-        else lo = mid;
+        uint j = (i + 1) % NBP;
+        float2 a = poly[i], b = poly[j];
+        float2 ab = b - a;
+        float denom = dir.x * ab.y - dir.y * ab.x;
+        if (abs(denom) < 1e-10) continue;
+        float2 pa = a - p;
+        float t = (pa.x * ab.y - pa.y * ab.x) / denom;
+        float u = (pa.x * dir.y - pa.y * dir.x) / denom;
+        if (t > 0.0 && u >= 0.0 && u <= 1.0 && t < bestT)
+            bestT = t;
     }
-    return lerp(p, float2(0,0), hi);
+    // Clamp: don't overshoot past neutral
+    return (bestT < 1.0) ? p + dir * bestT : float2(0, 0);
 }
 
 float4 main(
