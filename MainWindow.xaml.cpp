@@ -2457,11 +2457,8 @@ namespace winrt::ShaderLab::implementation
                 // Skip internal metadata that shouldn't appear as UI properties.
                 if (key == L"analysisFields" || key == L"propertyBindings")
                     continue;
-                // Skip hidden properties (in cbuffer but not user-visible).
-                if (key.starts_with(L"Prim") || key.starts_with(L"Ws"))
-                    continue;
-                // Skip monitor primaries injected into CIE plots.
-                if (key.starts_with(L"Mon"))
+                // Skip hidden properties (convention: name ends with _hidden).
+                if (key.size() > 7 && key.ends_with(L"_hidden"))
                     continue;
                 // Skip video source internal properties (managed by video UI controls).
                 if (key == L"IsVideo" || key == L"IsPlaying" || key == L"PlaybackSpeed" || key == L"Loop" || key == L"shaderPath")
@@ -4450,16 +4447,16 @@ namespace winrt::ShaderLab::implementation
                                 if (auto* f = std::get_if<float>(&it->second)) return *f;
                             return 0.0f;
                         };
-                        bool changed = std::abs(getF(L"PrimRedX") - src->primaryRed.x) > 0.0001f
-                            || std::abs(getF(L"PrimGreenX") - src->primaryGreen.x) > 0.0001f
-                            || std::abs(getF(L"PrimBlueX") - src->primaryBlue.x) > 0.0001f;
+                        bool changed = std::abs(getF(L"PrimRedX_hidden") - src->primaryRed.x) > 0.0001f
+                            || std::abs(getF(L"PrimGreenX_hidden") - src->primaryGreen.x) > 0.0001f
+                            || std::abs(getF(L"PrimBlueX_hidden") - src->primaryBlue.x) > 0.0001f;
 
-                        node.properties[L"PrimRedX"]   = src->primaryRed.x;
-                        node.properties[L"PrimRedY"]   = src->primaryRed.y;
-                        node.properties[L"PrimGreenX"] = src->primaryGreen.x;
-                        node.properties[L"PrimGreenY"] = src->primaryGreen.y;
-                        node.properties[L"PrimBlueX"]  = src->primaryBlue.x;
-                        node.properties[L"PrimBlueY"]  = src->primaryBlue.y;
+                        node.properties[L"PrimRedX_hidden"]   = src->primaryRed.x;
+                        node.properties[L"PrimRedY_hidden"]   = src->primaryRed.y;
+                        node.properties[L"PrimGreenX_hidden"] = src->primaryGreen.x;
+                        node.properties[L"PrimGreenY_hidden"] = src->primaryGreen.y;
+                        node.properties[L"PrimBlueX_hidden"]  = src->primaryBlue.x;
+                        node.properties[L"PrimBlueY_hidden"]  = src->primaryBlue.y;
                         if (changed) node.dirty = true;
                     }
                 }
@@ -4472,21 +4469,21 @@ namespace winrt::ShaderLab::implementation
                             if (auto* f = std::get_if<float>(&it->second)) return *f;
                         return 0.0f;
                     };
-                    bool changed = std::abs(getF(L"MonRedX") - src.primaryRed.x) > 0.0001f
-                        || std::abs(getF(L"MonGreenX") - src.primaryGreen.x) > 0.0001f
-                        || std::abs(getF(L"MonBlueX") - src.primaryBlue.x) > 0.0001f;
+                    bool changed = std::abs(getF(L"MonRedX_hidden") - src.primaryRed.x) > 0.0001f
+                        || std::abs(getF(L"MonGreenX_hidden") - src.primaryGreen.x) > 0.0001f
+                        || std::abs(getF(L"MonBlueX_hidden") - src.primaryBlue.x) > 0.0001f;
 
-                    node.properties[L"MonRedX"]   = src.primaryRed.x;
-                    node.properties[L"MonRedY"]   = src.primaryRed.y;
-                    node.properties[L"MonGreenX"] = src.primaryGreen.x;
-                    node.properties[L"MonGreenY"] = src.primaryGreen.y;
-                    node.properties[L"MonBlueX"]  = src.primaryBlue.x;
-                    node.properties[L"MonBlueY"]  = src.primaryBlue.y;
+                    node.properties[L"MonRedX_hidden"]   = src.primaryRed.x;
+                    node.properties[L"MonRedY_hidden"]   = src.primaryRed.y;
+                    node.properties[L"MonGreenX_hidden"] = src.primaryGreen.x;
+                    node.properties[L"MonGreenY_hidden"] = src.primaryGreen.y;
+                    node.properties[L"MonBlueX_hidden"]  = src.primaryBlue.x;
+                    node.properties[L"MonBlueY_hidden"]  = src.primaryBlue.y;
                     if (changed) node.dirty = true;
                 }
 
                 // Inject working space primaries into any node that uses them.
-                if (node.properties.count(L"WsRedX"))
+                if (node.properties.count(L"WsRedX_hidden"))
                 {
                     const auto& ws = activeProfile;
                     auto getF = [&](const std::wstring& k) -> float {
@@ -4495,16 +4492,16 @@ namespace winrt::ShaderLab::implementation
                             if (auto* f = std::get_if<float>(&it->second)) return *f;
                         return 0.0f;
                     };
-                    bool changed = std::abs(getF(L"WsRedX") - ws.primaryRed.x) > 0.0001f
-                        || std::abs(getF(L"WsGreenX") - ws.primaryGreen.x) > 0.0001f
-                        || std::abs(getF(L"WsBlueX") - ws.primaryBlue.x) > 0.0001f;
+                    bool changed = std::abs(getF(L"WsRedX_hidden") - ws.primaryRed.x) > 0.0001f
+                        || std::abs(getF(L"WsGreenX_hidden") - ws.primaryGreen.x) > 0.0001f
+                        || std::abs(getF(L"WsBlueX_hidden") - ws.primaryBlue.x) > 0.0001f;
 
-                    node.properties[L"WsRedX"]   = ws.primaryRed.x;
-                    node.properties[L"WsRedY"]   = ws.primaryRed.y;
-                    node.properties[L"WsGreenX"] = ws.primaryGreen.x;
-                    node.properties[L"WsGreenY"] = ws.primaryGreen.y;
-                    node.properties[L"WsBlueX"]  = ws.primaryBlue.x;
-                    node.properties[L"WsBlueY"]  = ws.primaryBlue.y;
+                    node.properties[L"WsRedX_hidden"]   = ws.primaryRed.x;
+                    node.properties[L"WsRedY_hidden"]   = ws.primaryRed.y;
+                    node.properties[L"WsGreenX_hidden"] = ws.primaryGreen.x;
+                    node.properties[L"WsGreenY_hidden"] = ws.primaryGreen.y;
+                    node.properties[L"WsBlueX_hidden"]  = ws.primaryBlue.x;
+                    node.properties[L"WsBlueY_hidden"]  = ws.primaryBlue.y;
                     if (changed) node.dirty = true;
                 }
             }

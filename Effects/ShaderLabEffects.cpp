@@ -318,12 +318,12 @@ cbuffer constants : register(b0) {
     float OverlayStrength;
     float Mode;
     // Primaries for modes 0 and 4 (auto-injected, not user-visible)
-    float PrimRedX;
-    float PrimRedY;
-    float PrimGreenX;
-    float PrimGreenY;
-    float PrimBlueX;
-    float PrimBlueY;
+    float PrimRedX_hidden;
+    float PrimRedY_hidden;
+    float PrimGreenX_hidden;
+    float PrimGreenY_hidden;
+    float PrimBlueX_hidden;
+    float PrimBlueY_hidden;
 };
 
 float4 main(
@@ -341,9 +341,9 @@ float4 main(
     float3 targetRGB = color.rgb;
 
     // Force the compiler to keep Prim* in the cbuffer by always reading them.
-    float2 mr = float2(PrimRedX, PrimRedY);
-    float2 mg = float2(PrimGreenX, PrimGreenY);
-    float2 mb = float2(PrimBlueX, PrimBlueY);
+    float2 mr = float2(PrimRedX_hidden, PrimRedY_hidden);
+    float2 mg = float2(PrimGreenX_hidden, PrimGreenY_hidden);
+    float2 mb = float2(PrimBlueX_hidden, PrimBlueY_hidden);
 
     if (TargetGamut > 0.5 && TargetGamut < 1.5) {
         targetRGB = color.rgb; // Rec.709
@@ -509,9 +509,9 @@ float4 main(
             };
             // Hidden cbuffer properties: primaries auto-injected by host.
             desc.hiddenDefaults = {
-                { L"PrimRedX",   0.64f }, { L"PrimRedY",   0.33f },
-                { L"PrimGreenX", 0.30f }, { L"PrimGreenY", 0.60f },
-                { L"PrimBlueX",  0.15f }, { L"PrimBlueY",  0.06f },
+                { L"PrimRedX_hidden",   0.64f }, { L"PrimRedY_hidden",   0.33f },
+                { L"PrimGreenX_hidden", 0.30f }, { L"PrimGreenY_hidden", 0.60f },
+                { L"PrimBlueX_hidden",  0.15f }, { L"PrimBlueY_hidden",  0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -534,12 +534,12 @@ cbuffer constants : register(b0) {
     float Brightness;   // scatter dot brightness (default 2.0)
     float DiagramSize;  // output size in pixels (default 512)
     uint ShowMonitor;   // 1=show current monitor gamut triangle
-    float MonRedX;      // Monitor primary red x (auto-injected)
-    float MonRedY;
-    float MonGreenX;
-    float MonGreenY;
-    float MonBlueX;
-    float MonBlueY;
+    float MonRedX_hidden;      // Monitor primary red x (auto-injected)
+    float MonRedY_hidden;
+    float MonGreenX_hidden;
+    float MonGreenY_hidden;
+    float MonBlueX_hidden;
+    float MonBlueY_hidden;
 };
 
 // CIE 1931 2-degree observer spectral locus (sampled at 5nm intervals, 380-700nm)
@@ -630,9 +630,9 @@ float4 main(
         result.rgb = lerp(result.rgb, float3(0,0.5,1) * lineBright, e * 0.8);
     }
     if (ShowMonitor > 0.5) {
-        float2 mR = float2(MonRedX, MonRedY);
-        float2 mG = float2(MonGreenX, MonGreenY);
-        float2 mB = float2(MonBlueX, MonBlueY);
+        float2 mR = float2(MonRedX_hidden, MonRedY_hidden);
+        float2 mG = float2(MonGreenX_hidden, MonGreenY_hidden);
+        float2 mB = float2(MonBlueX_hidden, MonBlueY_hidden);
         float e = GamutTriangle(xy, mR, mG, mB, thickness);
         result.rgb = lerp(result.rgb, float3(1, 0.8, 0) * lineBright, e * 0.9);
     }
@@ -690,9 +690,9 @@ float4 main(
                 { L"ShowMonitor",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
             };
             desc.hiddenDefaults = {
-                { L"MonRedX",   0.64f }, { L"MonRedY",   0.33f },
-                { L"MonGreenX", 0.30f }, { L"MonGreenY", 0.60f },
-                { L"MonBlueX",  0.15f }, { L"MonBlueY",  0.06f },
+                { L"MonRedX_hidden",   0.64f }, { L"MonRedY_hidden",   0.33f },
+                { L"MonGreenX_hidden", 0.30f }, { L"MonGreenY_hidden", 0.60f },
+                { L"MonBlueX_hidden",  0.15f }, { L"MonBlueY_hidden",  0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1530,9 +1530,9 @@ cbuffer Constants : register(b0)
 {
     float DiagramSize; // output size in pixels
     float TargetGamut; // 0 = sRGB, 1 = DCI-P3, 2 = BT.2020, 3 = Working Space
-    float WsRedX;   float WsRedY;
-    float WsGreenX; float WsGreenY;
-    float WsBlueX;  float WsBlueY;
+    float WsRedX_hidden;   float WsRedY_hidden;
+    float WsGreenX_hidden; float WsGreenY_hidden;
+    float WsBlueX_hidden;  float WsBlueY_hidden;
 };
 
 Texture2D InputTexture : register(t0);
@@ -1568,7 +1568,7 @@ float4 main(
     uint gamut = (uint)TargetGamut;
     if (gamut == 1)      { tR = GAMUT_P3_R; tG = GAMUT_P3_G; tB = GAMUT_P3_B; }
     else if (gamut == 2) { tR = GAMUT_2020_R; tG = GAMUT_2020_G; tB = GAMUT_2020_B; }
-    else if (gamut == 3) { tR = float2(WsRedX, WsRedY); tG = float2(WsGreenX, WsGreenY); tB = float2(WsBlueX, WsBlueY); }
+    else if (gamut == 3) { tR = float2(WsRedX_hidden, WsRedY_hidden); tG = float2(WsGreenX_hidden, WsGreenY_hidden); tB = float2(WsBlueX_hidden, WsBlueY_hidden); }
     else                 { tR = GAMUT_709_R; tG = GAMUT_709_G; tB = GAMUT_709_B; }
 
     float lineW = 0.003;
@@ -1630,9 +1630,9 @@ float4 main(
                 { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
             };
             desc.hiddenDefaults = {
-                { L"WsRedX", 0.64f }, { L"WsRedY", 0.33f },
-                { L"WsGreenX", 0.30f }, { L"WsGreenY", 0.60f },
-                { L"WsBlueX", 0.15f }, { L"WsBlueY", 0.06f },
+                { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },
+                { L"WsGreenX_hidden", 0.30f }, { L"WsGreenY_hidden", 0.60f },
+                { L"WsBlueX_hidden", 0.15f }, { L"WsBlueY_hidden", 0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1653,9 +1653,9 @@ cbuffer Constants : register(b0)
     float TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Working Space
     float Strength;    // 0=bypass, 1=full mapping
     float SourceGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Working Space
-    float WsRedX;   float WsRedY;
-    float WsGreenX; float WsGreenY;
-    float WsBlueX;  float WsBlueY;
+    float WsRedX_hidden;   float WsRedY_hidden;
+    float WsGreenX_hidden; float WsGreenY_hidden;
+    float WsBlueX_hidden;  float WsBlueY_hidden;
 };
 
 Texture2D InputTexture : register(t0);
@@ -1752,7 +1752,7 @@ float4 main(
     uint gamut = (uint)TargetGamut;
     if (gamut == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
     else if (gamut == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
-    else if (gamut == 3) { gR = float2(WsRedX, WsRedY); gG = float2(WsGreenX, WsGreenY); gB = float2(WsBlueX, WsBlueY); }
+    else if (gamut == 3) { gR = float2(WsRedX_hidden, WsRedY_hidden); gG = float2(WsGreenX_hidden, WsGreenY_hidden); gB = float2(WsBlueX_hidden, WsBlueY_hidden); }
     else                 { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
 
     uint mode = (uint)Mode;
@@ -1794,7 +1794,7 @@ float4 main(
         uint sg = (uint)SourceGamut;
         if (sg == 1)      { sR = GAMUT_P3_R; sG = GAMUT_P3_G; sB = GAMUT_P3_B; }
         else if (sg == 2) { sR = GAMUT_2020_R; sG = GAMUT_2020_G; sB = GAMUT_2020_B; }
-        else if (sg == 3) { sR = float2(WsRedX, WsRedY); sG = float2(WsGreenX, WsGreenY); sB = float2(WsBlueX, WsBlueY); }
+        else if (sg == 3) { sR = float2(WsRedX_hidden, WsRedY_hidden); sG = float2(WsGreenX_hidden, WsGreenY_hidden); sB = float2(WsBlueX_hidden, WsBlueY_hidden); }
         else              { sR = GAMUT_709_R; sG = GAMUT_709_G; sB = GAMUT_709_B; }
 
         float scale = ComputeFitScale(sR, sG, sB, gR, gG, gB);
@@ -1861,9 +1861,9 @@ float4 main(
                 { L"SourceGamut", L"float", 2.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
             };
             desc.hiddenDefaults = {
-                { L"WsRedX", 0.64f }, { L"WsRedY", 0.33f },
-                { L"WsGreenX", 0.30f }, { L"WsGreenY", 0.60f },
-                { L"WsBlueX", 0.15f }, { L"WsBlueY", 0.06f },
+                { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },
+                { L"WsGreenX_hidden", 0.30f }, { L"WsGreenY_hidden", 0.60f },
+                { L"WsBlueX_hidden", 0.15f }, { L"WsBlueY_hidden", 0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1881,9 +1881,9 @@ cbuffer Constants : register(b0)
     float TargetGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Working Space
     float Strength;      // 0=bypass, 1=full
     float SourceGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Working Space
-    float WsRedX;   float WsRedY;
-    float WsGreenX; float WsGreenY;
-    float WsBlueX;  float WsBlueY;
+    float WsRedX_hidden;   float WsRedY_hidden;
+    float WsGreenX_hidden; float WsGreenY_hidden;
+    float WsBlueX_hidden;  float WsBlueY_hidden;
 };
 
 Texture2D InputTexture : register(t0);
@@ -2007,7 +2007,7 @@ float4 main(
     uint g = (uint)TargetGamut;
     if (g == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
     else if (g == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
-    else if (g == 3) { gR = float2(WsRedX, WsRedY); gG = float2(WsGreenX, WsGreenY); gB = float2(WsBlueX, WsBlueY); }
+    else if (g == 3) { gR = float2(WsRedX_hidden, WsRedY_hidden); gG = float2(WsGreenX_hidden, WsGreenY_hidden); gB = float2(WsBlueX_hidden, WsBlueY_hidden); }
     else             { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
 
     // Use CIE xy triangle test for reliable in/out-of-gamut detection,
@@ -2026,7 +2026,7 @@ float4 main(
         uint sg = (uint)SourceGamut;
         if (sg == 1)      { sR = GAMUT_P3_R; sG = GAMUT_P3_G; sB = GAMUT_P3_B; }
         else if (sg == 2) { sR = GAMUT_2020_R; sG = GAMUT_2020_G; sB = GAMUT_2020_B; }
-        else if (sg == 3) { sR = float2(WsRedX, WsRedY); sG = float2(WsGreenX, WsGreenY); sB = float2(WsBlueX, WsBlueY); }
+        else if (sg == 3) { sR = float2(WsRedX_hidden, WsRedY_hidden); sG = float2(WsGreenX_hidden, WsGreenY_hidden); sB = float2(WsBlueX_hidden, WsBlueY_hidden); }
         else              { sR = GAMUT_709_R; sG = GAMUT_709_G; sB = GAMUT_709_B; }
 
         float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
@@ -2092,9 +2092,9 @@ float4 main(
                 { L"SourceGamut", L"uint", uint32_t(2), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
             };
             desc.hiddenDefaults = {
-                { L"WsRedX", 0.64f }, { L"WsRedY", 0.33f },
-                { L"WsGreenX", 0.30f }, { L"WsGreenY", 0.60f },
-                { L"WsBlueX", 0.15f }, { L"WsBlueY", 0.06f },
+                { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },
+                { L"WsGreenX_hidden", 0.30f }, { L"WsGreenY_hidden", 0.60f },
+                { L"WsBlueX_hidden", 0.15f }, { L"WsBlueY_hidden", 0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2110,9 +2110,9 @@ cbuffer Constants : register(b0)
     float DiagramSize;
     float TargetGamut;
     float Intensity;   // Which I level to highlight (PQ domain, 0-1)
-    float WsRedX;   float WsRedY;
-    float WsGreenX; float WsGreenY;
-    float WsBlueX;  float WsBlueY;
+    float WsRedX_hidden;   float WsRedY_hidden;
+    float WsGreenX_hidden; float WsGreenY_hidden;
+    float WsBlueX_hidden;  float WsBlueY_hidden;
 };
 
 Texture2D InputTexture : register(t0);
@@ -2151,7 +2151,7 @@ float4 main(
     uint g = (uint)TargetGamut;
     if (g == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
     else if (g == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
-    else if (g == 3) { gR = float2(WsRedX, WsRedY); gG = float2(WsGreenX, WsGreenY); gB = float2(WsBlueX, WsBlueY); }
+    else if (g == 3) { gR = float2(WsRedX_hidden, WsRedY_hidden); gG = float2(WsGreenX_hidden, WsGreenY_hidden); gB = float2(WsBlueX_hidden, WsBlueY_hidden); }
     else             { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
 
     float3 color = float3(0.01, 0.01, 0.01);
@@ -2213,9 +2213,9 @@ float4 main(
                 { L"Intensity",   L"float", 0.5f, 0.05f, 0.95f, 0.05f },
             };
             desc.hiddenDefaults = {
-                { L"WsRedX", 0.64f }, { L"WsRedY", 0.33f },
-                { L"WsGreenX", 0.30f }, { L"WsGreenY", 0.60f },
-                { L"WsBlueX", 0.15f }, { L"WsBlueY", 0.06f },
+                { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },
+                { L"WsGreenX_hidden", 0.30f }, { L"WsGreenY_hidden", 0.60f },
+                { L"WsBlueX_hidden", 0.15f }, { L"WsBlueY_hidden", 0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
