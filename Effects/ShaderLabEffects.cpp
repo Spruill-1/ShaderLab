@@ -743,9 +743,9 @@ float4 main(
     xy.x = center.x + (uv.x - 0.5) * 2.0 * halfExtent;
     xy.y = center.y - (uv.y - 0.5) * 2.0 * halfExtent; // y-up
 
-    // Outside the gamut triangle: dark background
+    // Outside the gamut triangle: black
     if (!PointInTriangle(xy, r, g, b))
-        return float4(0.05, 0.05, 0.05, 1.0);
+        return float4(0, 0, 0, 1.0);
 
     // Convert CIE xy + luminance to scRGB
     float Y = Luminance / 80.0;
@@ -762,7 +762,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Source";
-            desc.effectId = L"Gamut Source"; desc.effectVersion = 1;
+            desc.effectId = L"Gamut Source"; desc.effectVersion = 2;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutSourceHLSL;
