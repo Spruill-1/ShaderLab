@@ -405,7 +405,7 @@ namespace winrt::ShaderLab::implementation
         // Set version text: app version + effect library version.
         {
             auto& lib = ::ShaderLab::Effects::ShaderLabEffects::Instance();
-            AppVersionText().Text(std::format(L"v1.1.0  (effects lib r{})", lib.LibraryVersion()));
+            AppVersionText().Text(std::format(L"v1.1.0  (effects lib v{})", lib.LibraryVersion()));
         }
 
         m_nodeGraphController.SetGraph(&m_graph);
