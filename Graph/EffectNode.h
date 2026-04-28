@@ -318,5 +318,10 @@ namespace ShaderLab::Graph
         // "Phase" property and marks this node dirty each frame.
         bool isAnimatable{ false };
         bool isPlaying{ false };
+
+        // Set by the host before evaluation: true if this node feeds a visible
+        // output (Output node, output window, preview, or data-only analysis).
+        // The evaluator skips nodes where needed == false.
+        bool needed{ true };
     };
 }

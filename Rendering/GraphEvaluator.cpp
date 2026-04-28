@@ -38,6 +38,13 @@ namespace ShaderLab::Rendering
             if (!node)
                 continue;
 
+            // Skip nodes not needed by any visible output.
+            if (!node->needed)
+            {
+                node->dirty = false;
+                continue;
+            }
+
             switch (node->type)
             {
             case NodeType::Source:

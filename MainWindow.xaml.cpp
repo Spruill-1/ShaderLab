@@ -4642,6 +4642,61 @@ namespace winrt::ShaderLab::implementation
             }
         }
 
+        // Compute which nodes are needed (feed a visible output).
+        // Start by marking all nodes unneeded, then mark roots and propagate upstream.
+        {
+            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+                node.needed = false;
+
+            // Roots: Output nodes, preview node, output window nodes,
+            // and data-only nodes with visible analysis display.
+            std::vector<uint32_t> roots;
+            for (const auto& node : m_graph.Nodes())
+            {
+                if (node.type == ::ShaderLab::Graph::NodeType::Output)
+                    roots.push_back(node.id);
+                // Data-only and parameter nodes with analysis output need evaluation
+                // to display values on the graph canvas.
+                if (node.customEffect.has_value() &&
+                    node.customEffect->analysisOutputType == ::ShaderLab::Graph::AnalysisOutputType::Typed)
+                    roots.push_back(node.id);
+            }
+            if (m_previewNodeId != 0)
+                roots.push_back(m_previewNodeId);
+            for (const auto& window : m_outputWindows)
+                roots.push_back(window->NodeId());
+
+            // BFS upstream from roots.
+            std::unordered_set<uint32_t> visited;
+            std::vector<uint32_t> queue = roots;
+            while (!queue.empty())
+            {
+                uint32_t id = queue.back();
+                queue.pop_back();
+                if (visited.count(id)) continue;
+                visited.insert(id);
+                auto* node = m_graph.FindNode(id);
+                if (node) node->needed = true;
+                // Add all upstream nodes (via both image and data edges).
+                for (const auto* edge : m_graph.GetInputEdges(id))
+                    queue.push_back(edge->sourceNodeId);
+                // Add property binding sources.
+                if (node)
+                {
+                    for (const auto& [propName, binding] : node->propertyBindings)
+                    {
+                        if (binding.wholeArray)
+                            queue.push_back(binding.wholeArraySourceNodeId);
+                        for (const auto& src : binding.sources)
+                        {
+                            if (src.has_value())
+                                queue.push_back(src->sourceNodeId);
+                        }
+                    }
+                }
+            }
+        }
+
         // Evaluate the effect graph.
         m_graphEvaluator.Evaluate(m_graph, dc);
 
