@@ -620,12 +620,13 @@ namespace ShaderLab::Controls
             sliderHeight = 28.0f;    // space for inline slider
         }
 
-        // Data-only effects (have HLSL but no image output pin): shrink image body.
+        // Data-only effects (have HLSL but no image output pin): shrink image body
+        // only if they also have no image input pins.
         bool isDataOnlyEffect = node.customEffect.has_value() &&
             !node.customEffect->hlslSource.empty() &&
             node.outputPins.empty() &&
             node.customEffect->analysisOutputType == Graph::AnalysisOutputType::Typed;
-        if (isDataOnlyEffect)
+        if (isDataOnlyEffect && node.inputPins.empty())
             imageBodyHeight = 4.0f;
 
         float totalHeight = v.headerHeight + imageBodyHeight + sliderHeight + dataBodyHeight;
