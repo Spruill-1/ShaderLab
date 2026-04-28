@@ -1796,21 +1796,28 @@ float4 main(
     else if (g == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
     else             { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
 
-    float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
-    float2 ctcp = float2(ictcp.y, ictcp.z);
-    float origY = dot(max(color.rgb, 0.0), float3(0.2126, 0.7152, 0.0722));
+    // Use CIE xy triangle test for reliable in/out-of-gamut detection,
+    // then do the actual mapping in ICtCp for perceptual quality.
+    float3 xyz = ScRGBToXYZ(max(color.rgb, 0.0));
+    float xyzSum = xyz.x + xyz.y + xyz.z;
+    if (xyzSum < 1e-6) return color;
+    float2 cieXY = float2(xyz.x / xyzSum, xyz.y / xyzSum);
+    bool insideGamut = PointInTriangle(cieXY, gR, gG, gB);
 
-    float2 bnd[NBP];
-    SampleBoundary(gR, gG, gB, ictcp.x, bnd);
-
-    if (!PtInPoly(ctcp, bnd))
+    if (!insideGamut)
     {
+        float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
+        float2 ctcp = float2(ictcp.y, ictcp.z);
+        float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+
+        float2 bnd[NBP];
+        SampleBoundary(gR, gG, gB, ictcp.x, bnd);
+
         float2 mapped = ((uint)Mode == 1)
             ? CompressNeutral(ctcp, bnd)
             : NearestOnPoly(ctcp, bnd);
         ctcp = lerp(ctcp, mapped, Strength);
         float3 mappedRGB = ICtCpToScRGB(float3(ictcp.x, ctcp.x, ctcp.y));
-        // Preserve original luminance (ICtCp round-trip introduces small Y shift)
         float mappedY = dot(max(mappedRGB, 0.0), float3(0.2126, 0.7152, 0.0722));
         if (mappedY > 1e-6)
             mappedRGB *= origY / mappedY;
