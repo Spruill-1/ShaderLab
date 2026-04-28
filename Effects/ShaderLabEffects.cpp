@@ -1529,7 +1529,10 @@ float4 main(
 cbuffer Constants : register(b0)
 {
     float DiagramSize; // output size in pixels
-    float TargetGamut; // 0 = sRGB, 1 = DCI-P3, 2 = BT.2020
+    float TargetGamut; // 0 = sRGB, 1 = DCI-P3, 2 = BT.2020, 3 = Working Space
+    float WsRedX;   float WsRedY;
+    float WsGreenX; float WsGreenY;
+    float WsBlueX;  float WsBlueY;
 };
 
 Texture2D InputTexture : register(t0);
@@ -1565,6 +1568,7 @@ float4 main(
     uint gamut = (uint)TargetGamut;
     if (gamut == 1)      { tR = GAMUT_P3_R; tG = GAMUT_P3_G; tB = GAMUT_P3_B; }
     else if (gamut == 2) { tR = GAMUT_2020_R; tG = GAMUT_2020_G; tB = GAMUT_2020_B; }
+    else if (gamut == 3) { tR = float2(WsRedX, WsRedY); tG = float2(WsGreenX, WsGreenY); tB = float2(WsBlueX, WsBlueY); }
     else                 { tR = GAMUT_709_R; tG = GAMUT_709_G; tB = GAMUT_709_B; }
 
     float lineW = 0.003;
@@ -1616,14 +1620,19 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Coverage";
-            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 1;
+            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutCoverageHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"DiagramSize",  L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
-                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
+                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+            };
+            desc.hiddenDefaults = {
+                { L"WsRedX", 0.64f }, { L"WsRedY", 0.33f },
+                { L"WsGreenX", 0.30f }, { L"WsGreenY", 0.60f },
+                { L"WsBlueX", 0.15f }, { L"WsBlueY", 0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1641,9 +1650,12 @@ float4 main(
 cbuffer Constants : register(b0)
 {
     float Mode;        // 0=Clip, 1=Nearest, 2=Compress, 3=Fit Gamut
-    float TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020
+    float TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Working Space
     float Strength;    // 0=bypass, 1=full mapping
-    float SourceGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020 (for Fit mode)
+    float SourceGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Working Space
+    float WsRedX;   float WsRedY;
+    float WsGreenX; float WsGreenY;
+    float WsBlueX;  float WsBlueY;
 };
 
 Texture2D InputTexture : register(t0);
@@ -1740,6 +1752,7 @@ float4 main(
     uint gamut = (uint)TargetGamut;
     if (gamut == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
     else if (gamut == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
+    else if (gamut == 3) { gR = float2(WsRedX, WsRedY); gG = float2(WsGreenX, WsGreenY); gB = float2(WsBlueX, WsBlueY); }
     else                 { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
 
     uint mode = (uint)Mode;
@@ -1781,6 +1794,7 @@ float4 main(
         uint sg = (uint)SourceGamut;
         if (sg == 1)      { sR = GAMUT_P3_R; sG = GAMUT_P3_G; sB = GAMUT_P3_B; }
         else if (sg == 2) { sR = GAMUT_2020_R; sG = GAMUT_2020_G; sB = GAMUT_2020_B; }
+        else if (sg == 3) { sR = float2(WsRedX, WsRedY); sG = float2(WsGreenX, WsGreenY); sB = float2(WsBlueX, WsBlueY); }
         else              { sR = GAMUT_709_R; sG = GAMUT_709_G; sB = GAMUT_709_B; }
 
         float scale = ComputeFitScale(sR, sG, sB, gR, gG, gB);
@@ -1835,16 +1849,21 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Map";
-            desc.effectId = L"Gamut Map"; desc.effectVersion = 1;
+            desc.effectId = L"Gamut Map"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutMapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"Mode",        L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Clip", L"Nearest Point", L"Compress to White", L"Fit Gamut" } },
-                { L"TargetGamut", L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
+                { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
-                { L"SourceGamut", L"float", 2.0f, 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
+                { L"SourceGamut", L"float", 2.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+            };
+            desc.hiddenDefaults = {
+                { L"WsRedX", 0.64f }, { L"WsRedY", 0.33f },
+                { L"WsGreenX", 0.30f }, { L"WsGreenY", 0.60f },
+                { L"WsBlueX", 0.15f }, { L"WsBlueY", 0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1859,9 +1878,12 @@ float4 main(
 cbuffer Constants : register(b0)
 {
     float Mode;          // 0=Nearest on Shell, 1=Compress to Neutral, 2=Fit to Shell
-    float TargetGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020
+    float TargetGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Working Space
     float Strength;      // 0=bypass, 1=full
-    float SourceGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020 (for Fit mode)
+    float SourceGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Working Space
+    float WsRedX;   float WsRedY;
+    float WsGreenX; float WsGreenY;
+    float WsBlueX;  float WsBlueY;
 };
 
 Texture2D InputTexture : register(t0);
@@ -1985,6 +2007,7 @@ float4 main(
     uint g = (uint)TargetGamut;
     if (g == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
     else if (g == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
+    else if (g == 3) { gR = float2(WsRedX, WsRedY); gG = float2(WsGreenX, WsGreenY); gB = float2(WsBlueX, WsBlueY); }
     else             { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
 
     // Use CIE xy triangle test for reliable in/out-of-gamut detection,
@@ -2003,6 +2026,7 @@ float4 main(
         uint sg = (uint)SourceGamut;
         if (sg == 1)      { sR = GAMUT_P3_R; sG = GAMUT_P3_G; sB = GAMUT_P3_B; }
         else if (sg == 2) { sR = GAMUT_2020_R; sG = GAMUT_2020_G; sB = GAMUT_2020_B; }
+        else if (sg == 3) { sR = float2(WsRedX, WsRedY); sG = float2(WsGreenX, WsGreenY); sB = float2(WsBlueX, WsBlueY); }
         else              { sR = GAMUT_709_R; sG = GAMUT_709_G; sB = GAMUT_709_B; }
 
         float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
@@ -2056,16 +2080,21 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Perceptual Gamut Map";
-            desc.effectId = L"Perceptual Gamut Map"; desc.effectVersion = 1;
+            desc.effectId = L"Perceptual Gamut Map"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + perceptualGamutMapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"Mode",        L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"Nearest on Shell", L"Compress to Neutral", L"Fit to Shell" } },
-                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
+                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
-                { L"SourceGamut", L"uint", uint32_t(2), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
+                { L"SourceGamut", L"uint", uint32_t(2), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+            };
+            desc.hiddenDefaults = {
+                { L"WsRedX", 0.64f }, { L"WsRedY", 0.33f },
+                { L"WsGreenX", 0.30f }, { L"WsGreenY", 0.60f },
+                { L"WsBlueX", 0.15f }, { L"WsBlueY", 0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2081,6 +2110,9 @@ cbuffer Constants : register(b0)
     float DiagramSize;
     float TargetGamut;
     float Intensity;   // Which I level to highlight (PQ domain, 0-1)
+    float WsRedX;   float WsRedY;
+    float WsGreenX; float WsGreenY;
+    float WsBlueX;  float WsBlueY;
 };
 
 Texture2D InputTexture : register(t0);
@@ -2119,6 +2151,7 @@ float4 main(
     uint g = (uint)TargetGamut;
     if (g == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
     else if (g == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
+    else if (g == 3) { gR = float2(WsRedX, WsRedY); gG = float2(WsGreenX, WsGreenY); gB = float2(WsBlueX, WsBlueY); }
     else             { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
 
     float3 color = float3(0.01, 0.01, 0.01);
@@ -2169,15 +2202,186 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Boundary";
-            desc.effectId = L"ICtCp Boundary"; desc.effectVersion = 1;
+            desc.effectId = L"ICtCp Boundary"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + ictcpBoundaryHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"DiagramSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
-                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
+                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
                 { L"Intensity",   L"float", 0.5f, 0.05f, 0.95f, 0.05f },
+            };
+            desc.hiddenDefaults = {
+                { L"WsRedX", 0.64f }, { L"WsRedY", 0.33f },
+                { L"WsGreenX", 0.30f }, { L"WsGreenY", 0.60f },
+                { L"WsBlueX", 0.15f }, { L"WsBlueY", 0.06f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Image Statistics ----
+        // Scans the input image and outputs min/max/mean/median statistics.
+        // Designed for analyzing Delta E or luminance outputs.
+        {
+            static const std::string imageStatsHLSL = R"HLSL(
+// Image Statistics - computes min, max, mean of input pixel values.
+// Outputs a small image; row 0 encodes analysis fields.
+
+cbuffer Constants : register(b0)
+{
+    float OutputSize;
+    float Channel; // 0=Luminance(R), 1=R, 2=G, 3=B, 4=Alpha
+};
+
+Texture2D InputTexture : register(t0);
+SamplerState InputSampler : register(s0);
+
+float GetChannel(float4 pix, uint ch) {
+    if (ch == 1) return pix.r;
+    if (ch == 2) return pix.g;
+    if (ch == 3) return pix.b;
+    if (ch == 4) return pix.a;
+    // 0 = luminance from Rec.709
+    return dot(pix.rgb, float3(0.2126, 0.7152, 0.0722));
+}
+
+float4 main(
+    float4 pos : SV_POSITION, float4 ps : SCENE_POSITION, float4 uv0 : TEXCOORD0
+) : SV_Target
+{
+    float size = max(OutputSize, 4.0);
+    float2 dims;
+    InputTexture.GetDimensions(dims.x, dims.y);
+
+    // Only compute stats for pixel (0,0) in output-pixel space.
+    // All other pixels get a visualization bar.
+    uint ch = (uint)Channel;
+
+    // Scan the input: compute min, max, sum, and build a histogram for median.
+    float vMin = 1e10;
+    float vMax = -1e10;
+    float vSum = 0;
+    uint totalSamples = 0;
+
+    // 256-bin histogram for approximate median
+    // Map values to [0, histMax] range, clamp outside
+    float histMax = 100.0; // reasonable for Delta E or nit values
+    uint hist[256];
+    for (uint bi = 0; bi < 256; bi++) hist[bi] = 0;
+
+    uint sqrtSamples = (uint)min(ceil(sqrt(dims.x * dims.y)), 512.0);
+    float stepX = dims.x / (float)sqrtSamples;
+    float stepY = dims.y / (float)sqrtSamples;
+
+    for (uint sy = 0; sy < sqrtSamples; sy++)
+    {
+        for (uint sx = 0; sx < sqrtSamples; sx++)
+        {
+            float2 suv = float2((sx * stepX + 0.5) / dims.x, (sy * stepY + 0.5) / dims.y);
+            float4 pix = InputTexture.SampleLevel(InputSampler, suv, 0);
+            float v = GetChannel(pix, ch);
+            vMin = min(vMin, v);
+            vMax = max(vMax, v);
+            vSum += v;
+            totalSamples++;
+
+            // Histogram bin
+            float normalized = saturate(v / max(histMax, 0.001));
+            uint bin = min((uint)(normalized * 255.0), 255u);
+            hist[bin]++;
+        }
+    }
+
+    float vMean = (totalSamples > 0) ? vSum / (float)totalSamples : 0.0;
+
+    // Compute approximate median from histogram
+    uint halfCount = totalSamples / 2;
+    uint cumulative = 0;
+    float vMedian = 0;
+    for (uint mi = 0; mi < 256; mi++)
+    {
+        cumulative += hist[mi];
+        if (cumulative >= halfCount)
+        {
+            vMedian = ((float)mi / 255.0) * histMax;
+            break;
+        }
+    }
+
+    // Compute 95th percentile
+    uint p95Count = (uint)(totalSamples * 0.95);
+    cumulative = 0;
+    float vP95 = 0;
+    for (uint pi = 0; pi < 256; pi++)
+    {
+        cumulative += hist[pi];
+        if (cumulative >= p95Count)
+        {
+            vP95 = ((float)pi / 255.0) * histMax;
+            break;
+        }
+    }
+
+    // Row 0: encode analysis output fields (one float per pixel, R channel)
+    // Pixel 0: Min, 1: Max, 2: Mean, 3: Median, 4: P95, 5: Samples
+    float2 outPx = pos.xy;
+    if (outPx.y < 1.0)
+    {
+        if (outPx.x < 1.0) return float4(vMin, 0, 0, 1);
+        if (outPx.x < 2.0) return float4(vMax, 0, 0, 1);
+        if (outPx.x < 3.0) return float4(vMean, 0, 0, 1);
+        if (outPx.x < 4.0) return float4(vMedian, 0, 0, 1);
+        if (outPx.x < 5.0) return float4(vP95, 0, 0, 1);
+        if (outPx.x < 6.0) return float4((float)totalSamples, 0, 0, 1);
+    }
+
+    // Visual: simple bar chart representation
+    float barY = 1.0 - (outPx.y / size);
+    float barX = outPx.x / size;
+    float3 color = float3(0.05, 0.05, 0.05);
+
+    // 4 bars: Min, Mean, Median, Max (normalized to vMax)
+    float normMax = max(vMax, 0.001);
+    float barW = 0.2;
+    float gap = 0.05;
+    float bars[4] = { vMin / normMax, vMean / normMax, vMedian / normMax, vMax / normMax };
+    float3 barColors[4] = {
+        float3(0.2, 0.5, 1.0),  // Min: blue
+        float3(0.2, 0.8, 0.2),  // Mean: green
+        float3(1.0, 0.8, 0.0),  // Median: yellow
+        float3(1.0, 0.2, 0.2)   // Max: red
+    };
+    for (uint b = 0; b < 4; b++)
+    {
+        float bx = gap + b * (barW + gap);
+        if (barX >= bx && barX < bx + barW && barY <= bars[b])
+            color = barColors[b];
+    }
+
+    return float4(color, 1.0);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Image Statistics";
+            desc.effectId = L"Image Statistics"; desc.effectVersion = 1;
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + imageStatsHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"OutputSize", L"float", 64.0f, 4.0f, 256.0f, 8.0f },
+                { L"Channel",   L"float", 0.0f, 0.0f, 4.0f, 1.0f, { L"Luminance", L"Red", L"Green", L"Blue", L"Alpha" } },
+            };
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                { L"Min",     Graph::AnalysisFieldType::Float },
+                { L"Max",     Graph::AnalysisFieldType::Float },
+                { L"Mean",    Graph::AnalysisFieldType::Float },
+                { L"Median",  Graph::AnalysisFieldType::Float },
+                { L"P95",     Graph::AnalysisFieldType::Float },
+                { L"Samples", Graph::AnalysisFieldType::Float },
             };
             m_effects.push_back(std::move(desc));
         }

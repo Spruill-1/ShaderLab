@@ -4481,6 +4481,29 @@ namespace winrt::ShaderLab::implementation
                     node.properties[L"MonBlueY"]  = src.primaryBlue.y;
                     if (changed) node.dirty = true;
                 }
+
+                // Inject working space primaries into any node that uses them.
+                if (node.properties.count(L"WsRedX"))
+                {
+                    const auto& ws = activeProfile;
+                    auto getF = [&](const std::wstring& k) -> float {
+                        auto it = node.properties.find(k);
+                        if (it != node.properties.end())
+                            if (auto* f = std::get_if<float>(&it->second)) return *f;
+                        return 0.0f;
+                    };
+                    bool changed = std::abs(getF(L"WsRedX") - ws.primaryRed.x) > 0.0001f
+                        || std::abs(getF(L"WsGreenX") - ws.primaryGreen.x) > 0.0001f
+                        || std::abs(getF(L"WsBlueX") - ws.primaryBlue.x) > 0.0001f;
+
+                    node.properties[L"WsRedX"]   = ws.primaryRed.x;
+                    node.properties[L"WsRedY"]   = ws.primaryRed.y;
+                    node.properties[L"WsGreenX"] = ws.primaryGreen.x;
+                    node.properties[L"WsGreenY"] = ws.primaryGreen.y;
+                    node.properties[L"WsBlueX"]  = ws.primaryBlue.x;
+                    node.properties[L"WsBlueY"]  = ws.primaryBlue.y;
+                    if (changed) node.dirty = true;
+                }
             }
         }
 
