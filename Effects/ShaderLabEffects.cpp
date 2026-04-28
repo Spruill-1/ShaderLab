@@ -1736,16 +1736,15 @@ float4 main(
 
         // Check if inside gamut triangle
         bool inside = PointInTriangle(xy, gR, gG, gB);
-        if (!inside)
-        {
-            float2 mapped;
-            if (mode == 1)
-                mapped = NearestOnTriangle(xy, gR, gG, gB);
-            else
-                mapped = CompressToWhite(xy, gR, gG, gB);
+        if (inside) return color;  // In-gamut: pass through unchanged
 
-            xy = lerp(xy, mapped, Strength);
-        }
+        float2 mapped;
+        if (mode == 1)
+            mapped = NearestOnTriangle(xy, gR, gG, gB);
+        else
+            mapped = CompressToWhite(xy, gR, gG, gB);
+
+        xy = lerp(xy, mapped, Strength);
 
         // Reconstruct XYZ from mapped xy + original Y
         float X = (xy.y > 1e-6) ? xy.x * Y / xy.y : 0.0;
