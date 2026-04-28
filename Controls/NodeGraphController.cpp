@@ -1037,13 +1037,30 @@ namespace ShaderLab::Controls
                     if (m_pinLabelFormat && i < visual.dataInputPinLabels.size() && i < visual.dataInputPinNames.size())
                     {
                         std::wstring label = visual.dataInputPinLabels[i];
-                        // Append current property value.
                         auto propIt = node->properties.find(visual.dataInputPinNames[i]);
                         if (propIt != node->properties.end())
                         {
                             float val = 0;
                             if (auto* f = std::get_if<float>(&propIt->second)) val = *f;
-                            label += std::format(L" = {:.4g}", val);
+
+                            // Look up enum label if available.
+                            std::wstring valStr;
+                            if (node->customEffect.has_value())
+                            {
+                                for (const auto& p : node->customEffect->parameters)
+                                {
+                                    if (p.name == visual.dataInputPinNames[i] && !p.enumLabels.empty())
+                                    {
+                                        uint32_t idx = static_cast<uint32_t>(val + 0.5f);
+                                        if (idx < p.enumLabels.size())
+                                            valStr = p.enumLabels[idx];
+                                        break;
+                                    }
+                                }
+                            }
+                            if (valStr.empty())
+                                valStr = std::format(L"{:.4g}", val);
+                            label += L" = " + valStr;
                         }
                         D2D1_RECT_F labelRect = {
                             visual.dataInputPinPositions[i].x + PinRadius + 3.0f,
