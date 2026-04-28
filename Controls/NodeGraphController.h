@@ -25,6 +25,10 @@ namespace ShaderLab::Controls
         std::vector<std::wstring>  dataOutputPinNames;   // field names (for binding lookup)
         std::vector<std::wstring>  dataInputPinLabels;   // "PropName (type)" for display
         std::vector<std::wstring>  dataOutputPinLabels;  // "FieldName (type)" for display
+
+        // Parameter node inline control.
+        bool isParameterNode{ false };
+        D2D1_RECT_F sliderRect{};       // Slider track rect (for hit-test)
     };
 
     // Describes a pending connection drag operation.
@@ -94,6 +98,16 @@ namespace ShaderLab::Controls
         bool HitTestPin(D2D1_POINT_2F canvasPoint,
                         uint32_t& nodeId, uint32_t& pinIndex, bool& isOutput,
                         bool& isDataPin) const;
+
+        // Hit-test for inline slider on parameter nodes. Returns node ID or 0.
+        uint32_t HitTestSlider(D2D1_POINT_2F canvasPoint) const;
+
+        // Update slider value from canvas X position during drag.
+        // Returns true if value changed.
+        bool UpdateSliderDrag(uint32_t nodeId, D2D1_POINT_2F canvasPoint);
+
+        // Check if a node is a parameter node (no HLSL, data output only).
+        bool IsParameterNode(uint32_t nodeId) const;
 
         // Begin dragging selected nodes.
         void BeginDragNodes(D2D1_POINT_2F startPoint);

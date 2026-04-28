@@ -598,7 +598,21 @@ namespace ShaderLab::Controls
             uint32_t maxDataPins = (std::max)(dataInputCount, dataOutputCount);
             dataBodyHeight = 8.0f + maxDataPins * v.pinSpacing;  // 8px gap
         }
-        float totalHeight = v.headerHeight + imageBodyHeight + dataBodyHeight;
+
+        // Detect parameter nodes (no HLSL, data-only).
+        v.isParameterNode = node.customEffect.has_value() &&
+            node.customEffect->hlslSource.empty() &&
+            node.customEffect->analysisOutputType == Graph::AnalysisOutputType::Typed;
+
+        // Parameter nodes: shrink image body (no image I/O) and add slider space.
+        float sliderHeight = 0.0f;
+        if (v.isParameterNode)
+        {
+            imageBodyHeight = 4.0f;  // minimal gap
+            sliderHeight = 28.0f;    // space for inline slider
+        }
+
+        float totalHeight = v.headerHeight + imageBodyHeight + sliderHeight + dataBodyHeight;
 
         v.bounds = {
             node.position.x,
@@ -624,8 +638,20 @@ namespace ShaderLab::Controls
             });
         }
 
-        // Compute data pin positions (below image pins).
-        float dataStartY = node.position.y + v.headerHeight + imageBodyHeight + 4.0f;
+        // Compute data pin positions (below image pins + slider).
+        float dataStartY = node.position.y + v.headerHeight + imageBodyHeight + sliderHeight + 4.0f;
+
+        // Slider rect for parameter nodes.
+        if (v.isParameterNode)
+        {
+            float sliderY = node.position.y + v.headerHeight + imageBodyHeight;
+            v.sliderRect = {
+                node.position.x + 12.0f,
+                sliderY + 4.0f,
+                node.position.x + NodeWidth - 12.0f,
+                sliderY + sliderHeight - 4.0f
+            };
+        }
         for (uint32_t i = 0; i < dataInputCount; ++i)
         {
             v.dataInputPinPositions.push_back({
@@ -881,7 +907,8 @@ namespace ShaderLab::Controls
             D2D1_ROUNDED_RECT rrect = { visual.bounds, NodeCornerRadius, NodeCornerRadius };
             if (m_brushNode)
             {
-                m_brushNode->SetColor(NodeColor(node->type));
+                m_brushNode->SetColor(visual.isParameterNode
+                    ? D2D1::ColorF(0x1A2E3A) : NodeColor(node->type));
                 dc->FillRoundedRectangle(rrect, m_brushNode.get());
             }
 
@@ -899,7 +926,8 @@ namespace ShaderLab::Controls
             D2D1_ROUNDED_RECT headerRRect = { headerRect, NodeCornerRadius, NodeCornerRadius };
             if (m_brushHeader)
             {
-                m_brushHeader->SetColor(NodeHeaderColor(node->type));
+                m_brushHeader->SetColor(visual.isParameterNode
+                    ? D2D1::ColorF(0x00897B) : NodeHeaderColor(node->type));
                 dc->FillRoundedRectangle(headerRRect, m_brushHeader.get());
             }
 
@@ -1000,6 +1028,78 @@ namespace ShaderLab::Controls
                     }
                 }
             }
+
+            // Inline slider for parameter nodes.
+            if (visual.isParameterNode && node->customEffect.has_value())
+            {
+                auto propIt = node->properties.find(L"Value");
+                if (propIt != node->properties.end())
+                {
+                    float val = 0.0f;
+                    if (auto* f = std::get_if<float>(&propIt->second)) val = *f;
+
+                    float pMin = 0.0f, pMax = 1.0f;
+                    for (const auto& p : node->customEffect->parameters)
+                    {
+                        if (p.name == L"Value") { pMin = p.minValue; pMax = p.maxValue; break; }
+                    }
+
+                    float t = (pMax > pMin) ? (val - pMin) / (pMax - pMin) : 0.0f;
+                    t = (std::max)(0.0f, (std::min)(1.0f, t));
+
+                    float trackY = (visual.sliderRect.top + visual.sliderRect.bottom) * 0.5f;
+                    float trackH = 4.0f;
+                    D2D1_ROUNDED_RECT track = {
+                        { visual.sliderRect.left, trackY - trackH * 0.5f,
+                          visual.sliderRect.right, trackY + trackH * 0.5f },
+                        2.0f, 2.0f
+                    };
+                    winrt::com_ptr<ID2D1SolidColorBrush> trackBrush;
+                    dc->CreateSolidColorBrush(D2D1::ColorF(0x444444), trackBrush.put());
+                    if (trackBrush) dc->FillRoundedRectangle(track, trackBrush.get());
+
+                    float fillRight = visual.sliderRect.left + t * (visual.sliderRect.right - visual.sliderRect.left);
+                    D2D1_ROUNDED_RECT fill = {
+                        { visual.sliderRect.left, trackY - trackH * 0.5f,
+                          fillRight, trackY + trackH * 0.5f },
+                        2.0f, 2.0f
+                    };
+                    winrt::com_ptr<ID2D1SolidColorBrush> fillBrush;
+                    dc->CreateSolidColorBrush(D2D1::ColorF(0x00BCD4), fillBrush.put());
+                    if (fillBrush) dc->FillRoundedRectangle(fill, fillBrush.get());
+
+                    float handleX = fillRight;
+                    winrt::com_ptr<ID2D1SolidColorBrush> handleBrush;
+                    dc->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF), handleBrush.put());
+                    if (handleBrush) dc->FillEllipse({ { handleX, trackY }, 5.0f, 5.0f }, handleBrush.get());
+
+                    if (m_pinLabelFormat)
+                    {
+                        std::wstring valText;
+                        for (const auto& p : node->customEffect->parameters)
+                        {
+                            if (p.name == L"Value" && !p.enumLabels.empty())
+                            {
+                                uint32_t idx = static_cast<uint32_t>(val + 0.5f);
+                                if (idx < p.enumLabels.size())
+                                    valText = p.enumLabels[idx];
+                                break;
+                            }
+                        }
+                        if (valText.empty())
+                            valText = std::format(L"{:.2f}", val);
+
+                        D2D1_RECT_F valRect = {
+                            visual.sliderRect.left, visual.sliderRect.bottom - 2.0f,
+                            visual.sliderRect.right, visual.sliderRect.bottom + 12.0f
+                        };
+                        m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        if (m_brushText)
+                            dc->DrawText(valText.c_str(), static_cast<UINT32>(valText.size()),
+                                m_pinLabelFormat.get(), valRect, m_brushText.get());
+                    }
+                }
+            }
         }
     }
 
@@ -1070,5 +1170,66 @@ namespace ShaderLab::Controls
         case Graph::NodeType::Output:        return D2D1::ColorF(0x78909C);
         default:                             return D2D1::ColorF(0x3A7BD5);
         }
+    }
+
+    uint32_t NodeGraphController::HitTestSlider(D2D1_POINT_2F canvasPoint) const
+    {
+        for (const auto& [id, v] : m_visuals)
+        {
+            if (!v.isParameterNode) continue;
+            if (canvasPoint.x >= v.sliderRect.left && canvasPoint.x <= v.sliderRect.right &&
+                canvasPoint.y >= v.sliderRect.top - 6.0f && canvasPoint.y <= v.sliderRect.bottom + 6.0f)
+                return id;
+        }
+        return 0;
+    }
+
+    bool NodeGraphController::UpdateSliderDrag(uint32_t nodeId, D2D1_POINT_2F canvasPoint)
+    {
+        auto vIt = m_visuals.find(nodeId);
+        if (vIt == m_visuals.end() || !vIt->second.isParameterNode) return false;
+
+        auto* node = m_graph->FindNode(nodeId);
+        if (!node || !node->customEffect.has_value()) return false;
+
+        float pMin = 0.0f, pMax = 1.0f, step = 0.01f;
+        bool hasEnumLabels = false;
+        for (const auto& p : node->customEffect->parameters)
+        {
+            if (p.name == L"Value")
+            {
+                pMin = p.minValue; pMax = p.maxValue; step = p.step;
+                hasEnumLabels = !p.enumLabels.empty();
+                break;
+            }
+        }
+
+        float t = (canvasPoint.x - vIt->second.sliderRect.left)
+                / (vIt->second.sliderRect.right - vIt->second.sliderRect.left);
+        t = (std::max)(0.0f, (std::min)(1.0f, t));
+        float newVal = pMin + t * (pMax - pMin);
+
+        // Snap to step.
+        if (step > 0.001f)
+            newVal = std::round(newVal / step) * step;
+        newVal = (std::max)(pMin, (std::min)(pMax, newVal));
+
+        auto propIt = node->properties.find(L"Value");
+        if (propIt == node->properties.end()) return false;
+
+        float oldVal = 0.0f;
+        if (auto* f = std::get_if<float>(&propIt->second)) oldVal = *f;
+
+        if (std::abs(newVal - oldVal) < 0.0001f) return false;
+
+        propIt->second = newVal;
+        node->dirty = true;
+        return true;
+    }
+
+    bool NodeGraphController::IsParameterNode(uint32_t nodeId) const
+    {
+        auto it = m_visuals.find(nodeId);
+        return it != m_visuals.end() && it->second.isParameterNode;
     }
 }

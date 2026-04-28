@@ -1941,6 +1941,22 @@ namespace winrt::ShaderLab::implementation
                 node.id, node.name, node.position.x, node.position.y).c_str());
         }
 
+        // Check for inline slider hit on parameter nodes.
+        uint32_t sliderNodeId = m_nodeGraphController.HitTestSlider(canvasPoint);
+        if (sliderNodeId != 0)
+        {
+            m_isDraggingSlider = true;
+            m_sliderDragNodeId = sliderNodeId;
+            m_nodeGraphController.UpdateSliderDrag(sliderNodeId, canvasPoint);
+            m_selectedNodeId = sliderNodeId;
+            m_graph.MarkAllDirty();
+            m_forceRender = true;
+            UpdatePropertiesPanel();
+            NodeGraphContainer().CapturePointer(args.Pointer());
+            args.Handled(true);
+            return;
+        }
+
         // Check for pin hit first (start connection drag).
         uint32_t pinNodeId = 0;
         uint32_t pinIndex = 0;
@@ -1996,13 +2012,14 @@ namespace winrt::ShaderLab::implementation
             BottomTabView().SelectedIndex(0);
             NodeGraphContainer().Focus(winrt::Microsoft::UI::Xaml::FocusState::Programmatic);
 
-            // Preview the clicked node (skip histogram analysis effects).
+            // Preview the clicked node (skip parameter and histogram analysis effects).
             const auto* clickedNode = m_graph.FindNode(hitNodeId);
             bool isAnalysisEffect = clickedNode &&
                 clickedNode->effectClsid.has_value() &&
                 IsEqualGUID(clickedNode->effectClsid.value(), CLSID_D2D1Histogram);
+            bool isParamNode = m_nodeGraphController.IsParameterNode(hitNodeId);
 
-            if (!isAnalysisEffect)
+            if (!isAnalysisEffect && !isParamNode)
                 m_previewNodeId = hitNodeId;
 
             m_forceRender = true;
@@ -2035,7 +2052,17 @@ namespace winrt::ShaderLab::implementation
 
         auto canvasPoint = GraphPanelPointerToCanvas(args);
 
-        if (m_isDraggingNode)
+        if (m_isDraggingSlider)
+        {
+            if (m_nodeGraphController.UpdateSliderDrag(m_sliderDragNodeId, canvasPoint))
+            {
+                m_graph.MarkAllDirty();
+                m_forceRender = true;
+                UpdatePropertiesPanel();
+            }
+            args.Handled(true);
+        }
+        else if (m_isDraggingNode)
         {
             m_nodeGraphController.UpdateDragNodes(canvasPoint);
             args.Handled(true);
@@ -2054,6 +2081,15 @@ namespace winrt::ShaderLab::implementation
         if (m_isGraphPanning)
         {
             m_isGraphPanning = false;
+            NodeGraphContainer().ReleasePointerCapture(args.Pointer());
+            args.Handled(true);
+            return;
+        }
+
+        if (m_isDraggingSlider)
+        {
+            m_isDraggingSlider = false;
+            m_sliderDragNodeId = 0;
             NodeGraphContainer().ReleasePointerCapture(args.Pointer());
             args.Handled(true);
             return;

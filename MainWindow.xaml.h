@@ -228,6 +228,8 @@ namespace winrt::ShaderLab::implementation
         uint32_t m_selectedNodeId{ 0 };
         bool m_isDraggingNode{ false };
         bool m_isDraggingConnection{ false };
+        bool m_isDraggingSlider{ false };
+        uint32_t m_sliderDragNodeId{ 0 };
 
         // Effect Designer window.
         winrt::ShaderLab::EffectDesignerWindow m_designerWindow{ nullptr };
