@@ -1650,12 +1650,13 @@ float4 main(
     else
     {
         // Chromaticity-based mapping (modes 1 and 2).
-        float3 xyz = ScRGBToXYZ(max(color.rgb, 0.0));
+        // Use raw scRGB (with negatives) for XYZ to preserve true chromaticity.
+        float3 xyz = ScRGBToXYZ(color.rgb);
         float sum = xyz.x + xyz.y + xyz.z;
         if (sum < 1e-6) return color;
 
         float2 xy = float2(xyz.x / sum, xyz.y / sum);
-        float Y = xyz.y;  // Preserve luminance
+        float Y = max(xyz.y, 0.0);  // Preserve luminance (clamp negative Y)
 
         // Check if inside gamut triangle
         bool inside = PointInTriangle(xy, gR, gG, gB);
@@ -1687,8 +1688,8 @@ float4 main(
             desc.hlslSource = colorMath + gamutMapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"Mode",        L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"Clip", L"Nearest Point", L"Compress to White" } },
-                { L"TargetGamut", L"uint", uint32_t(0), 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
+                { L"Mode",        L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Clip", L"Nearest Point", L"Compress to White" } },
+                { L"TargetGamut", L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
             };
             m_effects.push_back(std::move(desc));
