@@ -541,6 +541,9 @@ namespace ShaderLab::Controls
         // analysis fields as outputs. Build name (for binding lookup) and label (for display).
         for (const auto& [key, val] : node.properties)
         {
+            // Skip hidden properties (internal cbuffer plumbing).
+            if (key.size() > 7 && key.ends_with(L"_hidden"))
+                continue;
             if (Graph::EffectGraph::IsBindablePropertyType(val))
             {
                 v.dataInputPinNames.push_back(key);
