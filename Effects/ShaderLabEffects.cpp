@@ -2270,6 +2270,7 @@ float4 main(
     float vMax = -1e10;
     float vSum = 0;
     uint totalSamples = 0;
+    uint nonzeroCount = 0;
 
     float histMax = 100.0;
     uint hist[256];
@@ -2290,6 +2291,7 @@ float4 main(
             vMax = max(vMax, v);
             vSum += v;
             totalSamples++;
+            if (abs(v) > 0.0001) nonzeroCount++;
 
             float normalized = saturate(v / max(histMax, 0.001));
             uint bin = min((uint)(normalized * 255.0), 255u);
@@ -2332,13 +2334,14 @@ float4 main(
     if (outPx.x < 4.0) return float4(vMedian, 0, 0, 1);
     if (outPx.x < 5.0) return float4(vP95, 0, 0, 1);
     if (outPx.x < 6.0) return float4((float)totalSamples, 0, 0, 1);
+    if (outPx.x < 7.0) return float4((totalSamples > 0) ? (float)nonzeroCount / (float)totalSamples : 0.0, 0, 0, 1);
     return float4(0, 0, 0, 1);
 }
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Image Statistics";
-            desc.effectId = L"Image Statistics"; desc.effectVersion = 2;
+            desc.effectId = L"Image Statistics"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + imageStatsHLSL;
@@ -2356,6 +2359,7 @@ float4 main(
                 { L"Median",  Graph::AnalysisFieldType::Float },
                 { L"P95",     Graph::AnalysisFieldType::Float },
                 { L"Samples", Graph::AnalysisFieldType::Float },
+                { L"Nonzero%", Graph::AnalysisFieldType::Float },
             };
             m_effects.push_back(std::move(desc));
         }
