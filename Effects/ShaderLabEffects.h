@@ -52,6 +52,14 @@ namespace ShaderLab::Effects
         const ShaderLabEffectDescriptor* FindByName(std::wstring_view name) const;
         const ShaderLabEffectDescriptor* FindById(std::wstring_view effectId) const;
         const std::vector<ShaderLabEffectDescriptor>& All() const { return m_effects; }
+
+        // Computed library version: sum of all effect versions.
+        uint32_t LibraryVersion() const
+        {
+            uint32_t v = 0;
+            for (const auto& e : m_effects) v += e.effectVersion;
+            return v;
+        }
         std::vector<const ShaderLabEffectDescriptor*> ByCategory(std::wstring_view category) const;
         std::vector<std::wstring> Categories() const;
 
