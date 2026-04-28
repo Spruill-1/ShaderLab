@@ -569,7 +569,7 @@ namespace ShaderLab::Controls
             if (Graph::EffectGraph::IsBindablePropertyType(val))
             {
                 v.dataInputPinNames.push_back(key);
-                v.dataInputPinLabels.push_back(key + L" (" + Graph::PropertyValueTypeTag(val) + L")");
+                v.dataInputPinLabels.push_back(key);
             }
         }
 

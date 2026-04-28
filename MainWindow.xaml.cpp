@@ -4499,14 +4499,17 @@ namespace winrt::ShaderLab::implementation
         }
 
         // Only re-evaluate the graph when something changed.
+        bool wasForceRender = m_forceRender;
         bool needsEval = m_graph.HasDirtyNodes() || m_needsFitPreview || m_forceRender;
         if (needsEval)
         {
             RenderFrame(deltaSec);
             m_forceRender = false;
             m_frameCount++;
-            // Rebuild node layout after evaluation (analysis output may have changed sizes).
-            m_nodeGraphController.RebuildLayout();
+            // Rebuild layout only on user-initiated changes (not animation ticks)
+            // to update analysis display sizing without killing performance.
+            if (wasForceRender)
+                m_nodeGraphController.RebuildLayout();
         }
 
         RenderNodeGraph();
