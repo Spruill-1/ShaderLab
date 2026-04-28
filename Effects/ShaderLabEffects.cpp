@@ -1326,7 +1326,7 @@ float4 main(
             desc.parameters = {
                 { L"Method",    L"float", 2.0f, 0.0f, 2.0f, 1.0f, { L"CIE76", L"CIE94", L"CIEDE2000" } },
                 { L"Scale",     L"float", 1.0f, 0.1f, 10.0f, 0.1f },
-                { L"MaxDeltaE", L"float", 10.0f, 1.0f, 100.0f, 1.0f },
+                { L"MaxDeltaE", L"float", 1.0f, 0.1f, 100.0f, 0.1f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2238,12 +2238,12 @@ Texture2D InputTexture : register(t0);
 SamplerState InputSampler : register(s0);
 
 float GetChannel(float4 pix, uint ch) {
-    if (ch == 1) return pix.r;
-    if (ch == 2) return pix.g;
-    if (ch == 3) return pix.b;
-    if (ch == 4) return pix.a;
-    // 0 = luminance from Rec.709
-    return dot(pix.rgb, float3(0.2126, 0.7152, 0.0722));
+    float result = dot(pix.rgb, float3(0.2126, 0.7152, 0.0722));
+    if (ch == 1) result = pix.r;
+    else if (ch == 2) result = pix.g;
+    else if (ch == 3) result = pix.b;
+    else if (ch == 4) result = pix.a;
+    return result;
 }
 
 float4 main(
