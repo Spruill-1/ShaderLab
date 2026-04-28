@@ -210,6 +210,7 @@ namespace ShaderLab::Rendering
             case NodeType::Output:
             {
                 // The output node simply passes through the first input.
+                node->cachedOutput = nullptr;
                 auto inputs = graph.GetInputEdges(nodeId);
                 if (!inputs.empty())
                 {

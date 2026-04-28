@@ -4434,7 +4434,37 @@ namespace winrt::ShaderLab::implementation
 
         auto* previewImage = ResolveDisplayImage(m_previewNodeId);
         if (previewImage)
+        {
+            drawDc->SetTransform(previewTransform);
             drawDc->DrawImage(previewImage);
+        }
+        else if (m_previewNodeId != 0)
+        {
+            // Draw "No Input" when previewing a node with broken upstream.
+            winrt::com_ptr<IDWriteFactory> dwFactory;
+            DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+                __uuidof(IDWriteFactory), dwFactory.as<IUnknown>().put());
+            if (dwFactory)
+            {
+                winrt::com_ptr<IDWriteTextFormat> fmt;
+                dwFactory->CreateTextFormat(L"Segoe UI", nullptr,
+                    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL, 18.0f, L"en-us", fmt.put());
+                if (fmt)
+                {
+                    fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    winrt::com_ptr<ID2D1SolidColorBrush> brush;
+                    drawDc->CreateSolidColorBrush(D2D1::ColorF(0.5f, 0.5f, 0.5f, 0.8f), brush.put());
+                    if (brush)
+                    {
+                        D2D1_SIZE_F sz = drawDc->GetSize();
+                        drawDc->DrawText(L"No Input", 8, fmt.get(),
+                            D2D1::RectF(0, 0, sz.width, sz.height), brush.get());
+                    }
+                }
+            }
+        }
 
         drawDc->SetTransform(D2D1::Matrix3x2F::Identity());
         drawDc->SetDpi(oldDpiX, oldDpiY);

@@ -266,6 +266,33 @@ namespace ShaderLab::Controls
                     D2D1::Matrix3x2F::Translation(m_panX, m_panY));
                 dc->DrawImage(image);
             }
+            else
+            {
+                // Draw "No Input" indicator for broken/disconnected graph chain.
+                winrt::com_ptr<IDWriteFactory> dwFactory;
+                DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+                    __uuidof(IDWriteFactory), dwFactory.as<IUnknown>().put());
+                if (dwFactory)
+                {
+                    winrt::com_ptr<IDWriteTextFormat> fmt;
+                    dwFactory->CreateTextFormat(L"Segoe UI", nullptr,
+                        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL, 18.0f, L"en-us", fmt.put());
+                    if (fmt)
+                    {
+                        fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                        winrt::com_ptr<ID2D1SolidColorBrush> brush;
+                        dc->CreateSolidColorBrush(D2D1::ColorF(0.5f, 0.5f, 0.5f, 0.8f), brush.put());
+                        if (brush)
+                        {
+                            D2D1_SIZE_F sz = m_renderTarget->GetSize();
+                            dc->DrawText(L"No Input", 8, fmt.get(),
+                                D2D1::RectF(0, 0, sz.width, sz.height), brush.get());
+                        }
+                    }
+                }
+            }
 
             dc->SetTransform(D2D1::Matrix3x2F::Identity());
             HRESULT hr = dc->EndDraw();
