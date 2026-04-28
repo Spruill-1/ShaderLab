@@ -41,6 +41,7 @@ namespace ShaderLab::Controls
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& args);
         void FitToView(ID2D1DeviceContext5* dc, ID2D1Image* image);
+        winrt::fire_and_forget SaveImageAsync();
 
         // Shared (non-owning).
         ID3D11Device5* m_d3dDevice{ nullptr };
@@ -53,6 +54,10 @@ namespace ShaderLab::Controls
         winrt::Microsoft::UI::Xaml::Controls::TextBlock m_fpsText{ nullptr };
         winrt::com_ptr<IDXGISwapChain3> m_swapChain;
         winrt::com_ptr<ID2D1Bitmap1> m_renderTarget;
+
+        // Last rendered image (non-owning, for save).
+        ID2D1Image* m_lastImage{ nullptr };
+        std::wstring m_nodeName;
 
         Rendering::PipelineFormat m_format{ Rendering::FormatScRgbFP16 };
         uint32_t m_nodeId{ 0 };

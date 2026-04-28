@@ -62,7 +62,18 @@ namespace ShaderLab::Controls
             m_fpsText.Foreground(MUX::Media::SolidColorBrush(
                 winrt::Windows::UI::Color{ 255, 180, 180, 180 }));
             m_fpsText.FontSize(11);
+            m_fpsText.VerticalAlignment(MUX::VerticalAlignment::Center);
             statusBar.Children().Append(m_fpsText);
+
+            // Save button in status bar (right-aligned)
+            auto saveBtn = MUXC::Button();
+            saveBtn.Content(winrt::box_value(L"Save"));
+            saveBtn.FontSize(11);
+            saveBtn.Padding(MUX::ThicknessHelper::FromLengths(8, 2, 8, 2));
+            saveBtn.HorizontalAlignment(MUX::HorizontalAlignment::Right);
+            saveBtn.Click([this](auto&&, auto&&) { SaveImageAsync(); });
+            statusBar.Children().Append(saveBtn);
+
             rootGrid.Children().Append(statusBar);
 
             m_window.Content(rootGrid);
@@ -228,6 +239,9 @@ namespace ShaderLab::Controls
                 FitToView(dc, image);
             }
 
+            // Store for save.
+            m_lastImage = image;
+
             // Save the main window's render target and state.
             winrt::com_ptr<ID2D1Image> oldTarget;
             dc->GetTarget(oldTarget.put());
@@ -313,6 +327,7 @@ namespace ShaderLab::Controls
 
     void OutputWindow::SetTitle(const std::wstring& title)
     {
+        m_nodeName = title;
         if (m_window)
             m_window.Title(winrt::hstring(title));
     }
@@ -409,5 +424,134 @@ namespace ShaderLab::Controls
         {
             m_needsResize = true;
         }
+    }
+
+    winrt::fire_and_forget OutputWindow::SaveImageAsync()
+    {
+        if (!m_dc || !m_lastImage || !m_window)
+            co_return;
+
+        // Get HWND for the file picker.
+        HWND hwnd{ nullptr };
+        auto windowNative = m_window.try_as<::IWindowNative>();
+        if (windowNative)
+            windowNative->get_WindowHandle(&hwnd);
+        if (!hwnd) co_return;
+
+        winrt::Windows::Storage::Pickers::FileSavePicker picker;
+        picker.as<::IInitializeWithWindow>()->Initialize(hwnd);
+        picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::PicturesLibrary);
+
+        std::wstring suggestedName = m_nodeName.empty() ? L"output" : m_nodeName;
+        for (auto& ch : suggestedName)
+            if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' || ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|')
+                ch = L'_';
+        picker.SuggestedFileName(winrt::hstring(suggestedName));
+        picker.FileTypeChoices().Insert(L"JPEG XR (HDR)", winrt::single_threaded_vector<winrt::hstring>({ L".jxr" }));
+        picker.FileTypeChoices().Insert(L"PNG Image (SDR)", winrt::single_threaded_vector<winrt::hstring>({ L".png" }));
+
+        auto file = co_await picker.PickSaveFileAsync();
+        if (!file) co_return;
+
+        auto* dc = m_dc;
+        auto* image = m_lastImage;
+        if (!dc || !image) co_return;
+
+        try
+        {
+            float oldDpiX, oldDpiY;
+            dc->GetDpi(&oldDpiX, &oldDpiY);
+            dc->SetDpi(96.0f, 96.0f);
+            dc->SetTransform(D2D1::Matrix3x2F::Identity());
+
+            D2D1_RECT_F bounds{};
+            dc->GetImageLocalBounds(image, &bounds);
+            uint32_t w = static_cast<uint32_t>(bounds.right - bounds.left);
+            uint32_t h = static_cast<uint32_t>(bounds.bottom - bounds.top);
+            dc->SetDpi(oldDpiX, oldDpiY);
+            if (w == 0 || h == 0) co_return;
+
+            auto fileExt = std::wstring(file.FileType().c_str());
+            bool isJxr = (fileExt == L".jxr" || fileExt == L".wdp");
+
+            DXGI_FORMAT renderFormat = isJxr
+                ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                : DXGI_FORMAT_B8G8R8A8_UNORM;
+
+            winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
+            D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET,
+                D2D1::PixelFormat(renderFormat, D2D1_ALPHA_MODE_PREMULTIPLIED));
+            dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bmpProps, renderBitmap.put());
+
+            winrt::com_ptr<ID2D1Image> oldTarget;
+            dc->GetTarget(oldTarget.put());
+            dc->SetTarget(renderBitmap.get());
+            dc->BeginDraw();
+            dc->Clear(D2D1::ColorF(0, 0, 0, 1.0f));
+            dc->SetTransform(D2D1::Matrix3x2F::Identity());
+            dc->DrawImage(image);
+            dc->EndDraw();
+            dc->SetTarget(oldTarget.get());
+
+            winrt::com_ptr<IWICImagingFactory> wicFactory;
+            winrt::check_hresult(CoCreateInstance(
+                CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(wicFactory.put())));
+
+            auto filePath = std::wstring(file.Path().c_str());
+            GUID containerFormat = isJxr ? GUID_ContainerFormatWmp : GUID_ContainerFormatPng;
+
+            winrt::com_ptr<IWICStream> stream;
+            winrt::check_hresult(wicFactory->CreateStream(stream.put()));
+            winrt::check_hresult(stream->InitializeFromFilename(filePath.c_str(), GENERIC_WRITE));
+
+            winrt::com_ptr<IWICBitmapEncoder> encoder;
+            winrt::check_hresult(wicFactory->CreateEncoder(containerFormat, nullptr, encoder.put()));
+            winrt::check_hresult(encoder->Initialize(stream.get(), WICBitmapEncoderNoCache));
+
+            winrt::com_ptr<IWICBitmapFrameEncode> frame;
+            winrt::com_ptr<IPropertyBag2> encoderOptions;
+            winrt::check_hresult(encoder->CreateNewFrame(frame.put(), encoderOptions.put()));
+
+            if (isJxr && encoderOptions)
+            {
+                PROPBAG2 option{};
+                option.pstrName = const_cast<LPOLESTR>(L"Lossless");
+                VARIANT val{};
+                val.vt = VT_BOOL;
+                val.boolVal = VARIANT_TRUE;
+                encoderOptions->Write(1, &option, &val);
+            }
+
+            winrt::check_hresult(frame->Initialize(encoderOptions.get()));
+            winrt::check_hresult(frame->SetSize(w, h));
+
+            WICPixelFormatGUID pixelFormat = isJxr
+                ? GUID_WICPixelFormat64bppRGBAHalf
+                : GUID_WICPixelFormat32bppBGRA;
+            winrt::check_hresult(frame->SetPixelFormat(&pixelFormat));
+
+            winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
+            D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(renderFormat, D2D1_ALPHA_MODE_PREMULTIPLIED));
+            dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, cpuProps, cpuBitmap.put());
+            D2D1_POINT_2U destPoint = { 0, 0 };
+            D2D1_RECT_U srcRect = { 0, 0, w, h };
+            cpuBitmap->CopyFromBitmap(&destPoint, renderBitmap.get(), &srcRect);
+
+            D2D1_MAPPED_RECT mapped{};
+            winrt::check_hresult(cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped));
+            winrt::check_hresult(frame->WritePixels(h, mapped.pitch, mapped.pitch * h, mapped.bits));
+            cpuBitmap->Unmap();
+
+            winrt::check_hresult(frame->Commit());
+            winrt::check_hresult(encoder->Commit());
+
+            if (m_fpsText)
+                m_fpsText.Text(L"Saved: " + file.Name());
+        }
+        catch (...) {}
     }
 }
