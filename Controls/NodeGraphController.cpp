@@ -931,8 +931,12 @@ namespace ShaderLab::Controls
             D2D1_ROUNDED_RECT rrect = { visual.bounds, NodeCornerRadius, NodeCornerRadius };
             if (m_brushNode)
             {
-                m_brushNode->SetColor(visual.isParameterNode
-                    ? D2D1::ColorF(0x1A2E3A) : NodeColor(node->type));
+                bool isDataOnly = !visual.isParameterNode && node->outputPins.empty() &&
+                    node->customEffect.has_value() && !node->customEffect->hlslSource.empty();
+                D2D1_COLOR_F bodyColor = visual.isParameterNode ? D2D1::ColorF(0x1A2E3A)
+                    : isDataOnly ? D2D1::ColorF(0x2A1E3A)
+                    : NodeColor(node->type);
+                m_brushNode->SetColor(bodyColor);
                 dc->FillRoundedRectangle(rrect, m_brushNode.get());
             }
 
@@ -950,8 +954,12 @@ namespace ShaderLab::Controls
             D2D1_ROUNDED_RECT headerRRect = { headerRect, NodeCornerRadius, NodeCornerRadius };
             if (m_brushHeader)
             {
-                m_brushHeader->SetColor(visual.isParameterNode
-                    ? D2D1::ColorF(0x00897B) : NodeHeaderColor(node->type));
+                bool isDataOnly = !visual.isParameterNode && node->outputPins.empty() &&
+                    node->customEffect.has_value() && !node->customEffect->hlslSource.empty();
+                D2D1_COLOR_F headerColor = visual.isParameterNode ? D2D1::ColorF(0x00897B)
+                    : isDataOnly ? D2D1::ColorF(0x7B1FA2)
+                    : NodeHeaderColor(node->type);
+                m_brushHeader->SetColor(headerColor);
                 dc->FillRoundedRectangle(headerRRect, m_brushHeader.get());
             }
 
