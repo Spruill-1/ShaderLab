@@ -41,6 +41,10 @@ namespace ShaderLab::Effects
         // Animatable effects receive Phase auto-advance from the render tick.
         // Must declare a "Phase" property (float, 0-1) and "Speed" property.
         bool isAnimatable{ false };
+
+        // Data-only effects have no visible image output pin. They produce
+        // analysis output fields but their image output is internal only.
+        bool dataOnly{ false };
     };
 
     // Registry of all ShaderLab pre-built effects.

@@ -2012,14 +2012,15 @@ namespace winrt::ShaderLab::implementation
             BottomTabView().SelectedIndex(0);
             NodeGraphContainer().Focus(winrt::Microsoft::UI::Xaml::FocusState::Programmatic);
 
-            // Preview the clicked node (skip parameter and histogram analysis effects).
+            // Preview the clicked node (skip parameter, data-only, and histogram effects).
             const auto* clickedNode = m_graph.FindNode(hitNodeId);
             bool isAnalysisEffect = clickedNode &&
                 clickedNode->effectClsid.has_value() &&
                 IsEqualGUID(clickedNode->effectClsid.value(), CLSID_D2D1Histogram);
             bool isParamNode = m_nodeGraphController.IsParameterNode(hitNodeId);
+            bool isDataOnly = clickedNode && clickedNode->outputPins.empty();
 
-            if (!isAnalysisEffect && !isParamNode)
+            if (!isAnalysisEffect && !isParamNode && !isDataOnly)
                 m_previewNodeId = hitNodeId;
 
             m_forceRender = true;
@@ -4444,6 +4445,8 @@ namespace winrt::ShaderLab::implementation
             RenderFrame(deltaSec);
             m_forceRender = false;
             m_frameCount++;
+            // Rebuild node layout after evaluation (analysis output may have changed sizes).
+            m_nodeGraphController.RebuildLayout();
         }
 
         RenderNodeGraph();

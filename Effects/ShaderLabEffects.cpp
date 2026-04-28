@@ -436,8 +436,8 @@ float4 main(
         node.type = (desc.shaderType == CustomShaderType::ComputeShader)
             ? NodeType::ComputeShader : NodeType::PixelShader;
 
-        // Parameter nodes (no HLSL) have no image output pin.
-        if (!desc.hlslSource.empty())
+        // Parameter nodes (no HLSL) and data-only effects have no image output pin.
+        if (!desc.hlslSource.empty() && !desc.dataOnly)
             node.outputPins.push_back({ L"Output", 0 });
 
         CustomEffectDefinition def;
@@ -2253,12 +2253,16 @@ float4 main(
     float4 pos : SV_POSITION, float4 ps : SCENE_POSITION, float4 uv0 : TEXCOORD0
 ) : SV_Target
 {
-    float size = max(OutputSize, 4.0);
+    float size = max(OutputSize, 8.0);
+    float2 outPx = pos.xy;
+
+    // Only row 0 pixels compute stats (for analysis readback).
+    // All other pixels return black — this is a data-only node.
+    if (outPx.y >= 1.0)
+        return float4(0, 0, 0, 1);
+
     float2 dims;
     InputTexture.GetDimensions(dims.x, dims.y);
-
-    // Only compute stats for pixel (0,0) in output-pixel space.
-    // All other pixels get a visualization bar.
     uint ch = (uint)Channel;
 
     // Scan the input: compute min, max, sum, and build a histogram for median.
@@ -2267,9 +2271,7 @@ float4 main(
     float vSum = 0;
     uint totalSamples = 0;
 
-    // 256-bin histogram for approximate median
-    // Map values to [0, histMax] range, clamp outside
-    float histMax = 100.0; // reasonable for Delta E or nit values
+    float histMax = 100.0;
     uint hist[256];
     for (uint bi = 0; bi < 256; bi++) hist[bi] = 0;
 
@@ -2289,7 +2291,6 @@ float4 main(
             vSum += v;
             totalSamples++;
 
-            // Histogram bin
             float normalized = saturate(v / max(histMax, 0.001));
             uint bin = min((uint)(normalized * 255.0), 255u);
             hist[bin]++;
@@ -2298,7 +2299,6 @@ float4 main(
 
     float vMean = (totalSamples > 0) ? vSum / (float)totalSamples : 0.0;
 
-    // Compute approximate median from histogram
     uint halfCount = totalSamples / 2;
     uint cumulative = 0;
     float vMedian = 0;
@@ -2312,7 +2312,6 @@ float4 main(
         }
     }
 
-    // Compute 95th percentile
     uint p95Count = (uint)(totalSamples * 0.95);
     cumulative = 0;
     float vP95 = 0;
@@ -2327,54 +2326,26 @@ float4 main(
     }
 
     // Row 0: encode analysis output fields (one float per pixel, R channel)
-    // Pixel 0: Min, 1: Max, 2: Mean, 3: Median, 4: P95, 5: Samples
-    float2 outPx = pos.xy;
-    if (outPx.y < 1.0)
-    {
-        if (outPx.x < 1.0) return float4(vMin, 0, 0, 1);
-        if (outPx.x < 2.0) return float4(vMax, 0, 0, 1);
-        if (outPx.x < 3.0) return float4(vMean, 0, 0, 1);
-        if (outPx.x < 4.0) return float4(vMedian, 0, 0, 1);
-        if (outPx.x < 5.0) return float4(vP95, 0, 0, 1);
-        if (outPx.x < 6.0) return float4((float)totalSamples, 0, 0, 1);
-    }
-
-    // Visual: simple bar chart representation
-    float barY = 1.0 - (outPx.y / size);
-    float barX = outPx.x / size;
-    float3 color = float3(0.05, 0.05, 0.05);
-
-    // 4 bars: Min, Mean, Median, Max (normalized to vMax)
-    float normMax = max(vMax, 0.001);
-    float barW = 0.2;
-    float gap = 0.05;
-    float bars[4] = { vMin / normMax, vMean / normMax, vMedian / normMax, vMax / normMax };
-    float3 barColors[4] = {
-        float3(0.2, 0.5, 1.0),  // Min: blue
-        float3(0.2, 0.8, 0.2),  // Mean: green
-        float3(1.0, 0.8, 0.0),  // Median: yellow
-        float3(1.0, 0.2, 0.2)   // Max: red
-    };
-    for (uint b = 0; b < 4; b++)
-    {
-        float bx = gap + b * (barW + gap);
-        if (barX >= bx && barX < bx + barW && barY <= bars[b])
-            color = barColors[b];
-    }
-
-    return float4(color, 1.0);
+    if (outPx.x < 1.0) return float4(vMin, 0, 0, 1);
+    if (outPx.x < 2.0) return float4(vMax, 0, 0, 1);
+    if (outPx.x < 3.0) return float4(vMean, 0, 0, 1);
+    if (outPx.x < 4.0) return float4(vMedian, 0, 0, 1);
+    if (outPx.x < 5.0) return float4(vP95, 0, 0, 1);
+    if (outPx.x < 6.0) return float4((float)totalSamples, 0, 0, 1);
+    return float4(0, 0, 0, 1);
 }
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Image Statistics";
-            desc.effectId = L"Image Statistics"; desc.effectVersion = 1;
+            desc.effectId = L"Image Statistics"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + imageStatsHLSL;
+            desc.dataOnly = true;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"OutputSize", L"float", 64.0f, 4.0f, 256.0f, 8.0f },
+                { L"OutputSize", L"float", 8.0f, 8.0f, 64.0f, 8.0f },
                 { L"Channel",   L"float", 0.0f, 0.0f, 4.0f, 1.0f, { L"Luminance", L"Red", L"Green", L"Blue", L"Alpha" } },
             };
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;

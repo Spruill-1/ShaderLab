@@ -620,7 +620,23 @@ namespace ShaderLab::Controls
             sliderHeight = 28.0f;    // space for inline slider
         }
 
-        float totalHeight = v.headerHeight + imageBodyHeight + sliderHeight + dataBodyHeight;
+        // Data-only effects (have HLSL but no image output pin): shrink image body.
+        bool isDataOnlyEffect = node.customEffect.has_value() &&
+            !node.customEffect->hlslSource.empty() &&
+            node.outputPins.empty() &&
+            node.customEffect->analysisOutputType == Graph::AnalysisOutputType::Typed;
+        if (isDataOnlyEffect)
+            imageBodyHeight = 4.0f;
+
+        // Add space for inline analysis output field display.
+        float analysisDisplayHeight = 0.0f;
+        uint32_t analysisFieldCount = 0;
+        if (node.analysisOutput.type == Graph::AnalysisOutputType::Typed)
+            analysisFieldCount = static_cast<uint32_t>(node.analysisOutput.fields.size());
+        if (analysisFieldCount > 0 && (isDataOnlyEffect || v.isParameterNode))
+            analysisDisplayHeight = 4.0f + analysisFieldCount * 16.0f;
+
+        float totalHeight = v.headerHeight + imageBodyHeight + sliderHeight + analysisDisplayHeight + dataBodyHeight;
 
         v.bounds = {
             node.position.x,
@@ -646,8 +662,8 @@ namespace ShaderLab::Controls
             });
         }
 
-        // Compute data pin positions (below image pins + slider).
-        float dataStartY = node.position.y + v.headerHeight + imageBodyHeight + sliderHeight + 4.0f;
+        // Compute data pin positions (below image pins + slider + analysis display).
+        float dataStartY = node.position.y + v.headerHeight + imageBodyHeight + sliderHeight + analysisDisplayHeight + 4.0f;
 
         // Slider rect for parameter nodes.
         if (v.isParameterNode)
@@ -1105,6 +1121,53 @@ namespace ShaderLab::Controls
                         if (m_brushText)
                             dc->DrawText(valText.c_str(), static_cast<UINT32>(valText.size()),
                                 m_pinLabelFormat.get(), valRect, m_brushText.get());
+                    }
+                }
+            }
+
+            // Inline analysis field values for data-only nodes.
+            if (node->analysisOutput.type == Graph::AnalysisOutputType::Typed &&
+                !node->analysisOutput.fields.empty() &&
+                (visual.isParameterNode || node->outputPins.empty()))
+            {
+                if (m_pinLabelFormat)
+                {
+                    float fieldY = visual.bounds.top + visual.headerHeight + 4.0f;
+                    // Skip past image body and slider area.
+                    if (visual.isParameterNode)
+                        fieldY = visual.sliderRect.bottom + 14.0f;
+                    else
+                        fieldY += 4.0f; // minimal image body
+
+                    winrt::com_ptr<ID2D1SolidColorBrush> labelBrush;
+                    dc->CreateSolidColorBrush(D2D1::ColorF(0x90CAF9), labelBrush.put());
+                    winrt::com_ptr<ID2D1SolidColorBrush> valueBrush;
+                    dc->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF), valueBrush.put());
+
+                    for (const auto& fv : node->analysisOutput.fields)
+                    {
+                        // Label on left, value on right.
+                        D2D1_RECT_F labelRect = {
+                            visual.bounds.left + 8.0f, fieldY,
+                            visual.bounds.left + 70.0f, fieldY + 14.0f
+                        };
+                        D2D1_RECT_F valRect = {
+                            visual.bounds.left + 72.0f, fieldY,
+                            visual.bounds.right - 8.0f, fieldY + 14.0f
+                        };
+
+                        m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                        if (labelBrush)
+                            dc->DrawText(fv.name.c_str(), static_cast<UINT32>(fv.name.size()),
+                                m_pinLabelFormat.get(), labelRect, labelBrush.get());
+
+                        std::wstring valStr = std::format(L"{:.4g}", fv.components[0]);
+                        m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                        if (valueBrush)
+                            dc->DrawText(valStr.c_str(), static_cast<UINT32>(valStr.size()),
+                                m_pinLabelFormat.get(), valRect, valueBrush.get());
+
+                        fieldY += 16.0f;
                     }
                 }
             }
