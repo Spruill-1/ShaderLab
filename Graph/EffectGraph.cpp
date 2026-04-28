@@ -748,6 +748,13 @@ namespace ShaderLab::Graph
                     ced.SetNamedValue(L"analysisFields", fields);
                 }
 
+                // ShaderLab effect identity (for version upgrade detection).
+                if (!def.shaderLabEffectId.empty())
+                {
+                    ced.SetNamedValue(L"shaderLabEffectId", WDJ::JsonValue::CreateStringValue(def.shaderLabEffectId));
+                    ced.SetNamedValue(L"shaderLabEffectVersion", WDJ::JsonValue::CreateNumberValue(def.shaderLabEffectVersion));
+                }
+
                 obj.SetNamedValue(L"customEffect", ced);
             }
 
@@ -991,6 +998,12 @@ namespace ShaderLab::Graph
                 // Infer Typed output type when fields exist but type wasn't set.
                 if (!def.analysisFields.empty() && def.analysisOutputType == AnalysisOutputType::None)
                     def.analysisOutputType = AnalysisOutputType::Typed;
+
+                // ShaderLab effect identity (for version upgrade detection).
+                if (ced.HasKey(L"shaderLabEffectId"))
+                    def.shaderLabEffectId = std::wstring(ced.GetNamedString(L"shaderLabEffectId"));
+                if (ced.HasKey(L"shaderLabEffectVersion"))
+                    def.shaderLabEffectVersion = static_cast<uint32_t>(ced.GetNamedNumber(L"shaderLabEffectVersion"));
 
                 // Recompile from source on load.
                 CoCreateGuid(&def.shaderGuid);

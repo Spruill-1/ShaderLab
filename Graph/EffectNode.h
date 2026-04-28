@@ -132,6 +132,10 @@ namespace ShaderLab::Graph
         std::vector<std::wstring> inputNames;           // Named inputs (textures).
         std::vector<ParameterDefinition> parameters;    // Declared cbuffer parameters.
 
+        // ShaderLab built-in effect identity (empty for user-authored effects).
+        std::wstring shaderLabEffectId;
+        uint32_t shaderLabEffectVersion{ 0 };
+
         // Compute shader settings.
         uint32_t threadGroupX{ 8 };
         uint32_t threadGroupY{ 8 };

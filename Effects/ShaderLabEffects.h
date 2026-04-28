@@ -12,6 +12,10 @@ namespace ShaderLab::Effects
         std::wstring category;      // "Analysis" or "Source"
         Graph::CustomShaderType shaderType{ Graph::CustomShaderType::PixelShader };
 
+        // Stable identifier and version for upgrade detection.
+        std::wstring effectId;          // Stable ID (survives renames)
+        uint32_t effectVersion{ 1 };    // Increment when HLSL or params change
+
         // Embedded HLSL source — compiled on first use.
         std::string hlslSource;
 
@@ -46,6 +50,7 @@ namespace ShaderLab::Effects
         static ShaderLabEffects& Instance();
 
         const ShaderLabEffectDescriptor* FindByName(std::wstring_view name) const;
+        const ShaderLabEffectDescriptor* FindById(std::wstring_view effectId) const;
         const std::vector<ShaderLabEffectDescriptor>& All() const { return m_effects; }
         std::vector<const ShaderLabEffectDescriptor*> ByCategory(std::wstring_view category) const;
         std::vector<std::wstring> Categories() const;

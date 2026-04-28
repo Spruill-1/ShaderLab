@@ -398,6 +398,14 @@ float4 main(
         return nullptr;
     }
 
+    const ShaderLabEffectDescriptor* ShaderLabEffects::FindById(std::wstring_view effectId) const
+    {
+        for (const auto& e : m_effects)
+            if (e.effectId == effectId)
+                return &e;
+        return nullptr;
+    }
+
     std::vector<const ShaderLabEffectDescriptor*> ShaderLabEffects::ByCategory(std::wstring_view category) const
     {
         std::vector<const ShaderLabEffectDescriptor*> result;
@@ -440,6 +448,8 @@ float4 main(
         def.threadGroupX = desc.threadGroupX;
         def.threadGroupY = desc.threadGroupY;
         def.threadGroupZ = desc.threadGroupZ;
+        def.shaderLabEffectId = desc.effectId;
+        def.shaderLabEffectVersion = desc.effectVersion;
         CoCreateGuid(&def.shaderGuid);
 
         // Set up input pins from input names.
@@ -467,6 +477,7 @@ float4 main(
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Luminance Heatmap";
+            desc.effectId = L"Luminance Heatmap"; desc.effectVersion = 1;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + s_luminanceHeatmapHLSL;
@@ -483,6 +494,7 @@ float4 main(
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Highlight";
+            desc.effectId = L"Gamut Highlight"; desc.effectVersion = 1;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + s_outOfGamutHLSL;
@@ -664,6 +676,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"CIE Chromaticity Plot";
+            desc.effectId = L"CIE Chromaticity Plot"; desc.effectVersion = 1;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + ciePlotHLSL;
@@ -746,6 +759,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Source";
+            desc.effectId = L"Gamut Source"; desc.effectVersion = 1;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutSourceHLSL;
@@ -813,6 +827,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Animated Gamut";
+            desc.effectId = L"Animated Gamut"; desc.effectVersion = 1;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + animGamutHLSL;
@@ -899,6 +914,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Color Checker";
+            desc.effectId = L"Color Checker"; desc.effectVersion = 1;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + colorCheckerHLSL;
@@ -935,6 +951,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Zone Plate";
+            desc.effectId = L"Zone Plate"; desc.effectVersion = 1;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + zonePlateHLSL;
@@ -989,6 +1006,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gradient Generator";
+            desc.effectId = L"Gradient Generator"; desc.effectVersion = 1;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gradientHLSL;
@@ -1076,6 +1094,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"HDR Test Pattern";
+            desc.effectId = L"HDR Test Pattern"; desc.effectVersion = 1;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + hdrTestHLSL;
@@ -1148,6 +1167,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Vectorscope";
+            desc.effectId = L"Vectorscope"; desc.effectVersion = 1;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + vectorscopeHLSL;
@@ -1298,6 +1318,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Delta E Comparator";
+            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 1;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + deltaEHLSL;
@@ -1351,6 +1372,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Nit Map";
+            desc.effectId = L"Nit Map"; desc.effectVersion = 1;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + falseColorHLSL;
@@ -1484,6 +1506,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Waveform Monitor";
+            desc.effectId = L"Waveform Monitor"; desc.effectVersion = 1;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + waveformHLSL;
@@ -1593,6 +1616,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Coverage";
+            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 1;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutCoverageHLSL;
@@ -1811,6 +1835,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Map";
+            desc.effectId = L"Gamut Map"; desc.effectVersion = 1;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutMapHLSL;
@@ -2031,6 +2056,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Perceptual Gamut Map";
+            desc.effectId = L"Perceptual Gamut Map"; desc.effectVersion = 1;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + perceptualGamutMapHLSL;
@@ -2143,6 +2169,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Boundary";
+            desc.effectId = L"ICtCp Boundary"; desc.effectVersion = 1;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + ictcpBoundaryHLSL;

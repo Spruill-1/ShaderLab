@@ -3458,6 +3458,75 @@ namespace winrt::ShaderLab::implementation
             pinsHeader.Margin({ 0, 8, 0, 0 });
             panel.Children().Append(pinsHeader);
         }
+
+        // ---- ShaderLab effect version upgrade button ----
+        if (node->customEffect.has_value() && !node->customEffect->shaderLabEffectId.empty())
+        {
+            auto& registry = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+            auto* latest = registry.FindById(node->customEffect->shaderLabEffectId);
+            if (latest && latest->effectVersion > node->customEffect->shaderLabEffectVersion)
+            {
+                auto upgradeBorder = Controls::Border();
+                upgradeBorder.Background(Media::SolidColorBrush(winrt::Windows::UI::Color{ 255, 50, 80, 140 }));
+                upgradeBorder.CornerRadius({ 4, 4, 4, 4 });
+                upgradeBorder.Padding({ 8, 6, 8, 6 });
+                upgradeBorder.Margin({ 0, 8, 0, 0 });
+
+                auto upgradeStack = Controls::StackPanel();
+                upgradeStack.Spacing(6);
+
+                auto upgradeText = Controls::TextBlock();
+                upgradeText.Text(std::format(L"Newer version available (v{} -> v{})",
+                    node->customEffect->shaderLabEffectVersion, latest->effectVersion));
+                upgradeText.FontSize(12);
+                upgradeText.Foreground(Media::SolidColorBrush(winrt::Microsoft::UI::Colors::White()));
+                upgradeStack.Children().Append(upgradeText);
+
+                auto upgradeBtn = Controls::Button();
+                upgradeBtn.Content(winrt::box_value(L"\xE777  Update Effect"));
+                upgradeBtn.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+                upgradeBtn.Click([this, capturedId](auto&&, auto&&)
+                {
+                    auto* n = m_graph.FindNode(capturedId);
+                    if (!n || !n->customEffect.has_value()) return;
+
+                    auto& reg = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+                    auto* desc = reg.FindById(n->customEffect->shaderLabEffectId);
+                    if (!desc) return;
+
+                    // Save current property values.
+                    auto savedProps = n->properties;
+
+                    // Create a fresh node from the latest descriptor.
+                    auto freshNode = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*desc);
+                    if (!freshNode.customEffect.has_value()) return;
+
+                    // Replace definition with fresh version.
+                    n->customEffect = std::move(freshNode.customEffect.value());
+                    n->inputPins = std::move(freshNode.inputPins);
+                    n->outputPins = std::move(freshNode.outputPins);
+                    n->isAnimatable = freshNode.isAnimatable;
+
+                    // Start with fresh default properties, then restore matching saved values.
+                    n->properties = std::move(freshNode.properties);
+                    for (const auto& [key, val] : savedProps)
+                    {
+                        auto it = n->properties.find(key);
+                        if (it != n->properties.end())
+                            it->second = val;
+                    }
+
+                    n->dirty = true;
+                    m_graphEvaluator.InvalidateNode(capturedId);
+                    m_graph.MarkAllDirty();
+                    PopulatePreviewNodeSelector();
+                    UpdatePropertiesPanel();
+                });
+                upgradeStack.Children().Append(upgradeBtn);
+                upgradeBorder.Child(upgradeStack);
+                panel.Children().Append(upgradeBorder);
+            }
+        }
     }
 
     void MainWindow::ShowCurveEditorDialog(
