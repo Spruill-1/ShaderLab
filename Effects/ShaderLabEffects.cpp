@@ -1750,6 +1750,10 @@ float4 main(
     float4 color = InputTexture.Sample(InputSampler, uv0.xy);
     if (Strength < 0.001) return color;
 
+    // Near-black pixels have unreliable chromaticity — pass through unchanged.
+    float lum = dot(max(color.rgb, 0.0), float3(0.2126, 0.7152, 0.0722));
+    if (lum < 1e-5) return color;
+
     // Get target gamut primaries
     float2 gR, gG, gB;
     uint gamut = (uint)TargetGamut;
@@ -2005,6 +2009,10 @@ float4 main(
 {
     float4 color = InputTexture.Sample(InputSampler, uv0.xy);
     if (Strength < 0.001) return color;
+
+    // Near-black pixels have unreliable chromaticity — pass through unchanged.
+    float lum = dot(max(color.rgb, 0.0), float3(0.2126, 0.7152, 0.0722));
+    if (lum < 1e-5) return color;
 
     float2 gR, gG, gB;
     uint g = (uint)TargetGamut;
