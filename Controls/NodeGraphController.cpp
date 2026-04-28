@@ -1030,13 +1030,21 @@ namespace ShaderLab::Controls
                     }
                 };
 
-                // Data input pins (left side) + labels with types.
+                // Data input pins (left side) + labels with current values.
                 for (uint32_t i = 0; i < visual.dataInputPinPositions.size(); ++i)
                 {
                     drawDiamond(visual.dataInputPinPositions[i]);
-                    if (m_pinLabelFormat && i < visual.dataInputPinLabels.size())
+                    if (m_pinLabelFormat && i < visual.dataInputPinLabels.size() && i < visual.dataInputPinNames.size())
                     {
-                        auto& label = visual.dataInputPinLabels[i];
+                        std::wstring label = visual.dataInputPinLabels[i];
+                        // Append current property value.
+                        auto propIt = node->properties.find(visual.dataInputPinNames[i]);
+                        if (propIt != node->properties.end())
+                        {
+                            float val = 0;
+                            if (auto* f = std::get_if<float>(&propIt->second)) val = *f;
+                            label += std::format(L" = {:.4g}", val);
+                        }
                         D2D1_RECT_F labelRect = {
                             visual.dataInputPinPositions[i].x + PinRadius + 3.0f,
                             visual.dataInputPinPositions[i].y - 7.0f,
@@ -1049,13 +1057,32 @@ namespace ShaderLab::Controls
                     }
                 }
 
-                // Data output pins (right side) + labels with types.
+                // Data output pins (right side) + labels.
+                // For data-only nodes with analysis output, show "Name = value" combined.
+                bool hasAnalysisValues = node->analysisOutput.type == Graph::AnalysisOutputType::Typed &&
+                    !node->analysisOutput.fields.empty() &&
+                    (visual.isParameterNode || node->outputPins.empty());
+
                 for (uint32_t i = 0; i < visual.dataOutputPinPositions.size(); ++i)
                 {
                     drawDiamond(visual.dataOutputPinPositions[i]);
                     if (m_pinLabelFormat && i < visual.dataOutputPinLabels.size())
                     {
-                        auto& label = visual.dataOutputPinLabels[i];
+                        std::wstring label = visual.dataOutputPinLabels[i];
+
+                        // Append analysis value if available.
+                        if (hasAnalysisValues && i < visual.dataOutputPinNames.size())
+                        {
+                            for (const auto& fv : node->analysisOutput.fields)
+                            {
+                                if (fv.name == visual.dataOutputPinNames[i])
+                                {
+                                    label += std::format(L" = {:.4g}", fv.components[0]);
+                                    break;
+                                }
+                            }
+                        }
+
                         D2D1_RECT_F labelRect = {
                             visual.bounds.left + 4.0f,
                             visual.dataOutputPinPositions[i].y - 7.0f,
@@ -1137,42 +1164,6 @@ namespace ShaderLab::Controls
                         if (m_brushText)
                             dc->DrawText(valText.c_str(), static_cast<UINT32>(valText.size()),
                                 m_pinLabelFormat.get(), valRect, m_brushText.get());
-                    }
-                }
-            }
-
-            // Inline analysis field values for data-only nodes.
-            // Render values next to data output pin labels (right-aligned).
-            if (node->analysisOutput.type == Graph::AnalysisOutputType::Typed &&
-                !node->analysisOutput.fields.empty() &&
-                (visual.isParameterNode || node->outputPins.empty()))
-            {
-                if (m_pinLabelFormat)
-                {
-                    winrt::com_ptr<ID2D1SolidColorBrush> valueBrush;
-                    dc->CreateSolidColorBrush(D2D1::ColorF(0xE0E0E0), valueBrush.put());
-
-                    // Match values to data output pins by field name.
-                    for (uint32_t i = 0; i < visual.dataOutputPinPositions.size() && i < visual.dataOutputPinNames.size(); ++i)
-                    {
-                        for (const auto& fv : node->analysisOutput.fields)
-                        {
-                            if (fv.name == visual.dataOutputPinNames[i])
-                            {
-                                std::wstring valStr = std::format(L"= {:.4g}", fv.components[0]);
-                                D2D1_RECT_F valRect = {
-                                    visual.bounds.left + 8.0f,
-                                    visual.dataOutputPinPositions[i].y - 7.0f,
-                                    visual.bounds.right - PinRadius - 6.0f,
-                                    visual.dataOutputPinPositions[i].y + 7.0f
-                                };
-                                m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                                if (valueBrush)
-                                    dc->DrawText(valStr.c_str(), static_cast<UINT32>(valStr.size()),
-                                        m_pinLabelFormat.get(), valRect, valueBrush.get());
-                                break;
-                            }
-                        }
                     }
                 }
             }
