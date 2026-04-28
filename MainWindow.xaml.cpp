@@ -96,10 +96,77 @@ namespace winrt::ShaderLab::implementation
                 winrt::Windows::System::VirtualKey::Control);
             bool ctrlDown = (static_cast<uint32_t>(ctrlState) & static_cast<uint32_t>(winrt::Windows::UI::Core::CoreVirtualKeyStates::Down)) != 0;
 
-            // Ctrl+A: select all nodes (except Output).
+            // Ctrl+A: select all nodes.
             if (ctrlDown && key == winrt::Windows::System::VirtualKey::A)
             {
                 m_nodeGraphController.SelectAll();
+                args.Handled(true);
+                return;
+            }
+
+            // Ctrl+C: copy selected nodes.
+            if (ctrlDown && key == winrt::Windows::System::VirtualKey::C)
+            {
+                auto& sel = m_nodeGraphController.SelectedNodes();
+                if (sel.empty() && m_selectedNodeId != 0)
+                {
+                    m_nodeGraphController.SelectNode(m_selectedNodeId);
+                }
+                m_nodeClipboard.clear();
+                m_edgeClipboard.clear();
+                for (uint32_t nodeId : m_nodeGraphController.SelectedNodes())
+                {
+                    auto* node = m_graph.FindNode(nodeId);
+                    if (node)
+                        m_nodeClipboard.push_back({ *node, nodeId });
+                }
+                // Copy internal edges (edges where both src and dst are in the selection).
+                for (const auto& edge : m_graph.Edges())
+                {
+                    bool srcIn = m_nodeGraphController.SelectedNodes().count(edge.sourceNodeId) > 0;
+                    bool dstIn = m_nodeGraphController.SelectedNodes().count(edge.destNodeId) > 0;
+                    if (srcIn && dstIn)
+                        m_edgeClipboard.push_back(edge);
+                }
+                args.Handled(true);
+                return;
+            }
+
+            // Ctrl+V: paste copied nodes.
+            if (ctrlDown && key == winrt::Windows::System::VirtualKey::V && !m_nodeClipboard.empty())
+            {
+                // Map old IDs to new IDs.
+                std::unordered_map<uint32_t, uint32_t> idMap;
+                float offsetX = 40.0f, offsetY = 40.0f;
+
+                for (auto& entry : m_nodeClipboard)
+                {
+                    auto newNode = entry.node;
+                    newNode.position.x += offsetX;
+                    newNode.position.y += offsetY;
+                    newNode.dirty = true;
+                    newNode.cachedOutput = nullptr;
+                    newNode.runtimeError.clear();
+                    // Fresh GUID for custom effects to avoid D2D shader ID collisions.
+                    if (newNode.customEffect.has_value())
+                        CoCreateGuid(&newNode.customEffect->shaderGuid);
+
+                    uint32_t newId = m_nodeGraphController.AddNode(std::move(newNode), { 0.0f, 0.0f });
+                    idMap[entry.originalId] = newId;
+                }
+
+                // Reconnect internal edges with new IDs.
+                for (const auto& edge : m_edgeClipboard)
+                {
+                    auto srcIt = idMap.find(edge.sourceNodeId);
+                    auto dstIt = idMap.find(edge.destNodeId);
+                    if (srcIt != idMap.end() && dstIt != idMap.end())
+                        m_graph.Connect(srcIt->second, edge.sourcePin, dstIt->second, edge.destPin);
+                }
+
+                m_graph.MarkAllDirty();
+                m_nodeGraphController.RebuildLayout();
+                PopulatePreviewNodeSelector();
                 args.Handled(true);
                 return;
             }

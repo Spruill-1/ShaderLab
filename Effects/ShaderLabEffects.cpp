@@ -754,6 +754,76 @@ float4 main(
             m_effects.push_back(std::move(desc));
         }
 
+        // ---- Animated Gamut Source ----
+        {
+            static const std::string animGamutHLSL = R"HLSL(
+// Animated Gamut Source - sweeps luminance from MinNits to MaxNits.
+// Phase (0-1) controls the current position in the sweep.
+
+cbuffer constants : register(b0) {
+    float Gamut;
+    float MinNits;
+    float MaxNits;
+    float Phase;
+    float OutputSize;
+    float LogScale;
+};
+
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    float size = max(OutputSize, 128.0);
+
+    float2 r, g, b;
+    if (Gamut > 1.5)     { r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }
+    else if (Gamut > 0.5){ r = GAMUT_P3_R;   g = GAMUT_P3_G;   b = GAMUT_P3_B; }
+    else                 { r = GAMUT_709_R;  g = GAMUT_709_G;  b = GAMUT_709_B; }
+
+    float2 center = D65_WHITE;
+    float halfExtent = 0.50;
+    float2 uv = uv0.xy / size;
+    float2 xy;
+    xy.x = center.x + (uv.x - 0.5) * 2.0 * halfExtent;
+    xy.y = center.y - (uv.y - 0.5) * 2.0 * halfExtent;
+
+    if (!PointInTriangle(xy, r, g, b))
+        return float4(0.0, 0.0, 0.0, 1.0);
+
+    float ph = frac(Phase);
+    float nits;
+    if (LogScale > 0.5) {
+        float logMin = log10(max(MinNits, 0.001));
+        float logMax = log10(max(MaxNits, 1.0));
+        nits = pow(10.0, lerp(logMin, logMax, ph));
+    } else {
+        nits = lerp(MinNits, MaxNits, ph);
+    }
+
+    float Y = nits / 80.0;
+    float3 xyz = xyYToXYZ(float3(xy.x, xy.y, Y));
+    float3 rgb = XYZToScRGB(xyz);
+    return float4(rgb, 1.0);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Animated Gamut";
+            desc.category = L"Source";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + animGamutHLSL;
+            desc.inputNames = {};
+            desc.parameters = {
+                { L"Gamut",      L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020" } },
+                { L"MinNits",   L"float", 0.1f, 0.001f, 100.0f, 0.1f },
+                { L"MaxNits",   L"float", 10000.0f, 100.0f, 10000.0f, 100.0f },
+                { L"Phase",     L"float", 0.0f, 0.0f, 1.0f, 0.01f },
+                { L"OutputSize", L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
+                { L"LogScale",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Linear", L"Logarithmic" } },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
         // ---- Color Checker (Source) ----
         {
             static const std::string colorCheckerHLSL = R"HLSL(

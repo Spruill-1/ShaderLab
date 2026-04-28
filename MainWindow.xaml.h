@@ -161,6 +161,14 @@ namespace winrt::ShaderLab::implementation
         uint32_t m_previewNodeId{ 0 };       // Tracks selected node for inline viewport
         std::vector<uint32_t> m_topoOrder;   // cached for [ ] navigation
 
+        // Node clipboard for copy/paste.
+        struct ClipboardEntry {
+            ::ShaderLab::Graph::EffectNode node;
+            uint32_t originalId;
+        };
+        std::vector<ClipboardEntry> m_nodeClipboard;
+        std::vector<::ShaderLab::Graph::EffectEdge> m_edgeClipboard;
+
         // Display profile selection.
         std::vector<::ShaderLab::Rendering::DisplayProfile> m_displayPresets;
         std::optional<::ShaderLab::Rendering::DisplayProfile> m_loadedIccProfile;
