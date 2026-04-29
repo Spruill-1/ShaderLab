@@ -18,12 +18,14 @@ graph TB
         PI[Pixel Inspector]
         PROPS[Properties Panel]
         EDW[Effect Designer Window]
+        OW[Output Windows<br/>Multi-Output System]
     end
 
     subgraph Core["Core Engine"]
         EG[EffectGraph<br/>DAG Model]
         EVAL[Graph Evaluator<br/>Topological Sort]
         PF[PipelineFormat<br/>scRGB FP16]
+        PARAM[Parameter Nodes<br/>Float/Int/Toggle/Gamut]
     end
 
     subgraph Rendering["Rendering Layer"]
@@ -31,14 +33,16 @@ graph TB
         D2D[D2D1 Device Context]
         SC[DXGI Swap Chain<br/>scRGB FP16]
         W2D[Win2D Interop]
+        GPU[GpuReduction<br/>D3D11 Compute Dispatch]
     end
 
     subgraph Effects["Effect System"]
         SRC[Source Nodes<br/>WIC Images / Flood]
         BIN[Built-in D2D Effects]
-        SLE[ShaderLab Effects<br/>9 Built-in Analysis+Source]
+        SLE[ShaderLab Effects<br/>18+ Versioned Analysis+Source]
         PS[Custom Pixel Shaders<br/>ID2D1DrawTransform]
         CS[Custom Compute Shaders<br/>ID2D1ComputeTransform]
+        STAT[StatisticsEffect<br/>D3D11 GPU Reduction]
     end
 
     subgraph Monitoring["Display Monitoring"]
@@ -55,19 +59,24 @@ graph TB
     MW --> PI
     MW --> PROPS
     MW --> EDW
+    MW --> OW
     NGE --> EG
     EG --> EVAL
     EVAL --> D2D
+    EVAL --> GPU
     PF --> SC
     PF --> EVAL
     D3D --> D2D
     D3D --> SC
+    D3D --> GPU
     W2D --> D2D
     SRC --> EG
     BIN --> EG
     SLE --> EG
     PS --> EG
     CS --> EG
+    PARAM --> EG
+    STAT --> EG
     DM --> HDR
     DM --> LUM
     DM --> DP
@@ -78,11 +87,12 @@ graph TB
     EDW -.->|Create/Update| PS
     EDW -.->|Create/Update| CS
     PI -.->|Read Back| EVAL
+    OW -.->|Independent Preview| EVAL
 ```
 
 ## Pipeline Format Strategy
 
-The rendering pipeline always uses **scRGB FP16** (`DXGI_FORMAT_R16G16B16A16_FLOAT` with `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`). Linear floating-point preserves full HDR range and precision; scRGB covers the full BT.2020 gamut including negative values. DWM/ACM handles the final display conversion.
+The rendering pipeline always uses **scRGB FP16** (`DXGI_FORMAT_R16G16B16A16_FLOAT` with `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`). Linear floating-point preserves full HDR range and precision; scRGB covers the full BT.2020 gamut including negative values. DWM/ACM handles the final display conversion. There is no built-in tone mapper — users build tone mappers as graph effects for full accuracy by default.
 
 ## Effect Graph Model
 
@@ -121,6 +131,7 @@ classDiagram
         BuiltInEffect
         PixelShader
         ComputeShader
+        Parameter
         Output
     }
 
@@ -226,13 +237,13 @@ sequenceDiagram
     participant UI as User / UI
     participant DM as DisplayMonitor
     participant ICC as IccProfileParser
-    participant CB as Callback (ToneMapper)
+    participant CB as Callback (PipelineFormat)
 
     alt Preset selection
         UI->>DM: SetSimulatedProfile(PresetP3_1000())
         DM->>DM: Store simulated profile
         DM->>CB: callback(profile.caps)
-        CB->>CB: Re-configure tone mapping
+        CB->>CB: Re-configure pipeline
     end
 
     alt ICC file load
@@ -255,18 +266,23 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    START([Evaluate Graph]) --> TOPO[Topological Sort Nodes]
+    START([Evaluate Graph]) --> PRUNE[Prune unneeded nodes<br/>Walk back from Output/Preview]
+    PRUNE --> TOPO[Topological Sort Needed Nodes]
     TOPO --> LOOP{Next node?}
     LOOP -->|Yes| CHECK{Node type?}
     CHECK -->|Source| LOAD[Load image via WIC<br/>or create Flood fill]
     CHECK -->|BuiltIn| D2D[Create D2D effect<br/>Set inputs from edges]
     CHECK -->|PixelShader| PS[Create custom effect<br/>with ID2D1DrawTransform]
     CHECK -->|ComputeShader| CS[Create custom effect<br/>with ID2D1ComputeTransform]
+    CHECK -->|D3D11Compute| D3D11[Render input to FP32 bitmap<br/>GetSurface → ID3D11Texture2D<br/>Dispatch D3D11 compute shader<br/>Read back result buffer]
+    CHECK -->|Parameter| PARAM[Populate analysis output<br/>from node properties]
     CHECK -->|Output| OUT[Draw to render target]
     LOAD --> CACHE[Cache ID2D1Image* output]
     D2D --> CACHE
     PS --> CACHE
     CS --> CACHE
+    D3D11 --> CACHE
+    PARAM --> CACHE
     OUT --> CACHE
     CACHE --> LOOP
     LOOP -->|No| PRESENT([Present to SwapChain])
@@ -309,6 +325,14 @@ flowchart TD
 | 29 | Versioning system (app + graph format) | Version.h defines app version (1.1.0) and graph format version (2). Both stored in saved graph JSON. Forward compatibility check on load — newer format version shows error dialog. Version displayed in status bar and title bar. | Day 5 |
 | 30 | Always scRGB FP16 pipeline (no fallback) | Removed sRGB/HDR10/FP32 pipeline format switching. Pipeline is always scRGB FP16. DWM/ACM handles final display conversion. Simplifies swap chain management, tone mapper, and render target creation. PipelineFormat.h retained but only one format used. | Day 5 |
 | 31 | MCP server for AI agent integration | Embedded Winsock2 HTTP server with JSON-RPC 2.0 on port 47808. 21 tools for graph manipulation, property control, HLSL compilation, render capture, analysis readback, pixel trace, effect listing, and display info. Enables AI agents (Copilot, Claude, etc.) to programmatically control ShaderLab. Routes in MainWindow.McpRoutes.cpp. | Day 5 |
+| 32 | Remove built-in tone mapper | Pipeline passes raw scRGB through. Users build tone mappers as graph effects. Full accuracy by default. | Day 6 |
+| 33 | Multi-output windows via OutputWindow | Each Output node gets its own SwapChainPanel window. Shares D2D device context. Bidirectional sync: close window ↔ delete node. | Day 6 |
+| 34 | Effect versioning with effectId/effectVersion | Stable IDs survive renames. Per-node and batch upgrade buttons. Preserves user property values on upgrade. | Day 6 |
+| 35 | _hidden suffix convention | Properties ending in `_hidden` excluded from UI. Replaces prefix-based filtering. Used for working space injection. | Day 6 |
+| 36 | D3D11 compute via evaluator dispatch | Bypass D2D tiling for reduction operations. GpuReduction uses 32×32 thread group with groupshared memory. Only 32 bytes read back to CPU. | Day 6 |
+| 37 | ID2D1StatisticsEffect COM interface | D2D-compatible effect wrapper with custom interface for analysis results. Pass-through pixel shader + D3D11 compute dispatch. | Day 6 |
+| 38 | Parameter nodes as data-only graph elements | No shader, evaluator handles directly. Teal color, inline slider, don't switch preview. Four types: Float, Integer, Toggle, Gamut. | Day 6 |
+| 39 | CPU analysis → GPU reduction for Image Statistics | Moved from pixel shader (512K redundant reads) to CPU readback (exact, single pass) to D3D11 compute (GPU-resident, 32-byte readback). | Day 6 |
 
 ---
 
@@ -352,13 +376,13 @@ ShaderLab/
 │
 ├── pch.h / pch.cpp             # Precompiled header (WinRT, D2D, D3D, Win2D, STL)
 ├── App.xaml / .h / .cpp        # Application entry point
-├── MainWindow.xaml / .h / .cpp # Main window layout and initialization (~4100 lines)
+├── MainWindow.xaml / .h / .cpp # Main window layout and initialization (~5000+ lines)
 ├── MainWindow.McpRoutes.cpp    # MCP server routes (~1400 lines)
 ├── MainWindow.idl              # WinRT interface definition
 ├── EffectDesignerWindow.xaml / .h / .cpp  # Effect Designer modal window
 │
 ├── Graph/                      # Effect graph data model
-│   ├── NodeType.h              # NodeType enum (Source, BuiltInEffect, PixelShader, ComputeShader, Output)
+│   ├── NodeType.h              # NodeType enum (Source, BuiltInEffect, PixelShader, ComputeShader, Parameter, Output)
 │   ├── PropertyValue.h         # std::variant type for node properties (float, int, bool, float2-4, string, matrix, vector)
 │   ├── EffectNode.h            # EffectNode struct, ParameterDefinition, PropertyBinding, AnalysisFieldDef
 │   ├── EffectEdge.h            # EffectEdge struct (source/dest node + pin IDs)
@@ -372,16 +396,17 @@ ShaderLab/
 │   ├── IccProfileParser.h      # IccProfileParser class + IccProfileData struct
 │   ├── IccProfileParser.cpp    # ICC binary format parsing (v2/v4), XYZ→xy conversion, gamut detection
 │   ├── PipelineFormat.h        # PipelineFormat struct (scRGB FP16 always)
-│   ├── FalseColorOverlay.h     # False color rendering overlay
 │   ├── RenderEngine.h          # RenderEngine class (D3D11 + D2D1 + swap chain lifecycle)
 │   ├── RenderEngine.cpp        # RenderEngine implementation (device creation, resize, draw cycle)
-│   ├── GraphEvaluator.h        # GraphEvaluator class (topological walk, effect cache, dirty gating)
-│   ├── GraphEvaluator.cpp      # GraphEvaluator implementation (per-node evaluation loop)
-│   ├── ToneMapper.h            # Tone mapping modes (None, Reinhard, ACES, Hable, SDR Clamp)
-│   └── ToneMapper.cpp          # D2D WhiteLevelAdjustment + HdrToneMap + ColorMatrix exposure
+│   ├── GraphEvaluator.h        # GraphEvaluator class (topological walk, effect cache, dirty gating, D3D11 dispatch)
+│   ├── GraphEvaluator.cpp      # GraphEvaluator implementation (per-node evaluation loop, needed-node pruning)
+│   ├── GpuReduction.h          # D3D11 compute reduction (32×32 thread group, groupshared memory, stride pattern)
+│   └── GpuReduction.cpp        # GpuReduction implementation (SRV creation, dispatch, 32-byte readback)
 ├── Effects/                    # Built-in effect wrappers, custom effect base
-│   ├── ShaderLabEffects.h      # 9 ShaderLab built-in effects + shared color math HLSL library
-│   ├── ShaderLabEffects.cpp    # Effect registration, embedded HLSL, auto-compile
+│   ├── ShaderLabEffects.h      # 18+ ShaderLab built-in effects (versioned) + shared color math HLSL library
+│   ├── ShaderLabEffects.cpp    # Effect registration, embedded HLSL, auto-compile, effectId/effectVersion
+│   ├── StatisticsEffect.h      # ID2D1EffectImpl + ID2D1DrawTransform + ID2D1StatisticsEffect interface
+│   ├── StatisticsEffect.cpp    # Pass-through pixel shader + D3D11 compute dispatch via ComputeFromTexture()
 │   ├── PropertyMetadata.h      # Effect property metadata for UI generation
 │   ├── ImageLoader.h           # WIC image loading class (HDR/SDR format detection)
 │   ├── ImageLoader.cpp         # WIC decode pipeline (file/stream → FormatConverter → D2D1Bitmap1)
@@ -396,6 +421,8 @@ ShaderLab/
 │   ├── CustomComputeShaderEffect.h   # ID2D1EffectImpl + ID2D1ComputeTransform for user compute shaders
 │   └── CustomComputeShaderEffect.cpp # Compute dispatch, CalculateThreadgroups, hardware feature check
 ├── Controls/                   # Editor controllers and custom UI logic
+│   ├── OutputWindow.h              # Multi-output window (per-Output-node OS window, SwapChainPanel)
+│   ├── OutputWindow.cpp            # Independent pan/zoom/save, bidirectional sync with graph nodes
 │   ├── ShaderEditorController.h    # HLSL compile-on-demand, D3DReflect auto-property generation
 │   ├── ShaderEditorController.cpp  # Compile, reflect, error parsing, default PS/CS templates
 │   ├── NodeGraphController.h       # Canvas-based node graph editor (layout, hit-test, D2D render)
@@ -470,26 +497,38 @@ void main(uint3 DTid : SV_DispatchThreadID) {
 
 ## ShaderLab Built-in Effects
 
-ShaderLab ships with 9 built-in effects implemented in `Effects/ShaderLabEffects.h/.cpp`. Each effect has its HLSL embedded as a string constant, compiled at first use, and shares a common color math library (BT.709/BT.2020/P3 matrices, PQ/HLG transfer functions, CIE xy conversions).
+ShaderLab ships with **18+ built-in effects** implemented in `Effects/ShaderLabEffects.h/.cpp`. Each effect has its HLSL embedded as a string constant, compiled at first use, and shares a common color math library (BT.709/BT.2020/P3 matrices, PQ/HLG transfer functions, CIE xy conversions). Effects are versioned with `effectId` and `effectVersion` for stable upgrade paths.
 
 ### Analysis Effects
 
 | Effect | Type | Description |
 |--------|------|-------------|
 | Luminance Heatmap | Pixel Shader | False-color overlay mapping BT.709 luminance to a heat gradient |
+| Nit Map | Pixel Shader | Display-referred luminance visualization (replaces FalseColorOverlay) |
 | Out-of-Gamut Highlight | Compute Shader | Highlights pixels outside a target gamut (sRGB, P3, BT.2020, or current monitor) |
 | CIE Chromaticity Plot | Compute Shader | Plots image pixels on a CIE 1931 xy chromaticity diagram |
 | Vectorscope | Compute Shader | YCbCr vectorscope visualization with graticule |
+| Waveform Monitor | Compute Shader | RGB parade waveform display |
+| Image Statistics | D3D11 Compute | GPU-accelerated min/max/avg luminance, data-only node (purple, inline values) |
 
 ### Source Effects
 
 | Effect | Type | Description |
 |--------|------|-------------|
-| Gamut Source | Pixel Shader | Generates a full-gamut color sweep |
+| Color Gamut Chart | Pixel Shader | Generates a full-gamut color sweep |
 | Color Checker | Pixel Shader | Macbeth ColorChecker pattern with accurate sRGB patches |
 | Zone Plate | Pixel Shader | Sine-wave zone plate for resolution/aliasing testing |
 | Gradient Generator | Pixel Shader | Configurable linear/radial gradient with HDR range |
 | HDR Test Pattern | Pixel Shader | Luminance step wedge from 0 to 10,000 nits |
+
+### Parameter Nodes
+
+| Type | Description |
+|------|-------------|
+| Float Parameter | Continuous slider (teal node, inline slider on canvas) |
+| Integer Parameter | Discrete slider |
+| Toggle Parameter | Boolean on/off |
+| Gamut Parameter | Gamut selection dropdown |
 
 ## Versioning
 
@@ -540,6 +579,149 @@ graph LR
 - **Cycle detection** covers both image edges and binding edges
 - Bound values resolved **every frame** (bypass dirty logic — upstream analysis may change)
 - **Authored properties never mutated** — bindings build an effective properties map at evaluation time
+
+## Multi-Output Windows
+
+Each **Output** node in the graph gets its own OS window with an independent SwapChainPanel, pan/zoom, and save-to-file. Implemented in `Controls/OutputWindow.h/.cpp`.
+
+- **Bidirectional sync**: Closing the window deletes the Output node from the graph; deleting the Output node closes the window.
+- **Shared D2D device context**: All output windows share the same D3D11/D2D1 device stack from `RenderEngine`.
+- **Independent viewport**: Each window has its own pan/zoom transform, separate from the main preview panel.
+
+## Animation System
+
+ShaderLab supports animated parameters and video sources:
+
+- **`isAnimatable` flag**: ParameterDefinition marks parameters that auto-advance over time (e.g., Phase, Speed).
+- **Play/Pause toolbar toggle**: Animation starts paused. Press Play to begin advancing animatable parameters.
+- **Phase/Speed auto-advance**: Animatable float parameters increment each frame based on Speed.
+- **Video sources**: Video source nodes participate in the animation timeline.
+
+## Parameter Nodes
+
+Parameter nodes are data-only graph elements (no HLSL shader) that expose a single value for binding to downstream effect properties.
+
+- **Four types**: Float, Integer, Toggle, Gamut
+- **Teal color** on the node graph canvas
+- **Inline slider**: Rendered directly on the D2D canvas for quick adjustment
+- **No preview switch**: Clicking a parameter node does not change the preview target
+- **Evaluator-populated**: The graph evaluator populates analysis output fields directly from node properties (no shader dispatch)
+
+## Effect Versioning System
+
+Each ShaderLab effect carries an `effectId` (stable GUID) and `effectVersion` (integer). This enables safe upgrades when effects are updated with new parameters or shader changes.
+
+- **`effectId`**: Stable identifier that survives effect renames.
+- **`effectVersion`**: Monotonically increasing version per effect.
+- **Per-node "Update Effect" button**: Shown in Properties panel when a node's version is behind the registry.
+- **"Update Effects (N)" batch button**: Toolbar button to upgrade all outdated nodes at once.
+- **Property preservation**: On upgrade, existing user property values are preserved where parameter names match.
+
+## Conditional Parameter Visibility
+
+Effect parameters support conditional visibility via the `visibleWhen` field on `ParameterDefinition`.
+
+- **Format**: `"ParamName == value"` (e.g., `"Mode == 1"`, `"EnableHDR == true"`)
+- **Hidden from UI**: When the condition is false, the parameter is hidden from both the Properties panel and data pins on the graph canvas.
+- **Dynamic**: Visibility re-evaluates whenever the controlling parameter changes.
+
+## D2D / D3D11 Hybrid Compute System
+
+### Problem
+
+D2D compute shaders are evaluated in **tiles**, with UAVs cleared per-tile and no support for atomic operations on `float4` UAVs. This makes reduction operations (min/max/average over an entire image) impossible within the D2D compute shader model.
+
+### Solution
+
+The graph evaluator owns a **D3D11 compute dispatch path** that bypasses D2D tiling entirely for nodes that require full-image reduction.
+
+### Architecture
+
+```mermaid
+flowchart LR
+    subgraph D2D["D2D Pipeline"]
+        INPUT[Upstream D2D Effect] --> BITMAP[Render to FP32 Bitmap]
+    end
+
+    subgraph Handoff["D2D → D3D11 Handoff"]
+        BITMAP --> SURF[IDXGISurface::GetSurface]
+        SURF --> TEX[ID3D11Texture2D]
+        TEX --> SRV[Create SRV]
+    end
+
+    subgraph D3D11["D3D11 Compute"]
+        SRV --> DISPATCH[Dispatch Compute Shader<br/>32×32 thread group]
+        DISPATCH --> REDUCE[groupshared Reduction<br/>Stride Pattern]
+        REDUCE --> BUF[32-byte Result Buffer]
+    end
+
+    subgraph Readback["CPU Readback"]
+        BUF --> MAP[Map + Read 32 bytes]
+        MAP --> ANALYSIS[Analysis Output Fields]
+    end
+```
+
+- **GpuReduction** (`Rendering/GpuReduction.h/.cpp`): Manages D3D11 compute dispatch with 32×32 thread groups, stride-based groupshared reduction, and minimal CPU readback (32 bytes).
+- **StatisticsEffect** (`Effects/StatisticsEffect.h/.cpp`): Implements `ID2D1EffectImpl` + `ID2D1DrawTransform` + custom `ID2D1StatisticsEffect` interface.
+  - **Pass-through pixel shader**: For D2D compatibility (effect can sit in a D2D graph and pass image through).
+  - **`ComputeFromTexture()`**: Called by the evaluator for the D3D11 compute path.
+  - **`ComputeStatistics(dc, image)`**: Generic D2D consumer path for standalone usage.
+- **`CustomShaderType::D3D11ComputeShader`**: Third enum value alongside `PixelShader` and `ComputeShader`.
+
+### Limitations
+
+- D2D effect context doesn't expose input images as D3D11 textures — the evaluator must render to a staging bitmap first.
+- Can't bind custom UAVs within D2D's effect framework — dispatch must happen outside D2D.
+- The evaluator orchestrates the D2D→D3D11 handoff; effects themselves are passive.
+
+## Working Space Integration
+
+ShaderLab effects that operate in a specific color space receive **working space primaries** from the active display profile at render time.
+
+- **Hidden properties**: Working space chromaticities are stored as properties with the `_hidden` suffix (e.g., `WsRedX_hidden`, `WsRedY_hidden`, `WsGreenX_hidden`, etc.).
+- **Injected at render time**: The evaluator injects these values from `DisplayMonitor::ActiveProfile()` before each evaluation.
+- **UI exclusion**: Properties ending in `_hidden` are excluded from the Properties panel and data pins.
+
+## Image Statistics Effect
+
+The **Image Statistics** effect is a GPU-accelerated, data-only analysis node:
+
+- **Purple color** on the graph canvas (data-only node type).
+- **Inline value display**: Statistics (min/max/average luminance, etc.) are rendered directly on the node canvas.
+- **D3D11 compute path**: Uses `StatisticsEffect` + `GpuReduction` for full-image reduction.
+- **No visual output**: The node produces analysis output fields only — no image output.
+
+## Copy / Paste Nodes
+
+- **Ctrl+C / Ctrl+V**: Copy selected nodes and paste with offset.
+- **Deep copy**: Each pasted node gets a fresh GUID.
+- **Internal edge preservation**: Edges between copied nodes are preserved in the paste.
+
+## Auto-Arrange
+
+- **Ctrl+L** or toolbar button: Automatically arranges nodes in topological-depth columns.
+- Nodes are sorted by their topological depth (distance from source nodes) and arranged in evenly-spaced columns.
+
+## Node Graph Visual Enhancements
+
+### Color Coding by Node Type
+
+| Color | Node Type |
+|-------|-----------|
+| Green | Source nodes (images, generators) |
+| Blue | Built-in D2D effects |
+| Red | Custom pixel shader effects |
+| Orange | Custom compute shader effects |
+| Teal | Parameter nodes |
+| Purple | Data-only nodes (Image Statistics) |
+| Gray | Output nodes |
+
+### Inline Data Display
+
+- **Data pin values**: Shown inline on the node canvas (current bound value).
+- **Enum labels**: Enum-typed properties show their label (not raw integer) on data pins.
+- **Image input pin labels**: Derived from effect input names (e.g., "Source", "Destination").
+- **"No Input" text**: Displayed on image input pins with broken/missing connections.
 
 ## MCP Server (AI Agent Integration)
 
