@@ -539,29 +539,42 @@ void main(uint3 DTid : SV_DispatchThreadID) {
 
 ## ShaderLab Built-in Effects
 
-ShaderLab ships with **18+ built-in effects** implemented in `Effects/ShaderLabEffects.h/.cpp`. Each effect has its HLSL embedded as a string constant, compiled at first use, and shares a common color math library (BT.709/BT.2020/P3 matrices, PQ/HLG transfer functions, CIE xy conversions). Effects are versioned with `effectId` and `effectVersion` for stable upgrade paths.
+ShaderLab ships with **25+ built-in effects** implemented in `Effects/ShaderLabEffects.h/.cpp`. Each effect has its HLSL embedded as a string constant, compiled at first use, and shares a common color math library (BT.709/BT.2020/P3 matrices, PQ/HLG transfer functions, CIE xy conversions). Effects are versioned with `effectId` and `effectVersion` for stable upgrade paths.
 
 ### Analysis Effects
 
 | Effect | Type | Description |
 |--------|------|-------------|
-| Luminance Heatmap | Pixel Shader | False-color overlay mapping BT.709 luminance to a heat gradient |
-| Nit Map | Pixel Shader | Display-referred luminance visualization (replaces FalseColorOverlay) |
-| Out-of-Gamut Highlight | Compute Shader | Highlights pixels outside a target gamut (sRGB, P3, BT.2020, or current monitor) |
-| CIE Chromaticity Plot | Compute Shader | Plots image pixels on a CIE 1931 xy chromaticity diagram |
-| Vectorscope | Compute Shader | YCbCr vectorscope visualization with graticule |
-| Waveform Monitor | Compute Shader | RGB parade waveform display |
-| Image Statistics | D3D11 Compute | GPU-accelerated min/max/avg luminance, data-only node (purple, inline values) |
+| Luminance Heatmap | Pixel Shader | False-color overlay mapping BT.709 luminance to Turbo/Inferno heat gradients |
+| Nit Map | Pixel Shader | Display-referred luminance visualization with nit-range zones |
+| Gamut Highlight | Pixel Shader | Highlights pixels outside a target gamut (sRGB, P3, BT.2020, or current monitor) |
+| CIE Chromaticity Plot | Pixel Shader | Plots image pixels on a CIE 1931 xy chromaticity diagram with gamut triangle overlays |
+| Vectorscope | Pixel Shader | YCbCr vectorscope visualization with graticule |
+| Waveform Monitor | Pixel Shader | RGB parade waveform display |
+| Delta E Comparator | Pixel Shader | Two-input CIEDE2000 perceptual color difference map |
+| Gamut Coverage | Pixel Shader | Percentage of target gamut volume covered by input image |
+| Split Comparison | Pixel Shader | Two-input side-by-side wipe with adjustable split position and divider line |
+| Image Statistics | D3D11 Compute | GPU-accelerated min/max/mean/median/P95 with 256-bin histogram (data-only node) |
+
+### Color Processing Effects
+
+| Effect | Type | Description |
+|--------|------|-------------|
+| Gamut Map | Pixel Shader | CIE xy gamut mapping: Clip, Nearest, Compress to White, Fit Gamut modes |
+| Perceptual Gamut Map | Pixel Shader | ICtCp perceptual gamut mapping: Nearest on Shell, Compress to Neutral, Fit to Shell |
 
 ### Source Effects
 
 | Effect | Type | Description |
 |--------|------|-------------|
-| Color Gamut Chart | Pixel Shader | Generates a full-gamut color sweep |
+| Gamut Source | Pixel Shader | Generates a swept gamut fill for a target color space |
+| Animated Gamut | Pixel Shader | Animated rotating gamut visualization (animatable) |
+| ICtCp Boundary | Pixel Shader | ICtCp gamut boundary visualization |
 | Color Checker | Pixel Shader | Macbeth ColorChecker pattern with accurate sRGB patches |
 | Zone Plate | Pixel Shader | Sine-wave zone plate for resolution/aliasing testing |
 | Gradient Generator | Pixel Shader | Configurable linear/radial gradient with HDR range |
 | HDR Test Pattern | Pixel Shader | Luminance step wedge from 0 to 10,000 nits |
+| Color Gamut Chart | Pixel Shader | Generates a full-gamut color sweep |
 
 ### Parameter Nodes
 
