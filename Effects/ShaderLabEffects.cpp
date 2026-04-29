@@ -588,7 +588,7 @@ static const float2 LOCUS[] = {
 bool IsInsideLocus(float2 p) {
     int winding = 0;
     // Test against spectral locus segments
-    for (int i = 0; i < LOCUS_COUNT; i++) {
+    for (uint i = 0; i < LOCUS_COUNT; i++) {
         float2 a = LOCUS[i];
         float2 b = LOCUS[(i + 1) % LOCUS_COUNT];
         // For the last point, close with purple line back to first
