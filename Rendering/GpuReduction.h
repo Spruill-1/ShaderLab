@@ -10,6 +10,8 @@ namespace ShaderLab::Rendering
         float min{ 0 };
         float max{ 0 };
         float mean{ 0 };
+        float median{ 0 };
+        float p95{ 0 };
         float sum{ 0 };
         uint32_t samples{ 0 };
         uint32_t totalPixels{ 0 };
@@ -40,9 +42,13 @@ namespace ShaderLab::Rendering
 
     private:
         winrt::com_ptr<ID3D11ComputeShader> m_shader;
-        winrt::com_ptr<ID3D11Buffer> m_resultBuffer;    // UAV output (8 uints)
+        winrt::com_ptr<ID3D11Buffer> m_resultBuffer;    // UAV output (8 stats + 256 histogram bins)
         winrt::com_ptr<ID3D11Buffer> m_stagingBuffer;   // CPU readback
         winrt::com_ptr<ID3D11Buffer> m_cbuffer;          // Constants
         winrt::com_ptr<ID3D11UnorderedAccessView> m_resultUAV;
+
+        static constexpr uint32_t HIST_BINS = 256;
+        static constexpr uint32_t STATS_UINTS = 8;
+        static constexpr uint32_t TOTAL_UINTS = STATS_UINTS + HIST_BINS;  // 264
     };
 }

@@ -30,6 +30,8 @@ RWBuffer<uint> Result : register(u0);
 
 #define GROUP_SIZE 32
 #define THREAD_COUNT (GROUP_SIZE * GROUP_SIZE)
+#define HIST_BINS 256
+#define HIST_MAX 100.0  // histogram range [0, HIST_MAX]
 
 groupshared float gs_min[THREAD_COUNT];
 groupshared float gs_max[THREAD_COUNT];
@@ -37,6 +39,7 @@ groupshared float gs_sum[THREAD_COUNT];
 groupshared uint  gs_count[THREAD_COUNT];
 groupshared uint  gs_total[THREAD_COUNT];
 groupshared uint  gs_nonzero[THREAD_COUNT];
+groupshared uint  gs_hist[HIST_BINS];
 
 float GetValue(float4 pix, uint ch)
 {
@@ -52,6 +55,11 @@ float GetValue(float4 pix, uint ch)
 void main(uint3 GTid : SV_GroupThreadID)
 {
     uint tid = GTid.x + GTid.y * GROUP_SIZE;
+
+    // Clear shared histogram (each thread clears one or more bins).
+    for (uint bi = tid; bi < HIST_BINS; bi += THREAD_COUNT)
+        gs_hist[bi] = 0;
+    GroupMemoryBarrierWithGroupSync();
 
     float tMin = 1e30;
     float tMax = -1e30;
@@ -78,6 +86,11 @@ void main(uint3 GTid : SV_GroupThreadID)
             tMax = max(tMax, v);
             tSum += v;
             tCount++;
+
+            // Histogram bin (atomic add to shared memory).
+            float normalized = saturate(v / HIST_MAX);
+            uint bin = min((uint)(normalized * 255.0), 255u);
+            InterlockedAdd(gs_hist[bin], 1u);
         }
     }
 
@@ -90,7 +103,7 @@ void main(uint3 GTid : SV_GroupThreadID)
 
     GroupMemoryBarrierWithGroupSync();
 
-    // Parallel reduction in shared memory.
+    // Parallel reduction for min/max/sum/count.
     for (uint stride = THREAD_COUNT / 2; stride > 0; stride >>= 1)
     {
         if (tid < stride)
@@ -105,19 +118,22 @@ void main(uint3 GTid : SV_GroupThreadID)
         GroupMemoryBarrierWithGroupSync();
     }
 
-    // Thread 0 writes final results.
+    // Thread 0 writes stats.
     if (tid == 0)
     {
         Result[0] = asuint(gs_min[0]);
         Result[1] = asuint(gs_max[0]);
-        // Store sum as float bits (precision loss is OK for mean computation).
         Result[2] = asuint(gs_sum[0]);
-        Result[3] = 0; // reserved
+        Result[3] = 0;
         Result[4] = gs_count[0];
         Result[5] = gs_total[0];
         Result[6] = gs_nonzero[0];
         Result[7] = 0;
     }
+
+    // All threads cooperate to write histogram bins to result buffer.
+    for (uint hbi = tid; hbi < HIST_BINS; hbi += THREAD_COUNT)
+        Result[8 + hbi] = gs_hist[hbi];
 }
 )";
 
@@ -149,9 +165,9 @@ void main(uint3 GTid : SV_GroupThreadID)
             nullptr, m_shader.put());
         if (FAILED(hr)) return;
 
-        // Create result buffer (8 uints = 32 bytes).
+        // Create result buffer (8 stats + 256 histogram bins = 264 uints).
         D3D11_BUFFER_DESC bufDesc{};
-        bufDesc.ByteWidth = 8 * sizeof(uint32_t);
+        bufDesc.ByteWidth = TOTAL_UINTS * sizeof(uint32_t);
         bufDesc.Usage = D3D11_USAGE_DEFAULT;
         bufDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
         bufDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
@@ -163,12 +179,13 @@ void main(uint3 GTid : SV_GroupThreadID)
         uavDesc.Format = DXGI_FORMAT_R32_TYPELESS;
         uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
         uavDesc.Buffer.FirstElement = 0;
-        uavDesc.Buffer.NumElements = 8;
+        uavDesc.Buffer.NumElements = TOTAL_UINTS;
         uavDesc.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
         hr = device->CreateUnorderedAccessView(m_resultBuffer.get(), &uavDesc, m_resultUAV.put());
         if (FAILED(hr)) return;
 
         // Staging buffer for CPU readback.
+        bufDesc.ByteWidth = TOTAL_UINTS * sizeof(uint32_t);
         bufDesc.Usage = D3D11_USAGE_STAGING;
         bufDesc.BindFlags = 0;
         bufDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -266,6 +283,33 @@ void main(uint3 GTid : SV_GroupThreadID)
             stats.totalPixels = totalPixels;
             stats.nonzeroPixels = nonzeroPixels;
             stats.mean = (sampleCount > 0) ? sumVal / static_cast<float>(sampleCount) : 0;
+
+            // Compute median and P95 from histogram.
+            constexpr float histMax = 100.0f;
+            if (sampleCount > 0)
+            {
+                const uint32_t* hist = result + STATS_UINTS;
+                uint32_t halfCount = sampleCount / 2;
+                uint32_t p95Count = static_cast<uint32_t>(sampleCount * 0.95f);
+                uint32_t cumulative = 0;
+                bool foundMedian = false, foundP95 = false;
+
+                for (uint32_t bi = 0; bi < HIST_BINS; ++bi)
+                {
+                    cumulative += hist[bi];
+                    if (!foundMedian && cumulative >= halfCount)
+                    {
+                        stats.median = (static_cast<float>(bi) / 255.0f) * histMax;
+                        foundMedian = true;
+                    }
+                    if (!foundP95 && cumulative >= p95Count)
+                    {
+                        stats.p95 = (static_cast<float>(bi) / 255.0f) * histMax;
+                        foundP95 = true;
+                    }
+                    if (foundMedian && foundP95) break;
+                }
+            }
 
             ctx->Unmap(m_stagingBuffer.get(), 0);
         }

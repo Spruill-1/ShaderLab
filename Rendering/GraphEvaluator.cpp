@@ -1182,10 +1182,8 @@ namespace ShaderLab::Rendering
         winrt::com_ptr<ID2D1Image> prevTarget;
         dc->GetTarget(prevTarget.put());
         dc->SetTarget(gpuTarget.get());
-        dc->BeginDraw();
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
         dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
-        dc->EndDraw();
         dc->SetTarget(prevTarget.get());
 
         // Get the underlying D3D11 texture from the D2D bitmap.
@@ -1248,6 +1246,8 @@ namespace ShaderLab::Rendering
         addField(L"Min", stats.min);
         addField(L"Max", stats.max);
         addField(L"Mean", stats.mean);
+        addField(L"Median", stats.median);
+        addField(L"P95", stats.p95);
         addField(L"Samples", static_cast<float>(stats.samples));
         addField(L"Nonzero%", vNonzero);
     }

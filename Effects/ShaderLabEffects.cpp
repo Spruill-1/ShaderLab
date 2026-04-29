@@ -2246,10 +2246,10 @@ float4 main(
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Image Statistics";
-            desc.effectId = L"Image Statistics"; desc.effectVersion = 6;
+            desc.effectId = L"Image Statistics"; desc.effectVersion = 7;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
-            // No HLSL — evaluator handles this via CPU readback.
+            // No HLSL — evaluator handles via D3D11 GPU reduction.
             desc.dataOnly = true;
             desc.inputNames = { L"Source" };
             desc.parameters = {
@@ -2261,6 +2261,8 @@ float4 main(
                 { L"Min",      Graph::AnalysisFieldType::Float },
                 { L"Max",      Graph::AnalysisFieldType::Float },
                 { L"Mean",     Graph::AnalysisFieldType::Float },
+                { L"Median",   Graph::AnalysisFieldType::Float },
+                { L"P95",      Graph::AnalysisFieldType::Float },
                 { L"Samples",  Graph::AnalysisFieldType::Float },
                 { L"Nonzero%", Graph::AnalysisFieldType::Float },
             };
