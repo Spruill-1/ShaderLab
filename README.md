@@ -26,6 +26,9 @@ A WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging
   - [GPU Reduction Shader Pattern](#gpu-reduction-shader-pattern)
   - [Known Limitations](#known-limitations)
 - [Effect Designer](#effect-designer)
+  - [Opening Built-in Effects](#opening-built-in-effects)
+  - [Export (Future)](#export-future)
+  - [Import from External Binary (Planned)](#import-from-external-binary-planned)
 - [Multi-Output Windows](#multi-output-windows)
 - [Animation System](#animation-system)
 - [Parameter Nodes](#parameter-nodes)
@@ -1006,6 +1009,10 @@ ShaderLab's built-in effects can be opened in the Effect Designer via the **"Edi
 ### Export (Future)
 
 The Effect Designer will support exporting D3D11 compute effects as standalone C++ header/module files. The export includes the HLSL source, input/parameter/output schema, and the dispatch contract. Developers can then customize the C++ post-processing (e.g., histogram → median computation) in their own codebase.
+
+### Import from External Binary (Planned)
+
+ShaderLab does not currently support importing a fully compiled effect from an external DLL or binary module. All effects are either built-in (registered at startup) or authored within the Effect Designer from HLSL source. A future release will add the ability to load pre-compiled D2D effect DLLs (implementing `ID2D1EffectImpl`) and D3D11 compute shader binaries (`.cso` files) directly into the graph, enabling teams to develop effects in external toolchains and test them inside ShaderLab without providing source code.
 
 ## Working Space Integration
 
