@@ -2241,29 +2241,30 @@ float4 main(
         }
 
         // ---- Image Statistics ----
-        // D3D11 compute shader: 32x32 thread group, stride-based reduction
-        // with 256-bin histogram. Dispatched outside D2D via GpuReduction.
+        // D3D11 compute shader with stride-based reduction + 256-bin histogram.
+        // Built-in path uses GpuReduction (RWBuffer<uint>); user-modified path
+        // uses D3D11ComputeRunner (RWStructuredBuffer<float4>) via Effect Designer.
         {
             static const std::string imageStatsHLSL = R"HLSL(
-// Image Statistics — D3D11 Compute Shader
-// 32x32 = 1024 threads in one group, dispatched as (1,1,1).
-// Each thread strides across the full image, accumulates per-thread
-// partials, then reduces in groupshared memory.
+// Image Statistics - D3D11 Compute Shader
+// 32x32 = 1024 threads, dispatched as (1,1,1).
+// Each thread strides across the full image, reduces in groupshared,
+// then thread 0 computes median/P95 from a 256-bin histogram CDF.
 //
-// Output buffer layout (RWBuffer<uint>, 264 elements):
-//   [0]     = min (float as uint via asuint — IEEE 754 ordering)
-//   [1]     = max (float as uint)
-//   [2]     = sum (float as uint)
-//   [3]     = reserved
-//   [4]     = sampleCount
-//   [5]     = totalPixels
-//   [6]     = nonzeroPixels
-//   [7]     = reserved
-//   [8..263] = 256-bin histogram (uint counts)
+// Output: RWStructuredBuffer<float4> — one float4 per analysis field.
+//   Result[0].x = Min
+//   Result[1].x = Max
+//   Result[2].x = Mean
+//   Result[3].x = Median  (from histogram CDF)
+//   Result[4].x = P95     (from histogram CDF)
+//   Result[5].x = Samples
+//   Result[6].x = Nonzero%
 //
-// Host reads back 264 uints (1056 bytes), computes:
-//   mean = asfloat(sum) / sampleCount
-//   median / P95 from histogram CDF
+// Width and Height are auto-injected at cbuffer offset 0.
+// Channel and NonzeroOnly are user parameters at offset 8.
+
+Texture2D<float4> Source : register(t0);
+RWStructuredBuffer<float4> Result : register(u0);
 
 cbuffer Constants : register(b0)
 {
@@ -2273,13 +2274,10 @@ cbuffer Constants : register(b0)
     uint NonzeroOnly;  // 0=all, 1=nonzero only
 };
 
-Texture2D<float4> Input : register(t0);
-RWBuffer<uint> Result : register(u0);
-
 #define GROUP_SIZE 32
 #define THREAD_COUNT (GROUP_SIZE * GROUP_SIZE)
 #define HIST_BINS 256
-#define HIST_MAX 100.0  // histogram range [0, HIST_MAX]
+#define HIST_MAX 100.0
 
 groupshared float gs_min[THREAD_COUNT];
 groupshared float gs_max[THREAD_COUNT];
@@ -2321,7 +2319,7 @@ void main(uint3 GTid : SV_GroupThreadID)
     {
         for (uint x = GTid.x; x < Width; x += GROUP_SIZE)
         {
-            float4 pix = Input[int2(x, y)];
+            float4 pix = Source.Load(int3(x, y, 0));
             float v = GetValue(pix, Channel);
 
             tTotal++;
@@ -2335,7 +2333,7 @@ void main(uint3 GTid : SV_GroupThreadID)
             tSum += v;
             tCount++;
 
-            // Histogram bin (atomic add to shared memory).
+            // Histogram bin.
             float normalized = saturate(v / HIST_MAX);
             uint bin = min((uint)(normalized * 255.0), 255u);
             InterlockedAdd(gs_hist[bin], 1u);
@@ -2351,7 +2349,7 @@ void main(uint3 GTid : SV_GroupThreadID)
 
     GroupMemoryBarrierWithGroupSync();
 
-    // Parallel reduction for min/max/sum/count.
+    // Parallel reduction.
     for (uint stride = THREAD_COUNT / 2; stride > 0; stride >>= 1)
     {
         if (tid < stride)
@@ -2366,22 +2364,53 @@ void main(uint3 GTid : SV_GroupThreadID)
         GroupMemoryBarrierWithGroupSync();
     }
 
-    // Thread 0 writes final stats.
+    // Thread 0 computes final stats and writes results.
     if (tid == 0)
     {
-        Result[0] = asuint(gs_min[0]);
-        Result[1] = asuint(gs_max[0]);
-        Result[2] = asuint(gs_sum[0]);
-        Result[3] = 0;
-        Result[4] = gs_count[0];
-        Result[5] = gs_total[0];
-        Result[6] = gs_nonzero[0];
-        Result[7] = 0;
-    }
+        float fMin = gs_min[0];
+        float fMax = gs_max[0];
+        uint  totalSamples = gs_count[0];
+        uint  totalPixels = gs_total[0];
+        uint  nonzeroPixels = gs_nonzero[0];
+        float fMean = (totalSamples > 0) ? (gs_sum[0] / float(totalSamples)) : 0.0;
 
-    // All threads cooperate to write histogram bins.
-    for (uint hbi = tid; hbi < HIST_BINS; hbi += THREAD_COUNT)
-        Result[8 + hbi] = gs_hist[hbi];
+        // Compute median and P95 from histogram CDF.
+        float fMedian = 0.0;
+        float fP95 = 0.0;
+        uint medianTarget = totalSamples / 2;
+        uint p95Target = (uint)(totalSamples * 0.95);
+        uint cumulative = 0;
+        bool foundMedian = false;
+        bool foundP95 = false;
+
+        for (uint b = 0; b < HIST_BINS; b++)
+        {
+            cumulative += gs_hist[b];
+            float binValue = (float(b) + 0.5) / 255.0 * HIST_MAX;
+            if (!foundMedian && cumulative >= medianTarget)
+            {
+                fMedian = binValue;
+                foundMedian = true;
+            }
+            if (!foundP95 && cumulative >= p95Target)
+            {
+                fP95 = binValue;
+                foundP95 = true;
+            }
+        }
+
+        float nonzeroPct = (totalPixels > 0)
+            ? float(nonzeroPixels) / float(totalPixels)
+            : 0.0;
+
+        Result[0] = float4(fMin, 0, 0, 0);
+        Result[1] = float4(fMax, 0, 0, 0);
+        Result[2] = float4(fMean, 0, 0, 0);
+        Result[3] = float4(fMedian, 0, 0, 0);
+        Result[4] = float4(fP95, 0, 0, 0);
+        Result[5] = float4(float(totalSamples), 0, 0, 0);
+        Result[6] = float4(nonzeroPct, 0, 0, 0);
+    }
 }
 )HLSL";
 

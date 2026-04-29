@@ -307,10 +307,12 @@ namespace ShaderLab::Rendering
             auto* node = graph.FindNode(deferred.nodeId);
             if (!node || !deferred.inputImage) continue;
 
-            // Built-in Image Statistics effect uses the hardcoded GpuReduction.
-            // User-authored D3D11 compute shaders use D3D11ComputeRunner.
+            // Built-in Image Statistics uses the hardcoded GpuReduction path,
+            // but only if the user hasn't recompiled via Effect Designer.
+            // Once recompiled, the user's shader runs through D3D11ComputeRunner.
             bool isBuiltinStats = node->customEffect.has_value() &&
-                node->customEffect->shaderLabEffectId == L"Image Statistics";
+                node->customEffect->shaderLabEffectId == L"Image Statistics" &&
+                !node->customEffect->isCompiled();
 
             if (isBuiltinStats)
             {
