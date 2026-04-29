@@ -1948,7 +1948,6 @@ float2 NearestOnPoly(float2 p, float2 poly[NBP])
 
 float2 CompressNeutral(float2 p, float2 poly[NBP])
 {
-    // Analytically intersect ray from p toward (0,0) with each polygon edge.
     float2 dir = float2(0,0) - p;
     float bestT = 1e10;
     for (uint i = 0; i < NBP; i++)
@@ -1964,10 +1963,10 @@ float2 CompressNeutral(float2 p, float2 poly[NBP])
         if (t > 0.0 && u >= 0.0 && u <= 1.0 && t < bestT)
             bestT = t;
     }
+    float2 result = NearestOnPoly(p, poly);
     if (bestT < 1.0)
-        return p + dir * bestT;
-    // Fallback: if ray missed all edges (precision), use nearest point.
-    return NearestOnPoly(p, poly);
+        result = p + dir * bestT;
+    return result;
 }
 
 // Compute uniform ICtCp scale factor: for each source boundary vertex,
