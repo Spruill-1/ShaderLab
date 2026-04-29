@@ -890,9 +890,9 @@ void main(uint3 GTid : SV_GroupThreadID) {
 
 ### Known Limitations
 
-- **Chained effect output**: D2D deferred `ID2D1Image*` from `effect->GetOutput()` must be realized by rendering to a bitmap before D3D11 can access it. First-frame timing with `justCreated` effects requires retry logic.
+- **D2D draw session required**: `ComputeStatistics(dc, image)` must be called with a dc that has an active D2D draw session (between `BeginDraw`/`EndDraw`) for chained effects to render correctly. D2D's deferred `ID2D1Image*` from `GetOutput()` only materializes to pixels during an active draw session. In ShaderLab, `ProcessDeferredCompute` runs inside the main `BeginDraw`/`EndDraw` pass.
 - **No shader linking**: D3D11 compute shaders are opaque to D2D. They don't participate in D2D's shader linking optimization for chained pixel shader effects.
-- **Device sharing**: The D3D11 device must be the same one backing D2D. Obtained via `ID2D1Device2::GetDxgiDevice()` or injected from the host's `RenderEngine`.
+- **Device sharing**: The D3D11 device must be the same one backing D2D. The effect acquires it lazily via `ID2D1Device2::GetDxgiDevice()` on first `ComputeStatistics` call.
 - **Single thread group**: Current `GpuReduction` dispatches `(1,1,1)` — one group of 1024 threads. For images larger than ~33 megapixels (1024² pixels per thread), a multi-dispatch pyramid would be needed.
 
 ## Working Space Integration
