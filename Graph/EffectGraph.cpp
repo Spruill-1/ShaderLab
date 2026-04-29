@@ -1012,7 +1012,7 @@ namespace ShaderLab::Graph
                 // Recompile from source on load.
                 CoCreateGuid(&def.shaderGuid);
                 std::string target = (def.shaderType == CustomShaderType::PixelShader)
-                    ? "ps_5_0" : "cs_5_0";
+                    ? "ps_5_0" : "cs_5_0"; // Both D2D and D3D11 compute use cs_5_0
                 // WinUI TextBox stores \r as line separator; D3DCompile needs \n.
                 std::string hlslUtf8(def.hlslSource.begin(), def.hlslSource.end());
                 for (auto& ch : hlslUtf8)

@@ -433,8 +433,8 @@ float4 main(
 
         EffectNode node;
         node.name = desc.name;
-        node.type = (desc.shaderType == CustomShaderType::ComputeShader)
-            ? NodeType::ComputeShader : NodeType::PixelShader;
+        node.type = (desc.shaderType == CustomShaderType::PixelShader)
+            ? NodeType::PixelShader : NodeType::ComputeShader;
 
         // Parameter nodes (no HLSL) and data-only effects have no image output pin.
         if (!desc.hlslSource.empty() && !desc.dataOnly)
@@ -2246,9 +2246,9 @@ float4 main(
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Image Statistics";
-            desc.effectId = L"Image Statistics"; desc.effectVersion = 5;
+            desc.effectId = L"Image Statistics"; desc.effectVersion = 6;
             desc.category = L"Analysis";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
             // No HLSL — evaluator handles this via CPU readback.
             desc.dataOnly = true;
             desc.inputNames = { L"Source" };

@@ -7,6 +7,7 @@
 #include "Rendering/PipelineFormat.h"
 #include "Rendering/IccProfileParser.h"
 #include "Effects/ShaderLabEffects.h"
+#include "Effects/StatisticsEffect.h"
 #include "Version.h"
 #include <microsoft.ui.xaml.media.dxinterop.h>
 
@@ -406,8 +407,9 @@ namespace winrt::ShaderLab::implementation
 
         HRESULT hr1 = ::ShaderLab::Effects::CustomPixelShaderEffect::RegisterEffect(factory1.get());
         HRESULT hr2 = ::ShaderLab::Effects::CustomComputeShaderEffect::RegisterEffect(factory1.get());
-        OutputDebugStringW(std::format(L"[CustomFX] RegisterEffect pixel=0x{:08X} compute=0x{:08X}\n",
-            static_cast<uint32_t>(hr1), static_cast<uint32_t>(hr2)).c_str());
+        HRESULT hr3 = ::ShaderLab::Effects::StatisticsEffect::RegisterEffect(factory1.get());
+        OutputDebugStringW(std::format(L"[CustomFX] RegisterEffect pixel=0x{:08X} compute=0x{:08X} stats=0x{:08X}\n",
+            static_cast<uint32_t>(hr1), static_cast<uint32_t>(hr2), static_cast<uint32_t>(hr3)).c_str());
 
         m_customEffectsRegistered = true;
     }

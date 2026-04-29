@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "GraphEvaluator.h"
 #include "../Effects/ShaderCompiler.h"
+#include "../Effects/StatisticsEffect.h"
 
 using namespace ShaderLab::Graph;
 
@@ -92,9 +93,9 @@ namespace ShaderLab::Rendering
             case NodeType::PixelShader:
             case NodeType::ComputeShader:
             {
-                // Image Statistics: CPU-side analysis (no shader needed).
+                // D3D11 Compute Shader: evaluator-owned dispatch via StatisticsEffect.
                 if (node->customEffect.has_value() &&
-                    node->customEffect->shaderLabEffectId == L"Image Statistics" &&
+                    node->customEffect->shaderType == CustomShaderType::D3D11ComputeShader &&
                     node->dirty)
                 {
                     // Find the upstream input image.

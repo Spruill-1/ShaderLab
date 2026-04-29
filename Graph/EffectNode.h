@@ -18,6 +18,7 @@ namespace ShaderLab::Graph
     {
         PixelShader,
         ComputeShader,
+        D3D11ComputeShader,  // Raw D3D11 compute (not D2D-tiled, full atomics/groupshared)
     };
 
     // Describes a user-defined parameter for a custom effect.

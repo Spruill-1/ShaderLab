@@ -98,6 +98,9 @@
     <ClInclude Include="Effects\CustomComputeShaderEffect.h">
       <Filter>Effects</Filter>
     </ClInclude>
+    <ClInclude Include="Effects\StatisticsEffect.h">
+      <Filter>Effects</Filter>
+    </ClInclude>
 
     <ClInclude Include="Controls\ShaderEditorController.h">
       <Filter>Controls</Filter>
@@ -171,6 +174,9 @@
       <Filter>Effects</Filter>
     </ClCompile>
     <ClCompile Include="Effects\CustomComputeShaderEffect.cpp">
+      <Filter>Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Effects\StatisticsEffect.cpp">
       <Filter>Effects</Filter>
     </ClCompile>
 
