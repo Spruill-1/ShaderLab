@@ -373,6 +373,7 @@ flowchart TD
 | 37 | ID2D1StatisticsEffect COM interface | D2D-compatible effect wrapper with custom interface for analysis results. Pass-through pixel shader + D3D11 compute dispatch. | Day 6 |
 | 38 | Parameter nodes as data-only graph elements | No shader, evaluator handles directly. Teal color, inline slider, don't switch preview. Four types: Float, Integer, Toggle, Gamut. | Day 6 |
 | 39 | CPU analysis → GPU reduction for Image Statistics | Moved from pixel shader (512K redundant reads) to CPU readback (exact, single pass) to D3D11 compute (GPU-resident, 32-byte readback). | Day 6 |
+| 40 | dc->Flush() for D2D→D3D11 texture handoff | D2D batches DrawImage commands until EndDraw/Flush. When rendering to a bitmap then reading it with D3D11 compute, Flush() must be called between DrawImage and D3D11 dispatch — otherwise D3D11 reads zeros from the uninitialized texture. Applied in both ComputeImageStatistics and DispatchUserD3D11Compute. | Day 7 |
 
 ---
 
@@ -779,8 +780,9 @@ flowchart TD
 
     subgraph Realize["Realize to D3D11 Texture"]
         CACHE --> CREATE["dc->CreateBitmap()<br/>DXGI_FORMAT_R32G32B32A32_FLOAT"]
-        CREATE --> DRAW["dc->BeginDraw()<br/>dc->DrawImage(cachedOutput)<br/>dc->EndDraw()"]
-        DRAW --> SURFACE["bitmap->GetSurface()<br/>→ IDXGISurface"]
+        CREATE --> DRAW["dc->SetTarget(bitmap)<br/>dc->DrawImage(cachedOutput)<br/>dc->SetTarget(prev)"]
+        DRAW --> FLUSH["dc->Flush()<br/>⚠ Required — D2D batches<br/>commands until Flush/EndDraw"]
+        FLUSH --> SURFACE["bitmap->GetSurface()<br/>→ IDXGISurface"]
         SURFACE --> QI["surface->QueryInterface()<br/>→ ID3D11Texture2D"]
     end
 
@@ -859,33 +861,40 @@ printf("Min=%.4f Max=%.4f Mean=%.4f Samples=%u Nonzero=%.1f%%\n",
     100.f * result.nonzeroPixels / result.totalPixels);
 ```
 
-The lazy path (`GetStatistics` with cached dc) internally calls `effect->GetOutput()`, renders to an FP32 bitmap, dispatches the D3D11 compute shader, and caches the results. **`GetStatistics` must be called between `BeginDraw` and `EndDraw`** — D2D's deferred `ID2D1Image*` from `GetOutput()` only materializes to real pixels during an active draw session. Subsequent calls return cached results until the next `DrawImage` invalidates them via `PrepareForRender`.
+The lazy path (`GetStatistics` with cached dc) internally calls `effect->GetOutput()`, renders to an FP32 bitmap, **flushes the D2D command batch** (`dc->Flush()`), then dispatches the D3D11 compute shader and caches the results. **`GetStatistics` must be called between `BeginDraw` and `EndDraw`** — D2D's deferred `ID2D1Image*` from `GetOutput()` only materializes to real pixels during an active draw session. The explicit Flush ensures D2D has completed rendering before D3D11 reads the texture. Subsequent calls return cached results until the next `DrawImage` invalidates them via `PrepareForRender`.
 
 For callers who prefer explicit control, `ComputeStatistics(dc, image)` and `ComputeFromTexture(texture)` are also available.
 
 ### Usage: ShaderLab Evaluator (Optimized Path)
 
 ```cpp
-// In GraphEvaluator::Evaluate(), for D3D11ComputeShader nodes:
+// In GraphEvaluator::ProcessDeferredCompute(), for D3D11ComputeShader nodes:
 
 // 1. Render upstream D2D output to FP32 bitmap
 winrt::com_ptr<ID2D1Bitmap1> gpuTarget;
 dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, fp32Props, gpuTarget.put());
+winrt::com_ptr<ID2D1Image> prevTarget;
+dc->GetTarget(prevTarget.put());
 dc->SetTarget(gpuTarget.get());
-dc->BeginDraw();
+dc->Clear(D2D1::ColorF(0, 0, 0, 0));
 dc->DrawImage(upstreamNode->cachedOutput);
-dc->EndDraw();
+dc->SetTarget(prevTarget.get());
 
-// 2. Get D3D11 texture (zero-copy — same DXGI surface)
+// 2. Flush D2D command batch — CRITICAL for D2D→D3D11 handoff.
+//    D2D batches DrawImage commands until EndDraw() or Flush().
+//    Without this, D3D11 reads uninitialized zeros from the texture.
+dc->Flush();
+
+// 3. Get D3D11 texture (zero-copy — same DXGI surface)
 winrt::com_ptr<IDXGISurface> surface;
 gpuTarget->GetSurface(surface.put());
 winrt::com_ptr<ID3D11Texture2D> d3dTexture;
 surface->QueryInterface(d3dTexture.put());
 
-// 3. Dispatch GPU reduction (single call)
+// 4. Dispatch GPU reduction (single call)
 auto stats = m_gpuReduction.Reduce(d3dCtx, d3dTexture.get(), channel, nonzeroOnly);
 
-// 4. Populate analysis output for graph data pins
+// 5. Populate analysis output for graph data pins
 node->analysisOutput.fields = { {"Min", stats.min}, {"Max", stats.max}, ... };
 ```
 
@@ -949,6 +958,7 @@ void main(uint3 GTid : SV_GroupThreadID) {
 
 ### Known Limitations
 
+- **D2D→D3D11 flush required**: When rendering a D2D effect chain to a bitmap and then reading it with D3D11, `dc->Flush()` **must** be called between `DrawImage` and any D3D11 access to the underlying texture. D2D batches draw commands until `EndDraw()` or `Flush()` — without an explicit flush, D3D11 reads zeros from the texture. This applies to both `ComputeImageStatistics` and `DispatchUserD3D11Compute` in `GraphEvaluator`.
 - **D2D draw session required**: `ComputeStatistics(dc, image)` must be called with a dc that has an active D2D draw session (between `BeginDraw`/`EndDraw`) for chained effects to render correctly. D2D's deferred `ID2D1Image*` from `GetOutput()` only materializes to pixels during an active draw session. In ShaderLab, `ProcessDeferredCompute` runs inside the main `BeginDraw`/`EndDraw` pass.
 - **No shader linking**: D3D11 compute shaders are opaque to D2D. They don't participate in D2D's shader linking optimization for chained pixel shader effects.
 - **Device sharing**: The D3D11 device must be the same one backing D2D. The effect acquires it lazily via `ID2D1Device2::GetDxgiDevice()` on first `ComputeStatistics` call.
