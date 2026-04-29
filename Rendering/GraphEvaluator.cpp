@@ -1214,10 +1214,15 @@ namespace ShaderLab::Rendering
 
         winrt::com_ptr<ID2D1Image> prevTarget;
         dc->GetTarget(prevTarget.put());
+
+        // Render the upstream D2D chain to our GPU bitmap.
         dc->SetTarget(gpuTarget.get());
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
         dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
         dc->SetTarget(prevTarget.get());
+
+        // Flush D2D command batch so the bitmap is populated before D3D11 reads it.
+        dc->Flush();
 
         // Get D3D11 texture from bitmap.
         winrt::com_ptr<IDXGISurface> surface;
@@ -1371,10 +1376,17 @@ namespace ShaderLab::Rendering
 
         winrt::com_ptr<ID2D1Image> prevTarget;
         dc->GetTarget(prevTarget.put());
+
+        // Render the upstream D2D chain to our GPU bitmap.
         dc->SetTarget(gpuTarget.get());
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
         dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
         dc->SetTarget(prevTarget.get());
+
+        // Flush D2D command batch so the bitmap is populated before D3D11 reads it.
+        // Without this, D2D lazily defers the DrawImage until EndDraw/Flush,
+        // and the D3D11 compute dispatch reads zeros from the texture.
+        dc->Flush();
 
         // Get the underlying D3D11 texture from the D2D bitmap.
         winrt::com_ptr<IDXGISurface> surface;
@@ -1442,3 +1454,4 @@ namespace ShaderLab::Rendering
         addField(L"Nonzero%", vNonzero);
     }
 }
+
