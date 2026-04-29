@@ -2240,6 +2240,71 @@ float4 main(
             m_effects.push_back(std::move(desc));
         }
 
+        // ---- Split Comparison ----
+        {
+            static const std::string splitCompareHLSL = R"HLSL(
+// Split Comparison — side-by-side wipe between two inputs.
+// SplitPosition [0..1]: 0 = full Image B, 1 = full Image A.
+// A thin dividing line is drawn at the split boundary.
+
+Texture2D ImageA : register(t0);
+Texture2D ImageB : register(t1);
+
+cbuffer Constants : register(b0)
+{
+    float SplitPosition;
+    float LineWidth;
+    float Orientation;
+};
+
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    float4 a = ImageA.Load(int3(uv0.xy, 0));
+    float4 b = ImageB.Load(int3(uv0.xy, 0));
+
+    uint w, h;
+    ImageA.GetDimensions(w, h);
+
+    float coord = uv0.x;
+    float size = float(w);
+    if (Orientation > 0.5)
+    {
+        coord = uv0.y;
+        size = float(h);
+    }
+
+    float splitPx = SplitPosition * size;
+    float dist = abs(coord - splitPx);
+
+    // Dividing line.
+    float halfLine = max(LineWidth * 0.5, 0.5);
+    if (dist < halfLine)
+        return float4(1, 1, 1, 1);
+
+    // Left/top = Image A, right/bottom = Image B.
+    if (coord < splitPx)
+        return a;
+    return b;
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Split Comparison";
+            desc.effectId = L"Split Comparison"; desc.effectVersion = 1;
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + splitCompareHLSL;
+            desc.inputNames = { L"ImageA", L"ImageB" };
+            desc.parameters = {
+                { L"SplitPosition", L"float", 0.5f, 0.0f, 1.0f, 0.01f },
+                { L"LineWidth",     L"float", 2.0f, 0.0f, 10.0f, 0.5f },
+                { L"Orientation",   L"float", 0.0f, 0.0f, 1.0f, 1.0f, { L"Horizontal", L"Vertical" } },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
         // ---- Image Statistics ----
         // D3D11 compute shader with stride-based reduction + 256-bin histogram.
         // Built-in path uses GpuReduction (RWBuffer<uint>); user-modified path

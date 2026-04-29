@@ -104,11 +104,16 @@ namespace ShaderLab::Rendering
                         auto* srcNode = graph.FindNode(inputs[0]->sourceNodeId);
                         if (srcNode) inputImage = srcNode->cachedOutput;
                     }
-                    if (inputImage && node->dirty)
+                    // Queue dispatch if input is available and we need (re)computation.
+                    // Triggers on: first eval (no analysis output yet), property change
+                    // (dirty), or upstream change (dirty propagated).
+                    bool needsCompute = node->dirty ||
+                        node->analysisOutput.fields.empty();
+                    if (inputImage && needsCompute)
                     {
                         m_deferredCompute.push_back({ nodeId, inputImage });
                     }
-                    // Always clear dirty — ProcessDeferredCompute handles the dispatch.
+                    // Clear dirty — dispatch handles re-computation.
                     node->dirty = false;
                     node->cachedOutput = nullptr;
                     break;
