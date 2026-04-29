@@ -6,6 +6,42 @@ A WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging
 
 ---
 
+## Table of Contents
+
+- [Architecture Overview](#architecture-overview)
+- [Pipeline Format Strategy](#pipeline-format-strategy)
+- [Effect Graph Model](#effect-graph-model)
+- [Display Monitoring](#display-monitoring)
+- [Display Profile Mocking](#display-profile-mocking)
+- [Topological Evaluation](#topological-evaluation)
+- [ShaderLab Built-in Effects](#shaderlab-built-in-effects)
+- [Compute Shader Analysis Pipeline](#compute-shader-analysis-pipeline)
+- [D2D / D3D11 Hybrid Compute System](#d2d--d3d11-hybrid-compute-system)
+  - [Problem](#problem)
+  - [COM Class Hierarchy](#com-class-hierarchy)
+  - [Data Flow](#data-flow-d2d--d3d11-handoff)
+  - [Three Effect Types Compared](#three-effect-types-compared)
+  - [Usage: Standalone D2D Application](#usage-standalone-d2d-application)
+  - [Usage: ShaderLab Evaluator](#usage-shaderlab-evaluator-optimized-path)
+  - [GPU Reduction Shader Pattern](#gpu-reduction-shader-pattern)
+  - [Known Limitations](#known-limitations)
+- [Multi-Output Windows](#multi-output-windows)
+- [Animation System](#animation-system)
+- [Parameter Nodes](#parameter-nodes)
+- [Effect Versioning System](#effect-versioning-system)
+- [Conditional Parameter Visibility](#conditional-parameter-visibility)
+- [Working Space Integration](#working-space-integration)
+- [Image Statistics Effect](#image-statistics-effect)
+- [Copy / Paste Nodes](#copy--paste-nodes)
+- [Auto-Arrange](#auto-arrange)
+- [Node Graph Visual Enhancements](#node-graph-visual-enhancements)
+- [MCP Server (AI Agent Integration)](#mcp-server-ai-agent-integration)
+- [Build Instructions](#build-instructions)
+- [Project Structure](#project-structure)
+- [Decision Log](#decision-log)
+
+---
+
 ## Architecture Overview
 
 ```mermaid
@@ -774,35 +810,31 @@ flowchart TD
 // Register at startup (once)
 StatisticsEffect::RegisterEffect(d2dFactory1.get());
 
-// Create effect in your D2D pipeline
+// Create effect and configure (once)
 winrt::com_ptr<ID2D1Effect> effect;
 dc->CreateEffect(StatisticsEffect::CLSID_StatisticsEffect, effect.put());
 
-// Wire into your existing D2D graph
-effect->SetInput(0, someUpstreamImage);
-
-// Render normally — pass-through pixel shader copies input to output
-dc->DrawImage(effect.get());
-
-// Query the custom interface for analysis results
 winrt::com_ptr<ID2D1StatisticsEffect> stats;
 effect->QueryInterface(IID_ID2D1StatisticsEffect, stats.put_void());
-stats->SetChannel(0);        // 0=luminance, 1=R, 2=G, 3=B, 4=A
+stats->SetDeviceContext(dc, effect.get());  // weak cache — dc must outlive effect
+stats->SetChannel(0);         // 0=luminance, 1=R, 2=G, 3=B, 4=A
 stats->SetNonzeroOnly(TRUE);  // exclude zero pixels
 
-// Trigger D3D11 compute dispatch
-// (pass the effect's output image — it's the same as the input since pass-through)
-winrt::com_ptr<ID2D1Image> output;
-effect->GetOutput(output.put());
-stats->ComputeStatistics(dc, output.get());
+// Per-frame: wire into your existing D2D pipeline
+effect->SetInput(0, someUpstreamImage);
+dc->DrawImage(effect.get());  // pass-through: output == input
 
-// Read results
+// Get results — lazy compute triggers automatically when stale
 Rendering::ImageStats result;
 stats->GetStatistics(&result);
 printf("Min=%.4f Max=%.4f Mean=%.4f Samples=%u Nonzero=%.1f%%\n",
     result.min, result.max, result.mean, result.samples,
     100.f * result.nonzeroPixels / result.totalPixels);
 ```
+
+The lazy path (`GetStatistics` with cached dc) internally calls `effect->GetOutput()`, renders to an FP32 bitmap, dispatches the D3D11 compute shader, and caches the results. Subsequent calls return cached results until the next `DrawImage` invalidates them via `PrepareForRender`.
+
+For callers who prefer explicit control, `ComputeStatistics(dc, image)` and `ComputeFromTexture(texture)` are also available.
 
 ### Usage: ShaderLab Evaluator (Optimized Path)
 
