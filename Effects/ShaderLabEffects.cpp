@@ -545,32 +545,67 @@ cbuffer constants : register(b0) {
     float MonBlueY_hidden;
 };
 
-// CIE 1931 2-degree observer spectral locus (sampled at 5nm intervals, 380-700nm)
-// Stored as xy pairs. Approximate with a polynomial for GPU efficiency.
-float2 SpectralLocusXY(float nm) {
-    // Attempt to sample across the spectral locus approximately
-    float t = saturate((nm - 380.0) / 320.0);
-    // x coordinate along the locus
-    float x = 0.17 + t * (0.73 - 0.17);
-    if (t < 0.3) x = 0.17 + t * 2.0 * 0.1;
-    // This is a rough approximation - the real locus is complex
-    // Use parametric curves fitted to CIE 1931 data:
-    float x2 = t * t;
-    float x3 = x2 * t;
-    x = 0.17 + 0.24*t + 1.67*x2 - 2.48*x3 + 1.04*x2*x2;
-    float y = 0.005 + 2.4*t - 6.3*x2 + 8.1*x3 - 3.8*x2*x2;
-    y = max(y, 0.005);
-    return float2(saturate(x), saturate(y));
-}
+// CIE 1931 2-degree observer spectral locus (sampled at 10nm, 380-700nm)
+// 33 xy pairs forming the horseshoe boundary.
+static const float2 LOCUS[] = {
+    float2(0.1741, 0.0050), // 380nm
+    float2(0.1740, 0.0050), // 390nm
+    float2(0.1714, 0.0049), // 400nm
+    float2(0.1644, 0.0051), // 410nm
+    float2(0.1566, 0.0177), // 420nm
+    float2(0.1440, 0.0297), // 430nm
+    float2(0.1241, 0.0578), // 440nm
+    float2(0.0913, 0.1327), // 450nm
+    float2(0.0687, 0.2007), // 460nm
+    float2(0.0454, 0.2950), // 470nm
+    float2(0.0235, 0.4127), // 480nm
+    float2(0.0082, 0.5384), // 490nm
+    float2(0.0039, 0.6548), // 500nm
+    float2(0.0139, 0.7502), // 510nm
+    float2(0.0743, 0.8338), // 520nm
+    float2(0.1547, 0.8059), // 530nm
+    float2(0.2296, 0.7543), // 540nm
+    float2(0.3016, 0.6923), // 550nm
+    float2(0.3731, 0.6245), // 560nm
+    float2(0.4441, 0.5547), // 570nm
+    float2(0.5125, 0.4866), // 580nm
+    float2(0.5752, 0.4242), // 590nm
+    float2(0.6270, 0.3725), // 600nm
+    float2(0.6658, 0.3340), // 610nm
+    float2(0.6915, 0.3083), // 620nm
+    float2(0.7079, 0.2920), // 630nm
+    float2(0.7190, 0.2809), // 640nm
+    float2(0.7260, 0.2740), // 650nm
+    float2(0.7300, 0.2700), // 660nm
+    float2(0.7320, 0.2680), // 670nm
+    float2(0.7334, 0.2666), // 680nm
+    float2(0.7340, 0.2660), // 690nm
+    float2(0.7347, 0.2653), // 700nm
+};
+#define LOCUS_COUNT 33
 
-// Check if xy coordinate is inside the visible gamut (approximate)
-bool IsVisibleGamut(float2 xy) {
-    // Very rough test: inside the horseshoe
-    if (xy.x < 0.0 || xy.y < 0.0 || xy.x + xy.y > 1.0) return false;
-    if (xy.y < 0.01) return false;
-    // Simple bounding: above the purple line and below the locus
-    float purpleY = lerp(0.005, 0.33, (xy.x - 0.17) / (0.73 - 0.17));
-    return xy.y > purpleY * 0.3;
+// Winding-number test: is point p inside the closed spectral locus + purple line?
+bool IsInsideLocus(float2 p) {
+    int winding = 0;
+    // Test against spectral locus segments
+    for (int i = 0; i < LOCUS_COUNT; i++) {
+        float2 a = LOCUS[i];
+        float2 b = LOCUS[(i + 1) % LOCUS_COUNT];
+        // For the last point, close with purple line back to first
+        if (i == LOCUS_COUNT - 1) b = LOCUS[0];
+        if (a.y <= p.y) {
+            if (b.y > p.y) {
+                float cross = (b.x - a.x) * (p.y - a.y) - (p.x - a.x) * (b.y - a.y);
+                if (cross > 0) winding++;
+            }
+        } else {
+            if (b.y <= p.y) {
+                float cross = (b.x - a.x) * (p.y - a.y) - (p.x - a.x) * (b.y - a.y);
+                if (cross < 0) winding--;
+            }
+        }
+    }
+    return winding != 0;
 }
 
 // Draw gamut triangle outline
@@ -605,14 +640,14 @@ float4 main(
     float4 result = float4(0.0, 0.0, 0.0, 1.0); // black background
 
     // Render the visible gamut region with approximate spectral colors
-    float3 xyY = float3(xy.x, xy.y, 0.5);
-    float3 xyz = xyYToXYZ(xyY);
-    float3 rgb = XYZToScRGB(xyz);
-    // Normalize to visible range - dim for HDR compatibility
-    float maxC = max(max(rgb.r, rgb.g), max(rgb.b, 0.001));
-    rgb = rgb / maxC * 0.15 * Brightness;
-
-    if (rgb.r >= -0.01 && rgb.g >= -0.01 && rgb.b >= -0.01 && xy.y > 0.01) {
+    if (IsInsideLocus(xy)) {
+        float3 xyY = float3(xy.x, xy.y, 0.5);
+        float3 xyz = xyYToXYZ(xyY);
+        float3 rgb = XYZToScRGB(xyz);
+        // Normalize brightness, clamp negatives to show the full visible gamut
+        // (not just Rec.709). Out-of-709 colors are desaturated toward white.
+        float maxC = max(max(abs(rgb.r), abs(rgb.g)), max(abs(rgb.b), 0.001));
+        rgb = rgb / maxC * 0.15 * Brightness;
         rgb = max(rgb, 0.0);
         result.rgb = rgb;
     }
@@ -679,7 +714,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"CIE Chromaticity Plot";
-            desc.effectId = L"CIE Chromaticity Plot"; desc.effectVersion = 1;
+            desc.effectId = L"CIE Chromaticity Plot"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + ciePlotHLSL;
