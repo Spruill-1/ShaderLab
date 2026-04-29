@@ -95,10 +95,8 @@ namespace ShaderLab::Rendering
             {
                 // D3D11 Compute Shader: evaluator-owned dispatch via StatisticsEffect.
                 if (node->customEffect.has_value() &&
-                    node->customEffect->shaderType == CustomShaderType::D3D11ComputeShader &&
-                    node->dirty)
+                    node->customEffect->shaderType == CustomShaderType::D3D11ComputeShader)
                 {
-                    // Find the upstream input image.
                     auto inputs = graph.GetInputEdges(nodeId);
                     ID2D1Image* inputImage = nullptr;
                     if (!inputs.empty())
@@ -106,9 +104,20 @@ namespace ShaderLab::Rendering
                         auto* srcNode = graph.FindNode(inputs[0]->sourceNodeId);
                         if (srcNode) inputImage = srcNode->cachedOutput;
                     }
-                    if (inputImage)
+                    if (inputImage && node->dirty)
+                    {
                         ComputeImageStatistics(dc, *node, inputImage);
-                    node->dirty = false;
+                        node->dirty = false;
+                    }
+                    else if (!inputImage)
+                    {
+                        // Upstream not ready yet — stay dirty for next pass.
+                    }
+                    else
+                    {
+                        node->dirty = false;
+                    }
+                    node->cachedOutput = nullptr;
                     break;
                 }
 
