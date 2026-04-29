@@ -683,27 +683,30 @@ float4 main(
     uint srcW, srcH;
     Source.GetDimensions(srcW, srcH);
     if (srcW > 0 && srcH > 0) {
-        float bestDist = 1e10;
-        float3 bestColor = float3(0,0,0);
+        // Subsample the source image on a grid and scatter to diagram.
+        // Use squared distance to avoid sqrt, smaller dots for performance.
+        uint stepX = max(1, srcW / 128);
+        uint stepY = max(1, srcH / 128);
+        float dotRadius = 0.004;
+        float dotRadiusSq = dotRadius * dotRadius;
+        float hitAccum = 0.0;
 
-        uint stepX = max(1, srcW / 64);
-        uint stepY = max(1, srcH / 64);
         for (uint sy = 0; sy < srcH; sy += stepY) {
             for (uint sx = 0; sx < srcW; sx += stepX) {
                 float4 srcPix = Source.Load(int3(sx, sy, 0));
                 if (srcPix.a < 0.001) continue;
                 float3 pxyz = ScRGBToXYZ(srcPix.rgb);
                 float2 pxy = XYZToxyY(pxyz).xy;
-                float d = length(pxy - xy);
-                if (d < bestDist) {
-                    bestDist = d;
-                    bestColor = srcPix.rgb;
+                float2 delta = pxy - xy;
+                float dSq = dot(delta, delta);
+                if (dSq < dotRadiusSq) {
+                    hitAccum += saturate(1.0 - dSq / dotRadiusSq);
                 }
             }
         }
 
-        if (bestDist < 0.01) {
-            float intensity = saturate(1.0 - bestDist / 0.01) * Brightness * 0.4;
+        if (hitAccum > 0.0) {
+            float intensity = saturate(hitAccum * 0.5) * Brightness * 0.3;
             result.rgb += intensity * float3(1, 1, 1);
         }
     }
@@ -714,7 +717,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"CIE Chromaticity Plot";
-            desc.effectId = L"CIE Chromaticity Plot"; desc.effectVersion = 2;
+            desc.effectId = L"CIE Chromaticity Plot"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + ciePlotHLSL;
