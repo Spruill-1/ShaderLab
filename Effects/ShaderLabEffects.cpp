@@ -1964,8 +1964,10 @@ float2 CompressNeutral(float2 p, float2 poly[NBP])
         if (t > 0.0 && u >= 0.0 && u <= 1.0 && t < bestT)
             bestT = t;
     }
-    // Clamp: don't overshoot past neutral
-    return (bestT < 1.0) ? p + dir * bestT : float2(0, 0);
+    if (bestT < 1.0)
+        return p + dir * bestT;
+    // Fallback: if ray missed all edges (precision), use nearest point.
+    return NearestOnPoly(p, poly);
 }
 
 // Compute uniform ICtCp scale factor: for each source boundary vertex,
