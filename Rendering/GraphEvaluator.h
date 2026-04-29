@@ -95,6 +95,12 @@ namespace ShaderLab::Rendering
             ID2D1DeviceContext5* dc,
             Graph::EffectNode& node);
 
+        // CPU-side image statistics: render input to bitmap, read back, compute stats.
+        void ComputeImageStatistics(
+            ID2D1DeviceContext5* dc,
+            Graph::EffectNode& node,
+            ID2D1Image* inputImage);
+
         // Temp target for forcing effect computation.
         winrt::com_ptr<ID2D1Bitmap1> m_analysisTarget;
         uint32_t m_analysisTargetW{ 0 };

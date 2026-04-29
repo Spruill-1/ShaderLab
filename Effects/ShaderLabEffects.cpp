@@ -2241,96 +2241,18 @@ float4 main(
         }
 
         // ---- Image Statistics ----
-        // Pixel shader that scans the input. Each row-0 pixel independently
-        // computes stats. OutputSize kept small (8) to limit redundant work.
-        // TODO: convert to CPU readback for optimal performance.
+        // CPU-side analysis: evaluator renders input to bitmap, reads back,
+        // computes stats in a single C++ loop. No shader needed.
         {
-            static const std::string imageStatsHLSL = R"HLSL(
-// Image Statistics - computes min, max, mean of input pixel values.
-
-cbuffer Constants : register(b0)
-{
-    float OutputSize;
-    float Channel;      // 0=Luminance, 1=R, 2=G, 3=B, 4=Alpha
-    float NonzeroOnly;  // 0=All pixels, 1=Nonzero only
-};
-
-Texture2D InputTexture : register(t0);
-SamplerState InputSampler : register(s0);
-
-float GetChannel(float4 pix, uint ch) {
-    float result = dot(pix.rgb, float3(0.2126, 0.7152, 0.0722));
-    if (ch == 1) result = pix.r;
-    else if (ch == 2) result = pix.g;
-    else if (ch == 3) result = pix.b;
-    else if (ch == 4) result = pix.a;
-    return result;
-}
-
-float4 main(
-    float4 pos : SV_POSITION, float4 ps : SCENE_POSITION, float4 uv0 : TEXCOORD0
-) : SV_Target
-{
-    float2 outPx = pos.xy;
-    if (outPx.y >= 1.0)
-        return float4(0, 0, 0, 1);
-
-    float2 dims;
-    InputTexture.GetDimensions(dims.x, dims.y);
-    uint ch = (uint)Channel;
-
-    float vMin = 1e10;
-    float vMax = -1e10;
-    float vSum = 0;
-    uint totalSamples = 0;
-    uint totalScanned = 0;
-    uint nonzeroCount = 0;
-
-    // Sample on a grid — cap at 256x256 for performance.
-    uint sqrtSamples = (uint)min(ceil(sqrt(dims.x * dims.y)), 256.0);
-    float stepX = dims.x / (float)sqrtSamples;
-    float stepY = dims.y / (float)sqrtSamples;
-
-    for (uint sy = 0; sy < sqrtSamples; sy++)
-    {
-        for (uint sx = 0; sx < sqrtSamples; sx++)
-        {
-            float2 suv = float2((sx * stepX + 0.5) / dims.x, (sy * stepY + 0.5) / dims.y);
-            float4 pix = InputTexture.SampleLevel(InputSampler, suv, 0);
-            float v = GetChannel(pix, ch);
-            totalScanned++;
-            bool isNonzero = abs(v) > 0.0001;
-            if (isNonzero) nonzeroCount++;
-            if (NonzeroOnly > 0.5 && !isNonzero) continue;
-            vMin = min(vMin, v);
-            vMax = max(vMax, v);
-            vSum += v;
-            totalSamples++;
-        }
-    }
-
-    float vMean = (totalSamples > 0) ? vSum / (float)totalSamples : 0.0;
-    float vNonzero = (totalScanned > 0) ? (float)nonzeroCount / (float)totalScanned : 0.0;
-
-    if (outPx.x < 1.0) return float4(vMin, 0, 0, 1);
-    if (outPx.x < 2.0) return float4(vMax, 0, 0, 1);
-    if (outPx.x < 3.0) return float4(vMean, 0, 0, 1);
-    if (outPx.x < 4.0) return float4((float)totalSamples, 0, 0, 1);
-    if (outPx.x < 5.0) return float4(vNonzero, 0, 0, 1);
-    return float4(0, 0, 0, 1);
-}
-)HLSL";
-
             ShaderLabEffectDescriptor desc;
             desc.name = L"Image Statistics";
-            desc.effectId = L"Image Statistics"; desc.effectVersion = 4;
+            desc.effectId = L"Image Statistics"; desc.effectVersion = 5;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
-            desc.hlslSource = colorMath + imageStatsHLSL;
+            // No HLSL — evaluator handles this via CPU readback.
             desc.dataOnly = true;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"OutputSize",   L"float", 8.0f, 8.0f, 64.0f, 8.0f },
                 { L"Channel",     L"float", 0.0f, 0.0f, 4.0f, 1.0f, { L"Luminance", L"Red", L"Green", L"Blue", L"Alpha" } },
                 { L"NonzeroOnly", L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"All Pixels", L"Nonzero Only" } },
             };

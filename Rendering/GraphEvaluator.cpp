@@ -92,6 +92,25 @@ namespace ShaderLab::Rendering
             case NodeType::PixelShader:
             case NodeType::ComputeShader:
             {
+                // Image Statistics: CPU-side analysis (no shader needed).
+                if (node->customEffect.has_value() &&
+                    node->customEffect->shaderLabEffectId == L"Image Statistics" &&
+                    node->dirty)
+                {
+                    // Find the upstream input image.
+                    auto inputs = graph.GetInputEdges(nodeId);
+                    ID2D1Image* inputImage = nullptr;
+                    if (!inputs.empty())
+                    {
+                        auto* srcNode = graph.FindNode(inputs[0]->sourceNodeId);
+                        if (srcNode) inputImage = srcNode->cachedOutput;
+                    }
+                    if (inputImage)
+                        ComputeImageStatistics(dc, *node, inputImage);
+                    node->dirty = false;
+                    break;
+                }
+
                 // Parameter nodes: no HLSL, just expose property values as analysis output.
                 if (node->customEffect.has_value() &&
                     node->customEffect->hlslSource.empty() &&
@@ -1112,5 +1131,133 @@ namespace ShaderLab::Rendering
         }
 
         cpuBitmap->Unmap();
+    }
+
+    // -----------------------------------------------------------------------
+    // CPU-side image statistics
+    // -----------------------------------------------------------------------
+
+    void GraphEvaluator::ComputeImageStatistics(
+        ID2D1DeviceContext5* dc,
+        EffectNode& node,
+        ID2D1Image* inputImage)
+    {
+        if (!dc || !inputImage) return;
+
+        // Get input image bounds.
+        D2D1_RECT_F bounds{};
+        dc->GetImageLocalBounds(inputImage, &bounds);
+        uint32_t w = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
+        uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
+        if (w == 0 || h == 0) return;
+
+        // Render input to a GPU target bitmap.
+        winrt::com_ptr<ID2D1Bitmap1> gpuTarget;
+        D2D1_BITMAP_PROPERTIES1 gpuProps = {};
+        gpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+        gpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+        HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, gpuProps, gpuTarget.put());
+        if (FAILED(hr)) return;
+
+        winrt::com_ptr<ID2D1Image> prevTarget;
+        dc->GetTarget(prevTarget.put());
+        dc->SetTarget(gpuTarget.get());
+        dc->BeginDraw();
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
+        dc->EndDraw();
+        dc->SetTarget(prevTarget.get());
+
+        // Create CPU-readable bitmap and copy.
+        winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
+        D2D1_BITMAP_PROPERTIES1 cpuProps = {};
+        cpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+        cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+        hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, cpuProps, cpuBitmap.put());
+        if (FAILED(hr)) return;
+
+        D2D1_POINT_2U dest = { 0, 0 };
+        D2D1_RECT_U srcRect = { 0, 0, w, h };
+        hr = cpuBitmap->CopyFromBitmap(&dest, gpuTarget.get(), &srcRect);
+        if (FAILED(hr)) return;
+
+        D2D1_MAPPED_RECT mapped{};
+        hr = cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped);
+        if (FAILED(hr)) return;
+
+        // Read channel selection from properties.
+        uint32_t channel = 0;
+        {
+            auto it = node.properties.find(L"Channel");
+            if (it != node.properties.end())
+                if (auto* f = std::get_if<float>(&it->second)) channel = static_cast<uint32_t>(*f);
+        }
+        bool nonzeroOnly = true;
+        {
+            auto it = node.properties.find(L"NonzeroOnly");
+            if (it != node.properties.end())
+                if (auto* f = std::get_if<float>(&it->second)) nonzeroOnly = *f > 0.5f;
+        }
+
+        // Single-pass scan over all pixels.
+        float vMin = 1e30f, vMax = -1e30f, vSum = 0;
+        uint64_t totalSamples = 0, totalScanned = 0, nonzeroCount = 0;
+
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            const float* row = reinterpret_cast<const float*>(
+                reinterpret_cast<const uint8_t*>(mapped.bits) + y * mapped.pitch);
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                float r = row[x * 4 + 0];
+                float g = row[x * 4 + 1];
+                float b = row[x * 4 + 2];
+                float a = row[x * 4 + 3];
+
+                float v = 0;
+                switch (channel)
+                {
+                case 1: v = r; break;
+                case 2: v = g; break;
+                case 3: v = b; break;
+                case 4: v = a; break;
+                default: v = 0.2126f * r + 0.7152f * g + 0.0722f * b; break;
+                }
+
+                totalScanned++;
+                bool isNonzero = std::abs(v) > 0.0001f;
+                if (isNonzero) nonzeroCount++;
+                if (nonzeroOnly && !isNonzero) continue;
+
+                vMin = (std::min)(vMin, v);
+                vMax = (std::max)(vMax, v);
+                vSum += v;
+                totalSamples++;
+            }
+        }
+
+        cpuBitmap->Unmap();
+
+        float vMean = (totalSamples > 0) ? vSum / static_cast<float>(totalSamples) : 0.0f;
+        float vNonzero = (totalScanned > 0) ? static_cast<float>(nonzeroCount) / static_cast<float>(totalScanned) : 0.0f;
+        if (totalSamples == 0) { vMin = 0; vMax = 0; }
+
+        // Populate analysis output.
+        node.analysisOutput.type = AnalysisOutputType::Typed;
+        node.analysisOutput.fields.clear();
+
+        auto addField = [&](const std::wstring& name, float value) {
+            AnalysisFieldValue fv;
+            fv.name = name;
+            fv.type = AnalysisFieldType::Float;
+            fv.components[0] = value;
+            node.analysisOutput.fields.push_back(std::move(fv));
+        };
+
+        addField(L"Min", vMin);
+        addField(L"Max", vMax);
+        addField(L"Mean", vMean);
+        addField(L"Samples", static_cast<float>(totalSamples));
+        addField(L"Nonzero%", vNonzero);
     }
 }
