@@ -29,6 +29,11 @@ namespace ShaderLab::Rendering
         // Returns nullptr if the graph is empty or has no Output node.
         ID2D1Image* Evaluate(Graph::EffectGraph& graph, ID2D1DeviceContext5* dc);
 
+        // Run deferred D3D11 compute dispatches for statistics nodes.
+        // Call AFTER Evaluate (and double-eval) when all D2D effects are initialized.
+        // The dc should be in a valid state (not inside BeginDraw/EndDraw).
+        void ProcessDeferredCompute(Graph::EffectGraph& graph, ID2D1DeviceContext5* dc);
+
         // Release all cached D2D effects (e.g., on device lost or graph clear).
         void ReleaseCache();
 
@@ -120,5 +125,12 @@ namespace ShaderLab::Rendering
 
         // GPU compute shader reduction for image statistics.
         GpuReduction m_gpuReduction;
+
+        // Deferred D3D11 compute dispatches (node ID + upstream image).
+        struct DeferredCompute {
+            uint32_t nodeId;
+            ID2D1Image* inputImage;  // non-owning, valid until next Evaluate
+        };
+        std::vector<DeferredCompute> m_deferredCompute;
     };
 }

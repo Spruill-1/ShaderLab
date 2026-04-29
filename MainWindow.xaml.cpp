@@ -4722,6 +4722,10 @@ namespace winrt::ShaderLab::implementation
         if (!drawDc)
             return;
 
+        // Process deferred D3D11 compute dispatches inside the active D2D
+        // draw session, where all effect chains are fully materialized.
+        m_graphEvaluator.ProcessDeferredCompute(m_graph, drawDc);
+
         // Set DPI to 96 so D2D coordinates match WinUI DIPs exactly.
         // The XAML compositor handles physical pixel scaling.
         // This ensures the preview transform, crosshair overlay, and pixel

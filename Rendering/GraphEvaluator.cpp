@@ -93,7 +93,7 @@ namespace ShaderLab::Rendering
             case NodeType::PixelShader:
             case NodeType::ComputeShader:
             {
-                // D3D11 Compute Shader: evaluator-owned dispatch via StatisticsEffect.
+                // D3D11 Compute Shader: defer dispatch until after all D2D effects are initialized.
                 if (node->customEffect.has_value() &&
                     node->customEffect->shaderType == CustomShaderType::D3D11ComputeShader)
                 {
@@ -106,17 +106,10 @@ namespace ShaderLab::Rendering
                     }
                     if (inputImage && node->dirty)
                     {
-                        ComputeImageStatistics(dc, *node, inputImage);
-                        node->dirty = false;
+                        m_deferredCompute.push_back({ nodeId, inputImage });
                     }
-                    else if (!inputImage)
-                    {
-                        // Upstream not ready yet — stay dirty for next pass.
-                    }
-                    else
-                    {
-                        node->dirty = false;
-                    }
+                    // Always clear dirty — ProcessDeferredCompute handles the dispatch.
+                    node->dirty = false;
                     node->cachedOutput = nullptr;
                     break;
                 }
@@ -302,6 +295,23 @@ namespace ShaderLab::Rendering
         }
 
         return finalOutput;
+    }
+
+    void GraphEvaluator::ProcessDeferredCompute(
+        EffectGraph& graph, ID2D1DeviceContext5* dc)
+    {
+        if (m_deferredCompute.empty() || !dc) return;
+
+        for (auto& deferred : m_deferredCompute)
+        {
+            auto* node = graph.FindNode(deferred.nodeId);
+            if (!node || !deferred.inputImage) continue;
+
+            // Use ComputeImageStatistics which renders the D2D image to a
+            // bitmap and dispatches the GPU reduction.
+            ComputeImageStatistics(dc, *node, deferred.inputImage);
+        }
+        m_deferredCompute.clear();
     }
 
     // -----------------------------------------------------------------------

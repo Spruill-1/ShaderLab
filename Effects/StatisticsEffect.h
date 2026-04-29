@@ -9,33 +9,57 @@ namespace ShaderLab::Effects
     DEFINE_GUID(IID_ID2D1StatisticsEffect,
         0x7a8b9c0d, 0x2345, 0x6789, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89);
 
-    // Custom COM interface for retrieving analysis results from a statistics effect.
-    // Any D2D consumer can QI for this after DrawImage to get reduction results.
+    // Custom COM interface for GPU-accelerated image statistics.
+    //
+    // Drop-in usage for any D2D application:
+    //
+    //   dc->CreateEffect(CLSID_StatisticsEffect, effect.put());
+    //   effect->SetInput(0, anyUpstreamImage);
+    //   dc->DrawImage(effect.get());   // pass-through: output == input
+    //
+    //   winrt::com_ptr<ID2D1StatisticsEffect> stats;
+    //   effect->QueryInterface(IID_ID2D1StatisticsEffect, stats.put_void());
+    //   stats->SetChannel(0);          // 0=luminance, 1=R, 2=G, 3=B, 4=A
+    //   stats->SetNonzeroOnly(TRUE);
+    //
+    //   winrt::com_ptr<ID2D1Image> output;
+    //   effect->GetOutput(output.put());
+    //   stats->ComputeStatistics(dc, output.get());  // self-contained D3D11 dispatch
+    //
+    //   Rendering::ImageStats result;
+    //   stats->GetStatistics(&result);
+    //
     MIDL_INTERFACE("7A8B9C0D-2345-6789-ABCD-EF0123456789")
     ID2D1StatisticsEffect : public IUnknown
     {
-        // Compute statistics on the provided D2D image.
-        // Call after dc->DrawImage(effect) with the effect's output image.
+        // Compute statistics on a D2D image.
+        // Typical usage after DrawImage:
+        //   winrt::com_ptr<ID2D1Image> output;
+        //   effect->GetOutput(output.put());
+        //   stats->ComputeStatistics(dc, output.get());
         STDMETHOD(ComputeStatistics)(ID2D1DeviceContext* dc, ID2D1Image* image) PURE;
 
         // Retrieve the last computed statistics.
         STDMETHOD(GetStatistics)(Rendering::ImageStats* stats) PURE;
 
-        // Set which channel to analyze (0=lum, 1=R, 2=G, 3=B, 4=A).
+        // Set which channel to analyze (0=luminance, 1=R, 2=G, 3=B, 4=A).
         STDMETHOD(SetChannel)(UINT32 channel) PURE;
 
-        // Set whether to exclude zero pixels from min/max/mean.
+        // Set whether to exclude near-zero pixels from min/max/mean.
         STDMETHOD(SetNonzeroOnly)(BOOL nonzeroOnly) PURE;
     };
 
-    // D2D effect implementation that wraps a pass-through pixel shader
-    // with D3D11 compute shader statistics. Works as a standard D2D effect:
-    //   dc->CreateEffect(CLSID_StatisticsEffect, ...)
-    //   effect->SetInput(0, someImage)
-    //   dc->DrawImage(effect)  // pass-through render
-    //   auto impl = effect.as<ID2D1StatisticsEffect>()
-    //   impl->ComputeStatistics(dc)
-    //   ImageStats stats; impl->GetStatistics(&stats)
+    // Self-contained D2D effect with D3D11 compute statistics.
+    //
+    // Works as a standard D2D effect in any existing pipeline. The pixel shader
+    // is a pass-through (output == input). The D3D11 compute dispatch is fully
+    // encapsulated — the effect acquires its own ID3D11Device from the DXGI
+    // device backing D2D during Initialize.
+    //
+    // For hosts that already have the input as an ID3D11Texture2D (e.g.,
+    // ShaderLab's evaluator), ComputeFromTexture() skips the D2D rendering
+    // step for better performance.
+    //
     class StatisticsEffect
         : public ID2D1EffectImpl
         , public ID2D1DrawTransform
@@ -56,8 +80,7 @@ namespace ShaderLab::Effects
         IFACEMETHODIMP_(ULONG) Release() override;
 
         // ---- ID2D1EffectImpl ----
-        IFACEMETHODIMP Initialize(
-            ID2D1EffectContext* effectContext,
+        IFACEMETHODIMP Initialize(ID2D1EffectContext* effectContext,
             ID2D1TransformGraph* transformGraph) override;
         IFACEMETHODIMP PrepareForRender(D2D1_CHANGE_TYPE changeType) override;
         IFACEMETHODIMP SetGraph(ID2D1TransformGraph* transformGraph) override;
@@ -67,21 +90,15 @@ namespace ShaderLab::Effects
 
         // ---- ID2D1Transform ----
         IFACEMETHODIMP MapInputRectsToOutputRect(
-            const D2D1_RECT_L* inputRects,
-            const D2D1_RECT_L* inputOpaqueSubRects,
-            UINT32 inputRectCount,
-            D2D1_RECT_L* outputRect,
+            const D2D1_RECT_L* inputRects, const D2D1_RECT_L* inputOpaqueSubRects,
+            UINT32 inputRectCount, D2D1_RECT_L* outputRect,
             D2D1_RECT_L* outputOpaqueSubRect) override;
         IFACEMETHODIMP MapOutputRectToInputRects(
-            const D2D1_RECT_L* outputRect,
-            D2D1_RECT_L* inputRects,
+            const D2D1_RECT_L* outputRect, D2D1_RECT_L* inputRects,
             UINT32 inputRectCount) const override;
         IFACEMETHODIMP MapInvalidRect(
-            UINT32 inputIndex,
-            D2D1_RECT_L invalidInputRect,
+            UINT32 inputIndex, D2D1_RECT_L invalidInputRect,
             D2D1_RECT_L* invalidOutputRect) const override;
-
-        // ---- ID2D1TransformNode ----
         IFACEMETHODIMP_(UINT32) GetInputCount() const override;
 
         // ---- ID2D1StatisticsEffect ----
@@ -90,11 +107,8 @@ namespace ShaderLab::Effects
         IFACEMETHODIMP SetChannel(UINT32 channel) override;
         IFACEMETHODIMP SetNonzeroOnly(BOOL nonzeroOnly) override;
 
-        // Direct texture path for evaluator (avoids re-rendering).
+        // ---- Optimized path (skips D2D re-render) ----
         HRESULT ComputeFromTexture(ID3D11Texture2D* texture);
-
-        // Set D3D11 device (called by evaluator after effect creation).
-        void SetD3D11Device(ID3D11Device* device, ID3D11DeviceContext* context);
 
     private:
         LONG m_refCount{ 1 };
@@ -102,17 +116,16 @@ namespace ShaderLab::Effects
         winrt::com_ptr<ID2D1DrawInfo> m_drawInfo;
         D2D1_RECT_L m_inputRect{};
 
-        // D3D11 compute resources.
+        // D3D11 resources — acquired from DXGI device in Initialize.
         winrt::com_ptr<ID3D11Device> m_d3dDevice;
         winrt::com_ptr<ID3D11DeviceContext> m_d3dContext;
         Rendering::GpuReduction m_reduction;
 
-        // Analysis settings.
+        // Settings + cached results.
         uint32_t m_channel{ 0 };
         bool m_nonzeroOnly{ true };
         Rendering::ImageStats m_lastStats{};
-
-        // Pass-through pixel shader GUID.
+        bool m_statsValid{ false };
         GUID m_passThroughGuid{};
     };
 }
