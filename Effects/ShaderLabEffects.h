@@ -45,6 +45,10 @@ namespace ShaderLab::Effects
         // Data-only effects have no visible image output pin. They produce
         // analysis output fields but their image output is internal only.
         bool dataOnly{ false };
+
+        // Image-producing compute effects output a texture (not just analysis data).
+        // Creates an output pin so downstream pixel shaders can read the result.
+        bool hasImageOutput{ false };
     };
 
     // Registry of all ShaderLab pre-built effects.

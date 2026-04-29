@@ -521,14 +521,124 @@ float4 main(
 
         // Future effects will be added here as they're implemented.
 
+        // ---- CIE Histogram (D3D11 Compute) ----
+        // Builds a 2D scatter histogram of source image chromaticity in CIE xy space.
+        // Output: a 2D texture where R = log2(count+1) normalized, usable as input
+        // to the CIE Chromaticity Plot pixel shader.
+        {
+            static const std::string cieHistHLSL = colorMath + R"HLSL(
+// CIE xy Histogram — D3D11 Compute Shader
+// Reads source image, converts each pixel to CIE xy, atomically
+// increments bins in groupshared memory, then writes to output texture.
+// Uses 64×64 = 4096 bins (16KB groupshared) covering CIE xy [0,0.8]×[0,0.9].
+
+Texture2D<float4> Source : register(t0);
+RWTexture2D<float4> Output : register(u0);
+
+cbuffer Constants : register(b0)
+{
+    uint Width;      // source width
+    uint Height;     // source height
+    uint OutputSize; // diagram output size (square)
+};
+
+#define GROUP_SIZE 32
+#define THREAD_COUNT (GROUP_SIZE * GROUP_SIZE)
+#define HIST_W 64
+#define HIST_H 64
+#define HIST_BINS (HIST_W * HIST_H)
+
+groupshared uint gs_hist[HIST_BINS];
+groupshared uint gs_maxCount;
+
+[numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
+void main(uint3 GTid : SV_GroupThreadID)
+{
+    uint tid = GTid.x + GTid.y * GROUP_SIZE;
+
+    // Clear histogram bins.
+    for (uint i = tid; i < HIST_BINS; i += THREAD_COUNT)
+        gs_hist[i] = 0;
+    if (tid == 0) gs_maxCount = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Pass 1: scatter source pixels into histogram.
+    for (uint y = GTid.y; y < Height; y += GROUP_SIZE)
+    {
+        for (uint x = GTid.x; x < Width; x += GROUP_SIZE)
+        {
+            float4 pix = Source[int2(x, y)];
+            if (pix.a < 0.001) continue;
+
+            float3 xyz = ScRGBToXYZ(pix.rgb);
+            float sum = xyz.x + xyz.y + xyz.z;
+            if (sum < 1e-6) continue;
+
+            float2 xy = float2(xyz.x / sum, xyz.y / sum);
+
+            // Map CIE xy [0,0.8]×[0,0.9] to bin coordinates.
+            int bx = (int)(xy.x / 0.8 * HIST_W);
+            int by = (int)(xy.y / 0.9 * HIST_H);
+            if (bx >= 0 && bx < HIST_W && by >= 0 && by < HIST_H)
+            {
+                InterlockedAdd(gs_hist[by * HIST_W + bx], 1u);
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Find max count for normalization.
+    for (uint mi = tid; mi < HIST_BINS; mi += THREAD_COUNT)
+        InterlockedMax(gs_maxCount, gs_hist[mi]);
+    GroupMemoryBarrierWithGroupSync();
+
+    float logMax = log2(float(gs_maxCount) + 1.0);
+    if (logMax < 1.0) logMax = 1.0;
+
+    // Pass 2: write histogram to output texture with bilinear spread.
+    uint outSize = max(OutputSize, 64);
+    for (uint oi = tid; oi < outSize * outSize; oi += THREAD_COUNT)
+    {
+        uint ox = oi % outSize;
+        uint oy = oi / outSize;
+
+        // Map output pixel to histogram bin.
+        float fx = float(ox) / float(outSize) * float(HIST_W);
+        float fy = float(oy) / float(outSize) * float(HIST_H);
+        uint bx = min(uint(fx), HIST_W - 1);
+        uint by = min(uint(fy), HIST_H - 1);
+
+        uint count = gs_hist[by * HIST_W + bx];
+        float intensity = (count > 0) ? log2(float(count) + 1.0) / logMax : 0.0;
+
+        Output[int2(ox, oy)] = float4(intensity, intensity, intensity, 1.0);
+    }
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"CIE Histogram";
+            desc.effectId = L"CIE Histogram"; desc.effectVersion = 1;
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hlslSource = cieHistHLSL;
+            desc.inputNames = { L"Source" };
+            desc.hasImageOutput = true;
+            desc.parameters = {
+                { L"OutputSize", L"uint", 512.0f, 64.0f, 2048.0f, 64.0f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
         // ---- CIE Chromaticity Plot ----
         {
             static const std::string ciePlotHLSL = R"HLSL(
 // CIE 1931 xy Chromaticity Diagram
 // Renders the spectral locus horseshoe with gamut triangle overlays.
-// When an input image is connected, each pixel's chromaticity is
-// scattered onto the diagram as a bright dot.
-Texture2D Source : register(t0);
+// Input 0: CIE Histogram texture (from CIE Histogram compute effect).
+//   Each pixel = log-normalized scatter density in CIE xy space.
+Texture2D Histogram : register(t0);
+SamplerState Sampler0 : register(s0);
 
 cbuffer constants : register(b0) {
     uint ShowRec709;    // 1=show gamut triangle
@@ -679,35 +789,24 @@ float4 main(
     float dw = length(xy - D65_WHITE);
     if (dw < 0.008) result.rgb = float3(0.5, 0.5, 0.5) * Brightness;
 
-    // Scatter source image pixels onto the diagram
-    uint srcW, srcH;
-    Source.GetDimensions(srcW, srcH);
-    if (srcW > 0 && srcH > 0) {
-        // Subsample the source image on a grid and scatter to diagram.
-        // Use squared distance to avoid sqrt, smaller dots for performance.
-        uint stepX = max(1, srcW / 128);
-        uint stepY = max(1, srcH / 128);
-        float dotRadius = 0.004;
-        float dotRadiusSq = dotRadius * dotRadius;
-        float hitAccum = 0.0;
-
-        for (uint sy = 0; sy < srcH; sy += stepY) {
-            for (uint sx = 0; sx < srcW; sx += stepX) {
-                float4 srcPix = Source.Load(int3(sx, sy, 0));
-                if (srcPix.a < 0.001) continue;
-                float3 pxyz = ScRGBToXYZ(srcPix.rgb);
-                float2 pxy = XYZToxyY(pxyz).xy;
-                float2 delta = pxy - xy;
-                float dSq = dot(delta, delta);
-                if (dSq < dotRadiusSq) {
-                    hitAccum += saturate(1.0 - dSq / dotRadiusSq);
-                }
-            }
-        }
-
-        if (hitAccum > 0.0) {
-            float intensity = saturate(hitAccum * 0.5) * Brightness * 0.3;
-            result.rgb += intensity * float3(1, 1, 1);
+    // Read scatter density from pre-computed histogram texture.
+    // The histogram covers CIE xy [0,0.8]×[0,0.9].
+    // Map our xy coordinate to UV for the histogram texture.
+    float2 histUV = float2(xy.x / 0.8, xy.y / 0.9);
+    if (histUV.x >= 0.0 && histUV.x <= 1.0 && histUV.y >= 0.0 && histUV.y <= 1.0) {
+        // Histogram is stored with y=0 at top, but CIE y=0 is at bottom.
+        // The compute shader maps bin y directly from CIE y, and output row 0 = bin y=0.
+        // But the pixel shader UV expects (0,0) at top-left.
+        // Flip: histogram row 0 = CIE y low, UV 0 = top → use (1-histUV.y).
+        float2 sampleUV = float2(histUV.x, 1.0 - histUV.y);
+        uint histW, histH;
+        Histogram.GetDimensions(histW, histH);
+        float4 histVal = Histogram.Load(int3(
+            int(sampleUV.x * float(histW)),
+            int(sampleUV.y * float(histH)), 0));
+        float intensity = histVal.r;
+        if (intensity > 0.0) {
+            result.rgb += intensity * Brightness * 0.3 * float3(1, 1, 1);
         }
     }
 
@@ -717,11 +816,11 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"CIE Chromaticity Plot";
-            desc.effectId = L"CIE Chromaticity Plot"; desc.effectVersion = 3;
+            desc.effectId = L"CIE Chromaticity Plot"; desc.effectVersion = 4;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + ciePlotHLSL;
-            desc.inputNames = { L"Source" };
+            desc.inputNames = { L"Histogram" };
             desc.parameters = {
                 { L"ShowRec709",   L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"ShowP3",       L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },

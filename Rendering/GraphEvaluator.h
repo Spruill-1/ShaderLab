@@ -130,8 +130,18 @@ namespace ShaderLab::Rendering
         // Per-node D3D11 compute runners for user-authored D3D11 compute effects.
         std::unordered_map<uint32_t, std::unique_ptr<D3D11ComputeRunner>> m_d3d11RunnerCache;
 
-        // Generic D3D11 compute dispatch for user-authored shaders.
+        // Cached output bitmaps for image-producing compute effects.
+        std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Bitmap1>> m_imageComputeCache;
+
+        // Generic D3D11 compute dispatch for user-authored shaders (analysis-only).
         void DispatchUserD3D11Compute(
+            ID2D1DeviceContext5* dc,
+            Graph::EffectNode& node,
+            ID2D1Image* inputImage);
+
+        // D3D11 compute dispatch that produces an image output (not analysis data).
+        // Creates an output texture, dispatches compute, wraps as D2D bitmap → cachedOutput.
+        void DispatchImageCompute(
             ID2D1DeviceContext5* dc,
             Graph::EffectNode& node,
             ID2D1Image* inputImage);
