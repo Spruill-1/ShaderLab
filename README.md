@@ -629,50 +629,271 @@ Effect parameters support conditional visibility via the `visibleWhen` field on 
 
 ### Problem
 
-D2D compute shaders are evaluated in **tiles**, with UAVs cleared per-tile and no support for atomic operations on `float4` UAVs. This makes reduction operations (min/max/average over an entire image) impossible within the D2D compute shader model.
+D2D's custom compute shader API (`ID2D1ComputeTransform`) has fundamental limitations that prevent full-image reduction operations:
 
-### Solution
+| Limitation | Impact |
+|-----------|--------|
+| **Per-tile UAV clearing** | D2D clears the output `RWTexture2D<float4>` before each tile dispatch. Scatter writes don't accumulate across tiles. |
+| **No custom UAV binding** | `ID2D1ComputeInfo::SetResourceTexture` binds read-only `ID2D1ResourceTexture` (register t), not UAVs (register u). |
+| **No uint atomics on output** | The output UAV is `RWTexture2D<float4>`. `InterlockedMin`/`InterlockedMax`/`InterlockedAdd` require `RWBuffer<uint>`. |
+| **No input as D3D11 texture** | `PrepareForRender` doesn't expose the input image as a D3D11 surface. The effect context is deliberately isolated from the device. |
 
-The graph evaluator owns a **D3D11 compute dispatch path** that bypasses D2D tiling entirely for nodes that require full-image reduction.
+The built-in `CLSID_D2D1Histogram` effect works around these via private D2D internals not exposed through the public API.
 
-### Architecture
+### Solution: Evaluator-Owned D3D11 Dispatch
+
+The graph evaluator owns a **raw D3D11 compute dispatch path** that bypasses D2D's tiling entirely. D2D handles the effect graph wiring (input/output connections), while D3D11 handles the actual computation.
+
+### COM Class Hierarchy
 
 ```mermaid
-flowchart LR
-    subgraph D2D["D2D Pipeline"]
-        INPUT[Upstream D2D Effect] --> BITMAP[Render to FP32 Bitmap]
+classDiagram
+    class ID2D1EffectImpl {
+        <<interface>>
+        +Initialize(effectContext, transformGraph)
+        +PrepareForRender(changeType)
+        +SetGraph(transformGraph)
+    }
+
+    class ID2D1DrawTransform {
+        <<interface>>
+        +SetDrawInfo(drawInfo)
+        +MapInputRectsToOutputRect()
+        +MapOutputRectToInputRects()
+        +MapInvalidRect()
+        +GetInputCount()
+    }
+
+    class ID2D1StatisticsEffect {
+        <<custom COM interface>>
+        +ComputeStatistics(dc, image) HRESULT
+        +GetStatistics(stats*) HRESULT
+        +SetChannel(channel) HRESULT
+        +SetNonzeroOnly(nonzeroOnly) HRESULT
+    }
+
+    class StatisticsEffect {
+        -GpuReduction m_reduction
+        -ID3D11Device* m_d3dDevice
+        -ID3D11DeviceContext* m_d3dContext
+        -GUID m_passThroughGuid
+        +ComputeFromTexture(ID3D11Texture2D*)
+        +SetD3D11Device(device, context)
+    }
+
+    class GpuReduction {
+        -ID3D11ComputeShader* m_shader
+        -ID3D11Buffer* m_resultBuffer
+        -ID3D11Buffer* m_stagingBuffer
+        +Initialize(ID3D11Device*)
+        +Reduce(ctx, texture, channel, nonzeroOnly) ImageStats
+    }
+
+    class CustomPixelShaderEffect {
+        <<existing>>
+        +LoadShaderBytecode()
+        +SetConstantBufferData()
+    }
+
+    class CustomComputeShaderEffect {
+        <<existing - D2D tiled>>
+        +SetThreadGroupSize()
+        +CalculateThreadgroups()
+    }
+
+    ID2D1EffectImpl <|.. StatisticsEffect
+    ID2D1DrawTransform <|.. StatisticsEffect
+    ID2D1StatisticsEffect <|.. StatisticsEffect
+    StatisticsEffect *-- GpuReduction
+    ID2D1EffectImpl <|.. CustomPixelShaderEffect
+    ID2D1DrawTransform <|.. CustomPixelShaderEffect
+    ID2D1EffectImpl <|.. CustomComputeShaderEffect
+
+    note for StatisticsEffect "Pass-through pixel shader\n+ D3D11 compute dispatch\nvia evaluator"
+    note for CustomComputeShaderEffect "D2D-tiled compute\nUAV cleared per tile\nNo atomics"
+```
+
+### Data Flow: D2D → D3D11 Handoff
+
+```mermaid
+flowchart TD
+    subgraph D2D_Graph["D2D Effect Graph (Evaluator)"]
+        SRC[Source Node<br/>ID2D1Image*] --> FX[Upstream Effect<br/>Gamut Map / Delta E / etc.]
+        FX --> CACHE["cachedOutput<br/>(deferred ID2D1Image*)"]
     end
 
-    subgraph Handoff["D2D → D3D11 Handoff"]
-        BITMAP --> SURF[IDXGISurface::GetSurface]
-        SURF --> TEX[ID3D11Texture2D]
-        TEX --> SRV[Create SRV]
+    subgraph Realize["Realize to D3D11 Texture"]
+        CACHE --> CREATE["dc->CreateBitmap()<br/>DXGI_FORMAT_R32G32B32A32_FLOAT"]
+        CREATE --> DRAW["dc->BeginDraw()<br/>dc->DrawImage(cachedOutput)<br/>dc->EndDraw()"]
+        DRAW --> SURFACE["bitmap->GetSurface()<br/>→ IDXGISurface"]
+        SURFACE --> QI["surface->QueryInterface()<br/>→ ID3D11Texture2D"]
     end
 
-    subgraph D3D11["D3D11 Compute"]
-        SRV --> DISPATCH[Dispatch Compute Shader<br/>32×32 thread group]
-        DISPATCH --> REDUCE[groupshared Reduction<br/>Stride Pattern]
-        REDUCE --> BUF[32-byte Result Buffer]
+    subgraph D3D11_Compute["D3D11 Compute Dispatch"]
+        QI --> SRV["CreateShaderResourceView()<br/>register(t0)"]
+        SRV --> CBUF["Update Constant Buffer<br/>(Width, Height, Channel, NonzeroOnly)"]
+        CBUF --> CLEAR["ClearUnorderedAccessViewUint()<br/>(reset result buffer)"]
+        CLEAR --> DISPATCH["ctx->Dispatch(1, 1, 1)<br/>32×32 = 1024 threads"]
     end
 
-    subgraph Readback["CPU Readback"]
-        BUF --> MAP[Map + Read 32 bytes]
-        MAP --> ANALYSIS[Analysis Output Fields]
+    subgraph GPU_Reduction["GPU Reduction (groupshared)"]
+        DISPATCH --> STRIDE["Each thread strides<br/>across entire image"]
+        STRIDE --> LOCAL["Per-thread accumulators<br/>min, max, sum, count"]
+        LOCAL --> SHARED["groupshared parallel reduction<br/>log2(1024) = 10 steps"]
+        SHARED --> WRITE["Thread 0 writes<br/>8 uints to RWBuffer"]
+    end
+
+    subgraph Readback["Result Readback (32 bytes)"]
+        WRITE --> COPY["CopyResource()<br/>→ staging buffer"]
+        COPY --> MAP["Map() + read 8 uints"]
+        MAP --> STATS["ImageStats struct<br/>min, max, mean, samples, nonzero"]
+        STATS --> ANALYSIS["node.analysisOutput.fields<br/>(data pins on graph)"]
     end
 ```
 
-- **GpuReduction** (`Rendering/GpuReduction.h/.cpp`): Manages D3D11 compute dispatch with 32×32 thread groups, stride-based groupshared reduction, and minimal CPU readback (32 bytes).
-- **StatisticsEffect** (`Effects/StatisticsEffect.h/.cpp`): Implements `ID2D1EffectImpl` + `ID2D1DrawTransform` + custom `ID2D1StatisticsEffect` interface.
-  - **Pass-through pixel shader**: For D2D compatibility (effect can sit in a D2D graph and pass image through).
-  - **`ComputeFromTexture()`**: Called by the evaluator for the D3D11 compute path.
-  - **`ComputeStatistics(dc, image)`**: Generic D2D consumer path for standalone usage.
-- **`CustomShaderType::D3D11ComputeShader`**: Third enum value alongside `PixelShader` and `ComputeShader`.
+### Three Effect Types Compared
 
-### Limitations
+| | D2D Pixel Shader | D2D Compute Shader | D3D11 Hybrid Compute |
+|---|---|---|---|
+| **COM class** | `CustomPixelShaderEffect` | `CustomComputeShaderEffect` | `StatisticsEffect` |
+| **D2D interface** | `ID2D1DrawTransform` | `ID2D1ComputeTransform` | `ID2D1DrawTransform` (pass-through) |
+| **Custom interface** | — | — | `ID2D1StatisticsEffect` |
+| **Shader target** | `ps_5_0` | `cs_5_0` | `cs_5_0` (dispatched by host) |
+| **Execution** | D2D renders directly | D2D dispatches per-tile | Evaluator dispatches via D3D11 |
+| **Tiling** | D2D-managed | D2D-managed (UAV cleared) | **None** — single dispatch |
+| **Atomics** | N/A | No (float4 UAV only) | **Yes** (`RWBuffer<uint>`) |
+| **groupshared** | N/A | Yes (per-tile only) | **Yes** (full image) |
+| **Shader linking** | Yes (D2D optimizes) | No | No |
+| **Image output** | Yes | Yes | Optional (pass-through or none) |
+| **Analysis output** | Via pixel readback | Via pixel readback | Via `GetStatistics()` or data pins |
+| **CustomShaderType** | `PixelShader` | `ComputeShader` | `D3D11ComputeShader` |
 
-- D2D effect context doesn't expose input images as D3D11 textures — the evaluator must render to a staging bitmap first.
-- Can't bind custom UAVs within D2D's effect framework — dispatch must happen outside D2D.
-- The evaluator orchestrates the D2D→D3D11 handoff; effects themselves are passive.
+### Usage: Standalone D2D Application
+
+```cpp
+// Register at startup (once)
+StatisticsEffect::RegisterEffect(d2dFactory1.get());
+
+// Create effect in your D2D pipeline
+winrt::com_ptr<ID2D1Effect> effect;
+dc->CreateEffect(StatisticsEffect::CLSID_StatisticsEffect, effect.put());
+
+// Wire into your existing D2D graph
+effect->SetInput(0, someUpstreamImage);
+
+// Render normally — pass-through pixel shader copies input to output
+dc->DrawImage(effect.get());
+
+// Query the custom interface for analysis results
+winrt::com_ptr<ID2D1StatisticsEffect> stats;
+effect->QueryInterface(IID_ID2D1StatisticsEffect, stats.put_void());
+stats->SetChannel(0);        // 0=luminance, 1=R, 2=G, 3=B, 4=A
+stats->SetNonzeroOnly(TRUE);  // exclude zero pixels
+
+// Trigger D3D11 compute dispatch
+// (pass the effect's output image — it's the same as the input since pass-through)
+winrt::com_ptr<ID2D1Image> output;
+effect->GetOutput(output.put());
+stats->ComputeStatistics(dc, output.get());
+
+// Read results
+Rendering::ImageStats result;
+stats->GetStatistics(&result);
+printf("Min=%.4f Max=%.4f Mean=%.4f Samples=%u Nonzero=%.1f%%\n",
+    result.min, result.max, result.mean, result.samples,
+    100.f * result.nonzeroPixels / result.totalPixels);
+```
+
+### Usage: ShaderLab Evaluator (Optimized Path)
+
+```cpp
+// In GraphEvaluator::Evaluate(), for D3D11ComputeShader nodes:
+
+// 1. Render upstream D2D output to FP32 bitmap
+winrt::com_ptr<ID2D1Bitmap1> gpuTarget;
+dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, fp32Props, gpuTarget.put());
+dc->SetTarget(gpuTarget.get());
+dc->BeginDraw();
+dc->DrawImage(upstreamNode->cachedOutput);
+dc->EndDraw();
+
+// 2. Get D3D11 texture (zero-copy — same DXGI surface)
+winrt::com_ptr<IDXGISurface> surface;
+gpuTarget->GetSurface(surface.put());
+winrt::com_ptr<ID3D11Texture2D> d3dTexture;
+surface->QueryInterface(d3dTexture.put());
+
+// 3. Dispatch GPU reduction (single call)
+auto stats = m_gpuReduction.Reduce(d3dCtx, d3dTexture.get(), channel, nonzeroOnly);
+
+// 4. Populate analysis output for graph data pins
+node->analysisOutput.fields = { {"Min", stats.min}, {"Max", stats.max}, ... };
+```
+
+### GPU Reduction Shader Pattern
+
+```hlsl
+// GpuReduction.cpp — embedded HLSL (cs_5_0)
+
+cbuffer Constants : register(b0) {
+    uint Width, Height, Channel, NonzeroOnly;
+};
+Texture2D<float4> Input : register(t0);
+RWBuffer<uint> Result : register(u0);  // 8 uints = 32 bytes
+
+#define GROUP_SIZE 32
+#define THREAD_COUNT (GROUP_SIZE * GROUP_SIZE)  // 1024
+
+groupshared float gs_min[THREAD_COUNT];
+groupshared float gs_max[THREAD_COUNT];
+groupshared float gs_sum[THREAD_COUNT];
+groupshared uint  gs_count[THREAD_COUNT];
+
+[numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
+void main(uint3 GTid : SV_GroupThreadID) {
+    uint tid = GTid.x + GTid.y * GROUP_SIZE;
+    float tMin = 1e30, tMax = -1e30, tSum = 0;
+    uint tCount = 0;
+
+    // Each thread strides across entire image
+    for (uint y = GTid.y; y < Height; y += GROUP_SIZE)
+        for (uint x = GTid.x; x < Width; x += GROUP_SIZE) {
+            float v = GetValue(Input[int2(x,y)], Channel);
+            tMin = min(tMin, v); tMax = max(tMax, v);
+            tSum += v; tCount++;
+        }
+
+    gs_min[tid] = tMin; gs_max[tid] = tMax;
+    gs_sum[tid] = tSum; gs_count[tid] = tCount;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Parallel reduction in shared memory (10 steps for 1024 threads)
+    for (uint stride = THREAD_COUNT/2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            gs_min[tid] = min(gs_min[tid], gs_min[tid+stride]);
+            gs_max[tid] = max(gs_max[tid], gs_max[tid+stride]);
+            gs_sum[tid] += gs_sum[tid+stride];
+            gs_count[tid] += gs_count[tid+stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Thread 0 writes final results
+    if (tid == 0) {
+        Result[0] = asuint(gs_min[0]);
+        Result[1] = asuint(gs_max[0]);
+        Result[2] = asuint(gs_sum[0]);
+        Result[4] = gs_count[0];
+    }
+}
+```
+
+### Known Limitations
+
+- **Chained effect output**: D2D deferred `ID2D1Image*` from `effect->GetOutput()` must be realized by rendering to a bitmap before D3D11 can access it. First-frame timing with `justCreated` effects requires retry logic.
+- **No shader linking**: D3D11 compute shaders are opaque to D2D. They don't participate in D2D's shader linking optimization for chained pixel shader effects.
+- **Device sharing**: The D3D11 device must be the same one backing D2D. Obtained via `ID2D1Device2::GetDxgiDevice()` or injected from the host's `RenderEngine`.
+- **Single thread group**: Current `GpuReduction` dispatches `(1,1,1)` — one group of 1024 threads. For images larger than ~33 megapixels (1024² pixels per thread), a multi-dispatch pyramid would be needed.
 
 ## Working Space Integration
 
