@@ -4496,6 +4496,23 @@ namespace winrt::ShaderLab::implementation
                     if (phase > 1.0f) phase -= 1.0f;
                     phaseIt->second = phase;
                     node.dirty = true;
+
+                    // Propagate dirty to all downstream nodes so D3D11 compute
+                    // effects re-dispatch when their upstream source animates.
+                    std::vector<uint32_t> downstream;
+                    downstream.push_back(node.id);
+                    for (size_t i = 0; i < downstream.size(); ++i)
+                    {
+                        for (const auto* edge : m_graph.GetOutputEdges(downstream[i]))
+                        {
+                            auto* dn = m_graph.FindNode(edge->destNodeId);
+                            if (dn && !dn->dirty)
+                            {
+                                dn->dirty = true;
+                                downstream.push_back(edge->destNodeId);
+                            }
+                        }
+                    }
                 }
             }
         }

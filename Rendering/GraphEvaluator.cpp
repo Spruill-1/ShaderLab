@@ -106,7 +106,7 @@ namespace ShaderLab::Rendering
                     }
                     // Queue dispatch if input is available and we need (re)computation.
                     // Triggers on: first eval (no analysis output yet), property change
-                    // (dirty), or upstream change (dirty propagated).
+                    // (dirty), or upstream change (dirty propagated by animation tick).
                     bool needsCompute = node->dirty ||
                         node->analysisOutput.fields.empty();
                     if (inputImage && needsCompute)
