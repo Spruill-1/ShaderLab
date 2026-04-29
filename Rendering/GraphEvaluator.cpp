@@ -302,10 +302,10 @@ namespace ShaderLab::Rendering
         return finalOutput;
     }
 
-    void GraphEvaluator::ProcessDeferredCompute(
+    bool GraphEvaluator::ProcessDeferredCompute(
         EffectGraph& graph, ID2D1DeviceContext5* dc)
     {
-        if (m_deferredCompute.empty() || !dc) return;
+        if (m_deferredCompute.empty() || !dc) return false;
 
         for (auto& deferred : m_deferredCompute)
         {
@@ -329,6 +329,7 @@ namespace ShaderLab::Rendering
             }
         }
         m_deferredCompute.clear();
+        return true;
     }
 
     // -----------------------------------------------------------------------

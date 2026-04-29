@@ -32,8 +32,8 @@ namespace ShaderLab::Rendering
 
         // Run deferred D3D11 compute dispatches for statistics nodes.
         // Call AFTER Evaluate (and double-eval) when all D2D effects are initialized.
-        // The dc should be in a valid state (not inside BeginDraw/EndDraw).
-        void ProcessDeferredCompute(Graph::EffectGraph& graph, ID2D1DeviceContext5* dc);
+        // Returns true if any compute dispatches ran (analysis output changed).
+        bool ProcessDeferredCompute(Graph::EffectGraph& graph, ID2D1DeviceContext5* dc);
 
         // Release all cached D2D effects (e.g., on device lost or graph clear).
         void ReleaseCache();
