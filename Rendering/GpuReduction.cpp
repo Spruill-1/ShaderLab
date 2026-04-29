@@ -31,7 +31,6 @@ RWBuffer<uint> Result : register(u0);
 #define GROUP_SIZE 32
 #define THREAD_COUNT (GROUP_SIZE * GROUP_SIZE)
 #define HIST_BINS 256
-#define HIST_MAX 100.0  // histogram range [0, HIST_MAX]
 
 groupshared float gs_min[THREAD_COUNT];
 groupshared float gs_max[THREAD_COUNT];
@@ -40,6 +39,8 @@ groupshared uint  gs_count[THREAD_COUNT];
 groupshared uint  gs_total[THREAD_COUNT];
 groupshared uint  gs_nonzero[THREAD_COUNT];
 groupshared uint  gs_hist[HIST_BINS];
+groupshared float gs_histMin;  // broadcast after reduction
+groupshared float gs_histMax;
 
 float GetValue(float4 pix, uint ch)
 {
@@ -56,11 +57,7 @@ void main(uint3 GTid : SV_GroupThreadID)
 {
     uint tid = GTid.x + GTid.y * GROUP_SIZE;
 
-    // Clear shared histogram (each thread clears one or more bins).
-    for (uint bi = tid; bi < HIST_BINS; bi += THREAD_COUNT)
-        gs_hist[bi] = 0;
-    GroupMemoryBarrierWithGroupSync();
-
+    // ---- Pass 1: compute min/max/sum/count (no histogram yet) ----
     float tMin = 1e30;
     float tMax = -1e30;
     float tSum = 0;
@@ -68,7 +65,6 @@ void main(uint3 GTid : SV_GroupThreadID)
     uint  tTotal = 0;
     uint  tNonzero = 0;
 
-    // Stride across entire image.
     for (uint y = GTid.y; y < Height; y += GROUP_SIZE)
     {
         for (uint x = GTid.x; x < Width; x += GROUP_SIZE)
@@ -86,11 +82,6 @@ void main(uint3 GTid : SV_GroupThreadID)
             tMax = max(tMax, v);
             tSum += v;
             tCount++;
-
-            // Histogram bin (atomic add to shared memory).
-            float normalized = saturate(v / HIST_MAX);
-            uint bin = min((uint)(normalized * 255.0), 255u);
-            InterlockedAdd(gs_hist[bin], 1u);
         }
     }
 
@@ -117,6 +108,43 @@ void main(uint3 GTid : SV_GroupThreadID)
         }
         GroupMemoryBarrierWithGroupSync();
     }
+
+    // Thread 0 broadcasts the data range for histogram binning.
+    if (tid == 0)
+    {
+        gs_histMin = gs_min[0];
+        gs_histMax = gs_max[0];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // ---- Pass 2: build adaptive histogram over [min, max] ----
+    float hMin = gs_histMin;
+    float hMax = gs_histMax;
+    float hRange = hMax - hMin;
+
+    // Clear histogram bins.
+    for (uint bi = tid; bi < HIST_BINS; bi += THREAD_COUNT)
+        gs_hist[bi] = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    if (hRange > 0.0 && gs_count[0] > 0)
+    {
+        for (uint y2 = GTid.y; y2 < Height; y2 += GROUP_SIZE)
+        {
+            for (uint x2 = GTid.x; x2 < Width; x2 += GROUP_SIZE)
+            {
+                float4 pix = Input[int2(x2, y2)];
+                float v = GetValue(pix, Channel);
+                bool nz = abs(v) > 0.0001;
+                if (NonzeroOnly == 1 && !nz) continue;
+
+                float normalized = saturate((v - hMin) / hRange);
+                uint bin = min((uint)(normalized * 255.0), 255u);
+                InterlockedAdd(gs_hist[bin], 1u);
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
 
     // Thread 0 writes stats.
     if (tid == 0)
@@ -284,9 +312,10 @@ void main(uint3 GTid : SV_GroupThreadID)
             stats.nonzeroPixels = nonzeroPixels;
             stats.mean = (sampleCount > 0) ? sumVal / static_cast<float>(sampleCount) : 0;
 
-            // Compute median and P95 from histogram.
-            constexpr float histMax = 100.0f;
-            if (sampleCount > 0)
+            // Compute median and P95 from adaptive histogram.
+            // Histogram bins span [minVal, maxVal] (set by the shader's second pass).
+            float histRange = maxVal - minVal;
+            if (sampleCount > 0 && histRange > 0)
             {
                 const uint32_t* hist = result + STATS_UINTS;
                 uint32_t halfCount = sampleCount / 2;
@@ -297,14 +326,16 @@ void main(uint3 GTid : SV_GroupThreadID)
                 for (uint32_t bi = 0; bi < HIST_BINS; ++bi)
                 {
                     cumulative += hist[bi];
+                    // Map bin center back to value in [min, max].
+                    float binValue = minVal + ((static_cast<float>(bi) + 0.5f) / 255.0f) * histRange;
                     if (!foundMedian && cumulative >= halfCount)
                     {
-                        stats.median = (static_cast<float>(bi) / 255.0f) * histMax;
+                        stats.median = binValue;
                         foundMedian = true;
                     }
                     if (!foundP95 && cumulative >= p95Count)
                     {
-                        stats.p95 = (static_cast<float>(bi) / 255.0f) * histMax;
+                        stats.p95 = binValue;
                         foundP95 = true;
                     }
                     if (foundMedian && foundP95) break;
