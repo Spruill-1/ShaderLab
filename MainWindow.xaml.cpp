@@ -4500,7 +4500,8 @@ namespace winrt::ShaderLab::implementation
 
         // Only re-evaluate the graph when something changed.
         bool wasForceRender = m_forceRender;
-        bool needsEval = m_graph.HasDirtyNodes() || m_needsFitPreview || m_forceRender;
+        bool hasDirty = m_graph.HasDirtyNodes();
+        bool needsEval = hasDirty || m_needsFitPreview || m_forceRender;
         if (needsEval)
         {
             RenderFrame(deltaSec);
