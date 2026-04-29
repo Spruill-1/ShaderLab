@@ -1229,15 +1229,25 @@ namespace winrt::ShaderLab::implementation
         }
 
         // Compute settings.
-        if (def.shaderType == ::ShaderLab::Graph::CustomShaderType::ComputeShader)
+        if (def.shaderType == ::ShaderLab::Graph::CustomShaderType::ComputeShader ||
+            def.shaderType == ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader)
         {
             ThreadGroupX().Value(def.threadGroupX);
             ThreadGroupY().Value(def.threadGroupY);
             ThreadGroupZ().Value(def.threadGroupZ);
         }
-
-        // HLSL source — format for readability.
-        HlslEditorBox().Text(winrt::hstring(FormatHlsl(def.hlslSource)));
+        // If no source exists (built-in effects that use hardcoded paths),
+        // generate a scaffold so the developer sees representative HLSL.
+        std::wstring hlslToShow = def.hlslSource;
+        if (hlslToShow.empty())
+        {
+            auto scaffoldDef = BuildDefinition();
+            scaffoldDef.shaderType = def.shaderType;
+            scaffoldDef.analysisFields = def.analysisFields;
+            scaffoldDef.analysisOutputType = def.analysisOutputType;
+            hlslToShow = GenerateHlsl(scaffoldDef);
+        }
+        HlslEditorBox().Text(winrt::hstring(FormatHlsl(hlslToShow)));
 
         // Update button states.
         UpdateInGraphButton().Visibility(Visibility::Visible);
