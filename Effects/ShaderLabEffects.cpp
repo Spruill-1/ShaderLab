@@ -2064,17 +2064,18 @@ float4 main(
     }
     else
     {
-        // Modes 0 and 1: per-pixel nearest/compress (only out-of-gamut pixels)
-        bool insideGamut = PointInTriangle(cieXY, gR, gG, gB);
-        if (!insideGamut)
+        // Modes 0 and 1: per-pixel nearest/compress
+        float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
+        float2 ctcp = float2(ictcp.y, ictcp.z);
+        float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+
+        float2 bnd[NBP];
+        SampleBoundary(gR, gG, gB, ictcp.x, bnd);
+
+        // Check if inside the ICtCp boundary polygon at this I level.
+        bool insideBnd = PtInPoly(ctcp, bnd);
+        if (!insideBnd)
         {
-            float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
-            float2 ctcp = float2(ictcp.y, ictcp.z);
-            float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
-
-            float2 bnd[NBP];
-            SampleBoundary(gR, gG, gB, ictcp.x, bnd);
-
             float2 mapped = (mode == 1)
                 ? CompressNeutral(ctcp, bnd)
                 : NearestOnPoly(ctcp, bnd);
@@ -2085,6 +2086,7 @@ float4 main(
                 mappedRGB *= origY / mappedY;
             color.rgb = mappedRGB;
         }
+        }
     }
     return color;
 }
@@ -2092,7 +2094,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Perceptual Gamut Map";
-            desc.effectId = L"Perceptual Gamut Map"; desc.effectVersion = 4;
+            desc.effectId = L"Perceptual Gamut Map"; desc.effectVersion = 5;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + perceptualGamutMapHLSL;
