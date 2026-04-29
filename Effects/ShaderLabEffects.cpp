@@ -2064,26 +2064,28 @@ float4 main(
     }
     else
     {
-        // Modes 0 and 1: per-pixel nearest/compress.
-        // Always compute mapped position — skip binary in/out test to avoid
-        // boundary precision artifacts. If pixel is inside, mapping won't
-        // reduce saturation, so we detect and preserve original.
-        float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
-        float2 ctcp = float2(ictcp.y, ictcp.z);
-        float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
-
-        float2 bnd[NBP];
-        SampleBoundary(gR, gG, gB, ictcp.x, bnd);
-
-        float2 mapped = (mode == 1)
-            ? CompressNeutral(ctcp, bnd)
-            : NearestOnPoly(ctcp, bnd);
-
-        // Only apply if mapping moves the point closer to neutral (i.e., it was outside).
-        float origDist = dot(ctcp, ctcp);
-        float mappedDist = dot(mapped, mapped);
-        if (mappedDist < origDist)
+        // Modes 0 and 1: per-pixel nearest/compress (only out-of-gamut pixels).
+        // Use CIE xy detection with slight inset to avoid boundary jitter.
+        // Inset the triangle slightly toward white so boundary pixels consistently
+        // classify as out-of-gamut rather than randomly flickering.
+        float2 white = float2(0.3127, 0.3290);
+        float inset = 0.002;
+        float2 iR = lerp(gR, white, inset);
+        float2 iG = lerp(gG, white, inset);
+        float2 iB = lerp(gB, white, inset);
+        bool insideGamut = PointInTriangle(cieXY, iR, iG, iB);
+        if (!insideGamut)
         {
+            float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
+            float2 ctcp = float2(ictcp.y, ictcp.z);
+            float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+
+            float2 bnd[NBP];
+            SampleBoundary(gR, gG, gB, ictcp.x, bnd);
+
+            float2 mapped = (mode == 1)
+                ? CompressNeutral(ctcp, bnd)
+                : NearestOnPoly(ctcp, bnd);
             ctcp = lerp(ctcp, mapped, Strength);
             float3 mappedRGB = ICtCpToScRGB(float3(ictcp.x, ctcp.x, ctcp.y));
             float mappedY = dot(max(mappedRGB, 0.0), float3(0.2126, 0.7152, 0.0722));
@@ -2098,7 +2100,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Perceptual Gamut Map";
-            desc.effectId = L"Perceptual Gamut Map"; desc.effectVersion = 6;
+            desc.effectId = L"Perceptual Gamut Map"; desc.effectVersion = 7;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + perceptualGamutMapHLSL;
