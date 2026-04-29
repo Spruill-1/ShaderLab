@@ -220,9 +220,26 @@ namespace ShaderLab::Effects
         return ComputeFromTexture(d3dTexture.get());
     }
 
+    IFACEMETHODIMP StatisticsEffect::SetDeviceContext(ID2D1DeviceContext* dc, ID2D1Effect* self)
+    {
+        m_weakDc = dc;
+        m_weakSelf = self;
+        return S_OK;
+    }
+
     IFACEMETHODIMP StatisticsEffect::GetStatistics(Rendering::ImageStats* stats)
     {
         if (!stats) return E_POINTER;
+
+        // Lazy compute: if stats are stale and we have cached dc + effect, dispatch.
+        if (!m_statsValid && m_weakDc && m_weakSelf)
+        {
+            winrt::com_ptr<ID2D1Image> output;
+            m_weakSelf->GetOutput(output.put());
+            if (output)
+                ComputeStatistics(m_weakDc, output.get());
+        }
+
         *stats = m_lastStats;
         return m_statsValid ? S_OK : S_FALSE;
     }

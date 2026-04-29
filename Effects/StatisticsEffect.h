@@ -13,33 +13,32 @@ namespace ShaderLab::Effects
     //
     // Drop-in usage for any D2D application:
     //
+    //   // Setup (once):
     //   dc->CreateEffect(CLSID_StatisticsEffect, effect.put());
-    //   effect->SetInput(0, anyUpstreamImage);
-    //   dc->DrawImage(effect.get());   // pass-through: output == input
-    //
-    //   winrt::com_ptr<ID2D1StatisticsEffect> stats;
-    //   effect->QueryInterface(IID_ID2D1StatisticsEffect, stats.put_void());
-    //   stats->SetChannel(0);          // 0=luminance, 1=R, 2=G, 3=B, 4=A
+    //   auto stats = effect.as<ID2D1StatisticsEffect>();
+    //   stats->SetDeviceContext(dc, effect.get());  // weak cache
+    //   stats->SetChannel(0);              // 0=luminance, 1=R, 2=G, 3=B, 4=A
     //   stats->SetNonzeroOnly(TRUE);
     //
-    //   winrt::com_ptr<ID2D1Image> output;
-    //   effect->GetOutput(output.put());
-    //   stats->ComputeStatistics(dc, output.get());  // self-contained D3D11 dispatch
+    //   // Per-frame (standard D2D pipeline):
+    //   effect->SetInput(0, anyUpstreamImage);
+    //   dc->DrawImage(effect.get());       // pass-through: output == input
     //
+    //   // Get results (lazy compute — no extra calls needed):
     //   Rendering::ImageStats result;
-    //   stats->GetStatistics(&result);
+    //   stats->GetStatistics(&result);     // auto-dispatches D3D11 compute if stale
     //
     MIDL_INTERFACE("7A8B9C0D-2345-6789-ABCD-EF0123456789")
     ID2D1StatisticsEffect : public IUnknown
     {
-        // Compute statistics on a D2D image.
-        // Typical usage after DrawImage:
-        //   winrt::com_ptr<ID2D1Image> output;
-        //   effect->GetOutput(output.put());
-        //   stats->ComputeStatistics(dc, output.get());
-        STDMETHOD(ComputeStatistics)(ID2D1DeviceContext* dc, ID2D1Image* image) PURE;
+        // Cache the device context and effect wrapper for lazy compute.
+        // Stored as weak (non-AddRef) pointers — both must outlive the effect.
+        // Call once after creation.
+        STDMETHOD(SetDeviceContext)(ID2D1DeviceContext* dc, ID2D1Effect* self) PURE;
 
-        // Retrieve the last computed statistics.
+        // Retrieve statistics. If results are stale (input changed since last
+        // DrawImage), automatically triggers a D3D11 compute dispatch using
+        // the cached device context. Returns S_FALSE if no dc is set.
         STDMETHOD(GetStatistics)(Rendering::ImageStats* stats) PURE;
 
         // Set which channel to analyze (0=luminance, 1=R, 2=G, 3=B, 4=A).
@@ -47,6 +46,10 @@ namespace ShaderLab::Effects
 
         // Set whether to exclude near-zero pixels from min/max/mean.
         STDMETHOD(SetNonzeroOnly)(BOOL nonzeroOnly) PURE;
+
+        // Explicit compute from a provided image + dc (for callers that
+        // don't want to use the cached dc pattern).
+        STDMETHOD(ComputeStatistics)(ID2D1DeviceContext* dc, ID2D1Image* image) PURE;
     };
 
     // Self-contained D2D effect with D3D11 compute statistics.
@@ -102,10 +105,11 @@ namespace ShaderLab::Effects
         IFACEMETHODIMP_(UINT32) GetInputCount() const override;
 
         // ---- ID2D1StatisticsEffect ----
-        IFACEMETHODIMP ComputeStatistics(ID2D1DeviceContext* dc, ID2D1Image* image) override;
+        IFACEMETHODIMP SetDeviceContext(ID2D1DeviceContext* dc, ID2D1Effect* self) override;
         IFACEMETHODIMP GetStatistics(Rendering::ImageStats* stats) override;
         IFACEMETHODIMP SetChannel(UINT32 channel) override;
         IFACEMETHODIMP SetNonzeroOnly(BOOL nonzeroOnly) override;
+        IFACEMETHODIMP ComputeStatistics(ID2D1DeviceContext* dc, ID2D1Image* image) override;
 
         // ---- Optimized path (skips D2D re-render) ----
         HRESULT ComputeFromTexture(ID3D11Texture2D* texture);
@@ -127,5 +131,10 @@ namespace ShaderLab::Effects
         Rendering::ImageStats m_lastStats{};
         bool m_statsValid{ false };
         GUID m_passThroughGuid{};
+
+        // Weak-cached device context for lazy compute in GetStatistics.
+        // NOT AddRef'd — consumer must ensure dc outlives the effect.
+        ID2D1DeviceContext* m_weakDc{ nullptr };
+        ID2D1Effect* m_weakSelf{ nullptr };  // Weak ref to our D2D effect wrapper.
     };
 }
