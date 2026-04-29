@@ -820,19 +820,27 @@ stats->SetDeviceContext(dc, effect.get());  // weak cache — dc must outlive ef
 stats->SetChannel(0);         // 0=luminance, 1=R, 2=G, 3=B, 4=A
 stats->SetNonzeroOnly(TRUE);  // exclude zero pixels
 
-// Per-frame: wire into your existing D2D pipeline
+// Per-frame render loop
 effect->SetInput(0, someUpstreamImage);
-dc->DrawImage(effect.get());  // pass-through: output == input
 
-// Get results — lazy compute triggers automatically when stale
+dc->BeginDraw();
+dc->DrawImage(effect.get());  // pass-through: output == input
+// ... render other content to your swap chain ...
+
+// GetStatistics MUST be called inside BeginDraw/EndDraw.
+// D2D deferred images only materialize during an active draw session.
 Rendering::ImageStats result;
 stats->GetStatistics(&result);
+
+dc->EndDraw();
+dc->Present();
+
 printf("Min=%.4f Max=%.4f Mean=%.4f Samples=%u Nonzero=%.1f%%\n",
     result.min, result.max, result.mean, result.samples,
     100.f * result.nonzeroPixels / result.totalPixels);
 ```
 
-The lazy path (`GetStatistics` with cached dc) internally calls `effect->GetOutput()`, renders to an FP32 bitmap, dispatches the D3D11 compute shader, and caches the results. Subsequent calls return cached results until the next `DrawImage` invalidates them via `PrepareForRender`.
+The lazy path (`GetStatistics` with cached dc) internally calls `effect->GetOutput()`, renders to an FP32 bitmap, dispatches the D3D11 compute shader, and caches the results. **`GetStatistics` must be called between `BeginDraw` and `EndDraw`** — D2D's deferred `ID2D1Image*` from `GetOutput()` only materializes to real pixels during an active draw session. Subsequent calls return cached results until the next `DrawImage` invalidates them via `PrepareForRender`.
 
 For callers who prefer explicit control, `ComputeStatistics(dc, image)` and `ComputeFromTexture(texture)` are also available.
 
