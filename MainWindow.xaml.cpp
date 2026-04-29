@@ -4649,16 +4649,17 @@ namespace winrt::ShaderLab::implementation
             for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
                 node.needed = false;
 
-            // Roots: Output nodes, preview node, output window nodes,
-            // and data-only nodes with visible analysis display.
+            // Roots: Output nodes, preview node, output window nodes.
+            // Data-only/analysis nodes are NOT automatic roots — they only
+            // evaluate when dirty or when something downstream needs them.
             std::vector<uint32_t> roots;
             for (const auto& node : m_graph.Nodes())
             {
                 if (node.type == ::ShaderLab::Graph::NodeType::Output)
                     roots.push_back(node.id);
-                // Data-only and parameter nodes with analysis output need evaluation
-                // to display values on the graph canvas.
-                if (node.customEffect.has_value() &&
+                // Only include data-only analysis nodes if they're dirty
+                // (need initial computation or property changed).
+                if (node.dirty && node.customEffect.has_value() &&
                     node.customEffect->analysisOutputType == ::ShaderLab::Graph::AnalysisOutputType::Typed)
                     roots.push_back(node.id);
             }
