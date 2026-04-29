@@ -28,9 +28,10 @@
                     <TextBlock Text="Effect Name:" VerticalAlignment="Center" Margin="0,0,8,0" />
                     <TextBox x:Name="EffectNameBox" Grid.Column="1" PlaceholderText="My Custom Effect" />
                     <TextBlock Text="Type:" Grid.Column="2" VerticalAlignment="Center" Margin="16,0,8,0" />
-                    <ComboBox x:Name="ShaderTypeSelector" Grid.Column="3" MinWidth="140">
+                    <ComboBox x:Name="ShaderTypeSelector" Grid.Column="3" MinWidth="180">
                         <x:String>Pixel Shader</x:String>
                         <x:String>Compute Shader</x:String>
+                        <x:String>D3D11 Compute Shader</x:String>
                     </ComboBox>
                 </Grid>
 

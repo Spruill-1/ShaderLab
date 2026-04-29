@@ -148,6 +148,7 @@
     <ClInclude Include="Rendering\DisplayProfile.h" />
     <ClInclude Include="Rendering\GraphEvaluator.h" />
     <ClInclude Include="Rendering\GpuReduction.h" />
+    <ClInclude Include="Rendering\D3D11ComputeRunner.h" />
     <ClInclude Include="Effects\StatisticsEffect.h" />
     <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
@@ -195,6 +196,7 @@
     <ClCompile Include="Rendering\DisplayMonitor.cpp" />
     <ClCompile Include="Rendering\GraphEvaluator.cpp" />
     <ClCompile Include="Rendering\GpuReduction.cpp" />
+    <ClCompile Include="Rendering\D3D11ComputeRunner.cpp" />
     <ClCompile Include="Effects\StatisticsEffect.cpp" />
     <ClCompile Include="Rendering\IccProfileParser.cpp" />
     <ClCompile Include="Rendering\RenderEngine.cpp" />

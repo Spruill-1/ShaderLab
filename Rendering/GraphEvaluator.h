@@ -6,6 +6,7 @@
 #include "../Effects/CustomComputeShaderEffect.h"
 #include "../Effects/ShaderCompiler.h"
 #include "GpuReduction.h"
+#include "D3D11ComputeRunner.h"
 
 namespace ShaderLab::Rendering
 {
@@ -125,6 +126,15 @@ namespace ShaderLab::Rendering
 
         // GPU compute shader reduction for image statistics.
         GpuReduction m_gpuReduction;
+
+        // Per-node D3D11 compute runners for user-authored D3D11 compute effects.
+        std::unordered_map<uint32_t, std::unique_ptr<D3D11ComputeRunner>> m_d3d11RunnerCache;
+
+        // Generic D3D11 compute dispatch for user-authored shaders.
+        void DispatchUserD3D11Compute(
+            ID2D1DeviceContext5* dc,
+            Graph::EffectNode& node,
+            ID2D1Image* inputImage);
 
         // Deferred D3D11 compute dispatches (node ID + upstream image).
         struct DeferredCompute {

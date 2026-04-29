@@ -307,9 +307,19 @@ namespace ShaderLab::Rendering
             auto* node = graph.FindNode(deferred.nodeId);
             if (!node || !deferred.inputImage) continue;
 
-            // Use ComputeImageStatistics which renders the D2D image to a
-            // bitmap and dispatches the GPU reduction.
-            ComputeImageStatistics(dc, *node, deferred.inputImage);
+            // Built-in Image Statistics effect uses the hardcoded GpuReduction.
+            // User-authored D3D11 compute shaders use D3D11ComputeRunner.
+            bool isBuiltinStats = node->customEffect.has_value() &&
+                node->customEffect->shaderLabEffectId == L"Image Statistics";
+
+            if (isBuiltinStats)
+            {
+                ComputeImageStatistics(dc, *node, deferred.inputImage);
+            }
+            else
+            {
+                DispatchUserD3D11Compute(dc, *node, deferred.inputImage);
+            }
         }
         m_deferredCompute.clear();
     }
@@ -322,12 +332,14 @@ namespace ShaderLab::Rendering
     {
         m_effectCache.clear();
         m_customImplCache.clear();
+        m_d3d11RunnerCache.clear();
         m_dummySourceBitmap = nullptr;
     }
 
     void GraphEvaluator::InvalidateNode(uint32_t nodeId)
     {
         m_effectCache.erase(nodeId);
+        m_d3d11RunnerCache.erase(nodeId);
         m_customImplCache.erase(nodeId);
     }
 
@@ -337,6 +349,14 @@ namespace ShaderLab::Rendering
             return;
 
         auto& def = node.customEffect.value();
+
+        // D3D11 compute shaders don't use D2D effects — just invalidate the runner.
+        if (def.shaderType == CustomShaderType::D3D11ComputeShader)
+        {
+            m_d3d11RunnerCache.erase(nodeId);
+            return;
+        }
+
         auto implIt = m_customImplCache.find(nodeId);
         if (implIt == m_customImplCache.end())
             return; // First compile — next Evaluate() will create the effect.
@@ -1151,6 +1171,169 @@ namespace ShaderLab::Rendering
         }
 
         cpuBitmap->Unmap();
+    }
+
+    // -----------------------------------------------------------------------
+    // D3D11 compute dispatch for user-authored shaders
+    // -----------------------------------------------------------------------
+
+    void GraphEvaluator::DispatchUserD3D11Compute(
+        ID2D1DeviceContext5* dc,
+        Graph::EffectNode& node,
+        ID2D1Image* inputImage)
+    {
+        if (!dc || !inputImage) return;
+        if (!node.customEffect.has_value() || !node.customEffect->isCompiled()) return;
+
+        auto& def = node.customEffect.value();
+        uint32_t fieldCount = 0;
+        for (const auto& f : def.analysisFields)
+            fieldCount += f.pixelCount();
+        if (fieldCount == 0) return;
+
+        // Render input D2D image to a D3D11-accessible bitmap.
+        D2D1_RECT_F bounds{};
+        dc->GetImageLocalBounds(inputImage, &bounds);
+        uint32_t w = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
+        uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
+        if (w == 0 || h == 0) return;
+
+        winrt::com_ptr<ID2D1Bitmap1> gpuTarget;
+        D2D1_BITMAP_PROPERTIES1 gpuProps{};
+        gpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+        gpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+        HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, gpuProps, gpuTarget.put());
+        if (FAILED(hr)) return;
+
+        winrt::com_ptr<ID2D1Image> prevTarget;
+        dc->GetTarget(prevTarget.put());
+        dc->SetTarget(gpuTarget.get());
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
+        dc->SetTarget(prevTarget.get());
+
+        // Get D3D11 texture from bitmap.
+        winrt::com_ptr<IDXGISurface> surface;
+        hr = gpuTarget->GetSurface(surface.put());
+        if (FAILED(hr)) return;
+
+        winrt::com_ptr<ID3D11Texture2D> d3dTexture;
+        hr = surface->QueryInterface(d3dTexture.put());
+        if (FAILED(hr)) return;
+
+        // Get or create the per-node runner.
+        auto& runner = m_d3d11RunnerCache[node.id];
+        if (!runner)
+        {
+            runner = std::make_unique<D3D11ComputeRunner>();
+            winrt::com_ptr<ID3D11Device> device;
+            d3dTexture->GetDevice(device.put());
+            runner->Initialize(device.get());
+        }
+
+        // Compile shader if needed (first run or recompile).
+        if (!runner->HasShader())
+        {
+            std::string hlslUtf8 = winrt::to_string(def.hlslSource);
+            for (auto& ch : hlslUtf8) { if (ch == '\r') ch = '\n'; }
+            if (!runner->CompileShader(hlslUtf8))
+                return;
+        }
+
+        // Pack cbuffer from node properties (offset 8+, Width/Height auto-injected by runner).
+        std::vector<BYTE> cbData;
+        if (!def.parameters.empty() && !def.compiledBytecode.empty())
+        {
+            // Reflect cbuffer layout to pack properties at correct offsets.
+            winrt::com_ptr<ID3D11ShaderReflection> reflect;
+            hr = D3DReflect(def.compiledBytecode.data(), def.compiledBytecode.size(),
+                IID_ID3D11ShaderReflection, reinterpret_cast<void**>(reflect.put()));
+            if (SUCCEEDED(hr))
+            {
+                auto* cbReflect = reflect->GetConstantBufferByIndex(0);
+                D3D11_SHADER_BUFFER_DESC cbDesc{};
+                if (cbReflect && SUCCEEDED(cbReflect->GetDesc(&cbDesc)))
+                {
+                    // Allocate enough for user params (skip first 8 bytes = Width/Height).
+                    uint32_t userSize = (cbDesc.Size > 8) ? (cbDesc.Size - 8) : 0;
+                    if (userSize > 0)
+                    {
+                        cbData.resize(userSize, 0);
+                        for (UINT v = 0; v < cbDesc.Variables; ++v)
+                        {
+                            auto* var = cbReflect->GetVariableByIndex(v);
+                            D3D11_SHADER_VARIABLE_DESC varDesc{};
+                            if (!var || FAILED(var->GetDesc(&varDesc))) continue;
+                            if (varDesc.StartOffset < 8) continue; // Skip Width/Height
+
+                            std::wstring varName(varDesc.Name, varDesc.Name + strlen(varDesc.Name));
+                            auto propIt = node.properties.find(varName);
+                            if (propIt == node.properties.end()) continue;
+
+                            uint32_t destOff = varDesc.StartOffset - 8;
+                            if (destOff + varDesc.Size > cbData.size()) continue;
+
+                            const auto& pv = propIt->second;
+                            if (auto* f = std::get_if<float>(&pv))
+                                memcpy(cbData.data() + destOff, f, 4);
+                            else if (auto* i = std::get_if<int32_t>(&pv))
+                                memcpy(cbData.data() + destOff, i, 4);
+                            else if (auto* u = std::get_if<uint32_t>(&pv))
+                                memcpy(cbData.data() + destOff, u, 4);
+                            else if (auto* b = std::get_if<bool>(&pv))
+                            {
+                                uint32_t val = *b ? 1u : 0u;
+                                memcpy(cbData.data() + destOff, &val, 4);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Dispatch and readback.
+        auto results = runner->Dispatch(d3dTexture.get(), cbData, fieldCount);
+        if (results.empty()) return;
+
+        // Map results to analysis output fields.
+        node.analysisOutput.type = AnalysisOutputType::Typed;
+        node.analysisOutput.fields.clear();
+
+        uint32_t pixelOffset = 0;
+        for (const auto& fd : def.analysisFields)
+        {
+            AnalysisFieldValue fv;
+            fv.name = fd.name;
+            fv.type = fd.type;
+
+            uint32_t pc = fd.pixelCount();
+            bool isArray = AnalysisFieldIsArray(fd.type);
+            uint32_t cc = AnalysisFieldComponentCount(fd.type);
+
+            if (!isArray)
+            {
+                // Single value field.
+                if (pixelOffset * 4 < results.size())
+                {
+                    for (uint32_t c = 0; c < cc && (pixelOffset * 4 + c) < results.size(); ++c)
+                        fv.components[c] = results[pixelOffset * 4 + c];
+                }
+            }
+            else
+            {
+                // Array field.
+                fv.arrayData.resize(fd.arrayLength * cc, 0.0f);
+                for (uint32_t i = 0; i < fd.arrayLength; ++i)
+                {
+                    uint32_t base = (pixelOffset + i) * 4;
+                    for (uint32_t c = 0; c < cc && (base + c) < results.size(); ++c)
+                        fv.arrayData[i * cc + c] = results[base + c];
+                }
+            }
+
+            pixelOffset += pc;
+            node.analysisOutput.fields.push_back(std::move(fv));
+        }
     }
 
     // -----------------------------------------------------------------------

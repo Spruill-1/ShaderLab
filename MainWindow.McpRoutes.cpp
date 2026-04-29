@@ -118,7 +118,9 @@ static std::string NodeToJson(const ::ShaderLab::Graph::EffectNode& node)
         auto& def = node.customEffect.value();
         json += ",\"customEffect\":{";
         json += std::format("\"shaderType\":\"{}\",\"compiled\":{},\"bytecodeSize\":{}",
-            def.shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader ? "PixelShader" : "ComputeShader",
+            def.shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader ? "PixelShader" :
+            def.shaderType == ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader ? "D3D11ComputeShader" :
+            "ComputeShader",
             def.isCompiled() ? "true" : "false",
             def.compiledBytecode.size());
         json += ",\"inputNames\":[";
@@ -450,24 +452,37 @@ namespace winrt::ShaderLab::implementation
                     auto name = jobj.GetNamedString(L"effectName");
 
                     // Support creating custom compute/pixel shader nodes directly.
-                    if (name == L"Custom Compute Shader" || name == L"Custom Pixel Shader")
+                    if (name == L"Custom Compute Shader" || name == L"Custom Pixel Shader" ||
+                        name == L"Custom D3D11 Compute Shader")
                     {
                         ::ShaderLab::Graph::EffectNode node;
                         bool isCompute = (name == L"Custom Compute Shader");
-                        node.type = isCompute
+                        bool isD3D11 = (name == L"Custom D3D11 Compute Shader");
+                        node.type = (isCompute || isD3D11)
                             ? ::ShaderLab::Graph::NodeType::ComputeShader
                             : ::ShaderLab::Graph::NodeType::PixelShader;
                         node.name = std::wstring(name);
-                        node.effectClsid = isCompute
-                            ? ::ShaderLab::Effects::CustomComputeShaderEffect::CLSID_CustomComputeShader
-                            : ::ShaderLab::Effects::CustomPixelShaderEffect::CLSID_CustomPixelShader;
-                        node.outputPins.push_back({ L"Output", 0 });
+
+                        if (isD3D11)
+                        {
+                            // D3D11 compute: no D2D effect, no output pin (data-only).
+                            // No effectClsid needed.
+                        }
+                        else
+                        {
+                            node.effectClsid = isCompute
+                                ? ::ShaderLab::Effects::CustomComputeShaderEffect::CLSID_CustomComputeShader
+                                : ::ShaderLab::Effects::CustomPixelShaderEffect::CLSID_CustomPixelShader;
+                            node.outputPins.push_back({ L"Output", 0 });
+                        }
 
                         // Create a default custom effect definition.
                         ::ShaderLab::Graph::CustomEffectDefinition def;
-                        def.shaderType = isCompute
-                            ? ::ShaderLab::Graph::CustomShaderType::ComputeShader
-                            : ::ShaderLab::Graph::CustomShaderType::PixelShader;
+                        def.shaderType = isD3D11
+                            ? ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader
+                            : isCompute
+                                ? ::ShaderLab::Graph::CustomShaderType::ComputeShader
+                                : ::ShaderLab::Graph::CustomShaderType::PixelShader;
                         CoCreateGuid(&def.shaderGuid);
 
                         // Default: 1 input named "Source".
@@ -475,6 +490,14 @@ namespace winrt::ShaderLab::implementation
                         node.inputPins.push_back({ L"I0", 0 });
 
                         if (isCompute) { def.threadGroupX = 8; def.threadGroupY = 8; def.threadGroupZ = 1; }
+
+                        if (isD3D11)
+                        {
+                            // Default analysis field so the node has output.
+                            def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::Typed;
+                            def.analysisFields.push_back(
+                                { L"Result", ::ShaderLab::Graph::AnalysisFieldType::Float4 });
+                        }
 
                         node.customEffect = std::move(def);
 

@@ -25,6 +25,7 @@ A WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging
   - [Usage: ShaderLab Evaluator](#usage-shaderlab-evaluator-optimized-path)
   - [GPU Reduction Shader Pattern](#gpu-reduction-shader-pattern)
   - [Known Limitations](#known-limitations)
+- [Effect Designer](#effect-designer)
 - [Multi-Output Windows](#multi-output-windows)
 - [Animation System](#animation-system)
 - [Parameter Nodes](#parameter-nodes)
@@ -437,7 +438,9 @@ ShaderLab/
 │   ├── GraphEvaluator.h        # GraphEvaluator class (topological walk, effect cache, dirty gating, D3D11 dispatch)
 │   ├── GraphEvaluator.cpp      # GraphEvaluator implementation (per-node evaluation loop, needed-node pruning)
 │   ├── GpuReduction.h          # D3D11 compute reduction (32×32 thread group, groupshared memory, stride pattern)
-│   └── GpuReduction.cpp        # GpuReduction implementation (SRV creation, dispatch, 32-byte readback)
+│   ├── GpuReduction.cpp        # GpuReduction implementation (SRV creation, dispatch, 32-byte readback)
+│   ├── D3D11ComputeRunner.h    # Generic D3D11 compute dispatch runner for user-authored shaders
+│   └── D3D11ComputeRunner.cpp  # Compile, dispatch, readback via RWStructuredBuffer<float4>
 ├── Effects/                    # Built-in effect wrappers, custom effect base
 │   ├── ShaderLabEffects.h      # 18+ ShaderLab built-in effects (versioned) + shared color math HLSL library
 │   ├── ShaderLabEffects.cpp    # Effect registration, embedded HLSL, auto-compile, effectId/effectVersion
@@ -934,6 +937,75 @@ void main(uint3 GTid : SV_GroupThreadID) {
 - **No shader linking**: D3D11 compute shaders are opaque to D2D. They don't participate in D2D's shader linking optimization for chained pixel shader effects.
 - **Device sharing**: The D3D11 device must be the same one backing D2D. The effect acquires it lazily via `ID2D1Device2::GetDxgiDevice()` on first `ComputeStatistics` call.
 - **Single thread group**: Current `GpuReduction` dispatches `(1,1,1)` — one group of 1024 threads. For images larger than ~33 megapixels (1024² pixels per thread), a multi-dispatch pyramid would be needed.
+
+## Effect Designer
+
+The Effect Designer is a modal window for authoring custom shader effects directly inside ShaderLab. It supports three shader types:
+
+### Supported Types
+
+| Type | Target | Execution | Output |
+|------|--------|-----------|--------|
+| **Pixel Shader** | `ps_5_0` | D2D render pipeline | Image (RGBA) |
+| **D2D Compute Shader** | `cs_5_0` | D2D per-tile dispatch | Image or analysis data |
+| **D3D11 Compute Shader** | `cs_5_0` | Host-side D3D11 dispatch | Analysis data only |
+
+### D3D11 Compute Shader Workflow
+
+D3D11 compute shaders run outside D2D's tiling system, enabling full-image reductions with atomics and groupshared memory. The Effect Designer generates a scaffold with the stride-based reduction pattern:
+
+```hlsl
+Texture2D<float4> Source : register(t0);
+RWStructuredBuffer<float4> Result : register(u0);
+
+cbuffer Constants : register(b0)
+{
+    uint Width;   // Auto-injected
+    uint Height;  // Auto-injected
+    // User parameters start at offset 8
+};
+
+groupshared float4 gs_sum[32 * 32];
+
+[numthreads(32, 32, 1)]
+void main(uint3 GTid : SV_GroupThreadID)
+{
+    uint tid = GTid.y * 32 + GTid.x;
+    float4 acc = float4(0, 0, 0, 0);
+
+    // Stride over entire image
+    for (uint y = GTid.y; y < Height; y += 32)
+        for (uint x = GTid.x; x < Width; x += 32)
+            acc += Source.Load(int3(x, y, 0));
+
+    gs_sum[tid] = acc;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Parallel reduction
+    for (uint s = 512; s > 0; s >>= 1) {
+        if (tid < s) gs_sum[tid] += gs_sum[tid + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (tid == 0)
+        Result[0] = gs_sum[0] / float(Width * Height);
+}
+```
+
+**Key differences from D2D compute:**
+- No `_TileOffset` — single dispatch covers the full image
+- `Width`/`Height` auto-injected at cbuffer offset 0 (user params at offset 8)
+- Output is `RWStructuredBuffer<float4>` (not `RWTexture2D<float4>`)
+- Results map to typed analysis output fields (one `float4` per field)
+- Supports atomics, full-image groupshared memory, and arbitrary reduction patterns
+
+### Opening Built-in Effects
+
+ShaderLab's built-in effects can be opened in the Effect Designer via the **"Edit in Effect Designer"** button in the Properties panel. The designer loads the effect's HLSL source, parameters, and analysis field definitions. Edits can be compiled and pushed back into the running graph.
+
+### Export (Future)
+
+The Effect Designer will support exporting D3D11 compute effects as standalone C++ header/module files. The export includes the HLSL source, input/parameter/output schema, and the dispatch contract. Developers can then customize the C++ post-processing (e.g., histogram → median computation) in their own codebase.
 
 ## Working Space Integration
 

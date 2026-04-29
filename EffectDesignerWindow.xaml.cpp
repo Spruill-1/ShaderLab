@@ -130,7 +130,9 @@ namespace winrt::ShaderLab::implementation
         Controls::SelectionChangedEventArgs const&)
     {
         bool isCompute = ShaderTypeSelector().SelectedIndex() == 1;
-        ComputeSettingsPanel().Visibility(isCompute ? Visibility::Visible : Visibility::Collapsed);
+        bool isD3D11 = ShaderTypeSelector().SelectedIndex() == 2;
+        ComputeSettingsPanel().Visibility(
+            (isCompute || isD3D11) ? Visibility::Visible : Visibility::Collapsed);
     }
 
     void EffectDesignerWindow::OnAddInput(
@@ -337,9 +339,12 @@ namespace winrt::ShaderLab::implementation
     {
         ::ShaderLab::Graph::CustomEffectDefinition def;
 
-        def.shaderType = ShaderTypeSelector().SelectedIndex() == 1
-            ? ::ShaderLab::Graph::CustomShaderType::ComputeShader
-            : ::ShaderLab::Graph::CustomShaderType::PixelShader;
+        def.shaderType = [&]() {
+            int idx = ShaderTypeSelector().SelectedIndex();
+            if (idx == 1) return ::ShaderLab::Graph::CustomShaderType::ComputeShader;
+            if (idx == 2) return ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader;
+            return ::ShaderLab::Graph::CustomShaderType::PixelShader;
+        }();
 
         // Inputs.
         auto inputPanel = InputsPanel();
@@ -585,9 +590,114 @@ namespace winrt::ShaderLab::implementation
             }
             hlsl += L"}\n";
         }
+        else if (def.shaderType == ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader)
+        {
+            // D3D11 compute shader — dispatched outside D2D tiling.
+            // Single dispatch(1,1,1) with stride pattern over the full image.
+            hlsl += L"// D3D11 Compute Shader — runs outside D2D's tiling system.\n";
+            hlsl += L"// Single dispatch(1,1,1) — one thread group strides over the full image.\n";
+            hlsl += L"// Width and Height are auto-injected at cbuffer offset 0.\n\n";
+
+            // Texture input
+            if (!def.inputNames.empty())
+                hlsl += std::format(L"Texture2D<float4> {} : register(t0);\n", def.inputNames[0]);
+            else
+                hlsl += L"Texture2D<float4> Source : register(t0);\n";
+
+            // Output structured buffer
+            hlsl += L"RWStructuredBuffer<float4> Result : register(u0);\n\n";
+
+            // Cbuffer with Width/Height first
+            hlsl += L"cbuffer Constants : register(b0)\n{\n";
+            hlsl += L"    uint Width;   // Auto-injected: source image width\n";
+            hlsl += L"    uint Height;  // Auto-injected: source image height\n";
+            for (const auto& p : def.parameters)
+                hlsl += L"    " + p.typeName + L" " + p.name + L";\n";
+            hlsl += L"};\n\n";
+
+            // Analysis field layout comments
+            uint32_t pixOff = 0;
+            for (const auto& fd : def.analysisFields)
+            {
+                std::wstring typeTag;
+                switch (fd.type)
+                {
+                case ::ShaderLab::Graph::AnalysisFieldType::Float:      typeTag = L"float"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float2:     typeTag = L"float2"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float3:     typeTag = L"float3"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float4:     typeTag = L"float4"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::FloatArray:  typeTag = L"float[]"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float2Array: typeTag = L"float2[]"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float3Array: typeTag = L"float3[]"; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float4Array: typeTag = L"float4[]"; break;
+                }
+                hlsl += std::format(L"// Result[{}]: {} {} ({})\n",
+                    pixOff, typeTag, fd.name,
+                    ::ShaderLab::Graph::AnalysisFieldIsArray(fd.type)
+                        ? std::format(L"{} elements", fd.pixelCount())
+                        : L"1 element");
+                pixOff += fd.pixelCount();
+            }
+            if (pixOff > 0) hlsl += L"\n";
+
+            // Groupshared + main
+            std::wstring srcName = def.inputNames.empty() ? L"Source" : def.inputNames[0];
+            hlsl += L"// Groupshared accumulators for parallel reduction.\n";
+            hlsl += L"groupshared float4 gs_sum[32 * 32];\n\n";
+
+            hlsl += L"[numthreads(32, 32, 1)]\n";
+            hlsl += L"void main(uint3 GTid : SV_GroupThreadID)\n";
+            hlsl += L"{\n";
+            hlsl += L"    uint tid = GTid.y * 32 + GTid.x;\n";
+            hlsl += L"    float4 acc = float4(0, 0, 0, 0);\n\n";
+
+            hlsl += L"    // Stride over entire image — each thread covers many pixels.\n";
+            hlsl += L"    for (uint y = GTid.y; y < Height; y += 32)\n";
+            hlsl += L"    {\n";
+            hlsl += L"        for (uint x = GTid.x; x < Width; x += 32)\n";
+            hlsl += L"        {\n";
+            hlsl += std::format(L"            float4 pixel = {}.Load(int3(x, y, 0));\n", srcName);
+            hlsl += L"            // TODO: accumulate your statistics here\n";
+            hlsl += L"            acc += pixel;\n";
+            hlsl += L"        }\n";
+            hlsl += L"    }\n\n";
+
+            hlsl += L"    // Parallel reduction in groupshared memory.\n";
+            hlsl += L"    gs_sum[tid] = acc;\n";
+            hlsl += L"    GroupMemoryBarrierWithGroupSync();\n\n";
+
+            hlsl += L"    for (uint s = (32 * 32) / 2; s > 0; s >>= 1)\n";
+            hlsl += L"    {\n";
+            hlsl += L"        if (tid < s)\n";
+            hlsl += L"            gs_sum[tid] += gs_sum[tid + s];\n";
+            hlsl += L"        GroupMemoryBarrierWithGroupSync();\n";
+            hlsl += L"    }\n\n";
+
+            hlsl += L"    // Thread 0 writes final results.\n";
+            hlsl += L"    if (tid == 0)\n";
+            hlsl += L"    {\n";
+            hlsl += L"        float totalPixels = float(Width * Height);\n";
+            hlsl += L"        float4 mean = gs_sum[0] / max(totalPixels, 1.0);\n";
+
+            if (!def.analysisFields.empty())
+            {
+                pixOff = 0;
+                for (const auto& fd : def.analysisFields)
+                {
+                    hlsl += std::format(L"        Result[{}] = mean; // {} — replace with your value\n",
+                        pixOff, fd.name);
+                    pixOff += fd.pixelCount();
+                }
+            }
+            else
+            {
+                hlsl += L"        Result[0] = mean;\n";
+            }
+            hlsl += L"    }\n";
+            hlsl += L"}\n";
+        }
         else
         {
-            // Compute shader.
             for (uint32_t i = 0; i < def.inputNames.size(); ++i)
             {
                 hlsl += std::format(L"Texture2D {} : register(t{});\n", def.inputNames[i], i);
@@ -925,12 +1035,18 @@ namespace winrt::ShaderLab::implementation
         // Configure pins from inputs.
         for (uint32_t i = 0; i < def.inputNames.size(); ++i)
             node.inputPins.push_back({ def.inputNames[i], i });
-        node.outputPins.push_back({ L"Output", 0 });
 
-        // Set custom effect CLSID based on shader type.
-        node.effectClsid = (def.shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader)
-            ? ::ShaderLab::Effects::CustomPixelShaderEffect::CLSID_CustomPixelShader
-            : ::ShaderLab::Effects::CustomComputeShaderEffect::CLSID_CustomComputeShader;
+        // D3D11 compute shaders are data-only (no image output pin).
+        if (def.shaderType != ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader)
+            node.outputPins.push_back({ L"Output", 0 });
+
+        // Set custom effect CLSID (D3D11 compute doesn't use a D2D effect).
+        if (def.shaderType != ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader)
+        {
+            node.effectClsid = (def.shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader)
+                ? ::ShaderLab::Effects::CustomPixelShaderEffect::CLSID_CustomPixelShader
+                : ::ShaderLab::Effects::CustomComputeShaderEffect::CLSID_CustomComputeShader;
+        }
 
         // Copy parameters as node properties with defaults.
         for (const auto& p : def.parameters)
@@ -971,7 +1087,8 @@ namespace winrt::ShaderLab::implementation
 
         EffectNameBox().Text(nodeName.empty() ? L"Custom Effect" : winrt::hstring(nodeName));
         ShaderTypeSelector().SelectedIndex(
-            def.shaderType == ::ShaderLab::Graph::CustomShaderType::ComputeShader ? 1 : 0);
+            def.shaderType == ::ShaderLab::Graph::CustomShaderType::ComputeShader ? 1 :
+            def.shaderType == ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader ? 2 : 0);
 
         // Populate inputs.
         InputsPanel().Children().Clear();
