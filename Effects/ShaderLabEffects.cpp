@@ -2241,12 +2241,12 @@ float4 main(
         }
 
         // ---- Image Statistics ----
-        // Scans the input image and outputs min/max/mean/median statistics.
-        // Designed for analyzing Delta E or luminance outputs.
+        // Pixel shader that scans the input. Each row-0 pixel independently
+        // computes stats. OutputSize kept small (8) to limit redundant work.
+        // TODO: convert to CPU readback for optimal performance.
         {
             static const std::string imageStatsHLSL = R"HLSL(
 // Image Statistics - computes min, max, mean of input pixel values.
-// Outputs a small image; row 0 encodes analysis fields.
 
 cbuffer Constants : register(b0)
 {
@@ -2271,11 +2271,7 @@ float4 main(
     float4 pos : SV_POSITION, float4 ps : SCENE_POSITION, float4 uv0 : TEXCOORD0
 ) : SV_Target
 {
-    float size = max(OutputSize, 8.0);
     float2 outPx = pos.xy;
-
-    // Only row 0 pixels compute stats (for analysis readback).
-    // All other pixels return black — this is a data-only node.
     if (outPx.y >= 1.0)
         return float4(0, 0, 0, 1);
 
@@ -2283,7 +2279,6 @@ float4 main(
     InputTexture.GetDimensions(dims.x, dims.y);
     uint ch = (uint)Channel;
 
-    // Scan the input: compute min, max, sum, and build a histogram for median.
     float vMin = 1e10;
     float vMax = -1e10;
     float vSum = 0;
@@ -2291,11 +2286,8 @@ float4 main(
     uint totalScanned = 0;
     uint nonzeroCount = 0;
 
-    float histMax = 100.0;
-    uint hist[256];
-    for (uint bi = 0; bi < 256; bi++) hist[bi] = 0;
-
-    uint sqrtSamples = (uint)min(ceil(sqrt(dims.x * dims.y)), 512.0);
+    // Sample on a grid — cap at 256x256 for performance.
+    uint sqrtSamples = (uint)min(ceil(sqrt(dims.x * dims.y)), 256.0);
     float stepX = dims.x / (float)sqrtSamples;
     float stepY = dims.y / (float)sqrtSamples;
 
@@ -2309,63 +2301,29 @@ float4 main(
             totalScanned++;
             bool isNonzero = abs(v) > 0.0001;
             if (isNonzero) nonzeroCount++;
-
             if (NonzeroOnly > 0.5 && !isNonzero) continue;
-
             vMin = min(vMin, v);
             vMax = max(vMax, v);
             vSum += v;
             totalSamples++;
-
-            float normalized = saturate(v / max(histMax, 0.001));
-            uint bin = min((uint)(normalized * 255.0), 255u);
-            hist[bin]++;
         }
     }
 
     float vMean = (totalSamples > 0) ? vSum / (float)totalSamples : 0.0;
+    float vNonzero = (totalScanned > 0) ? (float)nonzeroCount / (float)totalScanned : 0.0;
 
-    uint halfCount = totalSamples / 2;
-    uint cumulative = 0;
-    float vMedian = 0;
-    for (uint mi = 0; mi < 256; mi++)
-    {
-        cumulative += hist[mi];
-        if (cumulative >= halfCount)
-        {
-            vMedian = ((float)mi / 255.0) * histMax;
-            break;
-        }
-    }
-
-    uint p95Count = (uint)(totalSamples * 0.95);
-    cumulative = 0;
-    float vP95 = 0;
-    for (uint pi = 0; pi < 256; pi++)
-    {
-        cumulative += hist[pi];
-        if (cumulative >= p95Count)
-        {
-            vP95 = ((float)pi / 255.0) * histMax;
-            break;
-        }
-    }
-
-    // Row 0: encode analysis output fields (one float per pixel, R channel)
     if (outPx.x < 1.0) return float4(vMin, 0, 0, 1);
     if (outPx.x < 2.0) return float4(vMax, 0, 0, 1);
     if (outPx.x < 3.0) return float4(vMean, 0, 0, 1);
-    if (outPx.x < 4.0) return float4(vMedian, 0, 0, 1);
-    if (outPx.x < 5.0) return float4(vP95, 0, 0, 1);
-    if (outPx.x < 6.0) return float4((float)totalSamples, 0, 0, 1);
-    if (outPx.x < 7.0) return float4((totalScanned > 0) ? (float)nonzeroCount / (float)totalScanned : 0.0, 0, 0, 1);
+    if (outPx.x < 4.0) return float4((float)totalSamples, 0, 0, 1);
+    if (outPx.x < 5.0) return float4(vNonzero, 0, 0, 1);
     return float4(0, 0, 0, 1);
 }
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Image Statistics";
-            desc.effectId = L"Image Statistics"; desc.effectVersion = 3;
+            desc.effectId = L"Image Statistics"; desc.effectVersion = 4;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + imageStatsHLSL;
@@ -2378,12 +2336,10 @@ float4 main(
             };
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
             desc.analysisFields = {
-                { L"Min",     Graph::AnalysisFieldType::Float },
-                { L"Max",     Graph::AnalysisFieldType::Float },
-                { L"Mean",    Graph::AnalysisFieldType::Float },
-                { L"Median",  Graph::AnalysisFieldType::Float },
-                { L"P95",     Graph::AnalysisFieldType::Float },
-                { L"Samples", Graph::AnalysisFieldType::Float },
+                { L"Min",      Graph::AnalysisFieldType::Float },
+                { L"Max",      Graph::AnalysisFieldType::Float },
+                { L"Mean",     Graph::AnalysisFieldType::Float },
+                { L"Samples",  Graph::AnalysisFieldType::Float },
                 { L"Nonzero%", Graph::AnalysisFieldType::Float },
             };
             m_effects.push_back(std::move(desc));
