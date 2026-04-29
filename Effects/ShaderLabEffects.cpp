@@ -2241,15 +2241,156 @@ float4 main(
         }
 
         // ---- Image Statistics ----
-        // CPU-side analysis: evaluator renders input to bitmap, reads back,
-        // computes stats in a single C++ loop. No shader needed.
+        // D3D11 compute shader: 32x32 thread group, stride-based reduction
+        // with 256-bin histogram. Dispatched outside D2D via GpuReduction.
         {
+            static const std::string imageStatsHLSL = R"HLSL(
+// Image Statistics — D3D11 Compute Shader
+// 32x32 = 1024 threads in one group, dispatched as (1,1,1).
+// Each thread strides across the full image, accumulates per-thread
+// partials, then reduces in groupshared memory.
+//
+// Output buffer layout (RWBuffer<uint>, 264 elements):
+//   [0]     = min (float as uint via asuint — IEEE 754 ordering)
+//   [1]     = max (float as uint)
+//   [2]     = sum (float as uint)
+//   [3]     = reserved
+//   [4]     = sampleCount
+//   [5]     = totalPixels
+//   [6]     = nonzeroPixels
+//   [7]     = reserved
+//   [8..263] = 256-bin histogram (uint counts)
+//
+// Host reads back 264 uints (1056 bytes), computes:
+//   mean = asfloat(sum) / sampleCount
+//   median / P95 from histogram CDF
+
+cbuffer Constants : register(b0)
+{
+    uint Width;
+    uint Height;
+    uint Channel;      // 0=luminance, 1=R, 2=G, 3=B, 4=A
+    uint NonzeroOnly;  // 0=all, 1=nonzero only
+};
+
+Texture2D<float4> Input : register(t0);
+RWBuffer<uint> Result : register(u0);
+
+#define GROUP_SIZE 32
+#define THREAD_COUNT (GROUP_SIZE * GROUP_SIZE)
+#define HIST_BINS 256
+#define HIST_MAX 100.0  // histogram range [0, HIST_MAX]
+
+groupshared float gs_min[THREAD_COUNT];
+groupshared float gs_max[THREAD_COUNT];
+groupshared float gs_sum[THREAD_COUNT];
+groupshared uint  gs_count[THREAD_COUNT];
+groupshared uint  gs_total[THREAD_COUNT];
+groupshared uint  gs_nonzero[THREAD_COUNT];
+groupshared uint  gs_hist[HIST_BINS];
+
+float GetValue(float4 pix, uint ch)
+{
+    float result = 0.2126 * pix.r + 0.7152 * pix.g + 0.0722 * pix.b;
+    if (ch == 1) result = pix.r;
+    else if (ch == 2) result = pix.g;
+    else if (ch == 3) result = pix.b;
+    else if (ch == 4) result = pix.a;
+    return result;
+}
+
+[numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
+void main(uint3 GTid : SV_GroupThreadID)
+{
+    uint tid = GTid.x + GTid.y * GROUP_SIZE;
+
+    // Clear shared histogram.
+    for (uint bi = tid; bi < HIST_BINS; bi += THREAD_COUNT)
+        gs_hist[bi] = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    float tMin = 1e30;
+    float tMax = -1e30;
+    float tSum = 0;
+    uint  tCount = 0;
+    uint  tTotal = 0;
+    uint  tNonzero = 0;
+
+    // Stride across entire image.
+    for (uint y = GTid.y; y < Height; y += GROUP_SIZE)
+    {
+        for (uint x = GTid.x; x < Width; x += GROUP_SIZE)
+        {
+            float4 pix = Input[int2(x, y)];
+            float v = GetValue(pix, Channel);
+
+            tTotal++;
+            bool nz = abs(v) > 0.0001;
+            if (nz) tNonzero++;
+
+            if (NonzeroOnly == 1 && !nz) continue;
+
+            tMin = min(tMin, v);
+            tMax = max(tMax, v);
+            tSum += v;
+            tCount++;
+
+            // Histogram bin (atomic add to shared memory).
+            float normalized = saturate(v / HIST_MAX);
+            uint bin = min((uint)(normalized * 255.0), 255u);
+            InterlockedAdd(gs_hist[bin], 1u);
+        }
+    }
+
+    gs_min[tid] = tMin;
+    gs_max[tid] = tMax;
+    gs_sum[tid] = tSum;
+    gs_count[tid] = tCount;
+    gs_total[tid] = tTotal;
+    gs_nonzero[tid] = tNonzero;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Parallel reduction for min/max/sum/count.
+    for (uint stride = THREAD_COUNT / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            gs_min[tid] = min(gs_min[tid], gs_min[tid + stride]);
+            gs_max[tid] = max(gs_max[tid], gs_max[tid + stride]);
+            gs_sum[tid] += gs_sum[tid + stride];
+            gs_count[tid] += gs_count[tid + stride];
+            gs_total[tid] += gs_total[tid + stride];
+            gs_nonzero[tid] += gs_nonzero[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Thread 0 writes final stats.
+    if (tid == 0)
+    {
+        Result[0] = asuint(gs_min[0]);
+        Result[1] = asuint(gs_max[0]);
+        Result[2] = asuint(gs_sum[0]);
+        Result[3] = 0;
+        Result[4] = gs_count[0];
+        Result[5] = gs_total[0];
+        Result[6] = gs_nonzero[0];
+        Result[7] = 0;
+    }
+
+    // All threads cooperate to write histogram bins.
+    for (uint hbi = tid; hbi < HIST_BINS; hbi += THREAD_COUNT)
+        Result[8 + hbi] = gs_hist[hbi];
+}
+)HLSL";
+
             ShaderLabEffectDescriptor desc;
             desc.name = L"Image Statistics";
             desc.effectId = L"Image Statistics"; desc.effectVersion = 7;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
-            // No HLSL — evaluator handles via D3D11 GPU reduction.
+            desc.hlslSource = imageStatsHLSL;
             desc.dataOnly = true;
             desc.inputNames = { L"Source" };
             desc.parameters = {
