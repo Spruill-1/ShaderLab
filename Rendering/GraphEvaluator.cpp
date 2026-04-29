@@ -1134,7 +1134,7 @@ namespace ShaderLab::Rendering
     }
 
     // -----------------------------------------------------------------------
-    // CPU-side image statistics
+    // GPU-accelerated image statistics
     // -----------------------------------------------------------------------
 
     void GraphEvaluator::ComputeImageStatistics(
@@ -1151,7 +1151,7 @@ namespace ShaderLab::Rendering
         uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
         if (w == 0 || h == 0) return;
 
-        // Render input to a GPU target bitmap.
+        // Render input to a D2D bitmap backed by a DXGI surface.
         winrt::com_ptr<ID2D1Bitmap1> gpuTarget;
         D2D1_BITMAP_PROPERTIES1 gpuProps = {};
         gpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
@@ -1168,24 +1168,32 @@ namespace ShaderLab::Rendering
         dc->EndDraw();
         dc->SetTarget(prevTarget.get());
 
-        // Create CPU-readable bitmap and copy.
-        winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
-        D2D1_BITMAP_PROPERTIES1 cpuProps = {};
-        cpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
-        hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, cpuProps, cpuBitmap.put());
+        // Get the underlying D3D11 texture from the D2D bitmap.
+        winrt::com_ptr<IDXGISurface> surface;
+        hr = gpuTarget->GetSurface(surface.put());
         if (FAILED(hr)) return;
 
-        D2D1_POINT_2U dest = { 0, 0 };
-        D2D1_RECT_U srcRect = { 0, 0, w, h };
-        hr = cpuBitmap->CopyFromBitmap(&dest, gpuTarget.get(), &srcRect);
+        winrt::com_ptr<ID3D11Texture2D> d3dTexture;
+        hr = surface->QueryInterface(d3dTexture.put());
         if (FAILED(hr)) return;
 
-        D2D1_MAPPED_RECT mapped{};
-        hr = cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped);
-        if (FAILED(hr)) return;
+        // Initialize GPU reduction if needed.
+        if (!m_gpuReduction.IsInitialized())
+        {
+            winrt::com_ptr<ID3D11Device> device;
+            winrt::com_ptr<ID3D11DeviceContext> d3dCtx;
+            d3dTexture->GetDevice(device.put());
+            device->GetImmediateContext(d3dCtx.put());
+            m_gpuReduction.Initialize(device.get());
+        }
 
-        // Read channel selection from properties.
+        // Get D3D11 device context.
+        winrt::com_ptr<ID3D11Device> device;
+        d3dTexture->GetDevice(device.put());
+        winrt::com_ptr<ID3D11DeviceContext> d3dCtx;
+        device->GetImmediateContext(d3dCtx.put());
+
+        // Read channel/nonzero settings from properties.
         uint32_t channel = 0;
         {
             auto it = node.properties.find(L"Channel");
@@ -1199,48 +1207,11 @@ namespace ShaderLab::Rendering
                 if (auto* f = std::get_if<float>(&it->second)) nonzeroOnly = *f > 0.5f;
         }
 
-        // Single-pass scan over all pixels.
-        float vMin = 1e30f, vMax = -1e30f, vSum = 0;
-        uint64_t totalSamples = 0, totalScanned = 0, nonzeroCount = 0;
+        // Dispatch GPU reduction.
+        auto stats = m_gpuReduction.Reduce(d3dCtx.get(), d3dTexture.get(), channel, nonzeroOnly);
 
-        for (uint32_t y = 0; y < h; ++y)
-        {
-            const float* row = reinterpret_cast<const float*>(
-                reinterpret_cast<const uint8_t*>(mapped.bits) + y * mapped.pitch);
-            for (uint32_t x = 0; x < w; ++x)
-            {
-                float r = row[x * 4 + 0];
-                float g = row[x * 4 + 1];
-                float b = row[x * 4 + 2];
-                float a = row[x * 4 + 3];
-
-                float v = 0;
-                switch (channel)
-                {
-                case 1: v = r; break;
-                case 2: v = g; break;
-                case 3: v = b; break;
-                case 4: v = a; break;
-                default: v = 0.2126f * r + 0.7152f * g + 0.0722f * b; break;
-                }
-
-                totalScanned++;
-                bool isNonzero = std::abs(v) > 0.0001f;
-                if (isNonzero) nonzeroCount++;
-                if (nonzeroOnly && !isNonzero) continue;
-
-                vMin = (std::min)(vMin, v);
-                vMax = (std::max)(vMax, v);
-                vSum += v;
-                totalSamples++;
-            }
-        }
-
-        cpuBitmap->Unmap();
-
-        float vMean = (totalSamples > 0) ? vSum / static_cast<float>(totalSamples) : 0.0f;
-        float vNonzero = (totalScanned > 0) ? static_cast<float>(nonzeroCount) / static_cast<float>(totalScanned) : 0.0f;
-        if (totalSamples == 0) { vMin = 0; vMax = 0; }
+        float vNonzero = (stats.totalPixels > 0)
+            ? static_cast<float>(stats.nonzeroPixels) / static_cast<float>(stats.totalPixels) : 0.0f;
 
         // Populate analysis output.
         node.analysisOutput.type = AnalysisOutputType::Typed;
@@ -1254,10 +1225,10 @@ namespace ShaderLab::Rendering
             node.analysisOutput.fields.push_back(std::move(fv));
         };
 
-        addField(L"Min", vMin);
-        addField(L"Max", vMax);
-        addField(L"Mean", vMean);
-        addField(L"Samples", static_cast<float>(totalSamples));
+        addField(L"Min", stats.min);
+        addField(L"Max", stats.max);
+        addField(L"Mean", stats.mean);
+        addField(L"Samples", static_cast<float>(stats.samples));
         addField(L"Nonzero%", vNonzero);
     }
 }

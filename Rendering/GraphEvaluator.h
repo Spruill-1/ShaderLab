@@ -5,6 +5,7 @@
 #include "../Effects/CustomPixelShaderEffect.h"
 #include "../Effects/CustomComputeShaderEffect.h"
 #include "../Effects/ShaderCompiler.h"
+#include "GpuReduction.h"
 
 namespace ShaderLab::Rendering
 {
@@ -95,7 +96,7 @@ namespace ShaderLab::Rendering
             ID2D1DeviceContext5* dc,
             Graph::EffectNode& node);
 
-        // CPU-side image statistics: render input to bitmap, read back, compute stats.
+        // GPU-accelerated image statistics via D3D11 compute shader reduction.
         void ComputeImageStatistics(
             ID2D1DeviceContext5* dc,
             Graph::EffectNode& node,
@@ -116,5 +117,8 @@ namespace ShaderLab::Rendering
         // but source effects generate their own content.
         winrt::com_ptr<ID2D1Bitmap1> m_dummySourceBitmap;
         void EnsureDummySourceBitmap(ID2D1DeviceContext5* dc);
+
+        // GPU compute shader reduction for image statistics.
+        GpuReduction m_gpuReduction;
     };
 }

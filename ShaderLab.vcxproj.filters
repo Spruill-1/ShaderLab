@@ -58,6 +58,9 @@
     <ClInclude Include="Rendering\GraphEvaluator.h">
       <Filter>Rendering</Filter>
     </ClInclude>
+    <ClInclude Include="Rendering\GpuReduction.h">
+      <Filter>Rendering</Filter>
+    </ClInclude>
     <ClInclude Include="Rendering\ToneMapper.h">
       <Filter>Rendering</Filter>
     </ClInclude>
@@ -134,6 +137,9 @@
       <Filter>Rendering</Filter>
     </ClCompile>
     <ClCompile Include="Rendering\GraphEvaluator.cpp">
+      <Filter>Rendering</Filter>
+    </ClCompile>
+    <ClCompile Include="Rendering\GpuReduction.cpp">
       <Filter>Rendering</Filter>
     </ClCompile>
     <ClCompile Include="Rendering\ToneMapper.cpp">
