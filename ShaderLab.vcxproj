@@ -114,6 +114,8 @@
   <ItemGroup>
     <ClInclude Include="Controls\NodeGraphController.h" />
     <ClInclude Include="Controls\OutputWindow.h" />
+    <ClInclude Include="Controls\NodeLog.h" />
+    <ClInclude Include="Controls\LogWindow.h" />
     <ClInclude Include="Controls\PixelInspectorController.h" />
     <ClInclude Include="Controls\PixelTraceController.h" />
     <ClInclude Include="Controls\ShaderEditorController.h" />
@@ -164,6 +166,7 @@
   <ItemGroup>
     <ClCompile Include="Controls\NodeGraphController.cpp" />
     <ClCompile Include="Controls\OutputWindow.cpp" />
+    <ClCompile Include="Controls\LogWindow.cpp" />
     <ClCompile Include="Controls\PixelInspectorController.cpp" />
     <ClCompile Include="Controls\PixelTraceController.cpp" />
     <ClCompile Include="Controls\ShaderEditorController.cpp" />

@@ -3659,6 +3659,20 @@ namespace winrt::ShaderLab::implementation
                 panel.Children().Append(upgradeBorder);
             }
         }
+
+        // "Show Logs" button at the bottom of properties panel.
+        if (node)
+        {
+            auto logBtn = Controls::Button();
+            logBtn.Content(winrt::box_value(L"\xE7BA  Show Logs"));
+            logBtn.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+            logBtn.Margin({ 0, 12, 0, 0 });
+            uint32_t logNodeId = node->id;
+            logBtn.Click([this, logNodeId](auto&&, auto&&) {
+                OpenLogWindow(logNodeId);
+            });
+            panel.Children().Append(logBtn);
+        }
     }
 
     void MainWindow::ShowCurveEditorDialog(
@@ -4554,12 +4568,21 @@ namespace winrt::ShaderLab::implementation
         }
 
         // Update FPS counter every second (counts output frames only).
+        // Also update log windows at ~4Hz.
         auto fpsNow = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(fpsNow - m_fpsTimePoint).count();
+        if (elapsed >= 250)
+        {
+            if (!m_logWindows.empty())
+                UpdateLogWindows();
+        }
         if (elapsed >= 1000)
         {
             float fps = static_cast<float>(m_frameCount) * 1000.0f / static_cast<float>(elapsed);
-            FpsText().Text(std::format(L"FPS: {:.0f}", fps));
+            auto& ft = m_frameTiming;
+            FpsText().Text(std::format(L"{:.0f} FPS | {:.1f}ms (eval {:.1f} + compute {:.1f} + draw {:.1f})",
+                fps, ft.totalUs / 1000.0, ft.evaluateUs / 1000.0,
+                ft.deferredComputeUs / 1000.0, ft.drawUs / 1000.0 + ft.presentUs / 1000.0));
             m_frameCount = 0;
             m_fpsTimePoint = fpsNow;
         }
@@ -4752,17 +4775,51 @@ namespace winrt::ShaderLab::implementation
         // Process deferred D3D11 compute dispatches inside the active D2D
         // draw session, where all effect chains are fully materialized.
         uint32_t computeCount = static_cast<uint32_t>(m_graphEvaluator.DeferredComputeCount());
+        auto tComputeStart = std::chrono::high_resolution_clock::now();
         if (m_graphEvaluator.ProcessDeferredCompute(m_graph, drawDc))
         {
             m_nodeGraphController.SetNeedsRedraw();
-            // Re-evaluate downstream nodes that were marked dirty by
-            // ProcessDeferredCompute so they wire the new compute output
-            // in the same frame (avoids one-frame latency).
             if (m_graph.HasDirtyNodes())
                 m_graphEvaluator.Evaluate(m_graph, drawDc);
         }
 
         auto tComputeEnd = std::chrono::high_resolution_clock::now();
+
+        // Log compute dispatch timing if it was slow (>10ms).
+        if (computeCount > 0)
+        {
+            double computeMs = std::chrono::duration<double, std::milli>(tComputeEnd - tComputeStart).count();
+            if (computeMs > 10.0)
+            {
+                // Log to each compute node that dispatched.
+                for (const auto& node : m_graph.Nodes())
+                {
+                    if (node.customEffect.has_value() &&
+                        node.customEffect->shaderType == ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader &&
+                        !node.outputPins.empty() && node.cachedOutput)
+                    {
+                        m_nodeLogs[node.id].Warning(
+                            std::format(L"Slow compute dispatch: {:.1f}ms ({} dispatches)", computeMs, computeCount));
+                    }
+                }
+            }
+        }
+
+        // Log per-node state changes (errors) — only on transitions.
+        for (const auto& node : m_graph.Nodes())
+        {
+            auto& log = m_nodeLogs[node.id];
+            // Log runtime errors when they change.
+            static std::unordered_map<uint32_t, std::wstring> s_lastError;
+            if (node.runtimeError != s_lastError[node.id])
+            {
+                s_lastError[node.id] = node.runtimeError;
+                if (!node.runtimeError.empty())
+                    log.Error(node.runtimeError);
+                else
+                    log.Info(L"Error cleared");
+            }
+        }
 
         // Set DPI to 96 so D2D coordinates match WinUI DIPs exactly.
         // The XAML compositor handles physical pixel scaling.
@@ -4927,6 +4984,46 @@ namespace winrt::ShaderLab::implementation
 
             auto* image = ResolveDisplayImage(window->NodeId());
             window->Present(dc, image);
+        }
+    }
+
+    void MainWindow::OpenLogWindow(uint32_t nodeId)
+    {
+        // Check if already open.
+        for (auto& w : m_logWindows)
+        {
+            if (w->NodeId() == nodeId && w->IsOpen())
+                return;
+        }
+
+        auto* node = m_graph.FindNode(nodeId);
+        if (!node) return;
+
+        auto window = std::make_unique<::ShaderLab::Controls::LogWindow>();
+        window->Create(nodeId, node->name);
+
+        // Populate with existing log entries.
+        auto it = m_nodeLogs.find(nodeId);
+        if (it != m_nodeLogs.end())
+            window->Update(it->second);
+
+        m_logWindows.push_back(std::move(window));
+    }
+
+    void MainWindow::UpdateLogWindows()
+    {
+        // Remove closed windows.
+        m_logWindows.erase(
+            std::remove_if(m_logWindows.begin(), m_logWindows.end(),
+                [](const auto& w) { return !w->IsOpen(); }),
+            m_logWindows.end());
+
+        // Update open windows with new log entries.
+        for (auto& w : m_logWindows)
+        {
+            auto it = m_nodeLogs.find(w->NodeId());
+            if (it != m_nodeLogs.end())
+                w->Update(it->second);
         }
     }
 }

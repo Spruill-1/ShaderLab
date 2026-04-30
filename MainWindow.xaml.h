@@ -14,6 +14,8 @@
 #include "Controls/PixelInspectorController.h"
 #include "Controls/PixelTraceController.h"
 #include "Controls/OutputWindow.h"
+#include "Controls/LogWindow.h"
+#include "Controls/NodeLog.h"
 #include "EffectDesignerWindow.xaml.h"
 #include "ShaderLab/McpHttpServer.h"
 
@@ -141,6 +143,13 @@ namespace winrt::ShaderLab::implementation
         void OpenOutputWindow(uint32_t nodeId);
         void CloseOutputWindow(uint32_t nodeId);
         void PresentOutputWindows();
+
+        // Per-node log system.
+        std::unordered_map<uint32_t, ::ShaderLab::Controls::NodeLog> m_nodeLogs;
+        std::vector<std::unique_ptr<::ShaderLab::Controls::LogWindow>> m_logWindows;
+        void OpenLogWindow(uint32_t nodeId);
+        void UpdateLogWindows();
+        ::ShaderLab::Controls::NodeLog& GetNodeLog(uint32_t nodeId) { return m_nodeLogs[nodeId]; }
 
         // Render loop timer.
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer m_renderTimer{ nullptr };

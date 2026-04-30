@@ -515,8 +515,9 @@ namespace winrt::ShaderLab::implementation
                     if (slDesc)
                     {
                         auto node = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*slDesc);
-                        return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                        return DispatchSync([&, wname = std::wstring(name)]() -> ::ShaderLab::McpHttpServer::Response {
                             auto id = m_graph.AddNode(std::move(node));
+                            m_nodeLogs[id].Info(std::format(L"Node created: {}", wname));
                             m_graph.MarkAllDirty();
                             m_nodeGraphController.AutoLayout();
                             PopulatePreviewNodeSelector();
@@ -544,8 +545,9 @@ namespace winrt::ShaderLab::implementation
                         return { 400, R"({"error":"Unknown effect name"})" };
                     }
                     auto node = ::ShaderLab::Effects::EffectRegistry::CreateNode(*desc);
-                    return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    return DispatchSync([&, wname = std::wstring(name)]() -> ::ShaderLab::McpHttpServer::Response {
                         auto id = m_graph.AddNode(std::move(node));
+                        m_nodeLogs[id].Info(std::format(L"Node created: {}", wname));
                         m_graph.MarkAllDirty();
                         m_nodeGraphController.AutoLayout();
                         PopulatePreviewNodeSelector();
@@ -972,6 +974,78 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
+        // GET /node/{id}/logs — Return per-node log entries
+        // =====================================================================
+        m_mcpServer->AddRoute(L"GET", L"/node/", [this](const std::wstring& path, const std::string&)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                // Parse nodeId and optional /logs suffix from path.
+                // Expected: /node/{id}/logs or /node/{id}/logs?since={seq}
+                auto stripped = path.substr(6); // remove "/node/"
+                auto slashPos = stripped.find(L'/');
+                uint32_t nodeId = 0;
+                try { nodeId = static_cast<uint32_t>(std::stoi(stripped)); } catch (...) {
+                    return { 400, R"({"error":"Invalid node ID"})" };
+                }
+
+                auto it = m_nodeLogs.find(nodeId);
+                if (it == m_nodeLogs.end())
+                    return { 200, R"({"logs":[]})" };
+
+                auto& log = it->second;
+                // Check for ?since= parameter.
+                uint64_t sinceSeq = 0;
+                auto qPos = path.find(L"since=");
+                if (qPos != std::wstring::npos)
+                {
+                    try { sinceSeq = std::stoull(path.substr(qPos + 6)); } catch (...) {}
+                }
+
+                std::string json = "{\"logs\":[";
+                bool first = true;
+                for (const auto& entry : log.Entries())
+                {
+                    if (entry.sequence <= sinceSeq) continue;
+                    if (!first) json += ",";
+                    first = false;
+
+                    auto tt = std::chrono::system_clock::to_time_t(entry.timestamp);
+                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        entry.timestamp.time_since_epoch()).count() % 1000;
+                    struct tm tm_buf{};
+                    localtime_s(&tm_buf, &tt);
+                    char timeBuf[32]{};
+                    sprintf_s(timeBuf, "%02d:%02d:%02d.%03d",
+                        tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, static_cast<int>(ms));
+
+                    const char* levelStr = "Info";
+                    if (entry.level == ::ShaderLab::Controls::LogLevel::Warning) levelStr = "Warning";
+                    else if (entry.level == ::ShaderLab::Controls::LogLevel::Error) levelStr = "Error";
+
+                    // JSON-escape the message.
+                    std::string msg = ToUtf8(entry.message);
+                    std::string escaped;
+                    for (char c : msg) {
+                        if (c == '"') escaped += "\\\"";
+                        else if (c == '\\') escaped += "\\\\";
+                        else if (c == '\n') escaped += "\\n";
+                        else if (c == '\r') escaped += "\\r";
+                        else if (c == '\t') escaped += "\\t";
+                        else if (static_cast<unsigned char>(c) < 0x20)
+                            escaped += std::format("\\u{:04x}", static_cast<unsigned char>(c));
+                        else escaped += c;
+                    }
+
+                    json += std::format("{{\"seq\":{},\"time\":\"{}\",\"level\":\"{}\",\"message\":\"{}\"}}",
+                        entry.sequence, timeBuf, levelStr, escaped);
+                }
+                json += "]}";
+                return { 200, json };
+            });
+        });
+
+        // =====================================================================
         // POST /graph/bind-property — Bind a property to an analysis output field
         // =====================================================================
         m_mcpServer->AddRoute(L"POST", L"/graph/bind-property", [this](const std::wstring&, const std::string& body)
@@ -1283,6 +1357,7 @@ namespace winrt::ShaderLab::implementation
 {"name":"set_preview_node","description":"Set which node is previewed","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
 {"name":"render_capture","description":"Capture preview as PNG. Note: HDR values clipped to SDR.","inputSchema":{"type":"object","properties":{}}},
 {"name":"perf_timings","description":"Get per-frame performance timings (ms) for render pipeline phases","inputSchema":{"type":"object","properties":{}}},
+{"name":"node_logs","description":"Get per-node log entries (timestamped info/warning/error). Use sinceSeq for incremental reads.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"sinceSeq":{"type":"number","description":"Only return entries after this sequence number"}},"required":["nodeId"]}},
 {"name":"registry_get_effect","description":"Get metadata for a built-in effect","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
 {"name":"graph_bind_property","description":"Bind a node property to an upstream analysis output field","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"propertyName":{"type":"string"},"sourceNodeId":{"type":"number"},"sourceFieldName":{"type":"string"},"sourceComponent":{"type":"number","description":"0-3 for .xyzw component (scalar dest only)"}},"required":["nodeId","propertyName","sourceNodeId","sourceFieldName"]}},
 {"name":"graph_unbind_property","description":"Remove a property binding","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"propertyName":{"type":"string"}},"required":["nodeId","propertyName"]}},
@@ -1339,6 +1414,15 @@ namespace winrt::ShaderLab::implementation
                         restResp = m_mcpServer->RouteRequest(L"GET", L"/render/capture", "");
                     else if (toolName == "perf_timings")
                         restResp = m_mcpServer->RouteRequest(L"GET", L"/perf", "");
+                    else if (toolName == "node_logs")
+                    {
+                        auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(L"nodeId"));
+                        uint64_t sinceSeq = 0;
+                        if (args.HasKey(L"sinceSeq"))
+                            sinceSeq = static_cast<uint64_t>(args.GetNamedNumber(L"sinceSeq"));
+                        restResp = m_mcpServer->RouteRequest(L"GET",
+                            std::format(L"/node/{}/logs?since={}", nodeId, sinceSeq), "");
+                    }
                     else if (toolName == "registry_get_effect")
                     {
                         auto name = std::wstring(args.GetNamedString(L"name"));

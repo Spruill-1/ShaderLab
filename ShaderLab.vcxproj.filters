@@ -114,6 +114,12 @@
     <ClInclude Include="Controls\OutputWindow.h">
       <Filter>Controls</Filter>
     </ClInclude>
+    <ClInclude Include="Controls\NodeLog.h">
+      <Filter>Controls</Filter>
+    </ClInclude>
+    <ClInclude Include="Controls\LogWindow.h">
+      <Filter>Controls</Filter>
+    </ClInclude>
     <ClInclude Include="Controls\PixelInspectorController.h">
       <Filter>Controls</Filter>
     </ClInclude>
@@ -193,6 +199,9 @@
       <Filter>Controls</Filter>
     </ClCompile>
     <ClCompile Include="Controls\OutputWindow.cpp">
+      <Filter>Controls</Filter>
+    </ClCompile>
+    <ClCompile Include="Controls\LogWindow.cpp">
       <Filter>Controls</Filter>
     </ClCompile>
     <ClCompile Include="Controls\PixelInspectorController.cpp">
