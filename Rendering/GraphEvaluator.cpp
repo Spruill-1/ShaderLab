@@ -1434,7 +1434,21 @@ namespace ShaderLab::Rendering
         dc->GetTarget(prevTarget.put());
         dc->SetTarget(inputBitmap.get());
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-        dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
+        // Force D2D to re-evaluate the upstream effect chain by drawing
+        // through a fresh pass-through effect. Without this, D2D may
+        // return cached GPU results even when cbuffer properties changed.
+        winrt::com_ptr<ID2D1Effect> passThru;
+        hr = dc->CreateEffect(CLSID_D2D1ColorMatrix, passThru.put());
+        if (SUCCEEDED(hr))
+        {
+            // Identity color matrix = pass-through.
+            passThru->SetInput(0, inputImage);
+            dc->DrawImage(passThru.get(), D2D1::Point2F(-bounds.left, -bounds.top));
+        }
+        else
+        {
+            dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
+        }
         dc->SetTarget(prevTarget.get());
         dc->Flush();
 

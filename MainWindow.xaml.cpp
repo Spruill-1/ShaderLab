@@ -4746,7 +4746,14 @@ namespace winrt::ShaderLab::implementation
         // Process deferred D3D11 compute dispatches inside the active D2D
         // draw session, where all effect chains are fully materialized.
         if (m_graphEvaluator.ProcessDeferredCompute(m_graph, drawDc))
+        {
             m_nodeGraphController.SetNeedsRedraw();
+            // Re-evaluate downstream nodes that were marked dirty by
+            // ProcessDeferredCompute so they wire the new compute output
+            // in the same frame (avoids one-frame latency).
+            if (m_graph.HasDirtyNodes())
+                m_graphEvaluator.Evaluate(m_graph, drawDc);
+        }
 
         // Set DPI to 96 so D2D coordinates match WinUI DIPs exactly.
         // The XAML compositor handles physical pixel scaling.
