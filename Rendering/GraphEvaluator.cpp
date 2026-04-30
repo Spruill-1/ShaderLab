@@ -1235,18 +1235,25 @@ namespace ShaderLab::Rendering
         if (fieldCount == 0) return;
 
         // Render input D2D image to a D3D11-accessible bitmap.
+        // Use 96 DPI so bounds are in pixels (not DIPs).
+        float oldDpiX, oldDpiY;
+        dc->GetDpi(&oldDpiX, &oldDpiY);
+        dc->SetDpi(96.0f, 96.0f);
+
         D2D1_RECT_F bounds{};
         dc->GetImageLocalBounds(inputImage, &bounds);
         uint32_t w = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
         uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-        if (w == 0 || h == 0) return;
+        if (w == 0 || h == 0) { dc->SetDpi(oldDpiX, oldDpiY); return; }
 
         winrt::com_ptr<ID2D1Bitmap1> gpuTarget;
         D2D1_BITMAP_PROPERTIES1 gpuProps{};
         gpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
         gpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+        gpuProps.dpiX = 96.0f;
+        gpuProps.dpiY = 96.0f;
         HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, gpuProps, gpuTarget.put());
-        if (FAILED(hr)) return;
+        if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return; }
 
         winrt::com_ptr<ID2D1Image> prevTarget;
         dc->GetTarget(prevTarget.put());
@@ -1259,6 +1266,7 @@ namespace ShaderLab::Rendering
 
         // Flush D2D command batch so the bitmap is populated before D3D11 reads it.
         dc->Flush();
+        dc->SetDpi(oldDpiX, oldDpiY);
 
         // Get D3D11 texture from bitmap.
         winrt::com_ptr<IDXGISurface> surface;
@@ -1398,19 +1406,29 @@ namespace ShaderLab::Rendering
 
         auto& def = node.customEffect.value();
 
+        // Set DC to 96 DPI so GetImageLocalBounds returns pixel coordinates
+        // (at 96 DPI, 1 DIP = 1 pixel). High-DPI displays cause the bounds
+        // to be reported in DIPs, which would make us capture only a fraction
+        // of the actual effect output.
+        float oldDpiX, oldDpiY;
+        dc->GetDpi(&oldDpiX, &oldDpiY);
+        dc->SetDpi(96.0f, 96.0f);
+
         // Render upstream D2D chain to FP32 bitmap.
         D2D1_RECT_F bounds{};
         dc->GetImageLocalBounds(inputImage, &bounds);
         uint32_t srcW = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
         uint32_t srcH = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-        if (srcW == 0 || srcH == 0) { node.runtimeError = L"Zero input bounds"; return; }
+        if (srcW == 0 || srcH == 0) { dc->SetDpi(oldDpiX, oldDpiY); node.runtimeError = L"Zero input bounds"; return; }
 
         winrt::com_ptr<ID2D1Bitmap1> inputBitmap;
         D2D1_BITMAP_PROPERTIES1 bmpProps{};
         bmpProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
         bmpProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+        bmpProps.dpiX = 96.0f;
+        bmpProps.dpiY = 96.0f;
         HRESULT hr = dc->CreateBitmap(D2D1::SizeU(srcW, srcH), nullptr, 0, bmpProps, inputBitmap.put());
-        if (FAILED(hr)) { node.runtimeError = std::format(L"CreateBitmap input failed 0x{:08X}", (uint32_t)hr); return; }
+        if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); node.runtimeError = std::format(L"CreateBitmap input failed 0x{:08X}", (uint32_t)hr); return; }
 
         winrt::com_ptr<ID2D1Image> prevTarget;
         dc->GetTarget(prevTarget.put());
@@ -1419,6 +1437,9 @@ namespace ShaderLab::Rendering
         dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
         dc->SetTarget(prevTarget.get());
         dc->Flush();
+
+        // Restore DPI for subsequent operations.
+        dc->SetDpi(oldDpiX, oldDpiY);
 
         // Get D3D11 texture from the input bitmap.
         winrt::com_ptr<IDXGISurface> inputSurface;
@@ -1632,20 +1653,27 @@ namespace ShaderLab::Rendering
     {
         if (!dc || !inputImage) return;
 
+        // Use 96 DPI so GetImageLocalBounds returns pixel coordinates.
+        float oldDpiX, oldDpiY;
+        dc->GetDpi(&oldDpiX, &oldDpiY);
+        dc->SetDpi(96.0f, 96.0f);
+
         // Get input image bounds.
         D2D1_RECT_F bounds{};
         dc->GetImageLocalBounds(inputImage, &bounds);
         uint32_t w = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
         uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-        if (w == 0 || h == 0) return;
+        if (w == 0 || h == 0) { dc->SetDpi(oldDpiX, oldDpiY); return; }
 
         // Render input to a D2D bitmap backed by a DXGI surface.
         winrt::com_ptr<ID2D1Bitmap1> gpuTarget;
         D2D1_BITMAP_PROPERTIES1 gpuProps = {};
         gpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
         gpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+        gpuProps.dpiX = 96.0f;
+        gpuProps.dpiY = 96.0f;
         HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, gpuProps, gpuTarget.put());
-        if (FAILED(hr)) return;
+        if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return; }
 
         winrt::com_ptr<ID2D1Image> prevTarget;
         dc->GetTarget(prevTarget.put());
@@ -1660,6 +1688,7 @@ namespace ShaderLab::Rendering
         // Without this, D2D lazily defers the DrawImage until EndDraw/Flush,
         // and the D3D11 compute dispatch reads zeros from the texture.
         dc->Flush();
+        dc->SetDpi(oldDpiX, oldDpiY);
 
         // Get the underlying D3D11 texture from the D2D bitmap.
         winrt::com_ptr<IDXGISurface> surface;
