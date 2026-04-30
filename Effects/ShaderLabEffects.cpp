@@ -585,7 +585,7 @@ void main(uint3 GTid : SV_GroupThreadID) {
         float4 src = Source[int2(px, py)];
         if (src.a < 0.01) continue;
 
-        float3 xyz = ScRGBToXYZ(max(src.rgb, 0.0));
+        float3 xyz = ScRGBToXYZ(src.rgb);  // preserve negatives for wide-gamut chromaticity
         float sum = xyz.x + xyz.y + xyz.z;
         if (sum < 1e-7) continue;
 
