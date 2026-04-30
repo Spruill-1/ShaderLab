@@ -597,6 +597,15 @@ namespace winrt::ShaderLab::implementation
                 uint32_t dstPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstPin"));
                 return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                     bool ok = m_graph.Connect(srcId, srcPin, dstId, dstPin);
+                    if (ok)
+                    {
+                        auto* srcNode = m_graph.FindNode(srcId);
+                        auto* dstNode = m_graph.FindNode(dstId);
+                        std::wstring srcName = srcNode ? srcNode->name : std::format(L"Node {}", srcId);
+                        std::wstring dstName = dstNode ? dstNode->name : std::format(L"Node {}", dstId);
+                        m_nodeLogs[dstId].Info(std::format(L"Input {} connected ← {} (pin {})", dstPin, srcName, srcPin));
+                        m_nodeLogs[srcId].Info(std::format(L"Output {} connected → {} (pin {})", srcPin, dstName, dstPin));
+                    }
                     m_graph.MarkAllDirty();
                     m_nodeGraphController.AutoLayout();
                     return { 200, std::format("{{\"connected\":{}}}", ok ? "true" : "false") };
@@ -620,6 +629,11 @@ namespace winrt::ShaderLab::implementation
                 uint32_t dstPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstPin"));
                 return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                     bool ok = m_graph.Disconnect(srcId, srcPin, dstId, dstPin);
+                    if (ok)
+                    {
+                        m_nodeLogs[dstId].Info(std::format(L"Input {} disconnected", dstPin));
+                        m_nodeLogs[srcId].Info(std::format(L"Output {} disconnected", srcPin));
+                    }
                     m_graph.MarkAllDirty();
                     m_nodeGraphController.AutoLayout();
                     return { 200, std::format("{{\"disconnected\":{}}}", ok ? "true" : "false") };

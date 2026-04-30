@@ -446,6 +446,23 @@ namespace winrt::ShaderLab::implementation
         }
 
         m_nodeGraphController.SetGraph(&m_graph);
+        m_nodeGraphController.SetConnectionCallback(
+            [this](uint32_t srcId, uint32_t srcPin, uint32_t dstId, uint32_t dstPin, bool isData) {
+                auto* srcNode = m_graph.FindNode(srcId);
+                auto* dstNode = m_graph.FindNode(dstId);
+                std::wstring srcName = srcNode ? srcNode->name : std::format(L"Node {}", srcId);
+                std::wstring dstName = dstNode ? dstNode->name : std::format(L"Node {}", dstId);
+                if (isData)
+                {
+                    m_nodeLogs[dstId].Info(std::format(L"Property bound ← {} (data pin)", srcName));
+                    m_nodeLogs[srcId].Info(std::format(L"Data output bound → {}", dstName));
+                }
+                else
+                {
+                    m_nodeLogs[dstId].Info(std::format(L"Input {} connected ← {}", dstPin, srcName));
+                    m_nodeLogs[srcId].Info(std::format(L"Output {} connected → {}", srcPin, dstName));
+                }
+            });
 
         if (m_renderEngine.D3DDevice())
         {
@@ -2843,10 +2860,37 @@ namespace winrt::ShaderLab::implementation
                 panel.Children().Append(labelRow);
 
                 // Lambda to mark the node dirty after a property change.
-                auto markDirty = [this, capturedId]()
+                auto markDirty = [this, capturedId, capturedKey]()
                 {
                     auto* n = m_graph.FindNode(capturedId);
                     if (n) { n->dirty = true; m_graph.MarkAllDirty(); }
+
+                    // Log the property change.
+                    if (n)
+                    {
+                        auto propIt = n->properties.find(capturedKey);
+                        if (propIt != n->properties.end())
+                        {
+                            std::wstring valStr;
+                            std::visit([&](auto&& val) {
+                                using V = std::decay_t<decltype(val)>;
+                                if constexpr (std::is_same_v<V, float>)
+                                    valStr = std::format(L"{:.3f}", val);
+                                else if constexpr (std::is_same_v<V, int32_t>)
+                                    valStr = std::to_wstring(val);
+                                else if constexpr (std::is_same_v<V, uint32_t>)
+                                    valStr = std::to_wstring(val);
+                                else if constexpr (std::is_same_v<V, bool>)
+                                    valStr = val ? L"true" : L"false";
+                                else if constexpr (std::is_same_v<V, std::wstring>)
+                                    valStr = val;
+                                else
+                                    valStr = L"(complex)";
+                            }, propIt->second);
+                            m_nodeLogs[capturedId].Info(
+                                std::format(L"Property '{}' = {}", capturedKey, valStr));
+                        }
+                    }
 
                     // Rebuild properties panel and node layout when a property change
                     // might affect conditional visibility of other parameters.

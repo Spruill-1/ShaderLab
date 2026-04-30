@@ -151,6 +151,11 @@ namespace ShaderLab::Controls
         static constexpr float PinRadius = 6.0f;
         static constexpr float NodeCornerRadius = 6.0f;
 
+        // Optional callback for logging connection events.
+        // Args: srcNodeId, srcPin, dstNodeId, dstPin, isDataBinding
+        using ConnectionCallback = std::function<void(uint32_t, uint32_t, uint32_t, uint32_t, bool)>;
+        void SetConnectionCallback(ConnectionCallback cb) { m_connectionCallback = std::move(cb); }
+
     private:
         // Convert screen point to canvas point (accounting for pan/zoom).
         D2D1_POINT_2F ScreenToCanvas(D2D1_POINT_2F screenPoint) const;
@@ -169,6 +174,7 @@ namespace ShaderLab::Controls
         static D2D1_COLOR_F NodeHeaderColor(Graph::NodeType type);
 
         Graph::EffectGraph* m_graph{ nullptr };
+        ConnectionCallback m_connectionCallback;
 
         // Cached visual layout.
         std::unordered_map<uint32_t, NodeVisual> m_visuals;

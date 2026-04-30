@@ -371,6 +371,9 @@ namespace ShaderLab::Controls
         }
 
         bool result = false;
+        bool wasDataBinding = m_connectionDrag.isDataPin;
+        uint32_t connSrcId = 0, connSrcPin = 0, connDstId = 0, connDstPin = 0;
+
         if (m_connectionDrag.isDataPin)
         {
             // Data pin connection → creates a PropertyBinding.
@@ -408,26 +411,33 @@ namespace ShaderLab::Controls
                 auto err = m_graph->BindProperty(dstNodeId, propName, srcNodeId, fieldName, 0);
                 result = err.empty();
             }
+            connSrcId = srcNodeId; connSrcPin = srcPinIdx;
+            connDstId = dstNodeId; connDstPin = dstPinIdx;
         }
         else
         {
             // Image pin connection (existing behavior).
             if (m_connectionDrag.fromOutput && !targetIsOutput)
             {
-                result = m_graph->Connect(
-                    m_connectionDrag.sourceNodeId, m_connectionDrag.sourcePin,
-                    targetNodeId, targetPin);
+                connSrcId = m_connectionDrag.sourceNodeId; connSrcPin = m_connectionDrag.sourcePin;
+                connDstId = targetNodeId; connDstPin = targetPin;
+                result = m_graph->Connect(connSrcId, connSrcPin, connDstId, connDstPin);
             }
             else if (!m_connectionDrag.fromOutput && targetIsOutput)
             {
-                result = m_graph->Connect(
-                    targetNodeId, targetPin,
-                    m_connectionDrag.sourceNodeId, m_connectionDrag.sourcePin);
+                connSrcId = targetNodeId; connSrcPin = targetPin;
+                connDstId = m_connectionDrag.sourceNodeId; connDstPin = m_connectionDrag.sourcePin;
+                result = m_graph->Connect(connSrcId, connSrcPin, connDstId, connDstPin);
             }
         }
 
         CancelConnection();
-        if (result) RebuildLayout();
+        if (result)
+        {
+            RebuildLayout();
+            if (m_connectionCallback)
+                m_connectionCallback(connSrcId, connSrcPin, connDstId, connDstPin, wasDataBinding);
+        }
         return result;
     }
 
