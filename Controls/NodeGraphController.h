@@ -209,6 +209,9 @@ namespace ShaderLab::Controls
 
     public:
         void SetNeedsRedraw() { m_needsRedraw = true; }
+
+        // Release cached D2D resources (call after GPU device change).
+        void ReleaseDeviceResources();
         bool NeedsRedraw() const { return m_needsRedraw; }
     };
 }

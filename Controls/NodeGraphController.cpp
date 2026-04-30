@@ -721,6 +721,22 @@ namespace ShaderLab::Controls
     // D2D Resource management
     // -----------------------------------------------------------------------
 
+    void NodeGraphController::ReleaseDeviceResources()
+    {
+        m_brushNode = nullptr;
+        m_brushHeader = nullptr;
+        m_brushEdge = nullptr;
+        m_brushPin = nullptr;
+        m_brushSelection = nullptr;
+        m_brushText = nullptr;
+        m_brushDataPin = nullptr;
+        m_brushDataEdge = nullptr;
+        m_textFormat = nullptr;
+        m_pinLabelFormat = nullptr;
+        m_resourcesCreated = false;
+        m_needsRedraw = true;
+    }
+
     void NodeGraphController::EnsureResources(ID2D1DeviceContext* dc)
     {
         if (m_resourcesCreated) return;

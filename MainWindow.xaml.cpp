@@ -555,6 +555,11 @@ namespace winrt::ShaderLab::implementation
         // Release all device-dependent caches.
         m_graphEvaluator.ReleaseCache();
 
+        // Release node graph D2D resources and swap chain.
+        m_nodeGraphController.ReleaseDeviceResources();
+        m_graphRenderTarget = nullptr;
+        m_graphSwapChain = nullptr;
+
         // Close output windows (they have their own swap chains).
         for (auto& w : m_outputWindows) w->Close();
         m_outputWindows.clear();
@@ -565,6 +570,9 @@ namespace winrt::ShaderLab::implementation
         // Re-register custom D2D effects on the new D2D factory.
         m_customEffectsRegistered = false;
         RegisterCustomEffects();
+
+        // Recreate the node graph swap chain on the new device.
+        InitializeGraphPanel();
 
         // Reinitialize device-dependent subsystems.
         m_displayMonitor.Initialize(m_hwnd, m_renderEngine.DXGIFactory());
