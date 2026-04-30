@@ -105,9 +105,6 @@ namespace ShaderLab::Rendering
                         if (srcNode) inputImage = srcNode->cachedOutput;
                     }
                     bool hasImageOutput = !node->outputPins.empty();
-                    // Queue dispatch if input is available and we need (re)computation.
-                    // Triggers on: first eval (no analysis output yet), property change
-                    // (dirty), upstream change, or image-producing node without cached output.
                     bool needsCompute = node->dirty ||
                         node->analysisOutput.fields.empty() ||
                         (hasImageOutput && !node->cachedOutput);
@@ -115,10 +112,7 @@ namespace ShaderLab::Rendering
                     {
                         m_deferredCompute.push_back({ nodeId, inputImage });
                     }
-                    // Clear dirty — dispatch handles re-computation.
                     node->dirty = false;
-                    // Image-producing compute nodes keep cachedOutput (set by DispatchImageCompute).
-                    // Analysis-only nodes have no image output.
                     if (!hasImageOutput)
                         node->cachedOutput = nullptr;
                     break;
@@ -312,6 +306,8 @@ namespace ShaderLab::Rendering
     {
         if (m_deferredCompute.empty() || !dc) return false;
 
+        bool imageComputeProduced = false;
+
         for (auto& deferred : m_deferredCompute)
         {
             auto* node = graph.FindNode(deferred.nodeId);
@@ -323,6 +319,25 @@ namespace ShaderLab::Rendering
             if (hasImageOutput && node->customEffect.has_value())
             {
                 DispatchImageCompute(dc, *node, deferred.inputImage);
+                if (node->cachedOutput)
+                {
+                    imageComputeProduced = true;
+                    // Mark all downstream nodes dirty so they re-evaluate
+                    // on the next frame with the new histogram input.
+                    std::vector<uint32_t> queue = { node->id };
+                    for (size_t i = 0; i < queue.size(); ++i)
+                    {
+                        for (const auto* edge : graph.GetOutputEdges(queue[i]))
+                        {
+                            auto* dn = graph.FindNode(edge->destNodeId);
+                            if (dn && !dn->dirty)
+                            {
+                                dn->dirty = true;
+                                queue.push_back(edge->destNodeId);
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -356,6 +371,7 @@ namespace ShaderLab::Rendering
         m_customImplCache.clear();
         m_d3d11RunnerCache.clear();
         m_imageComputeCache.clear();
+        m_imageComputeTexCache.clear();
         m_dummySourceBitmap = nullptr;
     }
 
@@ -365,6 +381,7 @@ namespace ShaderLab::Rendering
         m_d3d11RunnerCache.erase(nodeId);
         m_customImplCache.erase(nodeId);
         m_imageComputeCache.erase(nodeId);
+        m_imageComputeTexCache.erase(nodeId);
     }
 
     void GraphEvaluator::UpdateNodeShader(uint32_t nodeId, const EffectNode& node)
@@ -1374,8 +1391,8 @@ namespace ShaderLab::Rendering
         EffectNode& node,
         ID2D1Image* inputImage)
     {
-        if (!dc || !inputImage) return;
-        if (!node.customEffect.has_value() || node.customEffect->hlslSource.empty()) return;
+        if (!dc || !inputImage) { node.runtimeError = L"No DC or input"; return; }
+        if (!node.customEffect.has_value() || node.customEffect->hlslSource.empty()) { node.runtimeError = L"No HLSL"; return; }
 
         auto& def = node.customEffect.value();
 
@@ -1384,14 +1401,14 @@ namespace ShaderLab::Rendering
         dc->GetImageLocalBounds(inputImage, &bounds);
         uint32_t srcW = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
         uint32_t srcH = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-        if (srcW == 0 || srcH == 0) return;
+        if (srcW == 0 || srcH == 0) { node.runtimeError = L"Zero input bounds"; return; }
 
         winrt::com_ptr<ID2D1Bitmap1> inputBitmap;
         D2D1_BITMAP_PROPERTIES1 bmpProps{};
         bmpProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
         bmpProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
         HRESULT hr = dc->CreateBitmap(D2D1::SizeU(srcW, srcH), nullptr, 0, bmpProps, inputBitmap.put());
-        if (FAILED(hr)) return;
+        if (FAILED(hr)) { node.runtimeError = std::format(L"CreateBitmap input failed 0x{:08X}", (uint32_t)hr); return; }
 
         winrt::com_ptr<ID2D1Image> prevTarget;
         dc->GetTarget(prevTarget.put());
@@ -1404,10 +1421,10 @@ namespace ShaderLab::Rendering
         // Get D3D11 texture from the input bitmap.
         winrt::com_ptr<IDXGISurface> inputSurface;
         hr = inputBitmap->GetSurface(inputSurface.put());
-        if (FAILED(hr)) return;
+        if (FAILED(hr)) { node.runtimeError = std::format(L"GetSurface failed 0x{:08X}", (uint32_t)hr); return; }
         winrt::com_ptr<ID3D11Texture2D> inputTex;
         hr = inputSurface->QueryInterface(inputTex.put());
-        if (FAILED(hr)) return;
+        if (FAILED(hr)) { node.runtimeError = L"QI for ID3D11Texture2D failed"; return; }
 
         winrt::com_ptr<ID3D11Device> device;
         inputTex->GetDevice(device.put());
@@ -1422,41 +1439,46 @@ namespace ShaderLab::Rendering
             {
                 auto it = node.properties.find(p.name);
                 if (it != node.properties.end())
+                {
                     if (auto* f = std::get_if<float>(&it->second))
                         outW = outH = static_cast<uint32_t>((std::max)(*f, 64.0f));
+                    else if (auto* u = std::get_if<uint32_t>(&it->second))
+                        outW = outH = (std::max)(*u, 64u);
+                }
                 break;
             }
         }
 
-        // Create output texture (D3D11, with UAV + SRV bindings for D2D interop).
-        winrt::com_ptr<ID3D11Texture2D> outputTex;
-        D3D11_TEXTURE2D_DESC outDesc{};
-        outDesc.Width = outW;
-        outDesc.Height = outH;
-        outDesc.MipLevels = 1;
-        outDesc.ArraySize = 1;
-        outDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        outDesc.SampleDesc.Count = 1;
-        outDesc.Usage = D3D11_USAGE_DEFAULT;
-        outDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        hr = device->CreateTexture2D(&outDesc, nullptr, outputTex.put());
-        if (FAILED(hr)) return;
+        // D3D11 texture with UAV for compute dispatch + SRV so D2D can wrap it.
+        winrt::com_ptr<ID3D11Texture2D> computeTex;
+        {
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = outW; td.Height = outH; td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+            hr = device->CreateTexture2D(&td, nullptr, computeTex.put());
+            if (FAILED(hr)) { node.runtimeError = std::format(L"CreateTex2D failed 0x{:08X}", (uint32_t)hr); return; }
+        }
 
-        // Create SRV for input, UAV for output.
+        // SRV for input, UAV for compute output.
         winrt::com_ptr<ID3D11ShaderResourceView> inputSRV;
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-        srvDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels = 1;
-        hr = device->CreateShaderResourceView(inputTex.get(), &srvDesc, inputSRV.put());
-        if (FAILED(hr)) return;
-
+        {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            sd.Texture2D.MipLevels = 1;
+            hr = device->CreateShaderResourceView(inputTex.get(), &sd, inputSRV.put());
+            if (FAILED(hr)) { node.runtimeError = L"CreateSRV failed"; return; }
+        }
         winrt::com_ptr<ID3D11UnorderedAccessView> outputUAV;
-        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-        uavDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-        hr = device->CreateUnorderedAccessView(outputTex.get(), &uavDesc, outputUAV.put());
-        if (FAILED(hr)) return;
+        {
+            D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+            hr = device->CreateUnorderedAccessView(computeTex.get(), &ud, outputUAV.put());
+            if (FAILED(hr)) { node.runtimeError = std::format(L"CreateUAV failed 0x{:08X}", (uint32_t)hr); return; }
+        }
 
         // Compile compute shader from HLSL source.
         winrt::com_ptr<ID3D11ComputeShader> shader;
@@ -1524,8 +1546,22 @@ namespace ShaderLab::Rendering
                                 auto it = node.properties.find(name);
                                 if (it != node.properties.end())
                                 {
+                                    // Check reflection type to handle float→uint conversion.
+                                    auto* typeInfo = var->GetType();
+                                    D3D11_SHADER_TYPE_DESC typeDesc{};
+                                    bool isUintVar = false;
+                                    if (typeInfo && SUCCEEDED(typeInfo->GetDesc(&typeDesc)))
+                                        isUintVar = (typeDesc.Type == D3D_SVT_UINT || typeDesc.Type == D3D_SVT_INT);
+
                                     if (auto* f = std::get_if<float>(&it->second))
-                                        memcpy(cb + varDesc.StartOffset, f, 4);
+                                    {
+                                        if (isUintVar) {
+                                            uint32_t u = static_cast<uint32_t>(*f);
+                                            memcpy(cb + varDesc.StartOffset, &u, 4);
+                                        } else {
+                                            memcpy(cb + varDesc.StartOffset, f, 4);
+                                        }
+                                    }
                                     else if (auto* u = std::get_if<uint32_t>(&it->second))
                                         memcpy(cb + varDesc.StartOffset, u, 4);
                                 }
@@ -1559,22 +1595,26 @@ namespace ShaderLab::Rendering
         ID3D11UnorderedAccessView* nullUAV[] = { nullptr };
         d3dCtx->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
         d3dCtx->CSSetShader(nullptr, nullptr, 0);
+        d3dCtx->Flush();
 
-        // Wrap output D3D11 texture as D2D bitmap → cachedOutput.
-        winrt::com_ptr<IDXGISurface> outSurface;
-        hr = outputTex->QueryInterface(outSurface.put());
-        if (FAILED(hr)) return;
+        // Wrap the compute output texture as a D2D bitmap (read-only for D2D).
+        // D2D can use any texture with SRV bind flag for DrawImage source.
+        winrt::com_ptr<IDXGISurface> computeSurface;
+        hr = computeTex->QueryInterface(computeSurface.put());
+        if (FAILED(hr)) { node.runtimeError = std::format(L"QI DXGI failed 0x{:08X}", (uint32_t)hr); return; }
 
         winrt::com_ptr<ID2D1Bitmap1> outBitmap;
-        D2D1_BITMAP_PROPERTIES1 outBmpProps{};
-        outBmpProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        outBmpProps.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
-        hr = dc->CreateBitmapFromDxgiSurface(outSurface.get(), outBmpProps, outBitmap.put());
-        if (FAILED(hr)) return;
+        D2D1_BITMAP_PROPERTIES1 bp{};
+        bp.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+        bp.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+        bp.dpiX = 96.0f;
+        bp.dpiY = 96.0f;
+        hr = dc->CreateBitmapFromDxgiSurface(computeSurface.get(), bp, outBitmap.put());
+        if (FAILED(hr)) { node.runtimeError = std::format(L"WrapBitmap failed 0x{:08X}", (uint32_t)hr); return; }
 
-        // Store the bitmap and set cachedOutput.
-        // Keep the com_ptr alive by caching it.
         m_imageComputeCache[node.id] = outBitmap;
+        // Also keep the compute texture alive (the D2D bitmap wraps it, doesn't own it).
+        m_imageComputeTexCache[node.id] = computeTex;
         node.cachedOutput = outBitmap.get();
         node.runtimeError.clear();
     }

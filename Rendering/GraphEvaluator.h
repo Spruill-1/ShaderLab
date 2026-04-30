@@ -132,6 +132,7 @@ namespace ShaderLab::Rendering
 
         // Cached output bitmaps for image-producing compute effects.
         std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Bitmap1>> m_imageComputeCache;
+        std::unordered_map<uint32_t, winrt::com_ptr<ID3D11Texture2D>> m_imageComputeTexCache;
 
         // Generic D3D11 compute dispatch for user-authored shaders (analysis-only).
         void DispatchUserD3D11Compute(
