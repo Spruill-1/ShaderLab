@@ -68,6 +68,17 @@ namespace ShaderLab::Rendering
                     std::map<std::wstring, PropertyValue> effectiveProps;
                     bool bindingsChanged = ResolveBindings(*node, graph, effectiveProps);
 
+                    // Write resolved binding values back for UI display.
+                    if (bindingsChanged)
+                    {
+                        for (const auto& [propName, binding] : node->propertyBindings)
+                        {
+                            auto eit = effectiveProps.find(propName);
+                            if (eit != effectiveProps.end())
+                                node->properties[propName] = eit->second;
+                        }
+                    }
+
                     if (node->dirty || bindingsChanged)
                     {
                         ApplyProperties(effect, *node, effectiveProps);
@@ -196,6 +207,18 @@ namespace ShaderLab::Rendering
                     std::map<std::wstring, PropertyValue> effectiveProps;
                     bool bindingsChanged = ResolveBindings(*node, graph, effectiveProps);
                     bool wasDirty = node->dirty || bindingsChanged;
+
+                    // Write resolved binding values back to node properties
+                    // so the node graph UI shows live bound values.
+                    if (bindingsChanged)
+                    {
+                        for (const auto& [propName, binding] : node->propertyBindings)
+                        {
+                            auto eit = effectiveProps.find(propName);
+                            if (eit != effectiveProps.end())
+                                node->properties[propName] = eit->second;
+                        }
+                    }
 
                     if (wasDirty)
                     {

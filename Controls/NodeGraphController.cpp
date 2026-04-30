@@ -1123,9 +1123,20 @@ namespace ShaderLab::Controls
                     if (auto* f = std::get_if<float>(&propIt->second)) val = *f;
 
                     float pMin = 0.0f, pMax = 1.0f;
-                    for (const auto& p : node->customEffect->parameters)
-                    {
-                        if (p.name == L"Value") { pMin = p.minValue; pMax = p.maxValue; break; }
+                    // Use dynamic Min/Max properties if present (parameter nodes).
+                    auto minIt = node->properties.find(L"Min");
+                    auto maxIt = node->properties.find(L"Max");
+                    if (minIt != node->properties.end()) {
+                        if (auto* f = std::get_if<float>(&minIt->second)) pMin = *f;
+                    } else {
+                        for (const auto& p : node->customEffect->parameters)
+                            if (p.name == L"Value") { pMin = p.minValue; break; }
+                    }
+                    if (maxIt != node->properties.end()) {
+                        if (auto* f = std::get_if<float>(&maxIt->second)) pMax = *f;
+                    } else {
+                        for (const auto& p : node->customEffect->parameters)
+                            if (p.name == L"Value") { pMax = p.maxValue; break; }
                     }
 
                     float t = (pMax > pMin) ? (val - pMin) / (pMax - pMin) : 0.0f;
@@ -1278,11 +1289,22 @@ namespace ShaderLab::Controls
 
         float pMin = 0.0f, pMax = 1.0f, step = 0.01f;
         bool hasEnumLabels = false;
+        // Use dynamic Min/Max properties if present.
+        auto minIt = node->properties.find(L"Min");
+        auto maxIt = node->properties.find(L"Max");
+        if (minIt != node->properties.end()) {
+            if (auto* f = std::get_if<float>(&minIt->second)) pMin = *f;
+        }
+        if (maxIt != node->properties.end()) {
+            if (auto* f = std::get_if<float>(&maxIt->second)) pMax = *f;
+        }
         for (const auto& p : node->customEffect->parameters)
         {
             if (p.name == L"Value")
             {
-                pMin = p.minValue; pMax = p.maxValue; step = p.step;
+                if (minIt == node->properties.end()) pMin = p.minValue;
+                if (maxIt == node->properties.end()) pMax = p.maxValue;
+                step = p.step;
                 hasEnumLabels = !p.enumLabels.empty();
                 break;
             }
