@@ -108,6 +108,23 @@ namespace ShaderLab::Rendering
                 if (node->customEffect.has_value() &&
                     node->customEffect->shaderType == CustomShaderType::D3D11ComputeShader)
                 {
+                    // Resolve property bindings for D3D11 compute nodes.
+                    if (!node->propertyBindings.empty())
+                    {
+                        std::map<std::wstring, PropertyValue> effectiveProps;
+                        bool bindingsChanged = ResolveBindings(*node, graph, effectiveProps);
+                        if (bindingsChanged)
+                        {
+                            for (const auto& [propName, binding] : node->propertyBindings)
+                            {
+                                auto eit = effectiveProps.find(propName);
+                                if (eit != effectiveProps.end())
+                                    node->properties[propName] = eit->second;
+                            }
+                            node->dirty = true;
+                        }
+                    }
+
                     auto inputs = graph.GetInputEdges(nodeId);
                     ID2D1Image* inputImage = nullptr;
                     if (!inputs.empty())
