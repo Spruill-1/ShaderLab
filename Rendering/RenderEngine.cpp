@@ -58,25 +58,48 @@ namespace ShaderLab::Rendering
 
         winrt::com_ptr<ID3D11Device> baseDevice;
         winrt::com_ptr<ID3D11DeviceContext> baseContext;
+        HRESULT hr = E_FAIL;
 
-        D3D_DRIVER_TYPE driverType = D3D_DRIVER_TYPE_HARDWARE;
-        if (devicePref == DevicePreference::Warp)
-            driverType = D3D_DRIVER_TYPE_WARP;
-        else if (devicePref == DevicePreference::Hardware)
-            driverType = D3D_DRIVER_TYPE_HARDWARE;
-
-        HRESULT hr = D3D11CreateDevice(
-            nullptr, driverType, nullptr, d3dFlags,
-            featureLevels, ARRAYSIZE(featureLevels),
-            D3D11_SDK_VERSION, baseDevice.put(), nullptr, baseContext.put());
-
-        // Default: fallback to WARP if hardware fails.
-        if (FAILED(hr) && devicePref == DevicePreference::Default)
+        if (devicePref == DevicePreference::Adapter)
         {
+            // Create on a specific adapter identified by LUID.
+            winrt::com_ptr<IDXGIAdapter1> adapter;
+            for (UINT i = 0; m_dxgiFactory->EnumAdapters1(i, adapter.put()) != DXGI_ERROR_NOT_FOUND; ++i)
+            {
+                DXGI_ADAPTER_DESC1 desc{};
+                adapter->GetDesc1(&desc);
+                if (desc.AdapterLuid.LowPart == m_preferredAdapterLuid.LowPart &&
+                    desc.AdapterLuid.HighPart == m_preferredAdapterLuid.HighPart)
+                {
+                    hr = D3D11CreateDevice(
+                        adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, d3dFlags,
+                        featureLevels, ARRAYSIZE(featureLevels),
+                        D3D11_SDK_VERSION, baseDevice.put(), nullptr, baseContext.put());
+                    break;
+                }
+                adapter = nullptr;
+            }
+        }
+
+        if (FAILED(hr))
+        {
+            D3D_DRIVER_TYPE driverType = D3D_DRIVER_TYPE_HARDWARE;
+            if (devicePref == DevicePreference::Warp)
+                driverType = D3D_DRIVER_TYPE_WARP;
+
             hr = D3D11CreateDevice(
-                nullptr, D3D_DRIVER_TYPE_WARP, nullptr, d3dFlags,
+                nullptr, driverType, nullptr, d3dFlags,
                 featureLevels, ARRAYSIZE(featureLevels),
                 D3D11_SDK_VERSION, baseDevice.put(), nullptr, baseContext.put());
+
+            // Default: fallback to WARP if hardware fails.
+            if (FAILED(hr) && (devicePref == DevicePreference::Default || devicePref == DevicePreference::Adapter))
+            {
+                hr = D3D11CreateDevice(
+                    nullptr, D3D_DRIVER_TYPE_WARP, nullptr, d3dFlags,
+                    featureLevels, ARRAYSIZE(featureLevels),
+                    D3D11_SDK_VERSION, baseDevice.put(), nullptr, baseContext.put());
+            }
         }
         winrt::check_hresult(hr);
 
@@ -321,5 +344,89 @@ namespace ShaderLab::Rendering
         DXGI_PRESENT_PARAMETERS params{};
         winrt::check_hresult(
             m_swapChain->Present1(vsync ? 1 : 0, 0, &params));
+    }
+
+    // -----------------------------------------------------------------------
+    // Adapter enumeration
+    // -----------------------------------------------------------------------
+
+    std::vector<AdapterInfo> RenderEngine::EnumerateAdapters()
+    {
+        std::vector<AdapterInfo> result;
+
+        winrt::com_ptr<IDXGIFactory6> factory;
+        if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(factory.put()))))
+            return result;
+
+        winrt::com_ptr<IDXGIAdapter1> adapter;
+        for (UINT i = 0; factory->EnumAdapters1(i, adapter.put()) != DXGI_ERROR_NOT_FOUND; ++i)
+        {
+            DXGI_ADAPTER_DESC1 desc{};
+            adapter->GetDesc1(&desc);
+
+            // Skip software adapters other than WARP.
+            bool isWarp = (desc.VendorId == 0x1414 && desc.DeviceId == 0x008C);
+            if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && !isWarp)
+            {
+                adapter = nullptr;
+                continue;
+            }
+
+            AdapterInfo info;
+            info.name = desc.Description;
+            info.vendorId = desc.VendorId;
+            info.deviceId = desc.DeviceId;
+            info.dedicatedVideoMemoryMB = static_cast<size_t>(desc.DedicatedVideoMemory / (1024 * 1024));
+            info.luid = desc.AdapterLuid;
+            info.isWarp = isWarp;
+            result.push_back(std::move(info));
+
+            adapter = nullptr;
+        }
+
+        // Always add WARP as an option if not already present.
+        bool hasWarp = false;
+        for (const auto& a : result)
+            if (a.isWarp) { hasWarp = true; break; }
+        if (!hasWarp)
+        {
+            AdapterInfo warp;
+            warp.name = L"Microsoft Basic Render Driver (WARP)";
+            warp.isWarp = true;
+            result.push_back(std::move(warp));
+        }
+
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // Reinitialize on a different adapter
+    // -----------------------------------------------------------------------
+
+    void RenderEngine::Reinitialize(DevicePreference devicePref, LUID adapterLuid)
+    {
+        m_preferredAdapterLuid = adapterLuid;
+
+        // Save state that Shutdown clears.
+        auto savedPanel = m_panel;
+        auto savedHwnd = m_hwnd;
+        auto savedFormat = m_format;
+        auto savedWidth = m_width;
+        auto savedHeight = m_height;
+
+        Shutdown();
+
+        m_panel = savedPanel;
+        m_hwnd = savedHwnd;
+        m_format = savedFormat;
+
+        // Recreate on the new adapter.
+        CreateDeviceResources(devicePref);
+        CreateSwapChain(m_panel);
+        ConfigureSwapChainColorSpace();
+        CreateRenderTarget();
+
+        if (savedWidth > 0 && savedHeight > 0)
+            Resize(savedWidth, savedHeight);
     }
 }

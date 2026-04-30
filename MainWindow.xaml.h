@@ -42,10 +42,14 @@ namespace winrt::ShaderLab::implementation
         void OnColumnSplitterPointerReleased(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnGpuInfoTapped(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::TappedRoutedEventArgs const& args);
 
     private:
         HWND GetWindowHandle();
         void InitializeRendering();
+        void SwitchAdapter(::ShaderLab::Rendering::DevicePreference pref, LUID adapterLuid);
         void OnPreviewPanelLoaded();
         void RegisterCustomEffects();
         void UpdateStatusBar();

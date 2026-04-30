@@ -509,6 +509,92 @@ namespace winrt::ShaderLab::implementation
         }
     }
 
+    void MainWindow::OnGpuInfoTapped(
+        winrt::Windows::Foundation::IInspectable const& sender,
+        winrt::Microsoft::UI::Xaml::Input::TappedRoutedEventArgs const& /*args*/)
+    {
+        namespace Controls = winrt::Microsoft::UI::Xaml::Controls;
+        using namespace ::ShaderLab::Rendering;
+
+        auto adapters = RenderEngine::EnumerateAdapters();
+        if (adapters.empty()) return;
+
+        auto flyout = Controls::MenuFlyout();
+        for (size_t i = 0; i < adapters.size(); ++i)
+        {
+            auto& a = adapters[i];
+            auto item = Controls::MenuFlyoutItem();
+            std::wstring label = a.name;
+            if (a.dedicatedVideoMemoryMB > 0)
+                label += std::format(L" ({} MB)", a.dedicatedVideoMemoryMB);
+            if (a.isWarp)
+                label += L" [Software]";
+
+            // Mark current adapter.
+            if (a.name == m_renderEngine.AdapterName() ||
+                (a.isWarp && m_renderEngine.IsWarp()))
+                label = L"\u2713 " + label;
+
+            item.Text(winrt::hstring(label));
+            auto luid = a.luid;
+            bool isWarp = a.isWarp;
+            item.Click([this, luid, isWarp](auto&&, auto&&) {
+                SwitchAdapter(
+                    isWarp ? DevicePreference::Warp : DevicePreference::Adapter,
+                    luid);
+            });
+            flyout.Items().Append(item);
+        }
+
+        flyout.ShowAt(sender.as<winrt::Microsoft::UI::Xaml::FrameworkElement>());
+    }
+
+    void MainWindow::SwitchAdapter(
+        ::ShaderLab::Rendering::DevicePreference pref, LUID adapterLuid)
+    {
+        // Release all device-dependent caches.
+        m_graphEvaluator.ReleaseCache();
+
+        // Close output windows (they have their own swap chains).
+        for (auto& w : m_outputWindows) w->Close();
+        m_outputWindows.clear();
+
+        // Reinitialize the render engine on the new adapter.
+        m_renderEngine.Reinitialize(pref, adapterLuid);
+
+        // Re-register custom D2D effects on the new D2D factory.
+        m_customEffectsRegistered = false;
+        RegisterCustomEffects();
+
+        // Reinitialize device-dependent subsystems.
+        m_displayMonitor.Initialize(m_hwnd, m_renderEngine.DXGIFactory());
+        if (m_renderEngine.D3DDevice())
+        {
+            m_pixelInspector.Initialize(m_renderEngine.D3DDevice());
+            m_pixelTrace.Initialize(m_renderEngine.D3DDevice());
+        }
+
+        // Re-prepare all source nodes on the new device.
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (dc)
+        {
+            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+            {
+                if (node.type == ::ShaderLab::Graph::NodeType::Source)
+                    m_sourceFactory.PrepareSourceNode(node, dc, 0.0,
+                        m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+            }
+        }
+
+        m_graph.MarkAllDirty();
+        m_graph.ClearCachedOutputs();
+        m_forceRender = true;
+        UpdateStatusBar();
+
+        m_nodeLogs[0].Info(std::format(L"GPU switched to: {}",
+            m_renderEngine.IsWarp() ? L"WARP (Software)" : m_renderEngine.AdapterName()));
+    }
+
     void MainWindow::OnPreviewSizeChanged(
         winrt::Windows::Foundation::IInspectable const& /*sender*/,
         winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& args)

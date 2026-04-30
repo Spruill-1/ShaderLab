@@ -276,7 +276,9 @@
                            Style="{StaticResource CaptionTextBlockStyle}" />
             </StackPanel>
 
-            <StackPanel Orientation="Horizontal" Grid.Column="3" Margin="0,0,20,0">
+            <StackPanel Orientation="Horizontal" Grid.Column="3" Margin="0,0,20,0"
+                        Tapped="OnGpuInfoTapped" Background="Transparent"
+                        ToolTipService.ToolTip="Click to change GPU adapter">
                 <FontIcon Glyph="&#xE964;" FontSize="11" Margin="0,0,5,0"
                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                 <TextBlock x:Name="GpuInfoText"

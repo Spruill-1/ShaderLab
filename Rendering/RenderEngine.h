@@ -12,6 +12,16 @@ namespace ShaderLab::Rendering
         Default,    // Hardware, fallback to WARP on failure
         Hardware,   // Force hardware GPU (fail if unavailable)
         Warp,       // Force WARP software renderer
+        Adapter,    // Use specific adapter (set via SetPreferredAdapter)
+    };
+
+    struct AdapterInfo {
+        std::wstring name;
+        uint32_t vendorId{};
+        uint32_t deviceId{};
+        size_t dedicatedVideoMemoryMB{};
+        LUID luid{};
+        bool isWarp{};
     };
 
     // Core rendering engine: owns D3D11 device, D2D1 device context, and the
@@ -82,6 +92,14 @@ namespace ShaderLab::Rendering
         const std::wstring&     AdapterName()      const { return m_adapterName; }
         bool                    IsWarp()           const { return m_isWarp; }
 
+        // Enumerate available DXGI adapters.
+        static std::vector<AdapterInfo> EnumerateAdapters();
+
+        // Reinitialize on a different adapter. Tears down all GPU resources
+        // and recreates the device stack on the specified adapter.
+        // Caller must release all device-dependent resources before calling.
+        void Reinitialize(DevicePreference devicePref, LUID adapterLuid = {});
+
     private:
         void CreateDeviceResources(DevicePreference devicePref);
         void CreateSwapChain(winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel const& panel);
@@ -108,6 +126,7 @@ namespace ShaderLab::Rendering
         HWND            m_hwnd{ nullptr };
         std::wstring    m_adapterName;
         bool            m_isWarp{ false };
+        LUID            m_preferredAdapterLuid{};
 
         // Keep panel reference for swap chain recreation on format change.
         winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel m_panel{ nullptr };
