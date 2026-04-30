@@ -112,7 +112,14 @@ namespace ShaderLab::Rendering
                         (!hasImageOutput && node->analysisOutput.fields.empty());
                     if (inputImage && needsCompute)
                     {
-                        m_deferredCompute.push_back({ nodeId, inputImage });
+                        // For image-producing compute, pre-render the upstream
+                        // D2D chain to a bitmap NOW while properties are fresh.
+                        // This avoids D2D GPU caching returning stale data when
+                        // ProcessDeferredCompute renders later inside BeginDraw.
+                        winrt::com_ptr<ID2D1Bitmap1> preRendered;
+                        if (hasImageOutput)
+                            preRendered = PreRenderInputBitmap(dc, inputImage);
+                        m_deferredCompute.push_back({ nodeId, inputImage, preRendered });
                     }
                     node->dirty = false;
                     if (!hasImageOutput)
@@ -320,7 +327,7 @@ namespace ShaderLab::Rendering
             bool hasImageOutput = !node->outputPins.empty();
             if (hasImageOutput && node->customEffect.has_value())
             {
-                DispatchImageCompute(dc, *node, deferred.inputImage);
+                DispatchImageCompute(dc, *node, deferred.inputImage, deferred.preRenderedInput.get());
                 if (node->cachedOutput)
                 {
                     imageComputeProduced = true;
@@ -1399,61 +1406,60 @@ namespace ShaderLab::Rendering
     void GraphEvaluator::DispatchImageCompute(
         ID2D1DeviceContext5* dc,
         EffectNode& node,
-        ID2D1Image* inputImage)
+        ID2D1Image* inputImage,
+        ID2D1Bitmap1* preRenderedInput)
     {
         if (!dc || !inputImage) { node.runtimeError = L"No DC or input"; return; }
         if (!node.customEffect.has_value() || node.customEffect->hlslSource.empty()) { node.runtimeError = L"No HLSL"; return; }
 
         auto& def = node.customEffect.value();
 
-        // Set DC to 96 DPI so GetImageLocalBounds returns pixel coordinates
-        // (at 96 DPI, 1 DIP = 1 pixel). High-DPI displays cause the bounds
-        // to be reported in DIPs, which would make us capture only a fraction
-        // of the actual effect output.
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
-
-        // Render upstream D2D chain to FP32 bitmap.
-        D2D1_RECT_F bounds{};
-        dc->GetImageLocalBounds(inputImage, &bounds);
-        uint32_t srcW = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
-        uint32_t srcH = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-        if (srcW == 0 || srcH == 0) { dc->SetDpi(oldDpiX, oldDpiY); node.runtimeError = L"Zero input bounds"; return; }
-
+        // Use pre-rendered bitmap if available (rendered during Evaluate
+        // when D2D properties were fresh). Otherwise, render now.
         winrt::com_ptr<ID2D1Bitmap1> inputBitmap;
-        D2D1_BITMAP_PROPERTIES1 bmpProps{};
-        bmpProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        bmpProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-        bmpProps.dpiX = 96.0f;
-        bmpProps.dpiY = 96.0f;
-        HRESULT hr = dc->CreateBitmap(D2D1::SizeU(srcW, srcH), nullptr, 0, bmpProps, inputBitmap.put());
-        if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); node.runtimeError = std::format(L"CreateBitmap input failed 0x{:08X}", (uint32_t)hr); return; }
+        uint32_t srcW = 0, srcH = 0;
 
-        winrt::com_ptr<ID2D1Image> prevTarget;
-        dc->GetTarget(prevTarget.put());
-        dc->SetTarget(inputBitmap.get());
-        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-        // Force D2D to re-evaluate the upstream effect chain by drawing
-        // through a fresh pass-through effect. Without this, D2D may
-        // return cached GPU results even when cbuffer properties changed.
-        winrt::com_ptr<ID2D1Effect> passThru;
-        hr = dc->CreateEffect(CLSID_D2D1ColorMatrix, passThru.put());
-        if (SUCCEEDED(hr))
+        if (preRenderedInput)
         {
-            // Identity color matrix = pass-through.
-            passThru->SetInput(0, inputImage);
-            dc->DrawImage(passThru.get(), D2D1::Point2F(-bounds.left, -bounds.top));
+            // Use the pre-rendered bitmap directly.
+            inputBitmap.copy_from(preRenderedInput);
+            auto sz = preRenderedInput->GetPixelSize();
+            srcW = sz.width;
+            srcH = sz.height;
         }
         else
         {
-            dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
-        }
-        dc->SetTarget(prevTarget.get());
-        dc->Flush();
+            // Fallback: render upstream D2D chain to FP32 bitmap now.
+            float oldDpiX2, oldDpiY2;
+            dc->GetDpi(&oldDpiX2, &oldDpiY2);
+            dc->SetDpi(96.0f, 96.0f);
 
-        // Restore DPI for subsequent operations.
-        dc->SetDpi(oldDpiX, oldDpiY);
+            D2D1_RECT_F bounds{};
+            dc->GetImageLocalBounds(inputImage, &bounds);
+            srcW = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
+            srcH = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
+            if (srcW == 0 || srcH == 0) { dc->SetDpi(oldDpiX2, oldDpiY2); node.runtimeError = L"Zero input bounds"; return; }
+
+            D2D1_BITMAP_PROPERTIES1 bmpProps{};
+            bmpProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+            bmpProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+            bmpProps.dpiX = 96.0f;
+            bmpProps.dpiY = 96.0f;
+            HRESULT hr2 = dc->CreateBitmap(D2D1::SizeU(srcW, srcH), nullptr, 0, bmpProps, inputBitmap.put());
+            if (FAILED(hr2)) { dc->SetDpi(oldDpiX2, oldDpiY2); node.runtimeError = std::format(L"CreateBitmap input failed 0x{:08X}", (uint32_t)hr2); return; }
+
+            winrt::com_ptr<ID2D1Image> prevTarget2;
+            dc->GetTarget(prevTarget2.put());
+            dc->SetTarget(inputBitmap.get());
+            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+            dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
+            dc->SetTarget(prevTarget2.get());
+            dc->Flush();
+            dc->SetDpi(oldDpiX2, oldDpiY2);
+        }
+
+        if (srcW == 0 || srcH == 0) { node.runtimeError = L"Zero input size"; return; }
+        HRESULT hr = S_OK;
 
         // Get D3D11 texture from the input bitmap.
         winrt::com_ptr<IDXGISurface> inputSurface;
@@ -1654,6 +1660,49 @@ namespace ShaderLab::Rendering
         m_imageComputeTexCache[node.id] = computeTex;
         node.cachedOutput = outBitmap.get();
         node.runtimeError.clear();
+    }
+
+    // -----------------------------------------------------------------------
+    // Pre-render upstream D2D chain to FP32 bitmap at 96 DPI
+    // -----------------------------------------------------------------------
+
+    winrt::com_ptr<ID2D1Bitmap1> GraphEvaluator::PreRenderInputBitmap(
+        ID2D1DeviceContext5* dc, ID2D1Image* inputImage)
+    {
+        if (!dc || !inputImage) return nullptr;
+
+        float oldDpiX, oldDpiY;
+        dc->GetDpi(&oldDpiX, &oldDpiY);
+        dc->SetDpi(96.0f, 96.0f);
+
+        D2D1_RECT_F bounds{};
+        dc->GetImageLocalBounds(inputImage, &bounds);
+        uint32_t w = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
+        uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
+        if (w == 0 || h == 0) { dc->SetDpi(oldDpiX, oldDpiY); return nullptr; }
+
+        winrt::com_ptr<ID2D1Bitmap1> bitmap;
+        D2D1_BITMAP_PROPERTIES1 props{};
+        props.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+        props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+        props.dpiX = 96.0f;
+        props.dpiY = 96.0f;
+        HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, props, bitmap.put());
+        if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return nullptr; }
+
+        // Render inside a standalone BeginDraw/EndDraw pair so the D2D
+        // effect chain is fully evaluated with current property values.
+        winrt::com_ptr<ID2D1Image> prevTarget;
+        dc->GetTarget(prevTarget.put());
+        dc->SetTarget(bitmap.get());
+        dc->BeginDraw();
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
+        dc->EndDraw();
+        dc->SetTarget(prevTarget.get());
+
+        dc->SetDpi(oldDpiX, oldDpiY);
+        return bitmap;
     }
 
     // -----------------------------------------------------------------------

@@ -145,13 +145,19 @@ namespace ShaderLab::Rendering
         void DispatchImageCompute(
             ID2D1DeviceContext5* dc,
             Graph::EffectNode& node,
-            ID2D1Image* inputImage);
+            ID2D1Image* inputImage,
+            ID2D1Bitmap1* preRenderedInput = nullptr);
 
         // Deferred D3D11 compute dispatches (node ID + upstream image).
         struct DeferredCompute {
             uint32_t nodeId;
             ID2D1Image* inputImage;  // non-owning, valid until next Evaluate
+            winrt::com_ptr<ID2D1Bitmap1> preRenderedInput;  // owning, pre-rendered bitmap (optional)
         };
         std::vector<DeferredCompute> m_deferredCompute;
+
+        // Pre-render a D2D image to an FP32 bitmap at 96 DPI.
+        winrt::com_ptr<ID2D1Bitmap1> PreRenderInputBitmap(
+            ID2D1DeviceContext5* dc, ID2D1Image* inputImage);
     };
 }
