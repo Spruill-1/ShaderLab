@@ -863,9 +863,12 @@ float4 main(
 // so all three gamuts share the same spatial mapping.
 
 cbuffer constants : register(b0) {
-    float Gamut;        // 0=Rec.709, 1=DCI-P3, 2=Rec.2020
+    float Gamut;        // 0=Rec.709, 1=DCI-P3, 2=Rec.2020, 3=Working Space
     float Luminance;    // nits (default 80.0, maps to scRGB 1.0)
     float OutputSize;   // pixels (default 1024)
+    float WsRedX_hidden;   float WsRedY_hidden;
+    float WsGreenX_hidden; float WsGreenY_hidden;
+    float WsBlueX_hidden;  float WsBlueY_hidden;
 };
 
 float4 main(
@@ -876,38 +879,28 @@ float4 main(
 
     // Select gamut primaries
     float2 r, g, b;
-    if (Gamut > 1.5)     { r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }
+    if (Gamut > 2.5)     { r = float2(WsRedX_hidden, WsRedY_hidden);
+                           g = float2(WsGreenX_hidden, WsGreenY_hidden);
+                           b = float2(WsBlueX_hidden, WsBlueY_hidden); }
+    else if (Gamut > 1.5){ r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }
     else if (Gamut > 0.5){ r = GAMUT_P3_R;   g = GAMUT_P3_G;   b = GAMUT_P3_B; }
     else                 { r = GAMUT_709_R;  g = GAMUT_709_G;  b = GAMUT_709_B; }
 
-    // Fixed coordinate system: D65 white point at image center.
-    // Scale based on Rec.2020 bounding box (the largest gamut) so all
-    // three gamuts map to the same spatial coordinates.
-    float2 center = D65_WHITE; // (0.3127, 0.3290)
-
-    // Rec.2020 spans roughly x:[0.131, 0.708], y:[0.046, 0.797]
-    // Max distance from D65 in any direction ~ 0.47
-    // Use a uniform half-extent with padding.
+    float2 center = D65_WHITE;
     float halfExtent = 0.50;
 
-    // Map pixel [0, size] -> CIE xy centered on D65
     float2 uv = uv0.xy / size;
     float2 xy;
     xy.x = center.x + (uv.x - 0.5) * 2.0 * halfExtent;
-    xy.y = center.y - (uv.y - 0.5) * 2.0 * halfExtent; // y-up
+    xy.y = center.y - (uv.y - 0.5) * 2.0 * halfExtent;
 
-    // Outside the gamut triangle: black
     if (!PointInTriangle(xy, r, g, b))
         return float4(0, 0, 0, 1.0);
 
-    // Convert CIE xy + luminance to scRGB
     float Y = Luminance / 80.0;
     float3 xyY_val = float3(xy.x, xy.y, Y);
     float3 xyz = xyYToXYZ(xyY_val);
     float3 rgb = XYZToScRGB(xyz);
-    // Preserve negative scRGB values - they represent colors outside Rec.709
-    // that are valid in wider gamuts (P3, Rec.2020). Downstream effects like
-    // Gamut Highlight rely on these negative components.
 
     return float4(rgb, 1.0);
 }
@@ -921,9 +914,14 @@ float4 main(
             desc.hlslSource = colorMath + gamutSourceHLSL;
             desc.inputNames = {};
             desc.parameters = {
-                { L"Gamut",      L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020" } },
+                { L"Gamut",      L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020", L"Working Space" } },
                 { L"Luminance",  L"float", 80.0f, 0.01f, 10000.0f, 10.0f },
                 { L"OutputSize", L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
+            };
+            desc.hiddenDefaults = {
+                { L"WsRedX_hidden",   0.64f }, { L"WsRedY_hidden",   0.33f },
+                { L"WsGreenX_hidden", 0.30f }, { L"WsGreenY_hidden", 0.60f },
+                { L"WsBlueX_hidden",  0.15f }, { L"WsBlueY_hidden",  0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -941,6 +939,9 @@ cbuffer constants : register(b0) {
     float Phase;
     float OutputSize;
     float LogScale;
+    float WsRedX_hidden;   float WsRedY_hidden;
+    float WsGreenX_hidden; float WsGreenY_hidden;
+    float WsBlueX_hidden;  float WsBlueY_hidden;
 };
 
 float4 main(
@@ -950,7 +951,10 @@ float4 main(
     float size = max(OutputSize, 128.0);
 
     float2 r, g, b;
-    if (Gamut > 1.5)     { r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }
+    if (Gamut > 2.5)     { r = float2(WsRedX_hidden, WsRedY_hidden);
+                           g = float2(WsGreenX_hidden, WsGreenY_hidden);
+                           b = float2(WsBlueX_hidden, WsBlueY_hidden); }
+    else if (Gamut > 1.5){ r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }
     else if (Gamut > 0.5){ r = GAMUT_P3_R;   g = GAMUT_P3_G;   b = GAMUT_P3_B; }
     else                 { r = GAMUT_709_R;  g = GAMUT_709_G;  b = GAMUT_709_B; }
 
@@ -990,13 +994,18 @@ float4 main(
             desc.inputNames = {};
             desc.isAnimatable = true;
             desc.parameters = {
-                { L"Gamut",      L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020" } },
+                { L"Gamut",      L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020", L"Working Space" } },
                 { L"MinNits",   L"float", 0.1f, 0.001f, 100.0f, 0.1f },
                 { L"MaxNits",   L"float", 10000.0f, 100.0f, 10000.0f, 100.0f },
                 { L"Phase",     L"float", 0.0f, 0.0f, 1.0f, 0.01f },
                 { L"OutputSize", L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
                 { L"LogScale",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Linear", L"Logarithmic" } },
                 { L"Speed",     L"float", 0.1f, 0.01f, 2.0f, 0.01f },
+            };
+            desc.hiddenDefaults = {
+                { L"WsRedX_hidden",   0.64f }, { L"WsRedY_hidden",   0.33f },
+                { L"WsGreenX_hidden", 0.30f }, { L"WsGreenY_hidden", 0.60f },
+                { L"WsBlueX_hidden",  0.15f }, { L"WsBlueY_hidden",  0.06f },
             };
             m_effects.push_back(std::move(desc));
         }
