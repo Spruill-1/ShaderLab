@@ -2277,9 +2277,11 @@ namespace winrt::ShaderLab::implementation
         panel.Children().Append(typeText);
 
         // ---- Custom effect: "Edit in Designer" button ----
+        // Hide for parameter nodes (no HLSL) and output nodes.
         if ((node->type == ::ShaderLab::Graph::NodeType::PixelShader ||
              node->type == ::ShaderLab::Graph::NodeType::ComputeShader) &&
-            node->customEffect.has_value())
+            node->customEffect.has_value() &&
+            !node->customEffect->hlslSource.empty())
         {
             auto editBtn = Controls::Button();
             editBtn.Content(winrt::box_value(L"\xE70F  Edit in Effect Designer"));
@@ -2855,7 +2857,13 @@ namespace winrt::ShaderLab::implementation
                             if (!p.visibleWhen.empty()) { hasVisibleWhen = true; break; }
                     }
 
-                    if (hasVisibleWhen || (n && n->effectClsid.has_value() &&
+                    // Also rebuild for parameter nodes when Min/Max changes
+                    // (need to update Value slider range).
+                    bool isParameterNode = n && n->customEffect.has_value() &&
+                        n->customEffect->hlslSource.empty() &&
+                        n->customEffect->analysisOutputType == ::ShaderLab::Graph::AnalysisOutputType::Typed;
+
+                    if (hasVisibleWhen || isParameterNode || (n && n->effectClsid.has_value() &&
                         IsEqualGUID(n->effectClsid.value(), CLSID_D2D1Histogram)))
                     {
                         this->DispatcherQueue().TryEnqueue(
@@ -2996,6 +3004,19 @@ namespace winrt::ShaderLab::implementation
                         float minV = meta ? meta->minValue : -FLT_MAX;
                         float maxV = meta ? meta->maxValue : FLT_MAX;
                         float stepV = meta ? meta->step : 0.01f;
+
+                        // For parameter nodes, the "Value" slider range uses
+                        // the current "Min"/"Max" property values dynamically.
+                        if (key == L"Value" && node->customEffect.has_value() &&
+                            node->customEffect->hlslSource.empty())
+                        {
+                            auto minIt = node->properties.find(L"Min");
+                            auto maxIt = node->properties.find(L"Max");
+                            if (minIt != node->properties.end())
+                                if (auto* f = std::get_if<float>(&minIt->second)) minV = *f;
+                            if (maxIt != node->properties.end())
+                                if (auto* f = std::get_if<float>(&maxIt->second)) maxV = *f;
+                        }
 
                         if (useCombo)
                         {
