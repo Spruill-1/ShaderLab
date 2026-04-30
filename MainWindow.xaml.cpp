@@ -559,6 +559,11 @@ namespace winrt::ShaderLab::implementation
         m_nodeGraphController.ReleaseDeviceResources();
         m_graphRenderTarget = nullptr;
         m_graphSwapChain = nullptr;
+        m_graphGridBrush = nullptr;
+
+        // Release pixel trace swatch resources.
+        m_traceSwatchTarget = nullptr;
+        m_traceSwapChain = nullptr;
 
         // Close output windows (they have their own swap chains).
         for (auto& w : m_outputWindows) w->Close();
@@ -597,6 +602,8 @@ namespace winrt::ShaderLab::implementation
         m_graph.MarkAllDirty();
         m_graph.ClearCachedOutputs();
         m_forceRender = true;
+        m_nodeGraphController.SetNeedsRedraw();
+        m_nodeGraphController.RebuildLayout();
         UpdateStatusBar();
 
         m_nodeLogs[0].Info(std::format(L"GPU switched to: {}",
