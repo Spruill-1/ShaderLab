@@ -105,9 +105,11 @@ namespace ShaderLab::Rendering
                         if (srcNode) inputImage = srcNode->cachedOutput;
                     }
                     bool hasImageOutput = !node->outputPins.empty();
+                    // Image-producing compute: recompute when dirty or no cached output.
+                    // Analysis-only compute: also recompute if no analysis fields yet.
                     bool needsCompute = node->dirty ||
-                        node->analysisOutput.fields.empty() ||
-                        (hasImageOutput && !node->cachedOutput);
+                        (hasImageOutput && !node->cachedOutput) ||
+                        (!hasImageOutput && node->analysisOutput.fields.empty());
                     if (inputImage && needsCompute)
                     {
                         m_deferredCompute.push_back({ nodeId, inputImage });

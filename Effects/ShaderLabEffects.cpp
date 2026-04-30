@@ -528,22 +528,18 @@ float4 main(
         {
             static const std::string cieHistHLSL = R"HLSL(
 // CIE xy Histogram: scatter source pixels into a 2D CIE xy histogram.
-// Each output pixel represents a bin in CIE xy space.
-// R channel: log-scaled density count.
-// G channel: average luminance of pixels in that bin (nits / 10000).
-// B channel: unused (0).
-// A channel: 1.0 if any pixel hit this bin, else 0.
+// Uses groupshared tiled accumulation to avoid data races.
+// Output R: log-scaled density, G: avg luminance / 10000, A: 1 if hit.
 
 Texture2D<float4> Source : register(t0);
 RWTexture2D<float4> Output : register(u0);
 
 cbuffer Constants : register(b0) {
-    uint Width;      // Source width
-    uint Height;     // Source height
-    uint OutputSize; // Histogram grid size (e.g. 512)
+    uint Width;
+    uint Height;
+    uint OutputSize;
 };
 
-// scRGB (Rec.709 linear) -> CIE XYZ
 float3 ScRGBToXYZ(float3 rgb) {
     return float3(
         0.4123908 * rgb.r + 0.3575843 * rgb.g + 0.1804808 * rgb.b,
@@ -552,10 +548,15 @@ float3 ScRGBToXYZ(float3 rgb) {
     );
 }
 
-// Coordinate system: D65 centered, half-extent 0.50
-// Matches the CIE Chromaticity Plot and Gamut Source effects.
 static const float2 CENTER = float2(0.3127, 0.3290);
 static const float HALF_EXTENT = 0.50;
+
+// Tile-based groupshared histogram.
+// 48x48 = 2304 bins, well within 32KB groupshared limit.
+#define TILE_SIZE 48
+groupshared uint gs_counts[TILE_SIZE * TILE_SIZE];
+groupshared float gs_lumSum[TILE_SIZE * TILE_SIZE];
+groupshared uint gs_maxCount;
 
 [numthreads(32, 32, 1)]
 void main(uint3 GTid : SV_GroupThreadID) {
@@ -564,72 +565,72 @@ void main(uint3 GTid : SV_GroupThreadID) {
     uint totalPixels = Width * Height;
     uint outSize = max(OutputSize, 64u);
 
-    // Clear output (each thread clears a chunk).
+    // Clear output texture.
     for (uint ci = tid; ci < outSize * outSize; ci += totalThreads) {
-        uint cx = ci % outSize;
-        uint cy = ci / outSize;
-        Output[int2(cx, cy)] = float4(0, 0, 0, 0);
+        Output[int2(ci % outSize, ci / outSize)] = float4(0, 0, 0, 0);
+    }
+
+    // Clear groupshared tile.
+    for (uint ti = tid; ti < TILE_SIZE * TILE_SIZE; ti += totalThreads) {
+        gs_counts[ti] = 0;
+        gs_lumSum[ti] = 0.0;
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Scatter source pixels into histogram bins.
+    // Process all source pixels, scatter into groupshared tile.
+    // The tile covers the full output range at reduced resolution.
     for (uint pi = tid; pi < totalPixels; pi += totalThreads) {
         uint px = pi % Width;
         uint py = pi / Width;
         float4 src = Source[int2(px, py)];
-
-        // Skip near-black pixels (alpha < threshold or very dark).
         if (src.a < 0.01) continue;
-        float3 rgb = src.rgb;
 
-        float3 xyz = ScRGBToXYZ(max(rgb, 0.0));
+        float3 xyz = ScRGBToXYZ(max(src.rgb, 0.0));
         float sum = xyz.x + xyz.y + xyz.z;
         if (sum < 1e-7) continue;
 
-        float cx = xyz.x / sum;
-        float cy = xyz.y / sum;
-        float luminance = xyz.y * 80.0; // scRGB 1.0 = 80 nits
+        float cieX = xyz.x / sum;
+        float cieY = xyz.y / sum;
 
-        // Map CIE xy to output pixel coordinates.
-        float u = (cx - CENTER.x) / (2.0 * HALF_EXTENT) + 0.5;
-        float v = 0.5 - (cy - CENTER.y) / (2.0 * HALF_EXTENT); // y-up
+        float u = (cieX - CENTER.x) / (2.0 * HALF_EXTENT) + 0.5;
+        float v = 0.5 - (cieY - CENTER.y) / (2.0 * HALF_EXTENT);
         if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
 
-        uint ox = (uint)(u * outSize);
-        uint oy = (uint)(v * outSize);
-        ox = min(ox, outSize - 1);
-        oy = min(oy, outSize - 1);
+        uint tx = min((uint)(u * TILE_SIZE), TILE_SIZE - 1);
+        uint ty = min((uint)(v * TILE_SIZE), TILE_SIZE - 1);
+        uint idx = ty * TILE_SIZE + tx;
 
-        // Atomic scatter: accumulate density and luminance.
-        // Since RWTexture2D doesn't support float atomics, we
-        // use a simple non-atomic add. For visualization purposes
-        // the occasional race is acceptable (no tearing, just
-        // slightly inaccurate counts).
-        float4 prev = Output[int2(ox, oy)];
-        float count = prev.r + 1.0;
-        float avgLum = (prev.g * prev.r + luminance / 10000.0) / count;
-        Output[int2(ox, oy)] = float4(count, avgLum, 0, 1.0);
+        InterlockedAdd(gs_counts[idx], 1u);
+        // Luminance accumulation has minor races but acceptable for avg.
+        gs_lumSum[idx] += xyz.y * 80.0 / 10000.0;
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Log-normalize the density counts.
-    float maxCount = 1.0;
-    for (uint fi = tid; fi < outSize * outSize; fi += totalThreads) {
-        uint fx = fi % outSize;
-        uint fy = fi / outSize;
-        float c = Output[int2(fx, fy)].r;
-        maxCount = max(maxCount, c);
+    // Find max count for log normalization.
+    if (tid == 0) gs_maxCount = 1;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint mi = tid; mi < TILE_SIZE * TILE_SIZE; mi += totalThreads) {
+        InterlockedMax(gs_maxCount, gs_counts[mi]);
     }
-    // Simple max reduction within thread — acceptable for visualization.
     GroupMemoryBarrierWithGroupSync();
 
-    for (uint ni = tid; ni < outSize * outSize; ni += totalThreads) {
-        uint nx = ni % outSize;
-        uint ny = ni / outSize;
-        float4 val = Output[int2(nx, ny)];
-        if (val.r > 0) {
-            float logDensity = log2(val.r + 1.0) / log2(maxCount + 1.0);
-            Output[int2(nx, ny)] = float4(logDensity, val.g, 0, 1.0);
+    float logMax = log2(float(gs_maxCount) + 1.0);
+
+    // Write groupshared tile to output texture, upscaling to full resolution.
+    // Each tile bin maps to a block of (outSize/TILE_SIZE) x (outSize/TILE_SIZE) pixels.
+    float scale = float(outSize) / float(TILE_SIZE);
+    for (uint oi = tid; oi < outSize * outSize; oi += totalThreads) {
+        uint ox = oi % outSize;
+        uint oy = oi / outSize;
+        // Map output pixel back to tile bin.
+        uint tx = min((uint)(float(ox) / scale), TILE_SIZE - 1);
+        uint ty = min((uint)(float(oy) / scale), TILE_SIZE - 1);
+        uint idx = ty * TILE_SIZE + tx;
+        uint cnt = gs_counts[idx];
+        if (cnt > 0) {
+            float logDensity = log2(float(cnt) + 1.0) / logMax;
+            float avgLum = gs_lumSum[idx] / float(cnt);
+            Output[int2(ox, oy)] = float4(logDensity, avgLum, 0, 1.0);
         }
     }
 }
