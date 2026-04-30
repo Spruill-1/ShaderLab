@@ -949,6 +949,29 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
+        // GET /perf — Return per-frame performance timings
+        // =====================================================================
+        m_mcpServer->AddRoute(L"GET", L"/perf", [this](const std::wstring&, const std::string&)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            auto& t = m_lastFrameTiming;
+            if (t.framesSampled == 0)
+                t = m_frameTiming;  // fallback to live if no snapshot yet
+            double fps = (t.totalUs > 0) ? 1000000.0 / t.totalUs : 0;
+            return { 200, std::format(
+                "{{\"fps\":{:.1f},\"totalMs\":{:.2f},"
+                "\"sourcesPrepMs\":{:.2f},\"evaluateMs\":{:.2f},"
+                "\"deferredComputeMs\":{:.2f},\"drawMs\":{:.2f},"
+                "\"presentMs\":{:.2f},\"computeDispatches\":{},"
+                "\"framesSampled\":{}}}",
+                fps, t.totalUs / 1000.0,
+                t.sourcesPrepUs / 1000.0, t.evaluateUs / 1000.0,
+                t.deferredComputeUs / 1000.0, t.drawUs / 1000.0,
+                t.presentUs / 1000.0, t.computeDispatches,
+                t.framesSampled) };
+        });
+
+        // =====================================================================
         // POST /graph/bind-property — Bind a property to an analysis output field
         // =====================================================================
         m_mcpServer->AddRoute(L"POST", L"/graph/bind-property", [this](const std::wstring&, const std::string& body)
@@ -1259,6 +1282,7 @@ namespace winrt::ShaderLab::implementation
 {"name":"effect_compile","description":"Compile HLSL for a custom effect node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"hlsl":{"type":"string"}},"required":["nodeId","hlsl"]}},
 {"name":"set_preview_node","description":"Set which node is previewed","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
 {"name":"render_capture","description":"Capture preview as PNG. Note: HDR values clipped to SDR.","inputSchema":{"type":"object","properties":{}}},
+{"name":"perf_timings","description":"Get per-frame performance timings (ms) for render pipeline phases","inputSchema":{"type":"object","properties":{}}},
 {"name":"registry_get_effect","description":"Get metadata for a built-in effect","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
 {"name":"graph_bind_property","description":"Bind a node property to an upstream analysis output field","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"propertyName":{"type":"string"},"sourceNodeId":{"type":"number"},"sourceFieldName":{"type":"string"},"sourceComponent":{"type":"number","description":"0-3 for .xyzw component (scalar dest only)"}},"required":["nodeId","propertyName","sourceNodeId","sourceFieldName"]}},
 {"name":"graph_unbind_property","description":"Remove a property binding","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"propertyName":{"type":"string"}},"required":["nodeId","propertyName"]}},
@@ -1313,6 +1337,8 @@ namespace winrt::ShaderLab::implementation
                         restResp = m_mcpServer->RouteRequest(L"POST", L"/render/preview-node", argsStr);
                     else if (toolName == "render_capture")
                         restResp = m_mcpServer->RouteRequest(L"GET", L"/render/capture", "");
+                    else if (toolName == "perf_timings")
+                        restResp = m_mcpServer->RouteRequest(L"GET", L"/perf", "");
                     else if (toolName == "registry_get_effect")
                     {
                         auto name = std::wstring(args.GetNamedString(L"name"));

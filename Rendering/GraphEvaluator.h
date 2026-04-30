@@ -34,6 +34,7 @@ namespace ShaderLab::Rendering
         // Call AFTER Evaluate (and double-eval) when all D2D effects are initialized.
         // Returns true if any compute dispatches ran (analysis output changed).
         bool ProcessDeferredCompute(Graph::EffectGraph& graph, ID2D1DeviceContext5* dc);
+        size_t DeferredComputeCount() const { return m_deferredCompute.size(); }
 
         // Release all cached D2D effects (e.g., on device lost or graph clear).
         void ReleaseCache();

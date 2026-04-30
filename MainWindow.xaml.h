@@ -148,6 +148,20 @@ namespace winrt::ShaderLab::implementation
         std::chrono::steady_clock::time_point m_fpsTimePoint;
         std::chrono::steady_clock::time_point m_lastRenderTick;
 
+        // Per-frame performance timings (microseconds, rolling averages).
+        struct FrameTimings {
+            double totalUs{};
+            double sourcesPrepUs{};
+            double evaluateUs{};
+            double deferredComputeUs{};
+            double drawUs{};
+            double presentUs{};
+            uint32_t computeDispatches{};
+            uint32_t framesSampled{};
+        };
+        FrameTimings m_frameTiming;
+        FrameTimings m_lastFrameTiming;  // snapshot for MCP read
+
         HWND m_hwnd{ nullptr };
         bool m_customEffectsRegistered{ false };
         bool m_isShuttingDown{ false };

@@ -4573,6 +4573,8 @@ namespace winrt::ShaderLab::implementation
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) return;
 
+        auto tFrameStart = std::chrono::high_resolution_clock::now();
+
         // Re-prepare dirty source nodes (e.g., Flood color changed, video frame advance).
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
         {
@@ -4722,6 +4724,8 @@ namespace winrt::ShaderLab::implementation
             }
         }
 
+        auto tSourcesEnd = std::chrono::high_resolution_clock::now();
+
         // Evaluate the effect graph.
         m_graphEvaluator.Evaluate(m_graph, dc);
 
@@ -4730,6 +4734,8 @@ namespace winrt::ShaderLab::implementation
         // pass produces correct output with the proper cbuffer values.
         if (m_graph.HasDirtyNodes())
             m_graphEvaluator.Evaluate(m_graph, dc);
+
+        auto tEvalEnd = std::chrono::high_resolution_clock::now();
 
         // Deferred fit: after first evaluation with valid output, fit the preview.
         if (m_needsFitPreview && GetPreviewImage())
@@ -4745,6 +4751,7 @@ namespace winrt::ShaderLab::implementation
 
         // Process deferred D3D11 compute dispatches inside the active D2D
         // draw session, where all effect chains are fully materialized.
+        uint32_t computeCount = static_cast<uint32_t>(m_graphEvaluator.DeferredComputeCount());
         if (m_graphEvaluator.ProcessDeferredCompute(m_graph, drawDc))
         {
             m_nodeGraphController.SetNeedsRedraw();
@@ -4754,6 +4761,8 @@ namespace winrt::ShaderLab::implementation
             if (m_graph.HasDirtyNodes())
                 m_graphEvaluator.Evaluate(m_graph, drawDc);
         }
+
+        auto tComputeEnd = std::chrono::high_resolution_clock::now();
 
         // Set DPI to 96 so D2D coordinates match WinUI DIPs exactly.
         // The XAML compositor handles physical pixel scaling.
@@ -4808,8 +4817,32 @@ namespace winrt::ShaderLab::implementation
         drawDc->SetTransform(D2D1::Matrix3x2F::Identity());
         drawDc->SetDpi(oldDpiX, oldDpiY);
 
+        auto tDrawEnd = std::chrono::high_resolution_clock::now();
+
         m_renderEngine.EndDraw();
         m_renderEngine.Present();
+
+        auto tPresentEnd = std::chrono::high_resolution_clock::now();
+
+        // Accumulate per-frame timing (exponential moving average, alpha=0.1).
+        {
+            auto usec = [](auto a, auto b) {
+                return std::chrono::duration<double, std::micro>(b - a).count();
+            };
+            const double a = 0.1;
+            auto& t = m_frameTiming;
+            t.sourcesPrepUs  = t.sourcesPrepUs * (1-a) + usec(tFrameStart, tSourcesEnd) * a;
+            t.evaluateUs     = t.evaluateUs * (1-a) + usec(tSourcesEnd, tEvalEnd) * a;
+            t.deferredComputeUs = t.deferredComputeUs * (1-a) + usec(tEvalEnd, tComputeEnd) * a;
+            t.drawUs         = t.drawUs * (1-a) + usec(tComputeEnd, tDrawEnd) * a;
+            t.presentUs      = t.presentUs * (1-a) + usec(tDrawEnd, tPresentEnd) * a;
+            t.totalUs        = t.totalUs * (1-a) + usec(tFrameStart, tPresentEnd) * a;
+            t.computeDispatches = computeCount;
+            t.framesSampled++;
+            // Snapshot every 30 frames for MCP reads.
+            if (t.framesSampled % 30 == 0)
+                m_lastFrameTiming = t;
+        }
 
         // Present to any open output windows.
         PresentOutputWindows();
