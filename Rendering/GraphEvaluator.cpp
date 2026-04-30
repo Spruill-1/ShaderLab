@@ -1523,28 +1523,46 @@ namespace ShaderLab::Rendering
             if (FAILED(hr)) { node.runtimeError = std::format(L"CreateUAV failed 0x{:08X}", (uint32_t)hr); return; }
         }
 
-        // Compile compute shader from HLSL source.
+        // Compile compute shader (cached by HLSL hash to avoid per-frame recompilation).
         winrt::com_ptr<ID3D11ComputeShader> shader;
         winrt::com_ptr<ID3DBlob> blob;
         {
-            std::string hlsl = winrt::to_string(def.hlslSource);
-            for (auto& ch : hlsl) { if (ch == '\r') ch = '\n'; }
-            winrt::com_ptr<ID3DBlob> errors;
-            hr = D3DCompile(hlsl.c_str(), hlsl.size(), "ImageCompute", nullptr, nullptr,
-                "main", "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
-                0, blob.put(), errors.put());
-            if (FAILED(hr))
+            size_t hlslHash = std::hash<std::wstring>{}(def.hlslSource);
+            auto& cached = m_imageComputeCache[node.id];
+            // Check if we have a cached shader for this node with matching HLSL.
+            // Reuse the m_imageComputeCache map entry's com_ptr as a simple existence check.
+            // Store shader+blob in m_imageComputeTexCache-adjacent map (repurposed).
+            static std::unordered_map<uint32_t, std::tuple<size_t,
+                winrt::com_ptr<ID3D11ComputeShader>,
+                winrt::com_ptr<ID3DBlob>>> s_shaderCache;
+            auto sit = s_shaderCache.find(node.id);
+            if (sit != s_shaderCache.end() && std::get<0>(sit->second) == hlslHash)
             {
-                if (errors)
-                {
-                    std::string msg(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize());
-                    node.runtimeError = std::wstring(msg.begin(), msg.end());
-                }
-                return;
+                shader = std::get<1>(sit->second);
+                blob = std::get<2>(sit->second);
             }
-            hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
-                nullptr, shader.put());
-            if (FAILED(hr)) return;
+            else
+            {
+                std::string hlsl = winrt::to_string(def.hlslSource);
+                for (auto& ch : hlsl) { if (ch == '\r') ch = '\n'; }
+                winrt::com_ptr<ID3DBlob> errors;
+                hr = D3DCompile(hlsl.c_str(), hlsl.size(), "ImageCompute", nullptr, nullptr,
+                    "main", "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                    0, blob.put(), errors.put());
+                if (FAILED(hr))
+                {
+                    if (errors)
+                    {
+                        std::string msg(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize());
+                        node.runtimeError = std::wstring(msg.begin(), msg.end());
+                    }
+                    return;
+                }
+                hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                    nullptr, shader.put());
+                if (FAILED(hr)) return;
+                s_shaderCache[node.id] = { hlslHash, shader, blob };
+            }
         }
 
         // Pack cbuffer: Width, Height (of source), then user params via reflection.
