@@ -589,19 +589,18 @@ namespace ShaderLab::Controls
             for (const auto& fd : node.customEffect->analysisFields)
             {
                 v.dataOutputPinNames.push_back(fd.name);
-                std::wstring typeTag;
-                switch (fd.type)
-                {
-                case Graph::AnalysisFieldType::Float:       typeTag = L"float"; break;
-                case Graph::AnalysisFieldType::Float2:      typeTag = L"float2"; break;
-                case Graph::AnalysisFieldType::Float3:      typeTag = L"float3"; break;
-                case Graph::AnalysisFieldType::Float4:      typeTag = L"float4"; break;
-                case Graph::AnalysisFieldType::FloatArray:   typeTag = L"float[]"; break;
-                case Graph::AnalysisFieldType::Float2Array:  typeTag = L"float2[]"; break;
-                case Graph::AnalysisFieldType::Float3Array:  typeTag = L"float3[]"; break;
-                case Graph::AnalysisFieldType::Float4Array:  typeTag = L"float4[]"; break;
-                }
                 v.dataOutputPinLabels.push_back(fd.name);
+            }
+        }
+        else if (node.analysisOutput.type == Graph::AnalysisOutputType::Typed &&
+                 !node.analysisOutput.fields.empty())
+        {
+            // Source nodes (e.g., video) may have analysis output set directly
+            // without customEffect. Discover output pins from live data.
+            for (const auto& fv : node.analysisOutput.fields)
+            {
+                v.dataOutputPinNames.push_back(fv.name);
+                v.dataOutputPinLabels.push_back(fv.name);
             }
         }
 
