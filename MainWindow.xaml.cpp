@@ -4690,19 +4690,6 @@ namespace winrt::ShaderLab::implementation
         // Clamp to avoid huge jumps (e.g., after breakpoint or sleep).
         if (deltaSec > 0.1) deltaSec = 0.016;
 
-        // Tick video sources and upload new frames BEFORE checking dirty state.
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (dc)
-        {
-            try {
-                m_sourceFactory.TickAndUploadVideos(
-                    const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()),
-                    dc, deltaSec);
-            } catch (...) {
-                // Video tick failed — skip this frame silently.
-            }
-        }
-
         // Tick clock nodes: advance time.
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
         {
@@ -4761,6 +4748,21 @@ namespace winrt::ShaderLab::implementation
                     }
                 }
             }
+        }
+
+        // Resolve source node property bindings (e.g., Clock.Time → Video.Time)
+        // BEFORE ticking video sources, so they see the updated time values.
+        m_graphEvaluator.ResolveSourceBindings(m_graph);
+
+        // Tick video sources and upload new frames.
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (dc)
+        {
+            try {
+                m_sourceFactory.TickAndUploadVideos(
+                    const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()),
+                    dc, deltaSec);
+            } catch (...) {}
         }
 
         // Only re-evaluate the graph when something changed.

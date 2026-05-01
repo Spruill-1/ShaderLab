@@ -479,6 +479,28 @@ namespace ShaderLab::Rendering
         m_imageComputeTexCache.erase(nodeId);
     }
 
+    void GraphEvaluator::ResolveSourceBindings(EffectGraph& graph)
+    {
+        for (auto& node : const_cast<std::vector<EffectNode>&>(graph.Nodes()))
+        {
+            if (node.type != NodeType::Source) continue;
+            if (node.propertyBindings.empty()) continue;
+
+            std::map<std::wstring, PropertyValue> effectiveProps;
+            bool changed = ResolveBindings(node, graph, effectiveProps);
+            if (changed)
+            {
+                for (const auto& [propName, binding] : node.propertyBindings)
+                {
+                    auto eit = effectiveProps.find(propName);
+                    if (eit != effectiveProps.end())
+                        node.properties[propName] = eit->second;
+                }
+                node.dirty = true;
+            }
+        }
+    }
+
     void GraphEvaluator::UpdateNodeShader(uint32_t nodeId, const EffectNode& node)
     {
         if (!node.customEffect.has_value() || !node.customEffect->isCompiled())

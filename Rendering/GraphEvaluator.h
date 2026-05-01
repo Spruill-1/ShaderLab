@@ -36,6 +36,10 @@ namespace ShaderLab::Rendering
         bool ProcessDeferredCompute(Graph::EffectGraph& graph, ID2D1DeviceContext5* dc);
         size_t DeferredComputeCount() const { return m_deferredCompute.size(); }
 
+        // Resolve property bindings for Source nodes only (lightweight, no D2D).
+        // Call before TickAndUploadVideos so video nodes see updated Time values.
+        void ResolveSourceBindings(Graph::EffectGraph& graph);
+
         // Release all cached D2D effects (e.g., on device lost or graph clear).
         void ReleaseCache();
 
