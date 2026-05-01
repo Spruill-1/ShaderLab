@@ -312,6 +312,7 @@ namespace ShaderLab::Effects
                                 seekTime = std::fmod(seekTime, provider->Duration());
 
                             provider->Seek(seekTime);
+                            provider->Tick(0);  // Process the seek
                             clockDriven = true;
                         }
                     }
