@@ -299,15 +299,39 @@ namespace ShaderLab::Graph
         if (!srcNode) return L"Source node not found";
 
         // Verify source has typed analysis output.
-        if (!srcNode->customEffect.has_value() ||
-            srcNode->customEffect->analysisOutputType != AnalysisOutputType::Typed)
+        bool hasAnalysis = false;
+        if (srcNode->customEffect.has_value() &&
+            srcNode->customEffect->analysisOutputType == AnalysisOutputType::Typed)
+            hasAnalysis = true;
+        else if (srcNode->analysisOutput.type == AnalysisOutputType::Typed &&
+                 !srcNode->analysisOutput.fields.empty())
+            hasAnalysis = true;
+        if (!hasAnalysis)
             return L"Source node has no typed analysis output";
 
         // Verify field exists on source and get its type.
         const AnalysisFieldDescriptor* srcField = nullptr;
-        for (const auto& fd : srcNode->customEffect->analysisFields)
+        AnalysisFieldDescriptor liveField{};  // for live-data fallback
+        if (srcNode->customEffect.has_value())
         {
-            if (fd.name == sourceFieldName) { srcField = &fd; break; }
+            for (const auto& fd : srcNode->customEffect->analysisFields)
+            {
+                if (fd.name == sourceFieldName) { srcField = &fd; break; }
+            }
+        }
+        // Fallback: check live analysisOutput fields (e.g., video Duration/Position).
+        if (!srcField)
+        {
+            for (const auto& fv : srcNode->analysisOutput.fields)
+            {
+                if (fv.name == sourceFieldName)
+                {
+                    liveField.name = fv.name;
+                    liveField.type = fv.type;
+                    srcField = &liveField;
+                    break;
+                }
+            }
         }
         if (!srcField) return L"Source field not found";
 
