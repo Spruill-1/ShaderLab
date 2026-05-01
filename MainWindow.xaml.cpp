@@ -4825,10 +4825,12 @@ namespace winrt::ShaderLab::implementation
             }
         }
 
-        // Tick animatable nodes: advance Phase by Speed * deltaSeconds.
+        // Tick clock nodes: advance time and update Time/Progress outputs.
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
         {
-            if (node.isAnimatable && node.isPlaying)
+            // Legacy animatable nodes: advance Phase by Speed * deltaSeconds.
+            // TODO: Remove once all animated effects are migrated to Clock.
+            if (node.isAnimatable && node.isPlaying && !node.isClock)
             {
                 auto phaseIt = node.properties.find(L"Phase");
                 auto speedIt = node.properties.find(L"Speed");
@@ -4844,7 +4846,7 @@ namespace winrt::ShaderLab::implementation
                 }
             }
 
-            // Clock nodes: advance time and update Time/Progress outputs.
+            // Clock nodes: advance time.
             if (node.isClock && node.isPlaying)
             {
                 float startTime = 0.0f, stopTime = 10.0f, speed = 1.0f;

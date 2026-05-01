@@ -51,8 +51,23 @@ namespace ShaderLab::Rendering
             case NodeType::Source:
             {
                 // Source nodes have their cachedOutput set externally
-                // (by WIC image loading or Flood effect in Step 8).
-                // Nothing to do here -- just ensure it's marked clean.
+                // (by WIC image loading, Flood effect, or video provider).
+                // Resolve property bindings (e.g., Clock → Video.Time).
+                if (!node->propertyBindings.empty())
+                {
+                    std::map<std::wstring, PropertyValue> effectiveProps;
+                    bool bindingsChanged = ResolveBindings(*node, graph, effectiveProps);
+                    if (bindingsChanged)
+                    {
+                        for (const auto& [propName, binding] : node->propertyBindings)
+                        {
+                            auto eit = effectiveProps.find(propName);
+                            if (eit != effectiveProps.end())
+                                node->properties[propName] = eit->second;
+                        }
+                        node->dirty = true;
+                    }
+                }
                 node->dirty = false;
                 break;
             }
