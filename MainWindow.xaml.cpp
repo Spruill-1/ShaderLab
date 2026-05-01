@@ -678,8 +678,8 @@ namespace winrt::ShaderLab::implementation
 
                     if (isVideo)
                     {
-                        node.runtimeError = L"Video source needs reload after GPU change";
-                        node.dirty = false;
+                        // Video sources reopen on the next render tick.
+                        node.dirty = true;
                         continue;
                     }
 
