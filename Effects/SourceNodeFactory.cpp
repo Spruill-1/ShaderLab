@@ -74,20 +74,6 @@ namespace ShaderLab::Effects
 
         node.outputPins.push_back({ L"Frame", 0 });
 
-        // CustomEffectDefinition with Time parameter (data input pin for Clock binding)
-        // and analysis outputs for video metadata.
-        CustomEffectDefinition def;
-        def.shaderType = CustomShaderType::PixelShader;
-        def.parameters = {
-            { L"Time", L"float", 0.0f, 0.0f, 3600.0f, 0.1f },
-        };
-        def.analysisOutputType = AnalysisOutputType::Typed;
-        def.analysisFields = {
-            { L"Duration", AnalysisFieldType::Float },
-            { L"Position", AnalysisFieldType::Float },
-        };
-        node.customEffect = std::move(def);
-
         return node;
     }
 
@@ -279,39 +265,29 @@ namespace ShaderLab::Effects
                 if (node.id == id) { nodePtr = &node; break; }
 
             bool clockDriven = false;
+            double seekTime = 0.0;
             if (nodePtr)
             {
-                // Check if Time property is bound (set by Clock via property binding).
                 auto timeIt = nodePtr->properties.find(L"Time");
                 if (timeIt != nodePtr->properties.end())
-                {
                     if (auto* f = std::get_if<float>(&timeIt->second))
-                    {
-                        if (*f > 0.001f || nodePtr->propertyBindings.count(L"Time"))
-                        {
-                            // Clock-driven: seek to the bound time position.
-                            double seekTime = static_cast<double>(*f);
-                            bool loop = true;
-                            auto loopIt = nodePtr->properties.find(L"Loop");
-                            if (loopIt != nodePtr->properties.end())
-                                if (auto* b = std::get_if<bool>(&loopIt->second)) loop = *b;
+                        seekTime = static_cast<double>(*f);
 
-                            if (loop && provider->Duration() > 0)
-                                seekTime = std::fmod(seekTime, provider->Duration());
+                bool loop = true;
+                auto loopIt = nodePtr->properties.find(L"Loop");
+                if (loopIt != nodePtr->properties.end())
+                    if (auto* b = std::get_if<bool>(&loopIt->second)) loop = *b;
 
-                            provider->Seek(seekTime);
-                            provider->Tick(0);  // Process the seek
-                            clockDriven = true;
-                        }
-                    }
-                }
+                if (loop && provider->Duration() > 0)
+                    seekTime = std::fmod(seekTime, provider->Duration());
+
+                clockDriven = nodePtr->propertyBindings.count(L"Time") > 0;
             }
 
-            if (!clockDriven)
-            {
-                // Free-running mode (no Clock connected): just tick forward.
-                provider->Tick(deltaSeconds);
-            }
+            // Always seek to the Time property value (Clock-driven or manual).
+            // No free-running — without a Clock, the video shows a static frame.
+            provider->Seek(seekTime);
+            provider->Tick(0);
 
             if (provider->UploadIfReady(dc))
             {
@@ -322,21 +298,18 @@ namespace ShaderLab::Effects
                     nodePtr->dirty = true;
 
                     // Update analysis output with position/duration.
-                    if (nodePtr->customEffect.has_value())
-                    {
-                        nodePtr->analysisOutput.type = Graph::AnalysisOutputType::Typed;
-                        nodePtr->analysisOutput.fields.clear();
-                        Graph::AnalysisFieldValue durFv;
-                        durFv.name = L"Duration";
-                        durFv.type = Graph::AnalysisFieldType::Float;
-                        durFv.components[0] = static_cast<float>(provider->Duration());
-                        nodePtr->analysisOutput.fields.push_back(std::move(durFv));
-                        Graph::AnalysisFieldValue posFv;
-                        posFv.name = L"Position";
-                        posFv.type = Graph::AnalysisFieldType::Float;
-                        posFv.components[0] = static_cast<float>(provider->CurrentPosition());
-                        nodePtr->analysisOutput.fields.push_back(std::move(posFv));
-                    }
+                    nodePtr->analysisOutput.type = Graph::AnalysisOutputType::Typed;
+                    nodePtr->analysisOutput.fields.clear();
+                    Graph::AnalysisFieldValue durFv;
+                    durFv.name = L"Duration";
+                    durFv.type = Graph::AnalysisFieldType::Float;
+                    durFv.components[0] = static_cast<float>(provider->Duration());
+                    nodePtr->analysisOutput.fields.push_back(std::move(durFv));
+                    Graph::AnalysisFieldValue posFv;
+                    posFv.name = L"Position";
+                    posFv.type = Graph::AnalysisFieldType::Float;
+                    posFv.components[0] = static_cast<float>(provider->CurrentPosition());
+                    nodePtr->analysisOutput.fields.push_back(std::move(posFv));
                 }
             }
         }
