@@ -41,6 +41,9 @@ namespace ShaderLab::Effects
         // Advance playback clock. Call each tick with wall-clock delta.
         void Tick(double deltaSeconds);
 
+        // Request the next frame without the accumulator (for clock-driven mode).
+        void RequestNextFrame();
+
         // Upload the latest decoded frame to GPU and run conversion shader.
         // Returns true if a new frame was uploaded. Call on UI thread.
         bool UploadIfReady(ID2D1DeviceContext5* dc);
@@ -58,9 +61,11 @@ namespace ShaderLab::Effects
         const std::wstring& LastError() const { return m_lastError; }
         const std::wstring& FilePath() const { return m_filePath; }
 
-    private:
         // Output format from MF Source Reader.
         enum class OutputFormat { RGB32, NV12, P010 };
+        OutputFormat GetOutputFormat() const { return m_outputFormat; }
+
+    private:
 
         void DecodeThreadFunc();
         bool DecodeOneFrame();

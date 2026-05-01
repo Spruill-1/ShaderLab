@@ -321,18 +321,17 @@ namespace ShaderLab::Effects
 
             if (clockDriven)
             {
-                // For sequential forward playback, use the wall-clock delta
-                // so the video advances at real-time speed matching the clock.
+                // For sequential forward playback, request the next frame every tick.
                 // Only use expensive Seek for actual jumps (backward or large skip).
                 if (diff < -frameDur || diff > frameDur * 30.0)
                 {
-                    // Non-sequential: backwards or large jump → full seek.
                     provider->Seek(seekTime);
                 }
                 else
                 {
-                    // Sequential forward: tick by the actual wall-clock delta.
-                    provider->Tick(deltaSeconds);
+                    // Sequential forward: request next decoded frame directly.
+                    // Bypasses the accumulator — MF decodes as fast as it can.
+                    provider->RequestNextFrame();
                 }
             }
             else

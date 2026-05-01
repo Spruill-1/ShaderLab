@@ -671,6 +671,18 @@ void main(uint3 id : SV_DispatchThreadID)
         }
     }
 
+    void VideoSourceProvider::RequestNextFrame()
+    {
+        if (!m_reader) return;
+        if (m_endOfStream)
+        {
+            if (m_loop) { Seek(0.0); m_playing = true; }
+            return;
+        }
+        if (!m_frameNeeded.exchange(true))
+            m_decodeCV.notify_one();
+    }
+
     // -----------------------------------------------------------------------
     // Upload (UI thread) — GPU copy or CPU upload, then run conversion shader
     // -----------------------------------------------------------------------
