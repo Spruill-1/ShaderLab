@@ -617,8 +617,9 @@ namespace ShaderLab::Controls
             dataBodyHeight = 8.0f + maxDataPins * v.pinSpacing;  // 8px gap
         }
 
-        // Detect parameter nodes (no HLSL, data-only).
-        v.isParameterNode = node.customEffect.has_value() &&
+        // Detect parameter nodes (no HLSL, data-only, not Source nodes).
+        v.isParameterNode = node.type != Graph::NodeType::Source &&
+            node.customEffect.has_value() &&
             node.customEffect->hlslSource.empty() &&
             node.customEffect->analysisOutputType == Graph::AnalysisOutputType::Typed;
         v.isClockNode = node.isClock;
