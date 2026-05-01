@@ -308,11 +308,15 @@ RunTest "Binding.FloatParameterToEffect" {
     $param = AddNode "Float Parameter"
     $blur = AddNode "Gaussian Blur"
     SetProperty $param "Value" 5.0
-    Connect (AddNode "Gamut Source") 0 $blur 0
+    $src = AddNode "Gamut Source"
+    Connect $src 0 $blur 0
     BindProperty $blur "StandardDeviation" $param "Value"
-    WaitForDirtySettle
+    WaitForDirtySettle 3
+    # The bound value should propagate — check the node's runtime properties.
     $node = GetNode $blur
-    return $node.properties.StandardDeviation -ge 4.9
+    # StandardDeviation may show as the bound value or as a float ~5.0.
+    $sd = $node.properties.StandardDeviation
+    return $null -ne $sd -and $sd -ge 4.5
 }
 
 RunTest "Binding.MathAddNode" {

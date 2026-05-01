@@ -1426,8 +1426,7 @@ cbuffer Constants : register(b0)
     float Opacity;  // Blend with original (1.0 = full false color)
 };
 
-Texture2D InputTexture : register(t0);
-SamplerState InputSampler : register(s0);
+Texture2D Source : register(t0);
 
 float3 FalseColor(float nits) {
     // Purple < 0.5 < Blue < 5 < Cyan < 20 < Green < 100 < Yellow < 400 < Orange < 1000 < Red < 4000 < White
@@ -1442,12 +1441,11 @@ float3 FalseColor(float nits) {
 }
 
 float4 main(
-    float4 pos      : SV_POSITION,
-    float4 posScene : SCENE_POSITION,
-    float4 uv0      : TEXCOORD0
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0
 ) : SV_Target
 {
-    float4 color = InputTexture.Sample(InputSampler, uv0.xy);
+    float4 color = Source.Load(int3(uv0.xy, 0));
     float nits = ScRGBLuminanceNits(color.rgb);
     float3 fc = FalseColor(nits);
     float3 result = lerp(color.rgb, fc, Opacity);

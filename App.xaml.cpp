@@ -7,6 +7,9 @@
 #include "Effects/SourceNodeFactory.h"
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
+#include "Effects/ShaderLabEffects.h"
+#include "Effects/EffectRegistry.h"
+#include "Effects/ShaderCompiler.h"
 #include <ShlObj.h>
 #pragma comment(lib, "shell32.lib")
 
@@ -89,6 +92,23 @@ namespace winrt::ShaderLab::implementation
                         devicePref = ::ShaderLab::Rendering::DevicePreference::Warp;
                     else if (json.find("\"gpu\"") != std::string::npos)
                         devicePref = ::ShaderLab::Rendering::DevicePreference::Hardware;
+                    if (json.find("\"test\": true") != std::string::npos)
+                    {
+                        int failures = 99;
+                        try { failures = RunTestMode(static_cast<int>(devicePref)); }
+                        catch (const winrt::hresult_error& ex) {
+                            OutputDebugStringW(std::format(L"[TEST] Exception: 0x{:08X}\n",
+                                static_cast<uint32_t>(ex.code())).c_str());
+                        }
+                        catch (const std::exception& ex) {
+                            OutputDebugStringA(ex.what());
+                        }
+                        catch (...) {
+                            OutputDebugStringW(L"[TEST] Unknown exception\n");
+                        }
+                        ExitProcess(static_cast<UINT>(failures));
+                        return;
+                    }
                     break;
                 }
             }
@@ -341,5 +361,269 @@ namespace winrt::ShaderLab::implementation
         }
 
         wprintf(L"[CLI] Done. %d images saved.\n", saved);
+    }
+
+    int App::RunTestMode(int devicePrefInt)
+    {
+        auto devicePref = static_cast<::ShaderLab::Rendering::DevicePreference>(devicePrefInt);
+
+        // Write results to a file the test runner can read.
+        wchar_t tempPath[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, tempPath);
+        std::wstring resultPath = std::wstring(tempPath) + L"shaderlab_test_results.txt";
+        FILE* rf = nullptr;
+        _wfopen_s(&rf, resultPath.c_str(), L"w");
+
+        int passed = 0, failed = 0;
+        auto LOG = [&](const char* fmt, ...) {
+            va_list args; va_start(args, fmt);
+            if (rf) { vfprintf(rf, fmt, args); fprintf(rf, "\n"); fflush(rf); }
+            char buf[512]; vsnprintf(buf, sizeof(buf), fmt, args);
+            OutputDebugStringA(buf); OutputDebugStringA("\n");
+            va_end(args);
+        };
+        auto TEST = [&](const char* name, bool result) {
+            if (result) { LOG("  [PASS] %s", name); passed++; }
+            else        { LOG("  [FAIL] %s", name); failed++; }
+        };
+
+        LOG("[TEST] Creating device (%s)...",
+            devicePref == ::ShaderLab::Rendering::DevicePreference::Warp ? "WARP" : "Hardware");
+
+        UINT d3dFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+        winrt::com_ptr<ID3D11Device> baseDevice;
+        winrt::com_ptr<ID3D11DeviceContext> baseCtx;
+        D3D_DRIVER_TYPE driverType = (devicePref == ::ShaderLab::Rendering::DevicePreference::Warp)
+            ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE;
+        HRESULT hr = D3D11CreateDevice(nullptr, driverType, nullptr, d3dFlags,
+            featureLevels, ARRAYSIZE(featureLevels),
+            D3D11_SDK_VERSION, baseDevice.put(), nullptr, baseCtx.put());
+        if (FAILED(hr)) { LOG("[TEST] FATAL: D3D11CreateDevice failed 0x%08X", (uint32_t)hr); if (rf) fclose(rf); return 1; }
+
+        winrt::com_ptr<ID3D10Multithread> mt;
+        baseDevice.as(mt);
+        if (mt) mt->SetMultithreadProtected(TRUE);
+
+        auto d3dDev5 = baseDevice.as<ID3D11Device5>().get();
+        auto d3dCtx4 = baseCtx.as<ID3D11DeviceContext4>().get();
+
+        winrt::com_ptr<ID2D1Factory7> d2dFactory;
+        D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+            __uuidof(ID2D1Factory7), reinterpret_cast<void**>(d2dFactory.put()));
+        winrt::com_ptr<IDXGIDevice> dxgiDev;
+        baseDevice->QueryInterface(dxgiDev.put());
+        winrt::com_ptr<ID2D1Device6> d2dDevice;
+        d2dFactory->CreateDevice(dxgiDev.as<IDXGIDevice>().get(),
+            reinterpret_cast<ID2D1Device**>(d2dDevice.put()));
+        winrt::com_ptr<ID2D1DeviceContext5> dc;
+        d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+            reinterpret_cast<ID2D1DeviceContext**>(dc.put()));
+
+        winrt::com_ptr<ID2D1Factory1> factory1;
+        d2dFactory->QueryInterface(factory1.put());
+        if (factory1) {
+            ::ShaderLab::Effects::CustomPixelShaderEffect::RegisterEffect(factory1.get());
+            ::ShaderLab::Effects::CustomComputeShaderEffect::RegisterEffect(factory1.get());
+        }
+
+        LOG("[TEST] Device created");
+
+        auto& registry = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+        auto& d2dReg = ::ShaderLab::Effects::EffectRegistry::Instance();
+
+        // Helper: evaluate graph. Returns the evaluator (must stay alive while checking output).
+        auto evaluate = [&](::ShaderLab::Graph::EffectGraph& g, ::ShaderLab::Effects::SourceNodeFactory& sf,
+            ::ShaderLab::Rendering::GraphEvaluator& evaluator) {
+            g.MarkAllDirty();
+            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(g.Nodes()))
+                if (node.type == ::ShaderLab::Graph::NodeType::Source)
+                    try { sf.PrepareSourceNode(node, dc.get(), 0.0, d3dDev5, d3dCtx4); } catch (...) {}
+            evaluator.Evaluate(g, dc.get());
+            evaluator.Evaluate(g, dc.get());
+        };
+        auto hasOutput = [&](const ::ShaderLab::Graph::EffectNode& node) -> bool {
+            if (!node.cachedOutput) return false;
+            try {
+                D2D1_RECT_F b{}; HRESULT hr2 = dc->GetImageLocalBounds(node.cachedOutput, &b);
+                return SUCCEEDED(hr2) && (b.right - b.left) > 0 && (b.bottom - b.top) > 0;
+            } catch (...) { return false; }
+        };
+
+        // ---- Graph Operations ----
+        LOG("\n=== Graph Operations ===");
+        {
+            ::ShaderLab::Graph::EffectGraph g;
+            auto n = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Gamut Source"));
+            auto id = g.AddNode(std::move(n));
+            TEST("AddNode", g.FindNode(id) != nullptr);
+            g.RemoveNode(id);
+            TEST("RemoveNode", g.Nodes().empty());
+
+            auto src = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Gamut Source"));
+            auto blur = d2dReg.CreateNode(*d2dReg.FindByName(L"Gaussian Blur"));
+            auto sId = g.AddNode(std::move(src));
+            auto bId = g.AddNode(std::move(blur));
+            TEST("Connect", g.Connect(sId, 0, bId, 0));
+            g.Disconnect(sId, 0, bId, 0);
+            TEST("Disconnect", g.GetInputEdges(bId).empty());
+            g.Connect(sId, 0, bId, 0);
+            TEST("TopoSort", g.TopologicalSort().size() == 2);
+            // WouldCreateCycle: blur→src WOULD create a cycle (src→blur exists).
+            TEST("DetectsCycle", g.WouldCreateCycle(bId, sId));
+            // src→blur would NOT create a new cycle (it already exists).
+            TEST("AllowsExisting", !g.WouldCreateCycle(sId, bId));
+        }
+
+        // ---- Serialization ----
+        LOG("\n=== Serialization ===");
+        {
+            ::ShaderLab::Graph::EffectGraph g;
+            auto src = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Gamut Source"));
+            auto blur = d2dReg.CreateNode(*d2dReg.FindByName(L"Gaussian Blur"));
+            auto sId = g.AddNode(std::move(src));
+            auto bId = g.AddNode(std::move(blur));
+            g.Connect(sId, 0, bId, 0);
+            g.FindNode(bId)->properties[L"StandardDeviation"] = 3.0f;
+            auto json = g.ToJson();
+            TEST("Serialize", !json.empty());
+            auto g2 = ::ShaderLab::Graph::EffectGraph::FromJson(json);
+            TEST("DeserializeNodes", g2.Nodes().size() == 2);
+            TEST("DeserializeEdges", !g2.Edges().empty());
+            auto* bl = g2.FindNode(bId);
+            bool propOk = false;
+            if (bl) { auto it = bl->properties.find(L"StandardDeviation"); if (it != bl->properties.end()) { auto* f = std::get_if<float>(&it->second); propOk = f && std::abs(*f - 3.0f) < 0.01f; } }
+            TEST("DeserializeProperty", propOk);
+        }
+
+        // ---- Source Effects ----
+        LOG("\n=== Source Effects ===");
+        { const wchar_t* names[] = { L"Gamut Source", L"Color Checker", L"Zone Plate", L"Gradient Generator", L"HDR Test Pattern" };
+          for (auto* name : names) {
+            std::string tn = "Source_"; for (auto* p = name; *p; ++p) tn += (char)*p;
+            try {
+            LOG("  testing %s...", tn.c_str());
+            ::ShaderLab::Graph::EffectGraph g; ::ShaderLab::Effects::SourceNodeFactory sf;
+            auto node = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(name));
+            auto id = g.AddNode(std::move(node));
+            LOG("    evaluating...");
+            ::ShaderLab::Rendering::GraphEvaluator ev; evaluate(g, sf, ev);
+            LOG("    checking output...");
+            auto* n = g.FindNode(id);
+            TEST(tn.c_str(), n && hasOutput(*n) && n->runtimeError.empty());
+            } catch (...) { TEST(tn.c_str(), false); }
+        }}
+
+        // ---- Analysis Effects ----
+        LOG("\n=== Analysis Effects ===");
+        { const wchar_t* names[] = { L"Luminance Heatmap", L"Gamut Highlight", L"Nit Map", L"Waveform Monitor", L"Split Comparison" };
+          for (auto* name : names) {
+            std::string tn = "Analysis_"; for (auto* p = name; *p; ++p) tn += (char)*p;
+            try {
+            ::ShaderLab::Graph::EffectGraph g; ::ShaderLab::Effects::SourceNodeFactory sf;
+            auto srcN = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Gamut Source"));
+            auto fxN = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(name));
+            auto sId = g.AddNode(std::move(srcN)); auto fId = g.AddNode(std::move(fxN));
+            g.Connect(sId, 0, fId, 0); ::ShaderLab::Rendering::GraphEvaluator ev; evaluate(g, sf, ev);
+            auto* n = g.FindNode(fId);
+            TEST(tn.c_str(), n && hasOutput(*n) && n->runtimeError.empty());
+            } catch (...) { TEST(tn.c_str(), false); }
+        }}
+
+        // ---- Built-in D2D Effects ----
+        LOG("\n=== D2D Effects ===");
+        { const wchar_t* names[] = { L"Gaussian Blur", L"Brightness", L"Contrast", L"Grayscale", L"Invert", L"Saturation", L"Hue Rotation", L"Exposure", L"Sharpen", L"Edge Detection", L"Crop" };
+          for (auto* name : names) {
+            std::string tn = "D2D_"; for (auto* p = name; *p; ++p) tn += (char)*p;
+            try {
+            ::ShaderLab::Graph::EffectGraph g; ::ShaderLab::Effects::SourceNodeFactory sf;
+            auto srcN = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Gamut Source"));
+            auto fxN = d2dReg.CreateNode(*d2dReg.FindByName(name));
+            auto sId = g.AddNode(std::move(srcN)); auto fId = g.AddNode(std::move(fxN));
+            g.Connect(sId, 0, fId, 0); ::ShaderLab::Rendering::GraphEvaluator ev; evaluate(g, sf, ev);
+            auto* n = g.FindNode(fId);
+            TEST(tn.c_str(), n && hasOutput(*n));
+            } catch (...) { TEST(tn.c_str(), false); }
+        }}
+
+        // ---- Math Nodes ----
+        LOG("\n=== Math Nodes ===");
+        { struct MT { const wchar_t* n; float a, b, e; };
+          MT tests[] = { {L"Add",3,7,10}, {L"Subtract",10,3,7}, {L"Multiply",4,5,20}, {L"Divide",20,4,5}, {L"Max",3,7,7}, {L"Min",3,7,3} };
+          for (auto& t : tests) {
+            ::ShaderLab::Graph::EffectGraph g; ::ShaderLab::Effects::SourceNodeFactory sf;
+            auto pA = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Float Parameter"));
+            auto pB = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Float Parameter"));
+            auto m = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(t.n));
+            auto aId = g.AddNode(std::move(pA)); auto bId = g.AddNode(std::move(pB));
+            auto mId = g.AddNode(std::move(m));
+            g.FindNode(aId)->properties[L"Value"] = t.a; g.FindNode(bId)->properties[L"Value"] = t.b;
+            g.BindProperty(mId, L"A", aId, L"Value", 0); g.BindProperty(mId, L"B", bId, L"Value", 0);
+            ::ShaderLab::Rendering::GraphEvaluator ev; evaluate(g, sf, ev);
+            auto* mn = g.FindNode(mId); bool ok = false;
+            if (mn) for (auto& f : mn->analysisOutput.fields) if (f.name == L"Result") { ok = std::abs(f.components[0] - t.e) < 0.01f; break; }
+            std::string tn = "Math_"; for (auto* p = t.n; *p; ++p) tn += (char)*p;
+            TEST(tn.c_str(), ok);
+        }}
+
+        // ---- Property Bindings ----
+        LOG("\n=== Bindings ===");
+        { ::ShaderLab::Graph::EffectGraph g; ::ShaderLab::Effects::SourceNodeFactory sf;
+          auto src = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Gamut Source"));
+          auto param = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Float Parameter"));
+          auto blur = d2dReg.CreateNode(*d2dReg.FindByName(L"Gaussian Blur"));
+          auto sId = g.AddNode(std::move(src)); auto pId = g.AddNode(std::move(param)); auto bId = g.AddNode(std::move(blur));
+          g.Connect(sId, 0, bId, 0); g.FindNode(pId)->properties[L"Value"] = 5.0f;
+          TEST("BindProperty", g.BindProperty(bId, L"StandardDeviation", pId, L"Value", 0).empty());
+          ::ShaderLab::Rendering::GraphEvaluator ev; evaluate(g, sf, ev);
+          auto* b = g.FindNode(bId); auto it = b->properties.find(L"StandardDeviation");
+          bool ok = it != b->properties.end(); if (ok) { auto* f = std::get_if<float>(&it->second); ok = f && *f >= 4.5f; }
+          TEST("BindingPropagates", ok);
+        }
+
+        // ---- Clock ----
+        LOG("\n=== Clock ===");
+        { auto* desc = registry.FindByName(L"Clock");
+          TEST("ClockExists", desc != nullptr);
+          if (desc) { auto n = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*desc);
+            TEST("IsClock", n.isClock);
+            TEST("HasAutoDuration", n.properties.count(L"AutoDuration") > 0);
+            TEST("HasTimeOutput", !n.customEffect->analysisFields.empty() && n.customEffect->analysisFields[0].name == L"Time");
+        }}
+
+        // ---- Shader Compilation ----
+        LOG("\n=== Shader Compilation ===");
+        { auto r = ::ShaderLab::Effects::ShaderCompiler::CompileFromString(
+            "Texture2D S:register(t0);float4 main(float4 p:SV_POSITION,float4 u:TEXCOORD0):SV_TARGET{return S.Load(int3(u.xy,0));}",
+            "t.hlsl", "main", "ps_5_0");
+          TEST("ValidPS", r.succeeded);
+          auto b = ::ShaderLab::Effects::ShaderCompiler::CompileFromString("bad!", "b.hlsl", "main", "ps_5_0");
+          TEST("InvalidFails", !b.succeeded);
+          auto c = ::ShaderLab::Effects::ShaderCompiler::CompileFromString(
+            "RWTexture2D<float4> o:register(u0);[numthreads(8,8,1)]void main(uint3 id:SV_DispatchThreadID){o[id.xy]=float4(1,0,0,1);}",
+            "t.hlsl", "main", "cs_5_0");
+          TEST("ValidCS", c.succeeded);
+        }
+
+        // ---- Effect Chain ----
+        LOG("\n=== Effect Chain ===");
+        { ::ShaderLab::Graph::EffectGraph g; ::ShaderLab::Effects::SourceNodeFactory sf;
+          auto src = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Gamut Source"));
+          auto blur = d2dReg.CreateNode(*d2dReg.FindByName(L"Gaussian Blur"));
+          auto inv = d2dReg.CreateNode(*d2dReg.FindByName(L"Invert"));
+          auto sId = g.AddNode(std::move(src)); auto bId = g.AddNode(std::move(blur)); auto iId = g.AddNode(std::move(inv));
+          g.Connect(sId, 0, bId, 0); g.Connect(bId, 0, iId, 0);
+          ::ShaderLab::Rendering::GraphEvaluator ev; evaluate(g, sf, ev);
+          TEST("ThreeNodeChain", g.FindNode(iId) && hasOutput(*g.FindNode(iId)));
+        }
+
+        // ---- Summary ----
+        LOG("\n========================================");
+        if (failed == 0) LOG("ALL %d TESTS PASSED", passed);
+        else LOG("%d PASSED, %d FAILED out of %d", passed, failed, passed + failed);
+        LOG("========================================");
+
+        if (rf) fclose(rf);
+        return failed;
     }
 }

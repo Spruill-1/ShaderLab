@@ -11,7 +11,7 @@ namespace winrt::ShaderLab::implementation
 
     private:
         void RunCliMode(const std::wstring& cmdLine, int devicePref);
-
+        int RunTestMode(int devicePref);
     private:
         winrt::Microsoft::UI::Xaml::Window window{ nullptr };
     };
