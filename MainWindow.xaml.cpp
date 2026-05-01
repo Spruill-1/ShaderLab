@@ -1094,7 +1094,10 @@ namespace winrt::ShaderLab::implementation
                 {
                     auto* desc = lib.FindById(node.customEffect->shaderLabEffectId);
                     if (desc)
+                    {
                         node.isAnimatable = desc->isAnimatable;
+                        node.isClock = desc->isClock;
+                    }
                 }
             }
         }
@@ -2234,6 +2237,21 @@ namespace winrt::ShaderLab::implementation
         {
             OutputDebugStringW(std::format(L"  node {} '{}' pos=({:.0f},{:.0f})\n",
                 node.id, node.name, node.position.x, node.position.y).c_str());
+        }
+
+        // Check for play button hit on clock nodes.
+        uint32_t playNodeId = m_nodeGraphController.HitTestPlayButton(canvasPoint);
+        if (playNodeId != 0)
+        {
+            auto* node = m_graph.FindNode(playNodeId);
+            if (node)
+            {
+                node->isPlaying = !node->isPlaying;
+                m_nodeGraphController.SetNeedsRedraw();
+                m_nodeLogs[playNodeId].Info(node->isPlaying ? L"Clock started" : L"Clock paused");
+            }
+            args.Handled(true);
+            return;
         }
 
         // Check for inline slider hit on parameter nodes.
@@ -4824,6 +4842,41 @@ namespace winrt::ShaderLab::implementation
                     phaseIt->second = phase;
                     node.dirty = true;
                 }
+            }
+
+            // Clock nodes: advance time and update Time/Progress outputs.
+            if (node.isClock && node.isPlaying)
+            {
+                float startTime = 0.0f, stopTime = 10.0f, speed = 1.0f;
+                bool loop = true;
+                auto getF = [&](const std::wstring& k, float def) {
+                    auto it = node.properties.find(k);
+                    if (it != node.properties.end())
+                        if (auto* f = std::get_if<float>(&it->second)) return *f;
+                    return def;
+                };
+                startTime = getF(L"StartTime", 0.0f);
+                stopTime = getF(L"StopTime", 10.0f);
+                speed = getF(L"Speed", 1.0f);
+                loop = getF(L"Loop", 1.0f) > 0.5f;
+
+                double duration = static_cast<double>(stopTime - startTime);
+                if (duration <= 0.0) duration = 1.0;
+
+                node.clockTime += deltaSec * speed;
+
+                if (loop)
+                {
+                    while (node.clockTime >= duration) node.clockTime -= duration;
+                    while (node.clockTime < 0.0) node.clockTime += duration;
+                }
+                else
+                {
+                    node.clockTime = std::clamp(node.clockTime, 0.0, duration);
+                    if (node.clockTime >= duration) node.isPlaying = false;
+                }
+
+                node.dirty = true;
             }
         }
 

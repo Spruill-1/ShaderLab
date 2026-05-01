@@ -28,7 +28,9 @@ namespace ShaderLab::Controls
 
         // Parameter node inline control.
         bool isParameterNode{ false };
+        bool isClockNode{ false };
         D2D1_RECT_F sliderRect{};       // Slider track rect (for hit-test)
+        D2D1_RECT_F playButtonRect{};   // Play/pause button rect (clock nodes)
     };
 
     // Describes a pending connection drag operation.
@@ -101,6 +103,9 @@ namespace ShaderLab::Controls
 
         // Hit-test for inline slider on parameter nodes. Returns node ID or 0.
         uint32_t HitTestSlider(D2D1_POINT_2F canvasPoint) const;
+
+        // Hit-test for play/pause button on clock nodes. Returns node ID or 0.
+        uint32_t HitTestPlayButton(D2D1_POINT_2F canvasPoint) const;
 
         // Update slider value from canvas X position during drag.
         // Returns true if value changed.

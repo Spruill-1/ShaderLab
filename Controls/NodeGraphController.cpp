@@ -621,13 +621,14 @@ namespace ShaderLab::Controls
         v.isParameterNode = node.customEffect.has_value() &&
             node.customEffect->hlslSource.empty() &&
             node.customEffect->analysisOutputType == Graph::AnalysisOutputType::Typed;
+        v.isClockNode = node.isClock;
 
         // Parameter nodes: shrink image body (no image I/O) and add slider space.
         float sliderHeight = 0.0f;
         if (v.isParameterNode)
         {
             imageBodyHeight = 4.0f;  // minimal gap
-            sliderHeight = 28.0f;    // space for inline slider
+            sliderHeight = v.isClockNode ? 48.0f : 28.0f;  // extra space for play button
         }
 
         // Data-only effects (have HLSL but no image output pin): shrink image body
@@ -672,12 +673,31 @@ namespace ShaderLab::Controls
         if (v.isParameterNode)
         {
             float sliderY = node.position.y + v.headerHeight + imageBodyHeight;
-            v.sliderRect = {
-                node.position.x + 12.0f,
-                sliderY + 4.0f,
-                node.position.x + NodeWidth - 12.0f,
-                sliderY + sliderHeight - 4.0f
-            };
+            if (v.isClockNode)
+            {
+                // Play button on top row, slider below.
+                v.playButtonRect = {
+                    node.position.x + 12.0f,
+                    sliderY + 2.0f,
+                    node.position.x + 32.0f,
+                    sliderY + 18.0f
+                };
+                v.sliderRect = {
+                    node.position.x + 36.0f,
+                    sliderY + 2.0f,
+                    node.position.x + NodeWidth - 12.0f,
+                    sliderY + 18.0f
+                };
+            }
+            else
+            {
+                v.sliderRect = {
+                    node.position.x + 12.0f,
+                    sliderY + 4.0f,
+                    node.position.x + NodeWidth - 12.0f,
+                    sliderY + sliderHeight - 4.0f
+                };
+            }
         }
         for (uint32_t i = 0; i < dataInputCount; ++i)
         {
@@ -1142,6 +1162,111 @@ namespace ShaderLab::Controls
             // Inline slider for parameter nodes.
             if (visual.isParameterNode && node->customEffect.has_value())
             {
+                if (visual.isClockNode)
+                {
+                    // Clock node: play/pause button + time seek slider.
+                    float startTime = 0.0f, stopTime = 10.0f;
+                    auto stIt = node->properties.find(L"StartTime");
+                    if (stIt != node->properties.end())
+                        if (auto* f = std::get_if<float>(&stIt->second)) startTime = *f;
+                    auto etIt = node->properties.find(L"StopTime");
+                    if (etIt != node->properties.end())
+                        if (auto* f = std::get_if<float>(&etIt->second)) stopTime = *f;
+                    float duration = stopTime - startTime;
+                    if (duration <= 0.0f) duration = 1.0f;
+
+                    float currentTime = startTime + static_cast<float>(node->clockTime);
+                    float t = static_cast<float>(node->clockTime / duration);
+                    t = (std::max)(0.0f, (std::min)(1.0f, t));
+
+                    // Play/Pause button (triangle or double-bar).
+                    {
+                        winrt::com_ptr<ID2D1SolidColorBrush> btnBrush;
+                        dc->CreateSolidColorBrush(
+                            node->isPlaying ? D2D1::ColorF(0x4CAF50) : D2D1::ColorF(0xB0B0B8),
+                            btnBrush.put());
+                        if (btnBrush)
+                        {
+                            float cx = (visual.playButtonRect.left + visual.playButtonRect.right) * 0.5f;
+                            float cy = (visual.playButtonRect.top + visual.playButtonRect.bottom) * 0.5f;
+                            if (node->isPlaying)
+                            {
+                                // Pause icon (two bars).
+                                dc->FillRectangle({ cx - 4, cy - 5, cx - 1, cy + 5 }, btnBrush.get());
+                                dc->FillRectangle({ cx + 1, cy - 5, cx + 4, cy + 5 }, btnBrush.get());
+                            }
+                            else
+                            {
+                                // Play icon (triangle).
+                                D2D1_POINT_2F pts[3] = {
+                                    { cx - 4, cy - 6 }, { cx - 4, cy + 6 }, { cx + 5, cy }
+                                };
+                                winrt::com_ptr<ID2D1PathGeometry> tri;
+                                winrt::com_ptr<ID2D1Factory> factory;
+                                dc->GetFactory(factory.put());
+                                if (factory)
+                                {
+                                    factory->CreatePathGeometry(tri.put());
+                                    if (tri)
+                                    {
+                                        winrt::com_ptr<ID2D1GeometrySink> sink;
+                                        tri->Open(sink.put());
+                                        sink->BeginFigure(pts[0], D2D1_FIGURE_BEGIN_FILLED);
+                                        sink->AddLine(pts[1]);
+                                        sink->AddLine(pts[2]);
+                                        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                                        sink->Close();
+                                        dc->FillGeometry(tri.get(), btnBrush.get());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Seek slider track.
+                    float trackY = (visual.sliderRect.top + visual.sliderRect.bottom) * 0.5f;
+                    float trackH = 4.0f;
+                    D2D1_ROUNDED_RECT track = {
+                        { visual.sliderRect.left, trackY - trackH * 0.5f,
+                          visual.sliderRect.right, trackY + trackH * 0.5f },
+                        2.0f, 2.0f
+                    };
+                    winrt::com_ptr<ID2D1SolidColorBrush> trackBrush;
+                    dc->CreateSolidColorBrush(D2D1::ColorF(0x444444), trackBrush.put());
+                    if (trackBrush) dc->FillRoundedRectangle(track, trackBrush.get());
+
+                    float fillRight = visual.sliderRect.left + t * (visual.sliderRect.right - visual.sliderRect.left);
+                    D2D1_ROUNDED_RECT fill = {
+                        { visual.sliderRect.left, trackY - trackH * 0.5f,
+                          fillRight, trackY + trackH * 0.5f },
+                        2.0f, 2.0f
+                    };
+                    winrt::com_ptr<ID2D1SolidColorBrush> fillBrush;
+                    dc->CreateSolidColorBrush(D2D1::ColorF(0x4CAF50), fillBrush.put());
+                    if (fillBrush) dc->FillRoundedRectangle(fill, fillBrush.get());
+
+                    float handleX = fillRight;
+                    winrt::com_ptr<ID2D1SolidColorBrush> handleBrush;
+                    dc->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF), handleBrush.put());
+                    if (handleBrush) dc->FillEllipse({ { handleX, trackY }, 4.0f, 4.0f }, handleBrush.get());
+
+                    // Time display below slider.
+                    if (m_pinLabelFormat)
+                    {
+                        std::wstring timeText = std::format(L"{:.1f}s / {:.1f}s", currentTime, stopTime);
+                        D2D1_RECT_F valRect = {
+                            visual.sliderRect.left, visual.sliderRect.bottom,
+                            visual.sliderRect.right, visual.sliderRect.bottom + 14.0f
+                        };
+                        m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        if (m_brushText)
+                            dc->DrawText(timeText.c_str(), static_cast<UINT32>(timeText.size()),
+                                m_pinLabelFormat.get(), valRect, m_brushText.get());
+                    }
+                }
+                else
+                {
+                // Regular parameter slider.
                 auto propIt = node->properties.find(L"Value");
                 if (propIt != node->properties.end())
                 {
@@ -1220,6 +1345,7 @@ namespace ShaderLab::Controls
                                 m_pinLabelFormat.get(), valRect, m_brushText.get());
                     }
                 }
+                } // end else (regular parameter)
             }
         }
     }
@@ -1305,6 +1431,20 @@ namespace ShaderLab::Controls
         return 0;
     }
 
+    uint32_t NodeGraphController::HitTestPlayButton(D2D1_POINT_2F canvasPoint) const
+    {
+        for (const auto& [id, v] : m_visuals)
+        {
+            if (!v.isClockNode) continue;
+            if (canvasPoint.x >= v.playButtonRect.left - 4.0f &&
+                canvasPoint.x <= v.playButtonRect.right + 4.0f &&
+                canvasPoint.y >= v.playButtonRect.top - 4.0f &&
+                canvasPoint.y <= v.playButtonRect.bottom + 4.0f)
+                return id;
+        }
+        return 0;
+    }
+
     bool NodeGraphController::UpdateSliderDrag(uint32_t nodeId, D2D1_POINT_2F canvasPoint)
     {
         auto vIt = m_visuals.find(nodeId);
@@ -1312,6 +1452,28 @@ namespace ShaderLab::Controls
 
         auto* node = m_graph->FindNode(nodeId);
         if (!node || !node->customEffect.has_value()) return false;
+
+        // Clock nodes: seek by setting clockTime.
+        if (vIt->second.isClockNode)
+        {
+            float startTime = 0.0f, stopTime = 10.0f;
+            auto stIt = node->properties.find(L"StartTime");
+            if (stIt != node->properties.end())
+                if (auto* f = std::get_if<float>(&stIt->second)) startTime = *f;
+            auto etIt = node->properties.find(L"StopTime");
+            if (etIt != node->properties.end())
+                if (auto* f = std::get_if<float>(&etIt->second)) stopTime = *f;
+            float duration = stopTime - startTime;
+            if (duration <= 0.0f) duration = 1.0f;
+
+            float t = (canvasPoint.x - vIt->second.sliderRect.left)
+                    / (vIt->second.sliderRect.right - vIt->second.sliderRect.left);
+            t = (std::max)(0.0f, (std::min)(1.0f, t));
+            node->clockTime = static_cast<double>(t * duration);
+            node->dirty = true;
+            m_needsRedraw = true;
+            return true;
+        }
 
         float pMin = 0.0f, pMax = 1.0f, step = 0.01f;
         bool hasEnumLabels = false;

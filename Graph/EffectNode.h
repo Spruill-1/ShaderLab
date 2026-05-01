@@ -320,6 +320,10 @@ namespace ShaderLab::Graph
         bool isAnimatable{ false };
         bool isPlaying{ false };
 
+        // Clock node: time-based animation source.
+        bool isClock{ false };
+        double clockTime{ 0.0 };  // accumulated time in seconds (runtime only)
+
         // Set by the host before evaluation: true if this node feeds a visible
         // output (Output node, output window, preview, or data-only analysis).
         // The evaluator skips nodes where needed == false.

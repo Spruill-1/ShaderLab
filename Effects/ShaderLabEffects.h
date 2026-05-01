@@ -49,6 +49,9 @@ namespace ShaderLab::Effects
         // Image-producing compute effects output a texture (not just analysis data).
         // Creates an output pin so downstream pixel shaders can read the result.
         bool hasImageOutput{ false };
+
+        // Clock nodes are time-based animation sources (special render loop handling).
+        bool isClock{ false };
     };
 
     // Registry of all ShaderLab pre-built effects.

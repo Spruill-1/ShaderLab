@@ -469,6 +469,7 @@ float4 main(
 
         node.customEffect = std::move(def);
         node.isAnimatable = desc.isAnimatable;
+        node.isClock = desc.isClock;
         return node;
     }
 
@@ -2736,6 +2737,31 @@ void main(uint3 GTid : SV_GroupThreadID)
             desc.analysisFields = {
                 { L"Value", Graph::AnalysisFieldType::Float },
             };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Parameter: Clock ----
+        // Time-based animation source. Outputs elapsed Time (seconds) and
+        // Progress (0→1 normalized). Has on-node Play/Pause and seek slider.
+        {
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Clock";
+            desc.effectId = L"Clock"; desc.effectVersion = 1;
+            desc.category = L"Parameter";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.parameters = {
+                { L"StartTime", L"float", 0.0f, 0.0f, 3600.0f, 0.1f },
+                { L"StopTime",  L"float", 10.0f, 0.0f, 3600.0f, 0.1f },
+                { L"Speed",     L"float", 1.0f, -10.0f, 10.0f, 0.1f },
+                { L"Loop",      L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Off", L"On" } },
+            };
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                { L"Time",     Graph::AnalysisFieldType::Float },
+                { L"Progress", Graph::AnalysisFieldType::Float },
+            };
+            // Mark as clock node for special render loop handling.
+            desc.isClock = true;
             m_effects.push_back(std::move(desc));
         }
     }

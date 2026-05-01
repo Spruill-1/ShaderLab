@@ -163,18 +163,49 @@ namespace ShaderLab::Rendering
                 {
                     node->analysisOutput.type = AnalysisOutputType::Typed;
                     node->analysisOutput.fields.clear();
-                    for (const auto& fd : node->customEffect->analysisFields)
+
+                    if (node->isClock)
                     {
-                        AnalysisFieldValue fv;
-                        fv.name = fd.name;
-                        fv.type = fd.type;
-                        auto propIt = node->properties.find(fd.name);
-                        if (propIt != node->properties.end())
+                        // Clock nodes compute Time/Progress from internal clock state.
+                        float startTime = 0.0f, stopTime = 10.0f;
+                        auto stIt = node->properties.find(L"StartTime");
+                        if (stIt != node->properties.end())
+                            if (auto* f = std::get_if<float>(&stIt->second)) startTime = *f;
+                        auto etIt = node->properties.find(L"StopTime");
+                        if (etIt != node->properties.end())
+                            if (auto* f = std::get_if<float>(&etIt->second)) stopTime = *f;
+                        double duration = static_cast<double>(stopTime - startTime);
+                        if (duration <= 0.0) duration = 1.0;
+
+                        float currentTime = startTime + static_cast<float>(node->clockTime);
+                        float progress = static_cast<float>(node->clockTime / duration);
+
+                        for (const auto& fd : node->customEffect->analysisFields)
                         {
-                            if (auto* f = std::get_if<float>(&propIt->second))
-                                fv.components[0] = *f;
+                            AnalysisFieldValue fv;
+                            fv.name = fd.name;
+                            fv.type = fd.type;
+                            if (fd.name == L"Time") fv.components[0] = currentTime;
+                            else if (fd.name == L"Progress") fv.components[0] = progress;
+                            node->analysisOutput.fields.push_back(std::move(fv));
                         }
-                        node->analysisOutput.fields.push_back(std::move(fv));
+                    }
+                    else
+                    {
+                        // Regular parameter nodes: copy property values.
+                        for (const auto& fd : node->customEffect->analysisFields)
+                        {
+                            AnalysisFieldValue fv;
+                            fv.name = fd.name;
+                            fv.type = fd.type;
+                            auto propIt = node->properties.find(fd.name);
+                            if (propIt != node->properties.end())
+                            {
+                                if (auto* f = std::get_if<float>(&propIt->second))
+                                    fv.components[0] = *f;
+                            }
+                            node->analysisOutput.fields.push_back(std::move(fv));
+                        }
                     }
                     node->cachedOutput = nullptr;
                     node->dirty = false;
