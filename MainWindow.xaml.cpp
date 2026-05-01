@@ -652,7 +652,8 @@ namespace winrt::ShaderLab::implementation
             AnimPlayIcon().Glyph(L"\xE769");
         }
 
-        // Re-prepare all source nodes on the new device.
+        // Re-prepare non-video source nodes on the new device.
+        // Video sources will re-prepare lazily on the next render tick.
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (dc)
         {
@@ -660,11 +661,17 @@ namespace winrt::ShaderLab::implementation
             {
                 if (node.type == ::ShaderLab::Graph::NodeType::Source)
                 {
+                    // Skip video sources — they'll re-open on next tick.
+                    bool isVideo = false;
+                    auto it = node.properties.find(L"IsVideo");
+                    if (it != node.properties.end())
+                        if (auto* b = std::get_if<bool>(&it->second)) isVideo = *b;
+                    if (isVideo) { node.dirty = true; continue; }
+
                     try {
                         m_sourceFactory.PrepareSourceNode(node, dc, 0.0,
                             m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
                     } catch (...) {
-                        // Source prep failed on new device — mark error.
                         node.runtimeError = L"Failed to prepare source on new GPU";
                     }
                 }
@@ -4743,8 +4750,7 @@ namespace winrt::ShaderLab::implementation
                     const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()),
                     dc, deltaSec);
             } catch (...) {
-                // Video tick failed — device may have changed. Clear stale providers.
-                m_sourceFactory.ReleaseCache();
+                // Video tick failed — skip this frame silently.
             }
         }
 
