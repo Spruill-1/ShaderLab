@@ -316,6 +316,13 @@ namespace ShaderLab::Controls
                     vit->second.sliderRect.top += ddy;
                     vit->second.sliderRect.bottom += ddy;
                 }
+                if (vit->second.isClockNode)
+                {
+                    vit->second.playButtonRect.left += ddx;
+                    vit->second.playButtonRect.right += ddx;
+                    vit->second.playButtonRect.top += ddy;
+                    vit->second.playButtonRect.bottom += ddy;
+                }
             }
         }
 
