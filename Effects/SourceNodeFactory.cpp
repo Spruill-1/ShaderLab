@@ -321,20 +321,19 @@ namespace ShaderLab::Effects
 
             if (clockDriven)
             {
-                // For sequential forward playback (small positive delta),
-                // use Tick which reads the next sample — much faster than Seek.
-                // Only use expensive Seek for jumps (backwards, large skip, loop wrap).
-                if (diff < -frameDur || diff > frameDur * 10.0)
+                // For sequential forward playback, use the wall-clock delta
+                // so the video advances at real-time speed matching the clock.
+                // Only use expensive Seek for actual jumps (backward or large skip).
+                if (diff < -frameDur || diff > frameDur * 30.0)
                 {
                     // Non-sequential: backwards or large jump → full seek.
                     provider->Seek(seekTime);
                 }
-                else if (diff > frameDur * 0.5)
+                else
                 {
-                    // Sequential forward: just tick to advance to next frame.
-                    provider->Tick(diff);
+                    // Sequential forward: tick by the actual wall-clock delta.
+                    provider->Tick(deltaSeconds);
                 }
-                // else: time hasn't changed enough for a new frame — skip.
             }
             else
             {
