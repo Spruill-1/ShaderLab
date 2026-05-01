@@ -32,6 +32,7 @@ namespace ShaderLab::Controls
         bool IsReady() const { return m_swapChain != nullptr; }
         uint32_t NodeId() const { return m_nodeId; }
         void SetTitle(const std::wstring& title);
+        void SetTimingText(const std::wstring& text);
 
     private:
         void CreateSwapChain();
@@ -81,6 +82,7 @@ namespace ShaderLab::Controls
         // FPS counter.
         uint32_t m_frameCount{ 0 };
         std::chrono::steady_clock::time_point m_fpsTime;
+        std::wstring m_timingText;
 
         // Event tokens for cleanup.
         winrt::event_token m_sizeChangedToken{};

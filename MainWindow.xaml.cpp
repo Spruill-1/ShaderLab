@@ -4773,9 +4773,11 @@ namespace winrt::ShaderLab::implementation
         }
 
         // Only re-evaluate the graph when something changed.
+        // Always render if output windows are open (they need continuous present).
         bool wasForceRender = m_forceRender;
         bool hasDirty = m_graph.HasDirtyNodes();
-        bool needsEval = hasDirty || m_needsFitPreview || m_forceRender;
+        bool hasOutputWindows = !m_outputWindows.empty();
+        bool needsEval = hasDirty || m_needsFitPreview || m_forceRender || hasOutputWindows;
         if (needsEval)
         {
             RenderFrame(deltaSec);
@@ -5209,6 +5211,11 @@ namespace winrt::ShaderLab::implementation
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) return;
 
+        auto& ft = m_frameTiming;
+        std::wstring timingStr = std::format(L"{:.1f}ms (eval {:.1f} + compute {:.1f} + draw {:.1f})",
+            ft.totalUs / 1000.0, ft.evaluateUs / 1000.0,
+            ft.deferredComputeUs / 1000.0, ft.drawUs / 1000.0 + ft.presentUs / 1000.0);
+
         for (auto& window : m_outputWindows)
         {
             if (!window->IsReady())
@@ -5218,6 +5225,7 @@ namespace winrt::ShaderLab::implementation
             auto* node = m_graph.FindNode(window->NodeId());
             if (node)
                 window->SetTitle(node->name);
+            window->SetTimingText(timingStr);
 
             auto* image = ResolveDisplayImage(window->NodeId());
             window->Present(dc, image);

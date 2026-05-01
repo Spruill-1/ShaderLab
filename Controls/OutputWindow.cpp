@@ -317,7 +317,10 @@ namespace ShaderLab::Controls
             if (elapsed >= 1.0)
             {
                 uint32_t fps = static_cast<uint32_t>(m_frameCount / elapsed);
-                m_fpsText.Text(std::to_wstring(fps) + L" FPS");
+                if (m_timingText.empty())
+                    m_fpsText.Text(std::to_wstring(fps) + L" FPS");
+                else
+                    m_fpsText.Text(std::format(L"{} FPS | {}", fps, m_timingText));
                 m_frameCount = 0;
                 m_fpsTime = now;
             }
@@ -357,6 +360,11 @@ namespace ShaderLab::Controls
         m_nodeName = title;
         if (m_window)
             m_window.Title(winrt::hstring(title));
+    }
+
+    void OutputWindow::SetTimingText(const std::wstring& text)
+    {
+        m_timingText = text;
     }
 
     void OutputWindow::CreateSwapChain()
