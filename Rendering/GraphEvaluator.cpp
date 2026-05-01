@@ -1575,6 +1575,23 @@ namespace ShaderLab::Rendering
             static std::unordered_map<uint32_t, std::tuple<size_t,
                 winrt::com_ptr<ID3D11ComputeShader>,
                 winrt::com_ptr<ID3DBlob>>> s_shaderCache;
+
+            // Clear on device change (detected by checking if cached shader's device matches).
+            if (!s_shaderCache.empty() && device)
+            {
+                bool stale = false;
+                for (auto& [id, entry] : s_shaderCache)
+                {
+                    auto& cachedShader = std::get<1>(entry);
+                    if (cachedShader)
+                    {
+                        winrt::com_ptr<ID3D11Device> shaderDevice;
+                        cachedShader->GetDevice(shaderDevice.put());
+                        if (shaderDevice.get() != device.get()) { stale = true; break; }
+                    }
+                }
+                if (stale) s_shaderCache.clear();
+            }
             auto sit = s_shaderCache.find(node.id);
             if (sit != s_shaderCache.end() && std::get<0>(sit->second) == hlslHash)
             {
