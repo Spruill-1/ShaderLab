@@ -566,6 +566,15 @@ namespace winrt::ShaderLab::implementation
         float savedPreviewPanY = m_previewPanY;
 
         // ---- NUKE EVERYTHING ----
+        auto logStep = [](const wchar_t* msg) {
+            OutputDebugStringW(msg);
+            // Also log to file for debugging.
+            FILE* f = nullptr;
+            _wfopen_s(&f, L"C:\\Users\\daspr\\AppData\\Local\\Temp\\shaderlab_gpuswitch.log", L"a");
+            if (f) { fwprintf(f, L"%s", msg); fclose(f); }
+        };
+        logStep(L"[GPU Switch] START\n");
+        logStep(L"[GPU Switch] Releasing caches...\n");
         m_graphEvaluator.ReleaseCache();
         m_sourceFactory.ReleaseCache();
         m_nodeGraphController.ReleaseDeviceResources();
@@ -579,8 +588,12 @@ namespace winrt::ShaderLab::implementation
         for (auto& w : m_logWindows) w->Close();
         m_logWindows.clear();
         m_graph.Clear();
+        logStep(L"[GPU Switch] Shutting down display monitor...\n");
+        m_displayMonitor.SetCallback(nullptr);
         m_displayMonitor.Shutdown();
+        logStep(L"[GPU Switch] Shutting down render engine...\n");
         m_renderEngine.Shutdown();
+        logStep(L"[GPU Switch] All shutdown complete.\n");
 
         // ---- REBUILD FROM SCRATCH ----
         m_devicePref = pref;
@@ -589,7 +602,9 @@ namespace winrt::ShaderLab::implementation
 
         try
         {
+            logStep(L"[GPU Switch] InitializeRendering...\n");
             InitializeRendering();
+            logStep(L"[GPU Switch] InitializeRendering done.\n");
         }
         catch (...)
         {
@@ -604,8 +619,10 @@ namespace winrt::ShaderLab::implementation
             }
         }
 
+        logStep(L"[GPU Switch] RegisterCustomEffects...\n");
         m_customEffectsRegistered = false;
         RegisterCustomEffects();
+        logStep(L"[GPU Switch] InitializeGraphPanel...\n");
         InitializeGraphPanel();
 
         if (m_renderEngine.D3DDevice())
@@ -615,9 +632,11 @@ namespace winrt::ShaderLab::implementation
         }
 
         // ---- RELOAD GRAPH ----
+        logStep(L"[GPU Switch] Reloading graph...\n");
         try { m_graph = ::ShaderLab::Graph::EffectGraph::FromJson(graphJson); }
         catch (...) {}
 
+        logStep(L"[GPU Switch] ResetAfterGraphLoad...\n");
         ResetAfterGraphLoad(false);
         m_nodeGraphController.RebuildLayout();
 
@@ -639,6 +658,7 @@ namespace winrt::ShaderLab::implementation
 
         // Re-prepare source nodes on the new device.
         // Skip video sources — they can be reopened by the user via file picker.
+        logStep(L"[GPU Switch] Preparing sources...\n");
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (dc)
         {
@@ -672,6 +692,7 @@ namespace winrt::ShaderLab::implementation
         m_forceRender = true;
         UpdateStatusBar();
 
+        logStep(L"[GPU Switch] Opening output windows...\n");
         // Reopen output windows.
         auto outputIds = m_graph.GetOutputNodeIds();
         for (uint32_t id : outputIds)
@@ -679,6 +700,7 @@ namespace winrt::ShaderLab::implementation
             try { OpenOutputWindow(id); } catch (...) {}
         }
 
+        logStep(L"[GPU Switch] COMPLETE. Restarting timer.\n");
         // Restart render timer.
         if (m_renderTimer) m_renderTimer.Start();
     }
@@ -4737,7 +4759,10 @@ namespace winrt::ShaderLab::implementation
         winrt::Windows::Foundation::IInspectable const& /*args*/)
     {
         if (m_isShuttingDown) return;
+        if (!m_renderEngine.IsInitialized()) return;
 
+        try
+        {
         // Compute frame delta time.
         auto now = std::chrono::steady_clock::now();
         double deltaSec = std::chrono::duration<double>(now - m_lastRenderTick).count();
@@ -4851,6 +4876,22 @@ namespace winrt::ShaderLab::implementation
                 ft.deferredComputeUs / 1000.0, ft.drawUs / 1000.0 + ft.presentUs / 1000.0));
             m_frameCount = 0;
             m_fpsTimePoint = fpsNow;
+        }
+
+        } // end try
+        catch (const winrt::hresult_error& ex)
+        {
+            OutputDebugStringW(std::format(L"[RenderTick] Exception: 0x{:08X}\n",
+                static_cast<uint32_t>(ex.code())).c_str());
+        }
+        catch (const std::exception& ex)
+        {
+            OutputDebugStringW(std::format(L"[RenderTick] std::exception: {}\n",
+                std::wstring(ex.what(), ex.what() + strlen(ex.what()))).c_str());
+        }
+        catch (...)
+        {
+            OutputDebugStringW(L"[RenderTick] Unknown exception\n");
         }
     }
 
