@@ -578,8 +578,19 @@ namespace winrt::ShaderLab::implementation
         m_outputWindows.clear();
         m_graph.Clear();
 
-        // Reinitialize the render engine on the new adapter.
-        m_renderEngine.Reinitialize(pref, adapterLuid);
+        try
+        {
+            // Reinitialize the render engine on the new adapter.
+            m_renderEngine.Reinitialize(pref, adapterLuid);
+        }
+        catch (const winrt::hresult_error& ex)
+        {
+            // GPU init failed — try to fall back to previous state.
+            OutputDebugStringW(std::format(L"[GPU Switch] Reinitialize failed: 0x{:08X}\n",
+                static_cast<uint32_t>(ex.code())).c_str());
+            try { m_renderEngine.Reinitialize(::ShaderLab::Rendering::DevicePreference::Default, {}); }
+            catch (...) {}
+        }
 
         // Re-register custom D2D effects on the new D2D factory.
         m_customEffectsRegistered = false;
@@ -614,7 +625,7 @@ namespace winrt::ShaderLab::implementation
         m_previewZoom = savedPreviewZoom;
         m_previewPanX = savedPreviewPanX;
         m_previewPanY = savedPreviewPanY;
-        m_needsFitPreview = false;  // Don't auto-fit — keep user's view
+        m_needsFitPreview = false;
         if (savedSelectedId != 0 && m_graph.FindNode(savedSelectedId))
         {
             m_selectedNodeId = savedSelectedId;
@@ -629,8 +640,15 @@ namespace winrt::ShaderLab::implementation
             for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
             {
                 if (node.type == ::ShaderLab::Graph::NodeType::Source)
-                    m_sourceFactory.PrepareSourceNode(node, dc, 0.0,
-                        m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                {
+                    try {
+                        m_sourceFactory.PrepareSourceNode(node, dc, 0.0,
+                            m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                    } catch (...) {
+                        // Source prep failed on new device — mark error.
+                        node.runtimeError = L"Failed to prepare source on new GPU";
+                    }
+                }
             }
         }
 
