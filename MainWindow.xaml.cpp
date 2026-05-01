@@ -710,6 +710,23 @@ namespace winrt::ShaderLab::implementation
         logStep(L"[GPU Switch] COMPLETE. Restarting timer.\n");
         // Restart render timer.
         if (m_renderTimer) m_renderTimer.Start();
+
+        // Deferred video reload: post to the dispatcher queue so it runs
+        // after the switch is fully complete and the first frames render.
+        DispatcherQueue().TryEnqueue(
+            winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low,
+            [this]() {
+                for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+                {
+                    if (node.type == ::ShaderLab::Graph::NodeType::Source &&
+                        !node.runtimeError.empty())
+                    {
+                        node.runtimeError.clear();
+                        node.dirty = true;
+                    }
+                }
+                m_forceRender = true;
+            });
     }
 
     void MainWindow::OnPreviewSizeChanged(
