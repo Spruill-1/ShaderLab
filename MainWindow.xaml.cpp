@@ -4765,15 +4765,35 @@ namespace winrt::ShaderLab::implementation
 
                 bool autoDuration = getF(L"AutoDuration", 1.0f) > 0.5f;
 
+                // Disable AutoDuration if StopTime has an explicit binding.
+                if (autoDuration && node.propertyBindings.count(L"StopTime"))
+                {
+                    autoDuration = false;
+                    node.properties[L"AutoDuration"] = 0.0f;
+                }
+
                 // Auto-detect StopTime from downstream video durations.
+                // Data bindings don't create graph edges — scan all nodes
+                // for propertyBindings that reference this Clock.
                 if (autoDuration)
                 {
                     float maxDur = 0.0f;
-                    for (const auto* edge : m_graph.GetOutputEdges(node.id))
+                    for (const auto& other : m_graph.Nodes())
                     {
-                        const auto* dest = m_graph.FindNode(edge->destNodeId);
-                        if (!dest) continue;
-                        for (const auto& field : dest->analysisOutput.fields)
+                        if (other.id == node.id) continue;
+                        // Check if this node has any property bound to our Clock.
+                        bool boundToThisClock = false;
+                        for (const auto& [propName, binding] : other.propertyBindings)
+                        {
+                            for (const auto& src : binding.sources)
+                            {
+                                if (src && src->sourceNodeId == node.id)
+                                { boundToThisClock = true; break; }
+                            }
+                            if (boundToThisClock) break;
+                        }
+                        if (!boundToThisClock) continue;
+                        for (const auto& field : other.analysisOutput.fields)
                         {
                             if (field.name == L"Duration" && field.components[0] > 0.0f)
                                 if (field.components[0] > maxDur) maxDur = field.components[0];
