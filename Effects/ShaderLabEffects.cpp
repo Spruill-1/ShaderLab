@@ -842,7 +842,7 @@ float4 main(
                 { L"ShowP3",       L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"ShowRec2020",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"Brightness",   L"float", 2.0f,  0.1f, 10.0f, 0.1f },
-                { L"DiagramSize",  L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
+                { L"DiagramSize",  L"float", 512.0f, 128.0f, 4096.0f, 64.0f },
                 { L"ShowMonitor",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
             };
             desc.hiddenDefaults = {
@@ -916,7 +916,7 @@ float4 main(
             desc.parameters = {
                 { L"Gamut",      L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020", L"Working Space" } },
                 { L"Luminance",  L"float", 80.0f, 0.01f, 10000.0f, 10.0f },
-                { L"OutputSize", L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
+                { L"OutputSize", L"float", 512.0f, 128.0f, 4096.0f, 64.0f },
             };
             desc.hiddenDefaults = {
                 { L"WsRedX_hidden",   0.64f }, { L"WsRedY_hidden",   0.33f },
@@ -1039,7 +1039,7 @@ float4 main(
             desc.inputNames = {};
             desc.parameters = {
                 { L"Frequency", L"float", 0.5f, 0.01f, 5.0f, 0.01f },
-                { L"PlateSize", L"float", 1024.0f, 64.0f, 2048.0f, 64.0f },
+                { L"PlateSize", L"float", 512.0f, 64.0f, 2048.0f, 64.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1100,7 +1100,7 @@ float4 main(
                 { L"EndR",         L"float", 1.0f, -1.0f, 125.0f, 0.01f },
                 { L"EndG",         L"float", 1.0f, -1.0f, 125.0f, 0.01f },
                 { L"EndB",         L"float", 1.0f, -1.0f, 125.0f, 0.01f },
-                { L"GradSize",     L"float", 1024.0f, 64.0f, 2048.0f, 64.0f },
+                { L"GradSize",     L"float", 512.0f, 64.0f, 2048.0f, 64.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1181,7 +1181,7 @@ float4 main(
             desc.hlslSource = colorMath + hdrTestHLSL;
             desc.inputNames = {};
             desc.parameters = {
-                { L"PatternSize", L"float", 1024.0f, 256.0f, 2048.0f, 64.0f },
+                { L"PatternSize", L"float", 512.0f, 256.0f, 2048.0f, 64.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1254,7 +1254,7 @@ float4 main(
             desc.hlslSource = colorMath + vectorscopeHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"ScopeSize",  L"float", 1024.0f, 64.0f, 2048.0f, 32.0f },
+                { L"ScopeSize",  L"float", 512.0f, 64.0f, 2048.0f, 32.0f },
                 { L"Intensity",  L"float", 1.0f,   0.1f, 5.0f, 0.1f },
             };
             m_effects.push_back(std::move(desc));
@@ -1707,7 +1707,7 @@ float4 main(
             desc.hlslSource = colorMath + gamutCoverageHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"DiagramSize",  L"float", 1024.0f, 128.0f, 4096.0f, 64.0f },
+                { L"DiagramSize",  L"float", 512.0f, 128.0f, 4096.0f, 64.0f },
                 { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
             };
             desc.hiddenDefaults = {
@@ -2306,7 +2306,7 @@ float4 main(
             desc.hlslSource = colorMath + ictcpBoundaryHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"DiagramSize", L"float", 1024.0f, 128.0f, 2048.0f, 64.0f },
+                { L"DiagramSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
                 { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
                 { L"Intensity",   L"float", 0.5f, 0.05f, 0.95f, 0.05f },
             };
