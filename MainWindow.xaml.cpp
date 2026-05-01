@@ -4848,8 +4848,7 @@ namespace winrt::ShaderLab::implementation
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
         {
             if (node.type == ::ShaderLab::Graph::NodeType::Source &&
-                (node.dirty || m_sourceFactory.GetVideoProvider(node.id)) &&
-                node.runtimeError.empty())  // Don't retry failed sources
+                (node.dirty || m_sourceFactory.GetVideoProvider(node.id)))
             {
                 try {
                     m_sourceFactory.PrepareSourceNode(node, dc, deltaSeconds, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
