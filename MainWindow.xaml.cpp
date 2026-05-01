@@ -4738,9 +4738,14 @@ namespace winrt::ShaderLab::implementation
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (dc)
         {
-            m_sourceFactory.TickAndUploadVideos(
-                const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()),
-                dc, deltaSec);
+            try {
+                m_sourceFactory.TickAndUploadVideos(
+                    const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()),
+                    dc, deltaSec);
+            } catch (...) {
+                // Video tick failed — device may have changed. Clear stale providers.
+                m_sourceFactory.ReleaseCache();
+            }
         }
 
         // Tick animatable nodes: advance Phase by Speed * deltaSeconds.
@@ -4853,7 +4858,13 @@ namespace winrt::ShaderLab::implementation
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
         {
             if (node.type == ::ShaderLab::Graph::NodeType::Source && (node.dirty || m_sourceFactory.GetVideoProvider(node.id)))
-                m_sourceFactory.PrepareSourceNode(node, dc, deltaSeconds, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+            {
+                try {
+                    m_sourceFactory.PrepareSourceNode(node, dc, deltaSeconds, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                } catch (...) {
+                    node.runtimeError = L"Source preparation failed";
+                }
+            }
         }
 
         // Inject display primaries into Gamut Highlight and CIE Chromaticity Plot nodes.
