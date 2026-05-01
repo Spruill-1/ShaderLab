@@ -64,7 +64,7 @@ namespace winrt::ShaderLab::implementation
         D2D1_SIZE_F PreviewViewportDips() const;
         void ApplyDisplayProfile(const ::ShaderLab::Rendering::DisplayProfile& profile);
         void RevertToLiveDisplay();
-        void ResetAfterGraphLoad();
+        void ResetAfterGraphLoad(bool reopenOutputWindows = true);
 
         // Pixel trace helpers.
         D2D1_RECT_F GetPreviewImageBounds();

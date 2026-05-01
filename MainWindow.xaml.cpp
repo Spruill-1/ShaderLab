@@ -620,7 +620,7 @@ namespace winrt::ShaderLab::implementation
         }
         catch (...) {} // Graph reload failed — start fresh.
 
-        ResetAfterGraphLoad();
+        ResetAfterGraphLoad(false);  // Don't reopen output windows yet
         m_nodeGraphController.RebuildLayout();
 
         // Restore view state so the user sees no difference.
@@ -676,6 +676,13 @@ namespace winrt::ShaderLab::implementation
 
         m_nodeLogs[0].Info(std::format(L"GPU switched to: {}",
             m_renderEngine.IsWarp() ? L"WARP (Software)" : m_renderEngine.AdapterName()));
+
+        // Reopen output windows on the new device (after everything is ready).
+        auto outputIds = m_graph.GetOutputNodeIds();
+        for (uint32_t id : outputIds)
+        {
+            try { OpenOutputWindow(id); } catch (...) {}
+        }
 
         // Restart the render timer.
         if (m_renderTimer) m_renderTimer.Start();
@@ -1049,7 +1056,7 @@ namespace winrt::ShaderLab::implementation
         }
     }
 
-    void MainWindow::ResetAfterGraphLoad()
+    void MainWindow::ResetAfterGraphLoad(bool reopenOutputWindows)
     {
         m_previewNodeId = 0;
         m_traceActive = false;
@@ -1073,9 +1080,14 @@ namespace winrt::ShaderLab::implementation
         UpdateStatusBar();
 
         // Reopen output windows for all Output nodes in the loaded graph.
-        auto outputIds = m_graph.GetOutputNodeIds();
-        for (uint32_t id : outputIds)
-            OpenOutputWindow(id);
+        if (reopenOutputWindows)
+        {
+            auto outputIds = m_graph.GetOutputNodeIds();
+            for (uint32_t id : outputIds)
+            {
+                try { OpenOutputWindow(id); } catch (...) {}
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
