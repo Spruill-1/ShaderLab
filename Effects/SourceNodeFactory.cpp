@@ -166,6 +166,12 @@ namespace ShaderLab::Effects
                     if (lv) provider->SetLoop(*lv);
                 }
 
+                // Always keep provider in "playing" state so Tick() processes
+                // frames. The Clock node drives seeking; m_playing just means
+                // the MF reader is in active decode mode.
+                if (!provider->IsPlaying())
+                    provider->Play();
+
                 // Tick/Upload now handled by TickAndUploadVideos() — called before graph eval.
                 // Just ensure cachedOutput is set.
                 node.cachedOutput = provider->CurrentBitmap();
