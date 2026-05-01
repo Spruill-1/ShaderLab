@@ -295,15 +295,16 @@ void main(uint3 id : SV_DispatchThreadID)
             PropVariantClear(&var);
         }
 
-        // Choose output format: HDR → P010, SDR → NV12.
-        // Both are YUV planar — GPU shader handles all color conversion.
+        // Choose output format.
+        // P010 preserves HDR; RGB32 is the reliable fallback (video processor
+        // handles all YUV→RGB conversion, avoiding NV12 stride issues).
         winrt::com_ptr<IMFMediaType> outputType;
         MFCreateMediaType(outputType.put());
         outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
 
         if (m_isHDR)
         {
-            // Try P010 first (native HDR output from HEVC decoders).
+            // Try P010 first (10-bit HDR).
             outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_P010);
             MFSetAttributeSize(outputType.get(), MF_MT_FRAME_SIZE, m_width, m_height);
             m_stride = m_width * 2;
@@ -315,22 +316,22 @@ void main(uint3 id : SV_DispatchThreadID)
             }
             else
             {
-                OutputDebugStringW(std::format(L"[VideoSource] P010 rejected: 0x{:08X}, falling back to NV12\n",
+                OutputDebugStringW(std::format(L"[VideoSource] P010 rejected: 0x{:08X}, falling back to RGB32\n",
                     static_cast<uint32_t>(hr)).c_str());
-                // Try NV12 with HDR flag — some decoders can output NV12.
-                // The color math will be wrong (SDR shader) but at least playback works.
+                // Fall back to RGB32 — video processor handles YUV→RGB.
                 outputType = nullptr;
                 MFCreateMediaType(outputType.put());
                 outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-                outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+                outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
                 MFSetAttributeSize(outputType.get(), MF_MT_FRAME_SIZE, m_width, m_height);
-                m_stride = m_width;
+                m_stride = m_width * 4;
                 hr = m_reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, outputType.get());
-                if (SUCCEEDED(hr)) m_outputFormat = OutputFormat::NV12;
+                if (SUCCEEDED(hr)) m_outputFormat = OutputFormat::RGB32;
             }
         }
         else
         {
+            // SDR: try NV12 first, fall back to RGB32.
             outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
             MFSetAttributeSize(outputType.get(), MF_MT_FRAME_SIZE, m_width, m_height);
             m_stride = m_width;
@@ -341,7 +342,6 @@ void main(uint3 id : SV_DispatchThreadID)
             }
             else
             {
-                // Fall back to RGB32.
                 outputType = nullptr;
                 MFCreateMediaType(outputType.put());
                 outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
