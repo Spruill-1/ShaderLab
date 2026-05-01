@@ -228,25 +228,25 @@ void main(uint3 id : SV_DispatchThreadID)
             return MFCreateSourceReaderFromURL(filePath.c_str(), attrs.get(), m_reader.put());
         };
 
-        // Attempt 1: DXGI manager (hardware decode, native P010 output).
+        // Attempt 1: DXGI manager (hardware decode).
         int readerAttempt = 1;
         hr = tryCreateReader(true, false);
         if (FAILED(hr))
         {
             OutputDebugStringW(std::format(L"[VideoSource] Attempt 1 (DXGI) failed: 0x{:08X}\n",
                 static_cast<uint32_t>(hr)).c_str());
-            // Attempt 2: No DXGI, no video proc (native decoder output, may give P010).
+            // Attempt 2: Video processing (software format conversion — reliable).
             m_dxgiDeviceManager = nullptr;
             readerAttempt = 2;
-            hr = tryCreateReader(false, false);
+            hr = tryCreateReader(false, true);
         }
         if (FAILED(hr))
         {
-            OutputDebugStringW(std::format(L"[VideoSource] Attempt 2 (native) failed: 0x{:08X}\n",
+            OutputDebugStringW(std::format(L"[VideoSource] Attempt 2 (video proc) failed: 0x{:08X}\n",
                 static_cast<uint32_t>(hr)).c_str());
-            // Attempt 3: Video processing (software, can convert formats but loses P010).
+            // Attempt 3: Bare reader (no acceleration, no format conversion).
             readerAttempt = 3;
-            hr = tryCreateReader(false, true);
+            hr = tryCreateReader(false, false);
         }
         if (FAILED(hr))
         {
