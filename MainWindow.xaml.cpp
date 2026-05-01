@@ -4832,9 +4832,24 @@ namespace winrt::ShaderLab::implementation
             }
         }
 
+        // Resolve source node property bindings (e.g., Clock.Time → Video.Time)
+        // BEFORE ticking video sources, so they see the updated time values.
+        m_graphEvaluator.ResolveSourceBindings(m_graph);
+
+        // Tick video sources and upload new frames.
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (dc)
+        {
+            try {
+                m_sourceFactory.TickAndUploadVideos(
+                    const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()),
+                    dc, deltaSec);
+            } catch (...) {}
+        }
+
         // Propagate dirty flags downstream so D3D11 compute effects
         // re-dispatch when upstream sources change (video frames, animation).
-        // D2D pixel shaders re-render lazily, but compute nodes check dirty explicitly.
+        // Runs AFTER video tick so new-frame dirty flags reach compute nodes.
         {
             std::vector<uint32_t> queue;
             for (const auto& node : m_graph.Nodes())
@@ -4851,21 +4866,6 @@ namespace winrt::ShaderLab::implementation
                     }
                 }
             }
-        }
-
-        // Resolve source node property bindings (e.g., Clock.Time → Video.Time)
-        // BEFORE ticking video sources, so they see the updated time values.
-        m_graphEvaluator.ResolveSourceBindings(m_graph);
-
-        // Tick video sources and upload new frames.
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (dc)
-        {
-            try {
-                m_sourceFactory.TickAndUploadVideos(
-                    const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()),
-                    dc, deltaSec);
-            } catch (...) {}
         }
 
         // Only re-evaluate the graph when something changed.
