@@ -197,16 +197,35 @@ void main(uint3 id : SV_DispatchThreadID)
 
         HRESULT hr;
 
+        // Create DXGI Device Manager for hardware-accelerated decode.
+        // This enables DXVA2 — the GPU decodes HEVC/H.264 directly.
+        UINT resetToken = 0;
+        winrt::com_ptr<IMFDXGIDeviceManager> dxgiManager;
+        hr = MFCreateDXGIDeviceManager(&resetToken, dxgiManager.put());
+        if (SUCCEEDED(hr))
+        {
+            hr = dxgiManager->ResetDevice(d3dDevice, resetToken);
+            if (SUCCEEDED(hr))
+            {
+                m_dxgiDeviceManager = dxgiManager;
+                m_resetToken = resetToken;
+            }
+        }
+
         winrt::com_ptr<IMFAttributes> attrs;
-        hr = MFCreateAttributes(attrs.put(), 2);
+        hr = MFCreateAttributes(attrs.put(), 3);
         if (FAILED(hr))
         {
             m_lastError = std::format(L"MFCreateAttributes failed: 0x{:08X}", static_cast<uint32_t>(hr));
             return false;
         }
 
-        attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
         attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+        attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+        if (m_dxgiDeviceManager)
+        {
+            attrs->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, m_dxgiDeviceManager.get());
+        }
 
         hr = MFCreateSourceReaderFromURL(filePath.c_str(), attrs.get(), m_reader.put());
         if (FAILED(hr))
@@ -397,6 +416,7 @@ void main(uint3 id : SV_DispatchThreadID)
         }
 
         m_reader = nullptr;
+        m_dxgiDeviceManager = nullptr;
         m_bitmap = nullptr;
         m_csP010 = nullptr; m_csNV12 = nullptr; m_csRGB32 = nullptr;
         m_texY = nullptr; m_texUV = nullptr; m_texRGB = nullptr;
@@ -689,7 +709,9 @@ void main(uint3 id : SV_DispatchThreadID)
 
     bool VideoSourceProvider::UploadIfReady(ID2D1DeviceContext5* dc)
     {
+        m_uploadAttempts++;
         if (!m_frameReady || !m_d3dContext || !dc) return false;
+        m_uploadSuccesses++;
 
         // Upload raw bytes from the front buffer to GPU textures.
         std::vector<BYTE> uploadBuf;
@@ -780,6 +802,7 @@ void main(uint3 id : SV_DispatchThreadID)
                 m_frameNeeded = false;
                 if (DecodeOneFrame())
                 {
+                    m_decodeCount++;
                     std::lock_guard lock(m_bufferMutex);
                     std::swap(m_frontBuffer, m_backBuffer);
                     m_frameReady = true;
@@ -807,6 +830,8 @@ void main(uint3 id : SV_DispatchThreadID)
         m_currentPositionSeconds = static_cast<double>(timestamp) / 10'000'000.0;
 
         // Lock buffer and copy raw bytes — GPU shader handles all color conversion.
+        // With DXVA2 (DXGI device manager), the buffer may be a GPU texture;
+        // Lock2D handles the GPU→CPU copy transparently.
         winrt::com_ptr<IMFMediaBuffer> buffer;
         DWORD bufCount = 0;
         sample->GetBufferCount(&bufCount);
@@ -839,11 +864,13 @@ void main(uint3 id : SV_DispatchThreadID)
         if (!m_firstFrameLogged)
         {
             m_firstFrameLogged = true;
+            winrt::com_ptr<IMFDXGIBuffer> dxgiBuf;
+            buffer.try_as(dxgiBuf);
             const wchar_t* fmtName = (m_outputFormat == OutputFormat::P010) ? L"P010"
                 : (m_outputFormat == OutputFormat::NV12) ? L"NV12" : L"RGB32";
             OutputDebugStringW(std::format(
-                L"[VideoSource] First frame (CPU): format={}, locked2D={}, pitch={}, stride={}, {}x{}\n",
-                fmtName, locked2D, pitch, m_stride, m_width, m_height).c_str());
+                L"[VideoSource] First frame: format={}, DXVA={}, locked2D={}, pitch={}, stride={}, {}x{}\n",
+                fmtName, dxgiBuf != nullptr, locked2D, pitch, m_stride, m_width, m_height).c_str());
         }
 
         // Raw byte copy — no color conversion. GPU shader handles everything.
@@ -874,10 +901,9 @@ void main(uint3 id : SV_DispatchThreadID)
         }
         else
         {
-            // Bottom-up: copy rows in reverse for Y plane.
             for (uint32_t y = 0; y < m_height; ++y)
             {
-                const BYTE* srcRow = data + y * pitch; // pitch is negative
+                const BYTE* srcRow = data + y * pitch;
                 BYTE* dstRow = m_backBuffer.data() + y * absPitch;
                 std::memcpy(dstRow, srcRow, absPitch);
             }

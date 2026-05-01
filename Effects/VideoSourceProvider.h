@@ -60,6 +60,9 @@ namespace ShaderLab::Effects
         bool IsHDR() const { return m_isHDR; }
         const std::wstring& LastError() const { return m_lastError; }
         const std::wstring& FilePath() const { return m_filePath; }
+        uint64_t UploadAttempts() const { return m_uploadAttempts; }
+        uint64_t UploadSuccesses() const { return m_uploadSuccesses; }
+        uint64_t DecodeCount() const { return m_decodeCount; }
 
         // Output format from MF Source Reader.
         enum class OutputFormat { RGB32, NV12, P010 };
@@ -76,6 +79,8 @@ namespace ShaderLab::Effects
 
         // MF objects.
         winrt::com_ptr<IMFSourceReader> m_reader;
+        winrt::com_ptr<IMFDXGIDeviceManager> m_dxgiDeviceManager;
+        UINT m_resetToken{ 0 };
 
         // D2D output bitmap (shared with D3D11 output texture).
         winrt::com_ptr<ID2D1Bitmap1> m_bitmap;
@@ -108,6 +113,9 @@ namespace ShaderLab::Effects
         OutputFormat m_outputFormat{ OutputFormat::RGB32 };
         bool m_bottomUp{ false };
         bool m_firstFrameLogged{ false };
+        std::atomic<uint64_t> m_uploadAttempts{ 0 };
+        std::atomic<uint64_t> m_uploadSuccesses{ 0 };
+        std::atomic<uint64_t> m_decodeCount{ 0 };
 
         // Playback state.
         std::atomic<bool> m_playing{ false };

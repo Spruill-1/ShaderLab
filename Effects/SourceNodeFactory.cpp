@@ -356,6 +356,24 @@ namespace ShaderLab::Effects
                 posFv.name = L"Position"; posFv.type = Graph::AnalysisFieldType::Float;
                 posFv.components[0] = static_cast<float>(provider->CurrentPosition());
                 nodePtr->analysisOutput.fields.push_back(std::move(posFv));
+                // Diagnostic counters
+                Graph::AnalysisFieldValue decFv;
+                decFv.name = L"Decodes"; decFv.type = Graph::AnalysisFieldType::Float;
+                decFv.components[0] = static_cast<float>(provider->DecodeCount());
+                nodePtr->analysisOutput.fields.push_back(std::move(decFv));
+                Graph::AnalysisFieldValue uplFv;
+                uplFv.name = L"Uploads"; uplFv.type = Graph::AnalysisFieldType::Float;
+                uplFv.components[0] = static_cast<float>(provider->UploadSuccesses());
+                nodePtr->analysisOutput.fields.push_back(std::move(uplFv));
+                Graph::AnalysisFieldValue attFv;
+                attFv.name = L"UploadAttempts"; attFv.type = Graph::AnalysisFieldType::Float;
+                attFv.components[0] = static_cast<float>(provider->UploadAttempts());
+                nodePtr->analysisOutput.fields.push_back(std::move(attFv));
+                // Format: 0=RGB32, 1=NV12, 2=P010
+                Graph::AnalysisFieldValue fmtFv;
+                fmtFv.name = L"Format"; fmtFv.type = Graph::AnalysisFieldType::Float;
+                fmtFv.components[0] = static_cast<float>(static_cast<int>(provider->GetOutputFormat()));
+                nodePtr->analysisOutput.fields.push_back(std::move(fmtFv));
             }
 
             if (provider->UploadIfReady(dc))

@@ -120,6 +120,13 @@ namespace ShaderLab::Rendering
         m_d3dDevice = baseDevice.as<ID3D11Device5>();
         m_d3dContext = baseContext.as<ID3D11DeviceContext4>();
 
+        // Enable multithread protection for DXVA2 video decode on background threads.
+        {
+            winrt::com_ptr<ID3D10Multithread> mt;
+            m_d3dDevice.as(mt);
+            if (mt) mt->SetMultithreadProtected(TRUE);
+        }
+
         // Query adapter info (GPU name, WARP detection).
         {
             winrt::com_ptr<IDXGIDevice> dxgiDev;
