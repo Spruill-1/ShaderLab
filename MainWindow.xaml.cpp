@@ -685,6 +685,67 @@ namespace winrt::ShaderLab::implementation
             });
     }
 
+    // -----------------------------------------------------------------------
+    // Drag and drop — create source nodes from dropped files
+    // -----------------------------------------------------------------------
+
+    void MainWindow::OnNodeGraphDragOver(
+        winrt::Windows::Foundation::IInspectable const& /*sender*/,
+        winrt::Microsoft::UI::Xaml::DragEventArgs const& args)
+    {
+        if (args.DataView().Contains(winrt::Windows::ApplicationModel::DataTransfer::StandardDataFormats::StorageItems()))
+            args.AcceptedOperation(winrt::Windows::ApplicationModel::DataTransfer::DataPackageOperation::Copy);
+    }
+
+    winrt::fire_and_forget MainWindow::OnNodeGraphDrop(
+        winrt::Windows::Foundation::IInspectable const& /*sender*/,
+        winrt::Microsoft::UI::Xaml::DragEventArgs const& args)
+    {
+        auto strong = get_strong();
+        if (!args.DataView().Contains(winrt::Windows::ApplicationModel::DataTransfer::StandardDataFormats::StorageItems()))
+            co_return;
+
+        auto items = co_await args.DataView().GetStorageItemsAsync();
+        auto* dc = m_renderEngine.D2DDeviceContext();
+
+        for (const auto& item : items)
+        {
+            auto file = item.try_as<winrt::Windows::Storage::StorageFile>();
+            if (!file) continue;
+
+            std::wstring path(file.Path());
+            bool isVideo = ::ShaderLab::Effects::SourceNodeFactory::IsVideoFile(path);
+
+            ::ShaderLab::Graph::EffectNode node;
+            if (isVideo)
+            {
+                node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(path);
+            }
+            else
+            {
+                node = ::ShaderLab::Effects::SourceNodeFactory::CreateImageSourceNode(path);
+            }
+
+            auto id = m_graph.AddNode(std::move(node));
+            m_nodeLogs[id].Info(std::format(L"Dropped: {}", std::filesystem::path(path).filename().wstring()));
+
+            // Prepare the source on the current device.
+            auto* addedNode = m_graph.FindNode(id);
+            if (addedNode && dc)
+            {
+                try {
+                    m_sourceFactory.PrepareSourceNode(*addedNode, dc, 0.0,
+                        m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                } catch (...) {}
+            }
+        }
+
+        m_graph.MarkAllDirty();
+        m_nodeGraphController.AutoLayout();
+        PopulatePreviewNodeSelector();
+        m_forceRender = true;
+    }
+
     void MainWindow::OnPreviewSizeChanged(
         winrt::Windows::Foundation::IInspectable const& /*sender*/,
         winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& args)

@@ -109,7 +109,10 @@
               Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
               BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
               BorderThickness="0,0,1,0">
-            <Grid x:Name="NodeGraphContainer" Background="Transparent">
+            <Grid x:Name="NodeGraphContainer" Background="Transparent"
+                  AllowDrop="True"
+                  DragOver="OnNodeGraphDragOver"
+                  Drop="OnNodeGraphDrop">
                 <SwapChainPanel x:Name="NodeGraphPanel" />
             </Grid>
         </Grid>

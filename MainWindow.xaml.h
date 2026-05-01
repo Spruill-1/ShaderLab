@@ -45,6 +45,12 @@ namespace winrt::ShaderLab::implementation
         void OnGpuInfoTapped(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::TappedRoutedEventArgs const& args);
+        void OnNodeGraphDragOver(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::DragEventArgs const& args);
+        winrt::fire_and_forget OnNodeGraphDrop(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::DragEventArgs const& args);
 
     private:
         HWND GetWindowHandle();

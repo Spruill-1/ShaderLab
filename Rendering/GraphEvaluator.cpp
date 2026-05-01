@@ -205,6 +205,34 @@ namespace ShaderLab::Rendering
                             node->analysisOutput.fields.push_back(std::move(fv));
                         }
                     }
+                    else if (node->customEffect.has_value() &&
+                            !node->customEffect->shaderLabEffectId.empty() &&
+                            node->customEffect->shaderLabEffectId.starts_with(L"Math "))
+                    {
+                        // Math parameter nodes: compute Result from A and B.
+                        float a = 0.0f, b = 0.0f;
+                        auto aIt = node->properties.find(L"A");
+                        if (aIt != node->properties.end())
+                            if (auto* f = std::get_if<float>(&aIt->second)) a = *f;
+                        auto bIt = node->properties.find(L"B");
+                        if (bIt != node->properties.end())
+                            if (auto* f = std::get_if<float>(&bIt->second)) b = *f;
+
+                        float result = 0.0f;
+                        auto& opId = node->customEffect->shaderLabEffectId;
+                        if (opId == L"Math Max")       result = (std::max)(a, b);
+                        else if (opId == L"Math Min")  result = (std::min)(a, b);
+                        else if (opId == L"Math Add")  result = a + b;
+                        else if (opId == L"Math Subtract") result = a - b;
+                        else if (opId == L"Math Multiply") result = a * b;
+                        else if (opId == L"Math Divide")   result = (std::abs(b) > 1e-10f) ? a / b : 0.0f;
+
+                        AnalysisFieldValue fv;
+                        fv.name = L"Result";
+                        fv.type = AnalysisFieldType::Float;
+                        fv.components[0] = result;
+                        node->analysisOutput.fields.push_back(std::move(fv));
+                    }
                     else
                     {
                         // Regular parameter nodes: copy property values.

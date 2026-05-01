@@ -2679,5 +2679,34 @@ void main(uint3 GTid : SV_GroupThreadID)
             desc.isClock = true;
             m_effects.push_back(std::move(desc));
         }
+
+        // ---- Math Parameter Nodes ----
+        // Each takes two float inputs (A, B) and outputs Result.
+        struct MathOp { std::wstring name; std::wstring id; };
+        MathOp mathOps[] = {
+            { L"Max",      L"Math Max" },
+            { L"Min",      L"Math Min" },
+            { L"Add",      L"Math Add" },
+            { L"Subtract", L"Math Subtract" },
+            { L"Multiply", L"Math Multiply" },
+            { L"Divide",   L"Math Divide" },
+        };
+        for (const auto& op : mathOps)
+        {
+            ShaderLabEffectDescriptor desc;
+            desc.name = op.name;
+            desc.effectId = op.id; desc.effectVersion = 1;
+            desc.category = L"Math";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.parameters = {
+                { L"A", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
+                { L"B", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
+            };
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                { L"Result", Graph::AnalysisFieldType::Float },
+            };
+            m_effects.push_back(std::move(desc));
+        }
     }
 }
