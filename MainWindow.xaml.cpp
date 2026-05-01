@@ -66,25 +66,6 @@ namespace winrt::ShaderLab::implementation
         TraceUnitSelector().SelectedIndex(0);
         TraceUnitSelector().SelectionChanged({ this, &MainWindow::OnTraceUnitSelectionChanged });
 
-        // Animation play/pause toggle.
-        AnimPlayPauseToggle().Click([this](auto&&, auto&&)
-        {
-            bool playing = AnimPlayPauseToggle().IsChecked().GetBoolean();
-            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-            {
-                if (node.isAnimatable)
-                {
-                    node.isPlaying = playing;
-                    // Sync video source IsPlaying property.
-                    auto it = node.properties.find(L"IsPlaying");
-                    if (it != node.properties.end())
-                        it->second = playing;
-                }
-            }
-            AnimPlayText().Text(playing ? L"Pause" : L"Play");
-            AnimPlayIcon().Glyph(playing ? L"\xE769" : L"\xE768");
-        });
-
         SaveGraphButton().Click({ this, &MainWindow::OnSaveGraphClicked });
         LoadGraphButton().Click({ this, &MainWindow::OnLoadGraphClicked });
         AutoArrangeButton().Click([this](auto&&, auto&&)
@@ -110,7 +91,7 @@ namespace winrt::ShaderLab::implementation
                 node.customEffect = std::move(freshNode.customEffect.value());
                 node.inputPins = std::move(freshNode.inputPins);
                 node.outputPins = std::move(freshNode.outputPins);
-                node.isAnimatable = freshNode.isAnimatable;
+                node.isClock = freshNode.isClock;
                 node.properties = std::move(freshNode.properties);
                 for (const auto& [key, val] : savedProps)
                 {
@@ -727,16 +708,6 @@ namespace winrt::ShaderLab::implementation
         try { m_topoOrder = m_graph.TopologicalSort(); }
         catch (...) { m_topoOrder.clear(); }
 
-        // Show/hide the animation play/pause button based on animatable nodes.
-        bool hasAnimatable = false;
-        for (const auto& node : m_graph.Nodes())
-        {
-            if (node.isAnimatable) { hasAnimatable = true; break; }
-        }
-        AnimPlayPauseToggle().Visibility(hasAnimatable
-            ? winrt::Microsoft::UI::Xaml::Visibility::Visible
-            : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
-
         UpdateOutdatedEffectsButton();
     }
 
@@ -1084,7 +1055,7 @@ namespace winrt::ShaderLab::implementation
 
         m_nodeGraphController.SetGraph(&m_graph);
 
-        // Restore isAnimatable flag from ShaderLab effect descriptors
+        // Restore isClock flag from ShaderLab effect descriptors
         // (not serialized in JSON, derived from effect definition).
         {
             auto& lib = ::ShaderLab::Effects::ShaderLabEffects::Instance();
@@ -1094,10 +1065,7 @@ namespace winrt::ShaderLab::implementation
                 {
                     auto* desc = lib.FindById(node.customEffect->shaderLabEffectId);
                     if (desc)
-                    {
-                        node.isAnimatable = desc->isAnimatable;
                         node.isClock = desc->isClock;
-                    }
                 }
             }
         }
@@ -3961,7 +3929,7 @@ namespace winrt::ShaderLab::implementation
                     n->customEffect = std::move(freshNode.customEffect.value());
                     n->inputPins = std::move(freshNode.inputPins);
                     n->outputPins = std::move(freshNode.outputPins);
-                    n->isAnimatable = freshNode.isAnimatable;
+                    n->isClock = freshNode.isClock;
 
                     // Start with fresh default properties, then restore matching saved values.
                     n->properties = std::move(freshNode.properties);
@@ -4825,28 +4793,9 @@ namespace winrt::ShaderLab::implementation
             }
         }
 
-        // Tick clock nodes: advance time and update Time/Progress outputs.
+        // Tick clock nodes: advance time.
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
         {
-            // Legacy animatable nodes: advance Phase by Speed * deltaSeconds.
-            // TODO: Remove once all animated effects are migrated to Clock.
-            if (node.isAnimatable && node.isPlaying && !node.isClock)
-            {
-                auto phaseIt = node.properties.find(L"Phase");
-                auto speedIt = node.properties.find(L"Speed");
-                if (phaseIt != node.properties.end() && speedIt != node.properties.end())
-                {
-                    float phase = 0.0f, speed = 0.1f;
-                    if (auto* f = std::get_if<float>(&phaseIt->second)) phase = *f;
-                    if (auto* f = std::get_if<float>(&speedIt->second)) speed = *f;
-                    phase += speed * static_cast<float>(deltaSec);
-                    if (phase > 1.0f) phase -= 1.0f;
-                    phaseIt->second = phase;
-                    node.dirty = true;
-                }
-            }
-
-            // Clock nodes: advance time.
             if (node.isClock && node.isPlaying)
             {
                 float startTime = 0.0f, stopTime = 10.0f, speed = 1.0f;

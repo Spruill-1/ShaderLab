@@ -38,10 +38,6 @@ namespace ShaderLab::Effects
         // Set on node creation; auto-updated by the evaluator for dynamic values.
         std::map<std::wstring, Graph::PropertyValue> hiddenDefaults;
 
-        // Animatable effects receive Phase auto-advance from the render tick.
-        // Must declare a "Phase" property (float, 0-1) and "Speed" property.
-        bool isAnimatable{ false };
-
         // Data-only effects have no visible image output pin. They produce
         // analysis output fields but their image output is internal only.
         bool dataOnly{ false };

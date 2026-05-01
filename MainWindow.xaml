@@ -65,15 +65,6 @@
                     </StackPanel>
                 </Button>
                 <AppBarSeparator />
-                <ToggleButton x:Name="AnimPlayPauseToggle" IsChecked="False"
-                              Visibility="Collapsed"
-                              ToolTipService.ToolTip="Play/pause all animatable effects">
-                    <StackPanel Orientation="Horizontal" Spacing="6">
-                        <FontIcon x:Name="AnimPlayIcon" Glyph="&#xE768;" FontSize="14" />
-                        <TextBlock x:Name="AnimPlayText" Text="Play" />
-                    </StackPanel>
-                </ToggleButton>
-                <AppBarSeparator />
                 <Button x:Name="EffectDesignerButton" ToolTipService.ToolTip="Open the HLSL Effect Designer">
                     <StackPanel Orientation="Horizontal" Spacing="6">
                         <FontIcon Glyph="&#xE943;" FontSize="14" />

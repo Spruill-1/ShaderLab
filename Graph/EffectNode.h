@@ -315,14 +315,10 @@ namespace ShaderLab::Graph
         // Dirty flag -- set when properties change, cleared after evaluation.
         bool dirty{ true };
 
-        // Animatable flag -- when true, the render tick auto-advances the
-        // "Phase" property and marks this node dirty each frame.
-        bool isAnimatable{ false };
-        bool isPlaying{ false };
-
         // Clock node: time-based animation source.
         bool isClock{ false };
-        double clockTime{ 0.0 };  // accumulated time in seconds (runtime only)
+        bool isPlaying{ false };   // runtime: toggled by on-node Play/Pause
+        double clockTime{ 0.0 };   // runtime: accumulated time in seconds
 
         // Set by the host before evaluation: true if this node feeds a visible
         // output (Output node, output window, preview, or data-only analysis).
