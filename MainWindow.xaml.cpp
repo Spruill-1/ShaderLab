@@ -552,27 +552,31 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::SwitchAdapter(
         ::ShaderLab::Rendering::DevicePreference pref, LUID adapterLuid)
     {
-        // Stop the render timer to prevent the render loop from
-        // accessing resources while we tear down and recreate them.
+        // Stop the render timer to prevent access during teardown.
         if (m_renderTimer) m_renderTimer.Stop();
 
-        // Release all device-dependent caches.
+        // Save the current graph + view state.
+        auto graphJson = m_graph.ToJson();
+        uint32_t savedPreviewId = m_previewNodeId;
+        uint32_t savedSelectedId = m_selectedNodeId;
+        auto savedPan = m_nodeGraphController.PanOffset();
+        float savedZoom = m_nodeGraphController.Zoom();
+        float savedPreviewZoom = m_previewZoom;
+        float savedPreviewPanX = m_previewPanX;
+        float savedPreviewPanY = m_previewPanY;
+
+        // Nuke everything: caches, graph, all device-dependent state.
         m_graphEvaluator.ReleaseCache();
         m_sourceFactory.ReleaseCache();
-
-        // Release node graph D2D resources and swap chain.
         m_nodeGraphController.ReleaseDeviceResources();
         m_graphRenderTarget = nullptr;
         m_graphSwapChain = nullptr;
         m_graphGridBrush = nullptr;
-
-        // Release pixel trace swatch resources.
         m_traceSwatchTarget = nullptr;
         m_traceSwapChain = nullptr;
-
-        // Close output windows (they have their own swap chains).
         for (auto& w : m_outputWindows) w->Close();
         m_outputWindows.clear();
+        m_graph.Clear();
 
         // Reinitialize the render engine on the new adapter.
         m_renderEngine.Reinitialize(pref, adapterLuid);
@@ -581,7 +585,7 @@ namespace winrt::ShaderLab::implementation
         m_customEffectsRegistered = false;
         RegisterCustomEffects();
 
-        // Recreate the node graph swap chain on the new device.
+        // Recreate the node graph swap chain.
         InitializeGraphPanel();
 
         // Reinitialize device-dependent subsystems.
@@ -590,6 +594,32 @@ namespace winrt::ShaderLab::implementation
         {
             m_pixelInspector.Initialize(m_renderEngine.D3DDevice());
             m_pixelTrace.Initialize(m_renderEngine.D3DDevice());
+        }
+
+        // Reload the graph from saved JSON.
+        try
+        {
+            m_graph = ::ShaderLab::Graph::EffectGraph::FromJson(graphJson);
+        }
+        catch (...) {} // Graph reload failed — start fresh.
+
+        ResetAfterGraphLoad();
+        m_nodeGraphController.RebuildLayout();
+
+        // Restore view state so the user sees no difference.
+        if (savedPreviewId != 0 && m_graph.FindNode(savedPreviewId))
+            m_previewNodeId = savedPreviewId;
+        m_nodeGraphController.SetPanOffset(savedPan.x, savedPan.y);
+        m_nodeGraphController.SetZoom(savedZoom);
+        m_previewZoom = savedPreviewZoom;
+        m_previewPanX = savedPreviewPanX;
+        m_previewPanY = savedPreviewPanY;
+        m_needsFitPreview = false;  // Don't auto-fit — keep user's view
+        if (savedSelectedId != 0 && m_graph.FindNode(savedSelectedId))
+        {
+            m_selectedNodeId = savedSelectedId;
+            m_nodeGraphController.SelectNode(savedSelectedId);
+            UpdatePropertiesPanel();
         }
 
         // Re-prepare all source nodes on the new device.
@@ -604,11 +634,7 @@ namespace winrt::ShaderLab::implementation
             }
         }
 
-        m_graph.MarkAllDirty();
-        m_graph.ClearCachedOutputs();
         m_forceRender = true;
-        m_nodeGraphController.SetNeedsRedraw();
-        m_nodeGraphController.RebuildLayout();
         UpdateStatusBar();
 
         m_nodeLogs[0].Info(std::format(L"GPU switched to: {}",
