@@ -239,8 +239,10 @@ namespace ShaderLab::Graph
 
     bool EffectGraph::WouldCreateCycle(uint32_t srcId, uint32_t dstId) const
     {
-        // If dstId can already reach srcId via image edges OR binding edges,
+        // If dstId can already reach srcId via image edges,
         // adding src->dst creates a cycle.
+        // NOTE: data bindings are NOT followed — they are resolved lazily
+        // and metadata flows (Duration→StopTime) are not render cycles.
         std::unordered_set<uint32_t> visited;
         std::queue<uint32_t> work;
         work.push(dstId);
@@ -256,31 +258,11 @@ namespace ShaderLab::Graph
             if (!visited.insert(current).second)
                 continue;
 
-            // Follow image edges.
+            // Follow image edges only.
             for (const auto& edge : m_edges)
             {
                 if (edge.sourceNodeId == current)
                     work.push(edge.destNodeId);
-            }
-
-            // Follow binding edges: nodes whose bindings reference current as a source.
-            for (const auto& node : m_nodes)
-            {
-                for (const auto& [propName, binding] : node.propertyBindings)
-                {
-                    bool references = false;
-                    if (binding.wholeArray && binding.wholeArraySourceNodeId == current)
-                        references = true;
-                    else
-                    {
-                        for (const auto& src : binding.sources)
-                        {
-                            if (src.has_value() && src->sourceNodeId == current)
-                            { references = true; break; }
-                        }
-                    }
-                    if (references) work.push(node.id);
-                }
             }
         }
         return false;
@@ -348,7 +330,9 @@ namespace ShaderLab::Graph
         // Scalar→scalar: wider source is OK (user picks component via sourceComponent).
         // Narrower source→wider dest: replicate (float→float4 fills x,x,x,0).
 
-        // Cycle check.
+        // Cycle check — only considers image edges, not data bindings.
+        // Data bindings (analysis outputs → properties) are resolved lazily
+        // and don't create render dependency cycles.
         if (WouldCreateCycle(sourceNodeId, destNodeId))
             return L"Binding would create a cycle";
 
