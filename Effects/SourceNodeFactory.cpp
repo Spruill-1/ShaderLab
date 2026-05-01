@@ -321,16 +321,15 @@ namespace ShaderLab::Effects
 
             if (clockDriven)
             {
-                // Only use expensive Seek for actual jumps (backward or large skip).
-                if (diff < -frameDur || diff > frameDur * 30.0)
+                // Only seek for actual jumps: backward or very large skip (>5s).
+                // Never seek for small forward gaps — sequential decode catches up
+                // naturally and avoids expensive keyframe re-decode on scene changes.
+                if (diff < -frameDur || diff > 5.0)
                 {
                     provider->Seek(seekTime);
                 }
                 else
                 {
-                    // Sequential forward: advance at wall-clock speed.
-                    // Tick uses the frame accumulator to request exactly one
-                    // decode per video frame duration, giving smooth playback.
                     provider->Tick(deltaSeconds);
                 }
             }
