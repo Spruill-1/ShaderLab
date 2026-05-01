@@ -333,6 +333,10 @@ float4 main(
     float4 color = Source.Load(int3(uv0.xy, 0));
     if (color.a < 0.001) return color;
 
+    // Skip near-black pixels where chromaticity is numerically unstable.
+    float lum = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+    if (lum < 0.001) return color;
+
     // All modes use the same primaries-based approach.
     // For Rec.709/P3/2020, the evaluator could inject known primaries,
     // but we use matrix conversion for those (more accurate).
