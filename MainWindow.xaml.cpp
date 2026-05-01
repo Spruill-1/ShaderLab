@@ -638,6 +638,7 @@ namespace winrt::ShaderLab::implementation
         }
 
         // Re-prepare source nodes on the new device.
+        // Skip video sources — they can be reopened by the user via file picker.
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (dc)
         {
@@ -645,11 +646,25 @@ namespace winrt::ShaderLab::implementation
             {
                 if (node.type == ::ShaderLab::Graph::NodeType::Source)
                 {
+                    bool isVideo = false;
+                    auto it = node.properties.find(L"IsVideo");
+                    if (it != node.properties.end())
+                        if (auto* b = std::get_if<bool>(&it->second)) isVideo = *b;
+
+                    if (isVideo)
+                    {
+                        node.runtimeError = L"Video source needs reload after GPU change";
+                        node.dirty = false;
+                        continue;
+                    }
+
                     node.dirty = true;
                     try {
                         m_sourceFactory.PrepareSourceNode(node, dc, 0.0,
                             m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-                    } catch (...) {}
+                    } catch (...) {
+                        node.dirty = false;
+                    }
                 }
             }
         }
@@ -4852,12 +4867,15 @@ namespace winrt::ShaderLab::implementation
         // Re-prepare dirty source nodes (e.g., Flood color changed, video frame advance).
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
         {
-            if (node.type == ::ShaderLab::Graph::NodeType::Source && (node.dirty || m_sourceFactory.GetVideoProvider(node.id)))
+            if (node.type == ::ShaderLab::Graph::NodeType::Source &&
+                (node.dirty || m_sourceFactory.GetVideoProvider(node.id)) &&
+                node.runtimeError.empty())  // Don't retry failed sources
             {
                 try {
                     m_sourceFactory.PrepareSourceNode(node, dc, deltaSeconds, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
                 } catch (...) {
                     node.runtimeError = L"Source preparation failed";
+                    node.dirty = false;
                 }
             }
         }
