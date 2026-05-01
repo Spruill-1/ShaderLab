@@ -637,6 +637,7 @@ void main(uint3 id : SV_DispatchThreadID)
         m_endOfStream = false;
         m_accumulatedTime = 0.0;
         m_currentPositionSeconds = seconds;
+        m_frameNeeded = true;  // Force decode at the new position.
         m_decodeCV.notify_one();
     }
 

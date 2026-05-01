@@ -284,10 +284,14 @@ namespace ShaderLab::Effects
                 clockDriven = nodePtr->propertyBindings.count(L"Time") > 0;
             }
 
-            // Always seek to the Time property value (Clock-driven or manual).
-            // No free-running — without a Clock, the video shows a static frame.
-            provider->Seek(seekTime);
-            provider->Tick(0);
+            // Only seek when the time position has changed significantly
+            // (more than half a frame to avoid flooding the MF decoder with seeks).
+            double currentPos = provider->CurrentPosition();
+            double frameDur = 1.0 / (std::max)(provider->FrameRate(), 1.0);
+            if (std::abs(seekTime - currentPos) > frameDur * 0.5)
+            {
+                provider->Seek(seekTime);
+            }
 
             if (provider->UploadIfReady(dc))
             {
