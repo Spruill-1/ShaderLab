@@ -91,6 +91,7 @@ namespace ShaderLab::Rendering
         // GPU / adapter info.
         const std::wstring&     AdapterName()      const { return m_adapterName; }
         bool                    IsWarp()           const { return m_isWarp; }
+        void SetPreferredAdapterLuid(LUID luid) { m_preferredAdapterLuid = luid; }
 
         // Enumerate available DXGI adapters.
         static std::vector<AdapterInfo> EnumerateAdapters();

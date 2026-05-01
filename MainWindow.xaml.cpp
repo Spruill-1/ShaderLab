@@ -552,10 +552,10 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::SwitchAdapter(
         ::ShaderLab::Rendering::DevicePreference pref, LUID adapterLuid)
     {
-        // Stop the render timer to prevent access during teardown.
+        // Stop render timer.
         if (m_renderTimer) m_renderTimer.Stop();
 
-        // Save the current graph + view state.
+        // Save graph + view state.
         auto graphJson = m_graph.ToJson();
         uint32_t savedPreviewId = m_previewNodeId;
         uint32_t savedSelectedId = m_selectedNodeId;
@@ -565,13 +565,7 @@ namespace winrt::ShaderLab::implementation
         float savedPreviewPanX = m_previewPanX;
         float savedPreviewPanY = m_previewPanY;
 
-        // Save per-node runtime state not in the JSON serialization.
-        std::unordered_map<uint32_t, bool> savedPlayingState;
-        for (const auto& node : m_graph.Nodes())
-            if (node.isPlaying) savedPlayingState[node.id] = true;
-        bool savedGlobalPlaying = AnimPlayPauseToggle().IsChecked().GetBoolean();
-
-        // Nuke everything: caches, graph, all device-dependent state.
+        // ---- NUKE EVERYTHING ----
         m_graphEvaluator.ReleaseCache();
         m_sourceFactory.ReleaseCache();
         m_nodeGraphController.ReleaseDeviceResources();
@@ -582,48 +576,36 @@ namespace winrt::ShaderLab::implementation
         m_traceSwapChain = nullptr;
         for (auto& w : m_outputWindows) w->Close();
         m_outputWindows.clear();
+        for (auto& w : m_logWindows) w->Close();
+        m_logWindows.clear();
         m_graph.Clear();
+        m_displayMonitor.Shutdown();
+        m_renderEngine.Shutdown();
 
-        try
-        {
-            // Reinitialize the render engine on the new adapter.
-            m_renderEngine.Reinitialize(pref, adapterLuid);
-        }
-        catch (const winrt::hresult_error& ex)
-        {
-            // GPU init failed — try to fall back to previous state.
-            OutputDebugStringW(std::format(L"[GPU Switch] Reinitialize failed: 0x{:08X}\n",
-                static_cast<uint32_t>(ex.code())).c_str());
-            try { m_renderEngine.Reinitialize(::ShaderLab::Rendering::DevicePreference::Default, {}); }
-            catch (...) {}
-        }
+        // ---- REBUILD FROM SCRATCH ----
+        m_devicePref = pref;
+        if (pref == ::ShaderLab::Rendering::DevicePreference::Adapter)
+            m_renderEngine.SetPreferredAdapterLuid(adapterLuid);
 
-        // Re-register custom D2D effects on the new D2D factory.
+        InitializeRendering();
         m_customEffectsRegistered = false;
         RegisterCustomEffects();
-
-        // Recreate the node graph swap chain.
         InitializeGraphPanel();
 
-        // Reinitialize device-dependent subsystems.
-        m_displayMonitor.Initialize(m_hwnd, m_renderEngine.DXGIFactory());
         if (m_renderEngine.D3DDevice())
         {
             m_pixelInspector.Initialize(m_renderEngine.D3DDevice());
             m_pixelTrace.Initialize(m_renderEngine.D3DDevice());
         }
 
-        // Reload the graph from saved JSON.
-        try
-        {
-            m_graph = ::ShaderLab::Graph::EffectGraph::FromJson(graphJson);
-        }
-        catch (...) {} // Graph reload failed — start fresh.
+        // ---- RELOAD GRAPH ----
+        try { m_graph = ::ShaderLab::Graph::EffectGraph::FromJson(graphJson); }
+        catch (...) {}
 
-        ResetAfterGraphLoad(false);  // Don't reopen output windows yet
+        ResetAfterGraphLoad(false);
         m_nodeGraphController.RebuildLayout();
 
-        // Restore view state so the user sees no difference.
+        // Restore view state.
         if (savedPreviewId != 0 && m_graph.FindNode(savedPreviewId))
             m_previewNodeId = savedPreviewId;
         m_nodeGraphController.SetPanOffset(savedPan.x, savedPan.y);
@@ -639,21 +621,7 @@ namespace winrt::ShaderLab::implementation
             UpdatePropertiesPanel();
         }
 
-        // Restore per-node runtime state.
-        for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-        {
-            if (savedPlayingState.count(node.id))
-                node.isPlaying = true;
-        }
-        if (savedGlobalPlaying)
-        {
-            AnimPlayPauseToggle().IsChecked(true);
-            AnimPlayText().Text(L"Pause");
-            AnimPlayIcon().Glyph(L"\xE769");
-        }
-
-        // Re-prepare non-video source nodes on the new device.
-        // Video sources will re-prepare lazily on the next render tick.
+        // Re-prepare source nodes on the new device.
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (dc)
         {
@@ -661,19 +629,11 @@ namespace winrt::ShaderLab::implementation
             {
                 if (node.type == ::ShaderLab::Graph::NodeType::Source)
                 {
-                    // Skip video sources — they'll re-open on next tick.
-                    bool isVideo = false;
-                    auto it = node.properties.find(L"IsVideo");
-                    if (it != node.properties.end())
-                        if (auto* b = std::get_if<bool>(&it->second)) isVideo = *b;
-                    if (isVideo) { node.dirty = true; continue; }
-
+                    node.dirty = true;
                     try {
                         m_sourceFactory.PrepareSourceNode(node, dc, 0.0,
                             m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-                    } catch (...) {
-                        node.runtimeError = L"Failed to prepare source on new GPU";
-                    }
+                    } catch (...) {}
                 }
             }
         }
@@ -681,17 +641,14 @@ namespace winrt::ShaderLab::implementation
         m_forceRender = true;
         UpdateStatusBar();
 
-        m_nodeLogs[0].Info(std::format(L"GPU switched to: {}",
-            m_renderEngine.IsWarp() ? L"WARP (Software)" : m_renderEngine.AdapterName()));
-
-        // Reopen output windows on the new device (after everything is ready).
+        // Reopen output windows.
         auto outputIds = m_graph.GetOutputNodeIds();
         for (uint32_t id : outputIds)
         {
             try { OpenOutputWindow(id); } catch (...) {}
         }
 
-        // Restart the render timer.
+        // Restart render timer.
         if (m_renderTimer) m_renderTimer.Start();
     }
 
