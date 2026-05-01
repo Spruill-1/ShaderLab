@@ -4828,6 +4828,7 @@ namespace winrt::ShaderLab::implementation
                 }
 
                 node.dirty = true;
+                m_nodeGraphController.SetNeedsRedraw();
             }
         }
 
