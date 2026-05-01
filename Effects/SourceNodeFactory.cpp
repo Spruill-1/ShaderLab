@@ -74,12 +74,13 @@ namespace ShaderLab::Effects
 
         node.outputPins.push_back({ L"Frame", 0 });
 
-        // Data input pin for Clock-driven seeking.
-        node.inputPins.push_back({ L"Time", 0 });
-
-        // Analysis output for downstream nodes to read video duration/position.
+        // CustomEffectDefinition with Time parameter (data input pin for Clock binding)
+        // and analysis outputs for video metadata.
         CustomEffectDefinition def;
         def.shaderType = CustomShaderType::PixelShader;
+        def.parameters = {
+            { L"Time", L"float", 0.0f, 0.0f, 3600.0f, 0.1f },
+        };
         def.analysisOutputType = AnalysisOutputType::Typed;
         def.analysisFields = {
             { L"Duration", AnalysisFieldType::Float },
