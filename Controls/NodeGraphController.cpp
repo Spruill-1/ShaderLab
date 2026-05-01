@@ -31,17 +31,47 @@ namespace ShaderLab::Controls
         if (!m_graph || m_graph->IsEmpty()) return;
 
         // 1. Compute topological depth for each node (longest path from sources).
+        //    Consider both image edges AND property bindings as dependencies.
         std::unordered_map<uint32_t, int> depth;
         std::vector<uint32_t> topoOrder;
         try { topoOrder = m_graph->TopologicalSort(); }
         catch (...) { return; } // Cycle — can't layout.
 
+        // Helper: collect all upstream node IDs for a given node (image edges + bindings).
+        auto getParentIds = [&](uint32_t nodeId) -> std::vector<uint32_t>
+        {
+            std::unordered_set<uint32_t> parents;
+            // Image edges.
+            for (const auto* edge : m_graph->GetInputEdges(nodeId))
+                parents.insert(edge->sourceNodeId);
+            // Property bindings.
+            const auto* node = m_graph->FindNode(nodeId);
+            if (node)
+            {
+                for (const auto& [propName, binding] : node->propertyBindings)
+                {
+                    if (binding.wholeArray)
+                    {
+                        if (binding.wholeArraySourceNodeId != 0)
+                            parents.insert(binding.wholeArraySourceNodeId);
+                    }
+                    else
+                    {
+                        for (const auto& src : binding.sources)
+                            if (src && src->sourceNodeId != 0)
+                                parents.insert(src->sourceNodeId);
+                    }
+                }
+            }
+            return { parents.begin(), parents.end() };
+        };
+
         for (uint32_t id : topoOrder)
         {
             int maxParentDepth = -1;
-            for (const auto* edge : m_graph->GetInputEdges(id))
+            for (uint32_t parentId : getParentIds(id))
             {
-                auto it = depth.find(edge->sourceNodeId);
+                auto it = depth.find(parentId);
                 if (it != depth.end())
                     maxParentDepth = (std::max)(maxParentDepth, it->second);
             }
@@ -67,9 +97,9 @@ namespace ShaderLab::Controls
                 auto avgParentY = [&](uint32_t nodeId) -> float
                 {
                     float sum = 0; int count = 0;
-                    for (const auto* edge : m_graph->GetInputEdges(nodeId))
+                    for (uint32_t parentId : getParentIds(nodeId))
                     {
-                        auto* parent = m_graph->FindNode(edge->sourceNodeId);
+                        auto* parent = m_graph->FindNode(parentId);
                         if (parent) { sum += parent->position.y; ++count; }
                     }
                     return count > 0 ? sum / count : 0.0f;
