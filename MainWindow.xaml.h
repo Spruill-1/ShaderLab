@@ -164,6 +164,7 @@ namespace winrt::ShaderLab::implementation
         // Render loop timer.
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer m_renderTimer{ nullptr };
         uint32_t m_frameCount{ 0 };
+        uint64_t m_lastVideoUploadCount{ 0 };
         std::chrono::steady_clock::time_point m_fpsTimePoint;
         std::chrono::steady_clock::time_point m_lastRenderTick;
 

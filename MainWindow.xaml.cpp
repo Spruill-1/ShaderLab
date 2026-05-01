@@ -4931,9 +4931,25 @@ namespace winrt::ShaderLab::implementation
         {
             float fps = static_cast<float>(m_frameCount) * 1000.0f / static_cast<float>(elapsed);
             auto& ft = m_frameTiming;
-            FpsText().Text(std::format(L"{:.0f} FPS | {:.1f}ms (eval {:.1f} + compute {:.1f} + draw {:.1f})",
-                fps, ft.totalUs / 1000.0, ft.evaluateUs / 1000.0,
-                ft.deferredComputeUs / 1000.0, ft.drawUs / 1000.0 + ft.presentUs / 1000.0));
+
+            // Video decode FPS.
+            uint64_t currentVideoUploads = m_sourceFactory.TotalVideoUploads();
+            float videoFps = static_cast<float>(currentVideoUploads - m_lastVideoUploadCount) * 1000.0f / static_cast<float>(elapsed);
+            m_lastVideoUploadCount = currentVideoUploads;
+
+            if (videoFps > 0.1f)
+            {
+                FpsText().Text(std::format(L"{:.0f} FPS | {:.1f}ms (eval {:.1f} + compute {:.1f} + draw {:.1f}) | video {:.0f} fps",
+                    fps, ft.totalUs / 1000.0, ft.evaluateUs / 1000.0,
+                    ft.deferredComputeUs / 1000.0, ft.drawUs / 1000.0 + ft.presentUs / 1000.0,
+                    videoFps));
+            }
+            else
+            {
+                FpsText().Text(std::format(L"{:.0f} FPS | {:.1f}ms (eval {:.1f} + compute {:.1f} + draw {:.1f})",
+                    fps, ft.totalUs / 1000.0, ft.evaluateUs / 1000.0,
+                    ft.deferredComputeUs / 1000.0, ft.drawUs / 1000.0 + ft.presentUs / 1000.0));
+            }
             m_frameCount = 0;
             m_fpsTimePoint = fpsNow;
         }

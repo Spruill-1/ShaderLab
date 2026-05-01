@@ -394,4 +394,12 @@ namespace ShaderLab::Effects
         auto it = m_videoCache.find(nodeId);
         return (it != m_videoCache.end()) ? it->second.get() : nullptr;
     }
+
+    uint64_t SourceNodeFactory::TotalVideoUploads() const
+    {
+        uint64_t total = 0;
+        for (const auto& [id, provider] : m_videoCache)
+            if (provider) total += provider->UploadSuccesses();
+        return total;
+    }
 }

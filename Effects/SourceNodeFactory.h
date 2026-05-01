@@ -65,6 +65,9 @@ namespace ShaderLab::Effects
         // Get the video provider for a node (for UI controls).
         VideoSourceProvider* GetVideoProvider(uint32_t nodeId);
 
+        // Get total video upload count across all providers.
+        uint64_t TotalVideoUploads() const;
+
     private:
         ImageLoader m_imageLoader;
 
