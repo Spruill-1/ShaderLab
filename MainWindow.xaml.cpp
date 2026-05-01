@@ -678,8 +678,10 @@ namespace winrt::ShaderLab::implementation
 
                     if (isVideo)
                     {
-                        // Video sources reopen on the next render tick.
-                        node.dirty = true;
+                        // Video sources need manual reload — auto-reopen
+                        // can hang MF decoder on some GPU transitions.
+                        node.runtimeError = L"Video needs reload — click Reload in Properties";
+                        node.dirty = false;
                         continue;
                     }
 
@@ -2556,6 +2558,31 @@ namespace winrt::ShaderLab::implementation
             errorText.FontSize(12);
             errorBorder.Child(errorText);
             panel.Children().Append(errorBorder);
+
+            // Add "Reload" button for video sources with errors.
+            {
+                auto isVideoIt = node->properties.find(L"IsVideo");
+                bool hasVideo = false;
+                if (isVideoIt != node->properties.end())
+                    if (auto* bv = std::get_if<bool>(&isVideoIt->second)) hasVideo = *bv;
+                if (hasVideo && node->shaderPath.has_value())
+                {
+                    auto reloadBtn = Controls::Button();
+                    reloadBtn.Content(winrt::box_value(L"\xE72C  Reload Video"));
+                    reloadBtn.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+                    reloadBtn.Margin({ 0, 0, 0, 8 });
+                    uint32_t reloadNodeId = capturedId;
+                    reloadBtn.Click([this, reloadNodeId](auto&&, auto&&) {
+                        auto* n = m_graph.FindNode(reloadNodeId);
+                        if (!n) return;
+                        n->runtimeError.clear();
+                        n->dirty = true;
+                        m_forceRender = true;
+                        UpdatePropertiesPanel();
+                    });
+                    panel.Children().Append(reloadBtn);
+                }
+            }
         }
 
         // ---- Image source: file path + Browse button ----
