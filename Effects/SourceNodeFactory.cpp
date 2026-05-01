@@ -284,13 +284,33 @@ namespace ShaderLab::Effects
                 clockDriven = nodePtr->propertyBindings.count(L"Time") > 0;
             }
 
-            // Only seek when the time position has changed significantly
-            // (more than half a frame to avoid flooding the MF decoder with seeks).
             double currentPos = provider->CurrentPosition();
+            double diff = seekTime - currentPos;
             double frameDur = 1.0 / (std::max)(provider->FrameRate(), 1.0);
-            if (std::abs(seekTime - currentPos) > frameDur * 0.5)
+
+            if (clockDriven)
             {
-                provider->Seek(seekTime);
+                // For sequential forward playback (small positive delta),
+                // use Tick which reads the next sample — much faster than Seek.
+                // Only use expensive Seek for jumps (backwards, large skip, loop wrap).
+                if (diff < -frameDur || diff > frameDur * 10.0)
+                {
+                    // Non-sequential: backwards or large jump → full seek.
+                    provider->Seek(seekTime);
+                }
+                else if (diff > frameDur * 0.5)
+                {
+                    // Sequential forward: just tick to advance to next frame.
+                    provider->Tick(diff);
+                }
+                // else: time hasn't changed enough for a new frame — skip.
+            }
+            else
+            {
+                // No clock: static frame at Time property value.
+                // Only seek if position differs from target.
+                if (std::abs(diff) > frameDur * 0.5)
+                    provider->Seek(seekTime);
             }
 
             if (provider->UploadIfReady(dc))
