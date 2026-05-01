@@ -344,6 +344,22 @@ namespace ShaderLab::Effects
                     provider->Seek(seekTime);
             }
 
+            // Always update analysis output (Duration/Position) regardless
+            // of whether a new frame was uploaded this tick.
+            if (nodePtr)
+            {
+                nodePtr->analysisOutput.type = Graph::AnalysisOutputType::Typed;
+                nodePtr->analysisOutput.fields.clear();
+                Graph::AnalysisFieldValue durFv;
+                durFv.name = L"Duration"; durFv.type = Graph::AnalysisFieldType::Float;
+                durFv.components[0] = static_cast<float>(provider->Duration());
+                nodePtr->analysisOutput.fields.push_back(std::move(durFv));
+                Graph::AnalysisFieldValue posFv;
+                posFv.name = L"Position"; posFv.type = Graph::AnalysisFieldType::Float;
+                posFv.components[0] = static_cast<float>(provider->CurrentPosition());
+                nodePtr->analysisOutput.fields.push_back(std::move(posFv));
+            }
+
             if (provider->UploadIfReady(dc))
             {
                 anyNewFrame = true;
@@ -351,20 +367,6 @@ namespace ShaderLab::Effects
                 {
                     nodePtr->cachedOutput = provider->CurrentBitmap();
                     nodePtr->dirty = true;
-
-                    // Update analysis output with position/duration.
-                    nodePtr->analysisOutput.type = Graph::AnalysisOutputType::Typed;
-                    nodePtr->analysisOutput.fields.clear();
-                    Graph::AnalysisFieldValue durFv;
-                    durFv.name = L"Duration";
-                    durFv.type = Graph::AnalysisFieldType::Float;
-                    durFv.components[0] = static_cast<float>(provider->Duration());
-                    nodePtr->analysisOutput.fields.push_back(std::move(durFv));
-                    Graph::AnalysisFieldValue posFv;
-                    posFv.name = L"Position";
-                    posFv.type = Graph::AnalysisFieldType::Float;
-                    posFv.components[0] = static_cast<float>(provider->CurrentPosition());
-                    nodePtr->analysisOutput.fields.push_back(std::move(posFv));
                 }
             }
         }
