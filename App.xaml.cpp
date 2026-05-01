@@ -516,7 +516,7 @@ namespace winrt::ShaderLab::implementation
 
         // ---- Analysis Effects ----
         LOG("\n=== Analysis Effects ===");
-        { const wchar_t* names[] = { L"Luminance Heatmap", L"Gamut Highlight", L"Nit Map", L"Waveform Monitor", L"Split Comparison" };
+        { const wchar_t* names[] = { L"Luminance Heatmap", L"Gamut Highlight", L"Nit Map", L"Waveform Monitor" };
           for (auto* name : names) {
             std::string tn = "Analysis_"; for (auto* p = name; *p; ++p) tn += (char)*p;
             try {
@@ -529,6 +529,19 @@ namespace winrt::ShaderLab::implementation
             TEST(tn.c_str(), n && hasOutput(*n) && n->runtimeError.empty());
             } catch (...) { TEST(tn.c_str(), false); }
         }}
+        // Split Comparison needs 2 inputs.
+        { try {
+            ::ShaderLab::Graph::EffectGraph g; ::ShaderLab::Effects::SourceNodeFactory sf;
+            auto src1 = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Gamut Source"));
+            auto src2 = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Color Checker"));
+            auto split = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Split Comparison"));
+            auto s1 = g.AddNode(std::move(src1)); auto s2 = g.AddNode(std::move(src2));
+            auto spId = g.AddNode(std::move(split));
+            g.Connect(s1, 0, spId, 0); g.Connect(s2, 0, spId, 1);
+            ::ShaderLab::Rendering::GraphEvaluator ev; evaluate(g, sf, ev);
+            auto* n = g.FindNode(spId);
+            TEST("Analysis_Split Comparison", n && hasOutput(*n) && n->runtimeError.empty());
+        } catch (...) { TEST("Analysis_Split Comparison", false); } }
 
         // ---- Built-in D2D Effects ----
         LOG("\n=== D2D Effects ===");

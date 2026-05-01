@@ -64,7 +64,7 @@ namespace ShaderLab::Effects
     {
         ShaderCompileResult result;
 
-        UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_WARNINGS_ARE_ERRORS;
+        UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
 #ifdef _DEBUG
         flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #else
