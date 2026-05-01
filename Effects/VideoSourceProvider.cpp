@@ -198,7 +198,6 @@ void main(uint3 id : SV_DispatchThreadID)
         HRESULT hr;
 
         // Create DXGI Device Manager for hardware-accelerated decode.
-        // This enables DXVA2 — the GPU decodes HEVC/H.264 directly.
         UINT resetToken = 0;
         winrt::com_ptr<IMFDXGIDeviceManager> dxgiManager;
         hr = MFCreateDXGIDeviceManager(&resetToken, dxgiManager.put());
@@ -212,28 +211,50 @@ void main(uint3 id : SV_DispatchThreadID)
             }
         }
 
-        winrt::com_ptr<IMFAttributes> attrs;
-        hr = MFCreateAttributes(attrs.put(), 3);
+        // Try opening with DXGI device manager first (hardware decode).
+        // If that fails, try without video processing (native decoder output).
+        // Final fallback: with video processing (software format conversion).
+        auto tryCreateReader = [&](bool useDxgi, bool useVideoProc) -> HRESULT
+        {
+            winrt::com_ptr<IMFAttributes> attrs;
+            HRESULT hres = MFCreateAttributes(attrs.put(), 3);
+            if (FAILED(hres)) return hres;
+
+            attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+            if (useDxgi && m_dxgiDeviceManager)
+                attrs->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, m_dxgiDeviceManager.get());
+            if (useVideoProc)
+                attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+            return MFCreateSourceReaderFromURL(filePath.c_str(), attrs.get(), m_reader.put());
+        };
+
+        // Attempt 1: DXGI manager (hardware decode, native P010 output).
+        int readerAttempt = 1;
+        hr = tryCreateReader(true, false);
         if (FAILED(hr))
         {
-            m_lastError = std::format(L"MFCreateAttributes failed: 0x{:08X}", static_cast<uint32_t>(hr));
-            return false;
+            OutputDebugStringW(std::format(L"[VideoSource] Attempt 1 (DXGI) failed: 0x{:08X}\n",
+                static_cast<uint32_t>(hr)).c_str());
+            // Attempt 2: No DXGI, no video proc (native decoder output, may give P010).
+            m_dxgiDeviceManager = nullptr;
+            readerAttempt = 2;
+            hr = tryCreateReader(false, false);
         }
-
-        attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-        attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-        if (m_dxgiDeviceManager)
+        if (FAILED(hr))
         {
-            attrs->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, m_dxgiDeviceManager.get());
+            OutputDebugStringW(std::format(L"[VideoSource] Attempt 2 (native) failed: 0x{:08X}\n",
+                static_cast<uint32_t>(hr)).c_str());
+            // Attempt 3: Video processing (software, can convert formats but loses P010).
+            readerAttempt = 3;
+            hr = tryCreateReader(false, true);
         }
-
-        hr = MFCreateSourceReaderFromURL(filePath.c_str(), attrs.get(), m_reader.put());
         if (FAILED(hr))
         {
             m_lastError = std::format(L"MFCreateSourceReaderFromURL failed: 0x{:08X}", static_cast<uint32_t>(hr));
             Close();
             return false;
         }
+        OutputDebugStringW(std::format(L"[VideoSource] Reader created via attempt {}\n", readerAttempt).c_str());
 
         m_reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
         m_reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), TRUE);
@@ -282,6 +303,7 @@ void main(uint3 id : SV_DispatchThreadID)
 
         if (m_isHDR)
         {
+            // Try P010 first (native HDR output from HEVC decoders).
             outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_P010);
             MFSetAttributeSize(outputType.get(), MF_MT_FRAME_SIZE, m_width, m_height);
             m_stride = m_width * 2;
@@ -289,10 +311,14 @@ void main(uint3 id : SV_DispatchThreadID)
             if (SUCCEEDED(hr))
             {
                 m_outputFormat = OutputFormat::P010;
+                OutputDebugStringW(L"[VideoSource] P010 format accepted\n");
             }
             else
             {
-                // Fall back to NV12.
+                OutputDebugStringW(std::format(L"[VideoSource] P010 rejected: 0x{:08X}, falling back to NV12\n",
+                    static_cast<uint32_t>(hr)).c_str());
+                // Try NV12 with HDR flag — some decoders can output NV12.
+                // The color math will be wrong (SDR shader) but at least playback works.
                 outputType = nullptr;
                 MFCreateMediaType(outputType.put());
                 outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);

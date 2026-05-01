@@ -530,12 +530,44 @@ namespace winrt::ShaderLab::implementation
                     {
                         // Check for special source types.
                         std::wstring wname(name.begin(), name.end());
-                        if (wname == L"Video Source")
+                        std::wstring filePath;
+                        if (jobj.HasKey(L"filePath"))
+                            filePath = std::wstring(jobj.GetNamedString(L"filePath"));
+
+                        if (wname == L"Video Source" || wname == L"Video")
                         {
-                            // Video Source requires a file path — create empty placeholder.
-                            auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(L"", L"Video Source");
+                            auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(filePath,
+                                filePath.empty() ? L"Video Source" : filePath.substr(filePath.find_last_of(L"\\/") + 1));
                             return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
                                 auto id = m_graph.AddNode(std::move(node));
+                                if (!filePath.empty())
+                                {
+                                    auto* graphNode = m_graph.FindNode(id);
+                                    auto* dc = m_renderEngine.D2DDeviceContext();
+                                    if (graphNode && dc)
+                                        m_sourceFactory.PrepareSourceNode(*graphNode, dc, 0.0,
+                                            m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                                }
+                                m_graph.MarkAllDirty();
+                                m_nodeGraphController.AutoLayout();
+                                PopulatePreviewNodeSelector();
+                                return { 200, std::format("{{\"nodeId\":{}}}", id) };
+                            });
+                        }
+                        if (wname == L"Image Source" || wname == L"Image")
+                        {
+                            auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateImageSourceNode(filePath,
+                                filePath.empty() ? L"Image Source" : filePath.substr(filePath.find_last_of(L"\\/") + 1));
+                            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                                auto id = m_graph.AddNode(std::move(node));
+                                if (!filePath.empty())
+                                {
+                                    auto* graphNode = m_graph.FindNode(id);
+                                    auto* dc = m_renderEngine.D2DDeviceContext();
+                                    if (graphNode && dc)
+                                        m_sourceFactory.PrepareSourceNode(*graphNode, dc, 0.0,
+                                            m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                                }
                                 m_graph.MarkAllDirty();
                                 m_nodeGraphController.AutoLayout();
                                 PopulatePreviewNodeSelector();
@@ -716,6 +748,13 @@ namespace winrt::ShaderLab::implementation
                     }
                     node->dirty = true;
                     m_graph.MarkAllDirty();
+
+                    // Handle special node flags set via properties.
+                    if (key == L"isPlaying")
+                    {
+                        auto* bv = std::get_if<bool>(&node->properties[key]);
+                        if (bv) node->isPlaying = *bv;
+                    }
 
                     // Sync shaderPath property to the dedicated node field (for source/shader nodes).
                     if (key == L"shaderPath")
@@ -1358,7 +1397,7 @@ namespace winrt::ShaderLab::implementation
                 if (method == "tools/list")
                 {
                     std::string tools = R"JSON({"tools":[
-{"name":"graph_add_node","description":"Add a built-in D2D effect node by name, or a ShaderLab analysis/source effect (e.g. Luminance Heatmap, CIE Chromaticity Plot, Gamut Highlight, Waveform Monitor, Vectorscope, False Color, Delta E Comparator, Gamut Coverage, Gamut Source, Color Checker, Zone Plate, Gradient Generator, HDR Test Pattern)","inputSchema":{"type":"object","properties":{"effectName":{"type":"string","description":"Effect name e.g. Gaussian Blur"}},"required":["effectName"]}},
+{"name":"graph_add_node","description":"Add a node. Use effectName for built-in/ShaderLab effects. For sources use effectName='Video' or 'Image' with optional filePath.","inputSchema":{"type":"object","properties":{"effectName":{"type":"string","description":"Effect name, or 'Video'/'Image' for source nodes"},"filePath":{"type":"string","description":"File path for Video/Image source nodes (optional)"}},"required":["effectName"]}},
 {"name":"graph_remove_node","description":"Remove a node by ID","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
 {"name":"graph_connect","description":"Connect output pin to input pin","inputSchema":{"type":"object","properties":{"srcId":{"type":"number"},"srcPin":{"type":"number"},"dstId":{"type":"number"},"dstPin":{"type":"number"}},"required":["srcId","srcPin","dstId","dstPin"]}},
 {"name":"graph_disconnect","description":"Disconnect an edge","inputSchema":{"type":"object","properties":{"srcId":{"type":"number"},"srcPin":{"type":"number"},"dstId":{"type":"number"},"dstPin":{"type":"number"}},"required":["srcId","srcPin","dstId","dstPin"]}},
