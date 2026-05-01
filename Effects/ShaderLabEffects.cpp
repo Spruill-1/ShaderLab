@@ -2696,7 +2696,7 @@ void main(uint3 GTid : SV_GroupThreadID)
             ShaderLabEffectDescriptor desc;
             desc.name = op.name;
             desc.effectId = op.id; desc.effectVersion = 1;
-            desc.category = L"Math";
+            desc.category = L"Parameter";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.parameters = {
                 { L"A", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
