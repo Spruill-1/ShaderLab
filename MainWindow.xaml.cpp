@@ -565,6 +565,12 @@ namespace winrt::ShaderLab::implementation
         float savedPreviewPanX = m_previewPanX;
         float savedPreviewPanY = m_previewPanY;
 
+        // Save per-node runtime state not in the JSON serialization.
+        std::unordered_map<uint32_t, bool> savedPlayingState;
+        for (const auto& node : m_graph.Nodes())
+            if (node.isPlaying) savedPlayingState[node.id] = true;
+        bool savedGlobalPlaying = AnimPlayPauseToggle().IsChecked().GetBoolean();
+
         // Nuke everything: caches, graph, all device-dependent state.
         m_graphEvaluator.ReleaseCache();
         m_sourceFactory.ReleaseCache();
@@ -631,6 +637,19 @@ namespace winrt::ShaderLab::implementation
             m_selectedNodeId = savedSelectedId;
             m_nodeGraphController.SelectNode(savedSelectedId);
             UpdatePropertiesPanel();
+        }
+
+        // Restore per-node runtime state.
+        for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+        {
+            if (savedPlayingState.count(node.id))
+                node.isPlaying = true;
+        }
+        if (savedGlobalPlaying)
+        {
+            AnimPlayPauseToggle().IsChecked(true);
+            AnimPlayText().Text(L"Pause");
+            AnimPlayIcon().Glyph(L"\xE769");
         }
 
         // Re-prepare all source nodes on the new device.
