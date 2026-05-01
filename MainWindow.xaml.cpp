@@ -552,8 +552,13 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::SwitchAdapter(
         ::ShaderLab::Rendering::DevicePreference pref, LUID adapterLuid)
     {
+        // Stop the render timer to prevent the render loop from
+        // accessing resources while we tear down and recreate them.
+        if (m_renderTimer) m_renderTimer.Stop();
+
         // Release all device-dependent caches.
         m_graphEvaluator.ReleaseCache();
+        m_sourceFactory.ReleaseCache();
 
         // Release node graph D2D resources and swap chain.
         m_nodeGraphController.ReleaseDeviceResources();
@@ -608,6 +613,9 @@ namespace winrt::ShaderLab::implementation
 
         m_nodeLogs[0].Info(std::format(L"GPU switched to: {}",
             m_renderEngine.IsWarp() ? L"WARP (Software)" : m_renderEngine.AdapterName()));
+
+        // Restart the render timer.
+        if (m_renderTimer) m_renderTimer.Start();
     }
 
     void MainWindow::OnPreviewSizeChanged(
