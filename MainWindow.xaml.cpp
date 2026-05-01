@@ -587,7 +587,23 @@ namespace winrt::ShaderLab::implementation
         if (pref == ::ShaderLab::Rendering::DevicePreference::Adapter)
             m_renderEngine.SetPreferredAdapterLuid(adapterLuid);
 
-        InitializeRendering();
+        try
+        {
+            InitializeRendering();
+        }
+        catch (...)
+        {
+            // Requested adapter failed — fall back to default.
+            OutputDebugStringW(L"[GPU Switch] InitializeRendering failed, falling back to Default\n");
+            m_devicePref = ::ShaderLab::Rendering::DevicePreference::Default;
+            try { InitializeRendering(); }
+            catch (...) {
+                // Total failure — restart timer and bail.
+                if (m_renderTimer) m_renderTimer.Start();
+                return;
+            }
+        }
+
         m_customEffectsRegistered = false;
         RegisterCustomEffects();
         InitializeGraphPanel();
@@ -1031,6 +1047,22 @@ namespace winrt::ShaderLab::implementation
         m_outputWindows.clear();
 
         m_nodeGraphController.SetGraph(&m_graph);
+
+        // Restore isAnimatable flag from ShaderLab effect descriptors
+        // (not serialized in JSON, derived from effect definition).
+        {
+            auto& lib = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+            {
+                if (node.customEffect.has_value() && !node.customEffect->shaderLabEffectId.empty())
+                {
+                    auto* desc = lib.FindById(node.customEffect->shaderLabEffectId);
+                    if (desc)
+                        node.isAnimatable = desc->isAnimatable;
+                }
+            }
+        }
+
         m_graph.MarkAllDirty();
         PopulatePreviewNodeSelector();
 
