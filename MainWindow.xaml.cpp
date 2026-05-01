@@ -4868,6 +4868,9 @@ namespace winrt::ShaderLab::implementation
         {
             if (!m_logWindows.empty())
                 UpdateLogWindows();
+            // Refresh properties panel for live bound/animated values.
+            if (m_selectedNodeId != 0 && m_graph.HasDirtyNodes())
+                UpdatePropertiesPanel();
         }
         if (elapsed >= 1000)
         {
