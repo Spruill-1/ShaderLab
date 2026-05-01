@@ -2665,6 +2665,7 @@ void main(uint3 GTid : SV_GroupThreadID)
             desc.category = L"Parameter";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.parameters = {
+                { L"AutoDuration", L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Off", L"On" } },
                 { L"StartTime", L"float", 0.0f, 0.0f, 3600.0f, 0.1f },
                 { L"StopTime",  L"float", 10.0f, 0.0f, 3600.0f, 0.1f },
                 { L"Speed",     L"float", 1.0f, -10.0f, 10.0f, 0.1f },

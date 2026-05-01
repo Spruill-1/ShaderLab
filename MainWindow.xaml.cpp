@@ -4754,39 +4754,61 @@ namespace winrt::ShaderLab::implementation
         // Tick clock nodes: advance time.
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
         {
-            if (node.isClock && node.isPlaying)
+            if (node.isClock)
             {
-                float startTime = 0.0f, stopTime = 10.0f, speed = 1.0f;
-                bool loop = true;
                 auto getF = [&](const std::wstring& k, float def) {
                     auto it = node.properties.find(k);
                     if (it != node.properties.end())
                         if (auto* f = std::get_if<float>(&it->second)) return *f;
                     return def;
                 };
-                startTime = getF(L"StartTime", 0.0f);
-                stopTime = getF(L"StopTime", 10.0f);
-                speed = getF(L"Speed", 1.0f);
-                loop = getF(L"Loop", 1.0f) > 0.5f;
 
-                double duration = static_cast<double>(stopTime - startTime);
-                if (duration <= 0.0) duration = 1.0;
+                bool autoDuration = getF(L"AutoDuration", 1.0f) > 0.5f;
 
-                node.clockTime += deltaSec * speed;
-
-                if (loop)
+                // Auto-detect StopTime from downstream video durations.
+                if (autoDuration)
                 {
-                    while (node.clockTime >= duration) node.clockTime -= duration;
-                    while (node.clockTime < 0.0) node.clockTime += duration;
-                }
-                else
-                {
-                    node.clockTime = std::clamp(node.clockTime, 0.0, duration);
-                    if (node.clockTime >= duration) node.isPlaying = false;
+                    float maxDur = 0.0f;
+                    for (const auto* edge : m_graph.GetOutputEdges(node.id))
+                    {
+                        const auto* dest = m_graph.FindNode(edge->destNodeId);
+                        if (!dest) continue;
+                        for (const auto& field : dest->analysisOutput.fields)
+                        {
+                            if (field.name == L"Duration" && field.components[0] > 0.0f)
+                                if (field.components[0] > maxDur) maxDur = field.components[0];
+                        }
+                    }
+                    if (maxDur > 0.0f)
+                        node.properties[L"StopTime"] = maxDur;
                 }
 
-                node.dirty = true;
-                m_nodeGraphController.SetNeedsRedraw();
+                if (node.isPlaying)
+                {
+                    float startTime = getF(L"StartTime", 0.0f);
+                    float stopTime = getF(L"StopTime", 10.0f);
+                    float speed = getF(L"Speed", 1.0f);
+                    bool loop = getF(L"Loop", 1.0f) > 0.5f;
+
+                    double duration = static_cast<double>(stopTime - startTime);
+                    if (duration <= 0.0) duration = 1.0;
+
+                    node.clockTime += deltaSec * speed;
+
+                    if (loop)
+                    {
+                        while (node.clockTime >= duration) node.clockTime -= duration;
+                        while (node.clockTime < 0.0) node.clockTime += duration;
+                    }
+                    else
+                    {
+                        node.clockTime = std::clamp(node.clockTime, 0.0, duration);
+                        if (node.clockTime >= duration) node.isPlaying = false;
+                    }
+
+                    node.dirty = true;
+                    m_nodeGraphController.SetNeedsRedraw();
+                }
             }
         }
 
