@@ -281,6 +281,25 @@ namespace ShaderLab::Effects
                 if (loop && provider->Duration() > 0)
                     seekTime = std::fmod(seekTime, provider->Duration());
 
+                // Past end of video with looping off → show black.
+                if (!loop && provider->Duration() > 0 && seekTime >= provider->Duration())
+                {
+                    nodePtr->cachedOutput = nullptr;
+                    clockDriven = true;  // skip tick/seek below
+                    // Still update analysis output.
+                    nodePtr->analysisOutput.type = Graph::AnalysisOutputType::Typed;
+                    nodePtr->analysisOutput.fields.clear();
+                    Graph::AnalysisFieldValue durFv;
+                    durFv.name = L"Duration"; durFv.type = Graph::AnalysisFieldType::Float;
+                    durFv.components[0] = static_cast<float>(provider->Duration());
+                    nodePtr->analysisOutput.fields.push_back(std::move(durFv));
+                    Graph::AnalysisFieldValue posFv;
+                    posFv.name = L"Position"; posFv.type = Graph::AnalysisFieldType::Float;
+                    posFv.components[0] = static_cast<float>(seekTime);
+                    nodePtr->analysisOutput.fields.push_back(std::move(posFv));
+                    continue;
+                }
+
                 clockDriven = nodePtr->propertyBindings.count(L"Time") > 0;
             }
 
