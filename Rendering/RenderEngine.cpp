@@ -28,6 +28,20 @@ namespace ShaderLab::Rendering
     void RenderEngine::Shutdown()
     {
         ReleaseRenderTarget();
+
+        // Clear the swap chain reference from the XAML panel BEFORE
+        // releasing it, otherwise the compositor crashes accessing
+        // a dangling swap chain.
+        if (m_panel)
+        {
+            try
+            {
+                auto panelNative = m_panel.as<ISwapChainPanelNative>();
+                if (panelNative) panelNative->SetSwapChain(nullptr);
+            }
+            catch (...) {}
+        }
+
         m_swapChain = nullptr;
         m_d2dDeviceContext = nullptr;
         m_d2dDevice = nullptr;

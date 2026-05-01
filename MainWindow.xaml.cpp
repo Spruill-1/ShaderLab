@@ -578,6 +578,11 @@ namespace winrt::ShaderLab::implementation
         m_graphEvaluator.ReleaseCache();
         m_sourceFactory.ReleaseCache();
         m_nodeGraphController.ReleaseDeviceResources();
+        // Clear swap chain references from XAML panels before destroying them.
+        try {
+            auto panelNative = NodeGraphPanel().as<ISwapChainPanelNative>();
+            if (panelNative) panelNative->SetSwapChain(nullptr);
+        } catch (...) {}
         m_graphRenderTarget = nullptr;
         m_graphSwapChain = nullptr;
         m_graphGridBrush = nullptr;
