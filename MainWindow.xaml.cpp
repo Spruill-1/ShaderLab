@@ -638,10 +638,23 @@ namespace winrt::ShaderLab::implementation
 
                     if (isVideo)
                     {
-                        // Video sources need manual reload — auto-reopen
-                        // can hang MF decoder on some GPU transitions.
-                        node.runtimeError = L"Video needs reload — click Reload in Properties";
-                        node.dirty = false;
+                        // Defer video reload — give the new device time to settle.
+                        uint32_t videoNodeId = node.id;
+                        node.dirty = true;
+                        DispatcherQueue().TryEnqueue([this, videoNodeId]() {
+                            auto* vn = m_graph.FindNode(videoNodeId);
+                            auto* vdc = m_renderEngine.D2DDeviceContext();
+                            if (vn && vdc)
+                            {
+                                try {
+                                    m_sourceFactory.PrepareSourceNode(*vn, vdc, 0.0,
+                                        m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                                    vn->runtimeError.clear();
+                                } catch (...) {
+                                    vn->runtimeError = L"Video reload failed after GPU switch";
+                                }
+                            }
+                        });
                         continue;
                     }
 
