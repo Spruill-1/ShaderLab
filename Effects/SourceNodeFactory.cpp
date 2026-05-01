@@ -74,6 +74,18 @@ namespace ShaderLab::Effects
 
         node.outputPins.push_back({ L"Frame", 0 });
 
+        // Pre-populate analysis output so data output pins are visible
+        // in the node graph before the first frame is decoded.
+        node.analysisOutput.type = AnalysisOutputType::Typed;
+        {
+            AnalysisFieldValue durFv;
+            durFv.name = L"Duration"; durFv.type = AnalysisFieldType::Float;
+            node.analysisOutput.fields.push_back(std::move(durFv));
+            AnalysisFieldValue posFv;
+            posFv.name = L"Position"; posFv.type = AnalysisFieldType::Float;
+            node.analysisOutput.fields.push_back(std::move(posFv));
+        }
+
         return node;
     }
 
