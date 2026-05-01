@@ -273,7 +273,29 @@ void main(uint3 id : SV_DispatchThreadID)
         nativeType->GetUINT32(MF_MT_TRANSFER_FUNCTION, &transferFunc);
         UINT32 colorPrimaries = 0;
         nativeType->GetUINT32(MF_MT_VIDEO_PRIMARIES, &colorPrimaries);
-        m_isHDR = (transferFunc == MFVideoTransFunc_2084) || (colorPrimaries == MFVideoPrimaries_BT2020);
+        
+        // Also check video profile — HEVC Main 10 is typically HDR.
+        GUID subtype{};
+        nativeType->GetGUID(MF_MT_SUBTYPE, &subtype);
+        UINT32 profile = 0;
+        nativeType->GetUINT32(MF_MT_MPEG2_PROFILE, &profile);
+
+        m_isHDR = (transferFunc == MFVideoTransFunc_2084) ||
+                  (colorPrimaries == MFVideoPrimaries_BT2020);
+
+        // Fallback: detect HDR from filename hint or 10-bit profile.
+        if (!m_isHDR && (subtype == MFVideoFormat_HEVC || subtype == MFVideoFormat_H265))
+        {
+            // HEVC Main 10 profile (2 = Main 10) is almost always HDR content.
+            if (profile == 2) m_isHDR = true;
+        }
+        // Filename hint: "(HDR)" in the path.
+        if (!m_isHDR && filePath.find(L"HDR") != std::wstring::npos)
+            m_isHDR = true;
+
+        OutputDebugStringW(std::format(
+            L"[VideoSource] HDR detection: transferFunc={}, primaries={}, profile={}, isHDR={}\n",
+            transferFunc, colorPrimaries, profile, m_isHDR).c_str());
 
         UINT32 width = 0, height = 0;
         hr = MFGetAttributeSize(nativeType.get(), MF_MT_FRAME_SIZE, &width, &height);
