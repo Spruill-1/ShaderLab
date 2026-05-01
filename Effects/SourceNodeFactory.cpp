@@ -158,25 +158,7 @@ namespace ShaderLab::Effects
                         provider->IsHDR()).c_str());
                 }
 
-                // Sync playback state from properties.
-                auto playIt = node.properties.find(L"IsPlaying");
-                if (playIt != node.properties.end())
-                {
-                    auto* pv = std::get_if<bool>(&playIt->second);
-                    if (pv)
-                    {
-                        if (*pv && !provider->IsPlaying()) provider->Play();
-                        else if (!*pv && provider->IsPlaying()) provider->Pause();
-                    }
-                }
-
-                auto speedIt = node.properties.find(L"PlaybackSpeed");
-                if (speedIt != node.properties.end())
-                {
-                    auto* sv = std::get_if<float>(&speedIt->second);
-                    if (sv) provider->SetSpeed(*sv);
-                }
-
+                // Sync loop state from properties.
                 auto loopIt = node.properties.find(L"Loop");
                 if (loopIt != node.properties.end())
                 {
