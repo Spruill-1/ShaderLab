@@ -176,6 +176,22 @@ namespace ShaderLab::Rendering
                     node->customEffect->analysisOutputType == AnalysisOutputType::Typed &&
                     !node->customEffect->analysisFields.empty())
                 {
+                    // Resolve property bindings for parameter/math/clock nodes.
+                    if (!node->propertyBindings.empty())
+                    {
+                        std::map<std::wstring, PropertyValue> effectiveProps;
+                        bool bindingsChanged = ResolveBindings(*node, graph, effectiveProps);
+                        if (bindingsChanged)
+                        {
+                            for (const auto& [propName, binding] : node->propertyBindings)
+                            {
+                                auto eit = effectiveProps.find(propName);
+                                if (eit != effectiveProps.end())
+                                    node->properties[propName] = eit->second;
+                            }
+                        }
+                    }
+
                     node->analysisOutput.type = AnalysisOutputType::Typed;
                     node->analysisOutput.fields.clear();
 
