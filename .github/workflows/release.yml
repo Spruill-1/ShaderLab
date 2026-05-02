@@ -21,12 +21,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [x64, arm64]
+        include:
+          - platform: x64
+            msbuild_platform: x64
+          - platform: arm64
+            msbuild_platform: ARM64
 
     env:
       Solution_Path: ShaderLab.slnx
       Configuration: Release
-      Platform: ${{ matrix.platform }}
+      Platform: ${{ matrix.msbuild_platform }}
 
     steps:
       - name: Checkout
@@ -74,9 +78,10 @@ jobs:
 
           # Find the VS-produced sideload bundle dir (contains the .msix + Dependencies\).
           # Filter to the matching platform to avoid picking up other-arch outputs.
-          $platform = '${{ env.Platform }}'
+          $platform = '${{ matrix.platform }}'
+          $msbuildPlatform = '${{ matrix.msbuild_platform }}'
           $msix = Get-ChildItem -Recurse -Path AppPackages -Filter '*.msix' -File `
-            | Where-Object { $_.FullName -match "_${platform}[_\\.]" -or $_.Directory.FullName -match "_${platform}_" } `
+            | Where-Object { $_.FullName -match "_${msbuildPlatform}[_\\.]" -or $_.Directory.FullName -match "_${msbuildPlatform}_" } `
             | Sort-Object FullName | Select-Object -First 1
           if (-not $msix) {
             # Fallback: pick first .msix whose parent folder name contains the platform.
