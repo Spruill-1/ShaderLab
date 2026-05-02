@@ -27,8 +27,18 @@ if ($devMode -ne 1) {
 }
 
 if (-not $MsixPath) {
-    $MsixPath = Get-ChildItem -Path $PSScriptRoot -Filter '*.msix' -File -Recurse `
-        | Sort-Object FullName | Select-Object -First 1 -ExpandProperty FullName
+    # Pick the ShaderLab package, not Microsoft.* dependency .msix files that
+    # may also live next to this script. Exclude anything starting with
+    # "Microsoft." and prefer files containing "ShaderLab".
+    $candidates = Get-ChildItem -Path $PSScriptRoot -Filter '*.msix' -File `
+        | Where-Object { $_.Name -notlike 'Microsoft.*' }
+    $shaderLab = $candidates | Where-Object { $_.Name -like '*ShaderLab*' } | Select-Object -First 1
+    if ($shaderLab) {
+        $MsixPath = $shaderLab.FullName
+    }
+    elseif ($candidates) {
+        $MsixPath = ($candidates | Sort-Object FullName | Select-Object -First 1).FullName
+    }
 }
 if (-not $MsixPath -or -not (Test-Path $MsixPath)) {
     Write-Host "ERROR: No .msix file found. Pass -MsixPath '<path-to-msix>'." -ForegroundColor Red
@@ -37,17 +47,37 @@ if (-not $MsixPath -or -not (Test-Path $MsixPath)) {
 
 Write-Host "Installing $MsixPath ..." -ForegroundColor Cyan
 
-# Install dependencies first (VCLibs UWPDesktop, WindowsAppRuntime).
+# Determine current architecture (PowerShell maps amd64 -> x64 for MSIX naming).
+$arch = $env:PROCESSOR_ARCHITECTURE.ToLower()
+if ($arch -eq 'amd64') { $arch = 'x64' }
+
+function Install-Dependency($file) {
+    # Skip wrong-architecture packages by filename heuristic
+    # (VS sideload packages embed the arch in the filename, e.g.
+    # Microsoft.WindowsAppRuntime.1.8_8000.1099.354.0_arm64__8wekyb3d8bbwe.msix).
+    $lower = $file.Name.ToLower()
+    foreach ($otherArch in @('x86','x64','arm64')) {
+        if ($otherArch -ne $arch -and $lower -match "[_\.]$otherArch([_\.]|$)") {
+            return  # skip
+        }
+    }
+    Write-Host "  Dependency: $($file.Name)" -ForegroundColor DarkGray
+    try { Add-AppxPackage -Path $file.FullName -ErrorAction SilentlyContinue } catch {}
+}
+
+# Top-level Microsoft.* dependency packages (some release zips put them next to Install.ps1).
+$mainName = [System.IO.Path]::GetFileName($MsixPath)
+Get-ChildItem -Path (Join-Path $PSScriptRoot '*') -Include '*.appx','*.msix' -File |
+    Where-Object { $_.Name -ne $mainName -and $_.Name -like 'Microsoft.*' } |
+    ForEach-Object { Install-Dependency $_ }
+
+# Install dependencies bundled by VS sideload under Dependencies\<arch>\.
 $depsDir = Join-Path (Split-Path $MsixPath -Parent) 'Dependencies'
 if (Test-Path $depsDir) {
-    $arch = $env:PROCESSOR_ARCHITECTURE.ToLower()
-    if ($arch -eq 'amd64') { $arch = 'x64' }
     $archDir = Join-Path $depsDir $arch
     if (Test-Path $archDir) {
-        Get-ChildItem -Path $archDir -Filter '*.appx' -File | ForEach-Object {
-            Write-Host "  Dependency: $($_.Name)" -ForegroundColor DarkGray
-            try { Add-AppxPackage -Path $_.FullName -ErrorAction SilentlyContinue } catch {}
-        }
+        Get-ChildItem -Path (Join-Path $archDir '*') -Include '*.appx','*.msix' -File |
+            ForEach-Object { Install-Dependency $_ }
     }
 }
 

@@ -14,14 +14,19 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Build & Publish Release
+  build:
+    name: Build (${{ matrix.platform }})
     runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, arm64]
 
     env:
       Solution_Path: ShaderLab.slnx
       Configuration: Release
-      Platform: x64
+      Platform: ${{ matrix.platform }}
 
     steps:
       - name: Checkout
@@ -68,8 +73,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
           # Find the VS-produced sideload bundle dir (contains the .msix + Dependencies\).
+          # Filter to the matching platform to avoid picking up other-arch outputs.
+          $platform = '${{ env.Platform }}'
           $msix = Get-ChildItem -Recurse -Path AppPackages -Filter '*.msix' -File `
+            | Where-Object { $_.FullName -match "_${platform}[_\\.]" -or $_.Directory.FullName -match "_${platform}_" } `
             | Sort-Object FullName | Select-Object -First 1
+          if (-not $msix) {
+            # Fallback: pick first .msix whose parent folder name contains the platform.
+            $msix = Get-ChildItem -Recurse -Path AppPackages -Filter '*.msix' -File `
+              | Sort-Object FullName | Select-Object -First 1
+          }
           if (-not $msix) {
             Write-Host "Contents of AppPackages:" -ForegroundColor Yellow
             Get-ChildItem -Recurse -Path AppPackages | Select-Object FullName | Format-Table -AutoSize
@@ -79,7 +92,7 @@ jobs:
           Write-Host "Using bundle: $bundleDir"
 
           $version = '${{ steps.ver.outputs.tag }}' -replace '^v',''
-          $zip = Join-Path $stage "ShaderLab-$version-x64.zip"
+          $zip = Join-Path $stage "ShaderLab-$version-$platform.zip"
 
           # Copy install script alongside the msix, then zip the whole bundle.
           Copy-Item -Force scripts/Install.ps1 (Join-Path $bundleDir 'Install.ps1')
@@ -91,15 +104,36 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ShaderLab-${{ steps.ver.outputs.tag }}
+          name: ShaderLab-${{ steps.ver.outputs.tag }}-${{ matrix.platform }}
           path: ${{ steps.collect.outputs.stage }}
           retention-days: 90
 
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ShaderLab-${{ steps.ver.outputs.tag }}-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -R artifacts
+
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ShaderLab ${{ steps.ver.outputs.tag }}
           generate_release_notes: true
-          files: ${{ steps.collect.outputs.stage }}/*
+          files: artifacts/*.zip
