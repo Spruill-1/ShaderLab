@@ -386,11 +386,8 @@ namespace winrt::ShaderLab::implementation
         factory->QueryInterface(IID_PPV_ARGS(factory1.put()));
         if (!factory1) return;
 
-        HRESULT hr1 = ::ShaderLab::Effects::CustomPixelShaderEffect::RegisterEffect(factory1.get());
-        HRESULT hr2 = ::ShaderLab::Effects::CustomComputeShaderEffect::RegisterEffect(factory1.get());
-        HRESULT hr3 = ::ShaderLab::Effects::StatisticsEffect::RegisterEffect(factory1.get());
-        OutputDebugStringW(std::format(L"[CustomFX] RegisterEffect pixel=0x{:08X} compute=0x{:08X} stats=0x{:08X}\n",
-            static_cast<uint32_t>(hr1), static_cast<uint32_t>(hr2), static_cast<uint32_t>(hr3)).c_str());
+        ::ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
+        OutputDebugStringW(L"[CustomFX] Registered engine D2D effects\n");
 
         m_customEffectsRegistered = true;
     }

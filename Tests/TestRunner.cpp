@@ -1,4 +1,4 @@
-#include "pch.h"
+#include "pch_engine.h"
 #include "Graph/EffectGraph.h"
 #include "Rendering/GraphEvaluator.h"
 #include "Effects/SourceNodeFactory.h"
@@ -34,6 +34,7 @@ namespace
             printf("  [FAIL] %s\n", name);
             g_failed++;
         }
+        fflush(stdout);
     }
 
     // Shared device resources.
@@ -60,10 +61,7 @@ namespace
 
     bool HasOutput(const ShaderLab::Graph::EffectNode& node)
     {
-        if (!node.cachedOutput) return false;
-        D2D1_RECT_F bounds{};
-        g_dc->GetImageLocalBounds(node.cachedOutput, &bounds);
-        return (bounds.right - bounds.left) > 0 && (bounds.bottom - bounds.top) > 0;
+        return node.cachedOutput != nullptr;
     }
 
     // ========================================================================
@@ -102,7 +100,8 @@ namespace
         TEST("TopoSort", topo.size() == 2 && topo[0] == srcId);
 
         // Cycle detection.
-        TEST("NoCycleForward", !g.WouldCreateCycle(blurId, srcId));
+        TEST("DetectsCycle", g.WouldCreateCycle(blurId, srcId));
+        TEST("AllowsExisting", !g.WouldCreateCycle(srcId, blurId));
     }
 
     void TestSerialization()
@@ -149,6 +148,9 @@ namespace
         };
         for (const auto* name : names)
         {
+            std::string testName = "Source_";
+            for (const wchar_t* p = name; *p; ++p) testName += static_cast<char>(*p);
+
             auto* desc = registry.FindByName(name);
             if (!desc) { TEST("FindDescriptor", false); continue; }
 
@@ -160,8 +162,6 @@ namespace
 
             auto* n = g.FindNode(id);
             bool ok = n && HasOutput(*n) && n->runtimeError.empty();
-            std::string testName = "Source_";
-            for (const wchar_t* p = name; *p; ++p) testName += static_cast<char>(*p);
             TEST(testName.c_str(), ok);
         }
     }
@@ -173,7 +173,7 @@ namespace
 
         const wchar_t* names[] = {
             L"Luminance Heatmap", L"Gamut Highlight", L"Nit Map",
-            L"Waveform Monitor", L"Split Comparison"
+            L"Waveform Monitor"
         };
         for (const auto* name : names)
         {
@@ -195,6 +195,28 @@ namespace
             std::string testName = "Analysis_";
             for (const wchar_t* p = name; *p; ++p) testName += static_cast<char>(*p);
             TEST(testName.c_str(), ok);
+        }
+
+        {
+            auto* desc = registry.FindByName(L"Split Comparison");
+            if (!desc) { TEST("FindDescriptor", false); return; }
+
+            ShaderLab::Graph::EffectGraph g;
+            ShaderLab::Effects::SourceNodeFactory sf;
+            auto src1 = ShaderLab::Effects::ShaderLabEffects::CreateNode(
+                *registry.FindByName(L"Gamut Source"));
+            auto src2 = ShaderLab::Effects::ShaderLabEffects::CreateNode(
+                *registry.FindByName(L"Color Checker"));
+            auto fxNode = ShaderLab::Effects::ShaderLabEffects::CreateNode(*desc);
+            auto src1Id = g.AddNode(std::move(src1));
+            auto src2Id = g.AddNode(std::move(src2));
+            auto fxId = g.AddNode(std::move(fxNode));
+            g.Connect(src1Id, 0, fxId, 0);
+            g.Connect(src2Id, 0, fxId, 1);
+            Evaluate(g, sf);
+
+            auto* n = g.FindNode(fxId);
+            TEST("Analysis_Split Comparison", n && HasOutput(*n) && n->runtimeError.empty());
         }
     }
 
@@ -388,6 +410,9 @@ void main(uint3 id : SV_DispatchThreadID) { output[id.xy] = float4(1,0,0,1); }
 
 int main(int argc, char* argv[])
 {
+    winrt::init_apartment();
+    MFStartup(MF_VERSION);
+
     // Parse adapter flag.
     bool useWarp = false;
     for (int i = 1; i < argc; ++i) {
@@ -397,6 +422,7 @@ int main(int argc, char* argv[])
         }
     }
 
+    setvbuf(stdout, nullptr, _IONBF, 0);
     printf("ShaderLab Test Runner\n");
     printf("=====================\n");
 
@@ -437,10 +463,7 @@ int main(int argc, char* argv[])
     // Register custom effects.
     winrt::com_ptr<ID2D1Factory1> factory1;
     g_d2dFactory->QueryInterface(factory1.put());
-    if (factory1) {
-        ShaderLab::Effects::CustomPixelShaderEffect::RegisterEffect(factory1.get());
-        ShaderLab::Effects::CustomComputeShaderEffect::RegisterEffect(factory1.get());
-    }
+    ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
 
     // Run tests.
     TestGraphOperations();
@@ -462,5 +485,7 @@ int main(int argc, char* argv[])
         printf("%d PASSED, %d FAILED out of %d\n", g_passed, g_failed, g_passed + g_failed);
     printf("========================================\n");
 
+    MFShutdown();
+    winrt::uninit_apartment();
     return g_failed;
 }

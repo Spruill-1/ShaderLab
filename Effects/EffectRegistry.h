@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 #include "../Graph/EffectNode.h"
 #include "PropertyMetadata.h"
 
@@ -28,7 +29,7 @@ namespace ShaderLab::Effects
 
     // Singleton catalog of all registered built-in D2D effects.
     // Populated once at startup with the common D2D effects.
-    class EffectRegistry
+    class SHADERLAB_API EffectRegistry
     {
     public:
         // Access the global registry instance.

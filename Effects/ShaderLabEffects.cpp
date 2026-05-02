@@ -1,8 +1,19 @@
-#include "pch.h"
+#include "pch_engine.h"
 #include "ShaderLabEffects.h"
+#include "CustomComputeShaderEffect.h"
+#include "CustomPixelShaderEffect.h"
+#include "StatisticsEffect.h"
 
 namespace ShaderLab::Effects
 {
+    void RegisterEngineD2DEffects(ID2D1Factory1* factory)
+    {
+        if (!factory) return;
+        CustomPixelShaderEffect::RegisterEffect(factory);
+        CustomComputeShaderEffect::RegisterEffect(factory);
+        StatisticsEffect::RegisterEffect(factory);
+    }
+
     // -----------------------------------------------------------------------
     // Shared color math HLSL (prepended to all ShaderLab shaders)
     // -----------------------------------------------------------------------

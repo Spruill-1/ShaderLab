@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 #include "EffectNode.h"
 #include "EffectEdge.h"
 
@@ -8,7 +9,7 @@ namespace ShaderLab::Graph
 {
     // DAG-based effect graph.
     // Owns nodes and edges; provides topological ordering and JSON round-trip.
-    class EffectGraph
+    class SHADERLAB_API EffectGraph
     {
     public:
         EffectGraph() = default;

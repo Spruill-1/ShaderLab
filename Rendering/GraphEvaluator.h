@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 #include "../Graph/EffectGraph.h"
 #include "../Effects/CustomPixelShaderEffect.h"
 #include "../Effects/CustomComputeShaderEffect.h"
@@ -21,10 +22,12 @@ namespace ShaderLab::Rendering
     // Usage:
     //   auto* finalImage = evaluator.Evaluate(graph, deviceContext);
     //   if (finalImage) { dc->DrawImage(finalImage); }
-    class GraphEvaluator
+    class SHADERLAB_API GraphEvaluator
     {
     public:
         GraphEvaluator() = default;
+        GraphEvaluator(const GraphEvaluator&) = delete;
+        GraphEvaluator& operator=(const GraphEvaluator&) = delete;
 
         // Walk the graph in topological order and produce the final output image.
         // Returns nullptr if the graph is empty or has no Output node.

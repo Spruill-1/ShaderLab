@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 
 namespace ShaderLab::Effects
 {
@@ -10,7 +11,7 @@ namespace ShaderLab::Effects
     // Decode happens on a background thread (raw byte copy only).
     // Color conversion (YCbCr→RGB→PQ→linear→gamut→scRGB) runs on GPU
     // via a D3D11 compute shader during UploadIfReady().
-    class VideoSourceProvider
+    class SHADERLAB_API VideoSourceProvider
     {
     public:
         VideoSourceProvider();

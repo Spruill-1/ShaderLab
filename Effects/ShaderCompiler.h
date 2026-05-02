@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 
 namespace ShaderLab::Effects
 {
@@ -31,7 +32,7 @@ namespace ShaderLab::Effects
         bool                     succeeded{ false };
 
         // Human-readable error string (empty on success).
-        std::wstring ErrorMessage() const;
+        SHADERLAB_API std::wstring ErrorMessage() const;
     };
 
     // Reflection result.
@@ -44,7 +45,7 @@ namespace ShaderLab::Effects
 
     // HLSL shader compilation and reflection utilities.
     // Wraps D3DCompile and D3DReflect for use by the custom effect system.
-    class ShaderCompiler
+    class SHADERLAB_API ShaderCompiler
     {
     public:
         // Compile an HLSL file from disk.

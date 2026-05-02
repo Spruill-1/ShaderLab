@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 #include "DisplayProfile.h"
 
 namespace ShaderLab::Rendering
@@ -16,12 +17,12 @@ namespace ShaderLab::Rendering
     };
 
     // Parses ICC profile binary files to extract display colorimetry data.
-    class IccProfileParser
+    class SHADERLAB_API IccProfileParser
     {
     public:
         static std::optional<IccProfileData> LoadFromFile(const std::wstring& filePath);
     };
 
     // Converts parsed ICC data into a full DisplayProfile.
-    DisplayProfile DisplayProfileFromIcc(const IccProfileData& icc);
+    SHADERLAB_API DisplayProfile DisplayProfileFromIcc(const IccProfileData& icc);
 }

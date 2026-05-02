@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 
 namespace ShaderLab::Effects
 {
@@ -12,7 +13,7 @@ namespace ShaderLab::Effects
     //
     // For HDR images, the loader converts to GUID_WICPixelFormat64bppRGBAHalf
     // (FP16) to preserve extended range. For SDR, it uses GUID_WICPixelFormat32bppPBGRA.
-    class ImageLoader
+    class SHADERLAB_API ImageLoader
     {
     public:
         ImageLoader();

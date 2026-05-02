@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 #include "../Graph/EffectNode.h"
 
 namespace ShaderLab::Effects
@@ -51,7 +52,7 @@ namespace ShaderLab::Effects
     };
 
     // Registry of all ShaderLab pre-built effects.
-    class ShaderLabEffects
+    class SHADERLAB_API ShaderLabEffects
     {
     public:
         static ShaderLabEffects& Instance();
@@ -79,6 +80,8 @@ namespace ShaderLab::Effects
 
         std::vector<ShaderLabEffectDescriptor> m_effects;
     };
+
+    SHADERLAB_API void RegisterEngineD2DEffects(ID2D1Factory1* factory);
 
     // Shared HLSL color math functions (prepended to all ShaderLab shaders).
     const std::string& GetColorMathHLSL();

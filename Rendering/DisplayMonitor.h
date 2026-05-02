@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 #include "DisplayInfo.h"
 #include "DisplayProfile.h"
 
@@ -15,7 +16,7 @@ namespace ShaderLab::Rendering
     //
     // Both paths re-query IDXGIOutput6::GetDesc1 and fire the callback
     // only when capabilities actually differ from the cached snapshot.
-    class DisplayMonitor
+    class SHADERLAB_API DisplayMonitor
     {
     public:
         DisplayMonitor() = default;

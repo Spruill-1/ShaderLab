@@ -1,0 +1,133 @@
+﻿{
+    "formatVersion":  2,
+    "appVersion":  "1.1.0",
+    "nodes":  [
+                  {
+                      "id":  1,
+                      "name":  "Gamut Source",
+                      "type":  "PixelShader",
+                      "position":  [
+                                       60,
+                                       60
+                                   ],
+                      "properties":  [
+                                         {
+                                             "name":  "Gamut",
+                                             "type":  "float",
+                                             "value":  0
+                                         },
+                                         {
+                                             "name":  "Luminance",
+                                             "type":  "float",
+                                             "value":  80
+                                         },
+                                         {
+                                             "name":  "OutputSize",
+                                             "type":  "float",
+                                             "value":  64
+                                         },
+                                         {
+                                             "name":  "WsBlueX_hidden",
+                                             "type":  "float",
+                                             "value":  0.15000000596046448
+                                         },
+                                         {
+                                             "name":  "WsBlueY_hidden",
+                                             "type":  "float",
+                                             "value":  0.059999998658895493
+                                         },
+                                         {
+                                             "name":  "WsGreenX_hidden",
+                                             "type":  "float",
+                                             "value":  0.30000001192092896
+                                         },
+                                         {
+                                             "name":  "WsGreenY_hidden",
+                                             "type":  "float",
+                                             "value":  0.60000002384185791
+                                         },
+                                         {
+                                             "name":  "WsRedX_hidden",
+                                             "type":  "float",
+                                             "value":  0.63999998569488525
+                                         },
+                                         {
+                                             "name":  "WsRedY_hidden",
+                                             "type":  "float",
+                                             "value":  0.33000001311302185
+                                         }
+                                     ],
+                      "inputPins":  [
+
+                                    ],
+                      "outputPins":  [
+                                         {
+                                             "name":  "Output",
+                                             "index":  0
+                                         }
+                                     ],
+                      "customEffect":  {
+                                           "shaderType":  0,
+                                           "hlslSource":  "\n// ---- ShaderLab Color Math Library ----\n\n// scRGB: linear Rec.709 primaries, 1.0 = 80 nits SDR white\n// Pipeline operates in FP16 scRGB throughout.\n\n// sRGB EOTF (decode gamma)\nfloat3 SRGBToLinear(float3 c) {\n    return float3(\n        c.r \u003c= 0.04045 ? c.r / 12.92 : pow((c.r + 0.055) / 1.055, 2.4),\n        c.g \u003c= 0.04045 ? c.g / 12.92 : pow((c.g + 0.055) / 1.055, 2.4),\n        c.b \u003c= 0.04045 ? c.b / 12.92 : pow((c.b + 0.055) / 1.055, 2.4));\n}\n\n// sRGB inverse EOTF (encode gamma)\nfloat3 LinearToSRGB(float3 c) {\n    return float3(\n        c.r \u003c= 0.0031308 ? c.r * 12.92 : 1.055 * pow(c.r, 1.0/2.4) - 0.055,\n        c.g \u003c= 0.0031308 ? c.g * 12.92 : 1.055 * pow(c.g, 1.0/2.4) - 0.055,\n        c.b \u003c= 0.0031308 ? c.b * 12.92 : 1.055 * pow(c.b, 1.0/2.4) - 0.055);\n}\n\n// scRGB (Rec.709 linear) -\u003e CIE XYZ (D65)\nstatic const float3x3 REC709_TO_XYZ = float3x3(\n    0.4123908, 0.3575843, 0.1804808,\n    0.2126390, 0.7151687, 0.0721923,\n    0.0193308, 0.1191950, 0.9505322\n);\n\n// CIE XYZ (D65) -\u003e scRGB (Rec.709 linear)\nstatic const float3x3 XYZ_TO_REC709 = float3x3(\n     3.2409699, -1.5373832, -0.4986108,\n    -0.9692436,  1.8759675,  0.0415551,\n     0.0556301, -0.2039770,  1.0569715\n);\n\n// scRGB -\u003e CIE XYZ\nfloat3 ScRGBToXYZ(float3 rgb) {\n    return mul(REC709_TO_XYZ, rgb);\n}\n\n// CIE XYZ -\u003e scRGB\nfloat3 XYZToScRGB(float3 xyz) {\n    return mul(XYZ_TO_REC709, xyz);\n}\n\n// CIE XYZ -\u003e CIE xyY\nfloat3 XYZToxyY(float3 xyz) {\n    float sum = xyz.x + xyz.y + xyz.z;\n    float2 xy = (sum \u003c 1e-10) ? float2(0.3127, 0.3290) : float2(xyz.x / sum, xyz.y / sum);\n    return float3(xy, xyz.y);\n}\n\n// CIE xyY -\u003e CIE XYZ\nfloat3 xyYToXYZ(float3 xyY) {\n    float X = (xyY.y \u003c 1e-10) ? 0.0 : xyY.x * xyY.z / xyY.y;\n    float Z = (xyY.y \u003c 1e-10) ? 0.0 : (1.0 - xyY.x - xyY.y) * xyY.z / xyY.y;\n    return float3(X, xyY.z, Z);\n}\n\n// Luminance in nits from scRGB (1.0 scRGB = 80 nits)\nfloat ScRGBToNits(float3 rgb) {\n    return dot(rgb, float3(0.2126390, 0.7151687, 0.0721923)) * 80.0;\n}\n\n// Luminance in nits from scRGB (Y component, handles negative values)\nfloat ScRGBLuminanceNits(float3 rgb) {\n    return max(0.0, dot(rgb, float3(0.2126390, 0.7151687, 0.0721923))) * 80.0;\n}\n\n// PQ (ST.2084) EOTF: PQ signal [0,1] -\u003e linear nits [0,10000]\nfloat PQ_EOTF(float N) {\n    float Np = pow(max(N, 0.0), 1.0 / 78.84375);\n    float num = max(Np - 0.8359375, 0.0);\n    float den = 18.8515625 - 18.6875 * Np;\n    return 10000.0 * pow(num / max(den, 1e-10), 1.0 / 0.1593017578125);\n}\n\n// PQ inverse EOTF: linear nits [0,10000] -\u003e PQ signal [0,1]\nfloat PQ_InvEOTF(float L) {\n    float Lp = pow(max(L, 0.0) / 10000.0, 0.1593017578125);\n    float num = 0.8359375 + 18.8515625 * Lp;\n    float den = 1.0 + 18.6875 * Lp;\n    return pow(num / den, 78.84375);\n}\n\n// Rec.2020 linear -\u003e CIE XYZ\nstatic const float3x3 REC2020_TO_XYZ = float3x3(\n    0.6369580, 0.1446169, 0.1688810,\n    0.2627002, 0.6779981, 0.0593017,\n    0.0000000, 0.0280727, 1.0609851\n);\n\n// CIE XYZ -\u003e Rec.2020 linear\nstatic const float3x3 XYZ_TO_REC2020 = float3x3(\n     1.7166512, -0.3556708, -0.2533663,\n    -0.6666844,  1.6164812,  0.0157685,\n     0.0176399, -0.0427706,  0.9421031\n);\n\n// DCI-P3 (D65) linear -\u003e CIE XYZ\nstatic const float3x3 P3D65_TO_XYZ = float3x3(\n    0.4865709, 0.2656677, 0.1982173,\n    0.2289746, 0.6917385, 0.0792869,\n    0.0000000, 0.0451134, 1.0439444\n);\n\n// CIE XYZ -\u003e DCI-P3 (D65) linear\nstatic const float3x3 XYZ_TO_P3D65 = float3x3(\n     2.4934969, -0.9313836, -0.4027108,\n    -0.8294890,  1.7626641,  0.0236247,\n     0.0358458, -0.0761724,  0.9568845\n);\n\n// Gamut primaries in CIE xy coordinates\n// Rec.709/sRGB\nstatic const float2 GAMUT_709_R  = float2(0.64, 0.33);\nstatic const float2 GAMUT_709_G  = float2(0.30, 0.60);\nstatic const float2 GAMUT_709_B  = float2(0.15, 0.06);\n\n// DCI-P3 (D65)\nstatic const float2 GAMUT_P3_R   = float2(0.680, 0.320);\nstatic const float2 GAMUT_P3_G   = float2(0.265, 0.690);\nstatic const float2 GAMUT_P3_B   = float2(0.150, 0.060);\n\n// Rec.2020\nstatic const float2 GAMUT_2020_R = float2(0.708, 0.292);\nstatic const float2 GAMUT_2020_G = float2(0.170, 0.797);\nstatic const float2 GAMUT_2020_B = float2(0.131, 0.046);\n\n// D65 white point\nstatic const float2 D65_WHITE    = float2(0.3127, 0.3290);\n\n// Check if point p is inside triangle (a, b, c) using barycentric coordinates\nbool PointInTriangle(float2 p, float2 a, float2 b, float2 c) {\n    float2 v0 = c - a, v1 = b - a, v2 = p - a;\n    float d00 = dot(v0, v0);\n    float d01 = dot(v0, v1);\n    float d02 = dot(v0, v2);\n    float d11 = dot(v1, v1);\n    float d12 = dot(v1, v2);\n    float inv = 1.0 / (d00 * d11 - d01 * d01);\n    float u = (d11 * d02 - d01 * d12) * inv;\n    float v = (d00 * d12 - d01 * d02) * inv;\n    return (u \u003e= 0) \u0026\u0026 (v \u003e= 0) \u0026\u0026 (u + v \u003c= 1.0);\n}\n\n// Turbo colormap approximation (for luminance heatmaps)\nfloat3 TurboColormap(float t) {\n    t = saturate(t);\n    float r = saturate(0.13572138 + t * (4.61539260 + t * (-42.66032258 + t * (132.13108234 + t * (-152.94239396 + t * 59.28637943)))));\n    float g = saturate(0.09140261 + t * (2.19418839 + t * (4.84296658 + t * (-14.18503333 + t * (4.27729857 + t * 2.82956604)))));\n    float b = saturate(0.10667330 + t * (12.64194608 + t * (-60.58204836 + t * (110.36276771 + t * (-89.90310912 + t * 27.34824973)))));\n    return float3(r, g, b);\n}\n\n// D65 reference white in XYZ\nstatic const float3 D65_XYZ = float3(0.95047, 1.00000, 1.08883);\n\n// CIE Lab helper\nfloat LabF(float t) {\n    // Signed extension: handle negative XYZ values from out-of-gamut scRGB.\n    float at = abs(t);\n    float ft = (at \u003e 0.008856) ? pow(at, 1.0/3.0) : (7.787 * at + 16.0/116.0);\n    return (t \u003c 0.0) ? -ft : ft;\n}\n\n// CIE XYZ -\u003e CIE L*a*b* (D65)\nfloat3 XYZToLab(float3 xyz) {\n    float fx = LabF(xyz.x / D65_XYZ.x);\n    float fy = LabF(xyz.y / D65_XYZ.y);\n    float fz = LabF(xyz.z / D65_XYZ.z);\n    float L = 116.0 * fy - 16.0;\n    float a = 500.0 * (fx - fy);\n    float b = 200.0 * (fy - fz);\n    return float3(L, a, b);\n}\n\n// scRGB -\u003e CIE L*a*b*\nfloat3 ScRGBToLab(float3 rgb) {\n    return XYZToLab(ScRGBToXYZ(rgb));\n}\n\n// ---- ICtCp (BT.2100) ----\n// Pipeline: scRGB -\u003e XYZ -\u003e LMS (BT.2124 cross-talk) -\u003e PQ encode -\u003e ICtCp\n\n// XYZ to LMS (BT.2124 / Hunt-Pointer-Estevez with cross-talk)\nstatic const float3x3 XYZ_TO_LMS_ICTCP = float3x3(\n     0.3592832, 0.6976051, -0.0358916,\n    -0.1920808, 1.1004768,  0.0753741,\n     0.0070797, 0.0748262,  0.8433009\n);\n\n// LMS to XYZ (inverse)\nstatic const float3x3 LMS_TO_XYZ_ICTCP = float3x3(\n     2.0701800, -1.3264569,  0.2066510,\n     0.3649882,  0.6805541, -0.0453723,\n    -0.0496570, -0.0492033,  1.1880720\n);\n\n// PQ-encoded LMS to ICtCp\nstatic const float3x3 PQLMS_TO_ICTCP = float3x3(\n    2048.0/4096.0,  2048.0/4096.0,     0.0/4096.0,\n    6610.0/4096.0, -13613.0/4096.0,  7003.0/4096.0,\n   17933.0/4096.0, -17390.0/4096.0,  -543.0/4096.0\n);\n\n// ICtCp to PQ-encoded LMS (inverse)\nstatic const float3x3 ICTCP_TO_PQLMS = float3x3(\n    1.0,  0.008609037,  0.111029625,\n    1.0, -0.008609037, -0.111029625,\n    1.0,  0.560031336, -0.320627175\n);\n\n// scRGB -\u003e ICtCp\nfloat3 ScRGBToICtCp(float3 rgb) {\n    // scRGB (1.0 = 80 nits) -\u003e absolute luminance XYZ\n    float3 xyz = ScRGBToXYZ(max(rgb, 0.0));\n    // Scale to absolute nits for PQ (XYZ Y=1 = 80 nits in scRGB)\n    xyz *= 80.0;\n    float3 lms = mul(XYZ_TO_LMS_ICTCP, xyz);\n    lms = max(lms, 0.0);\n    // PQ encode each LMS component (input in nits, output [0,1])\n    float3 pqLms = float3(\n        PQ_InvEOTF(lms.x),\n        PQ_InvEOTF(lms.y),\n        PQ_InvEOTF(lms.z));\n    return mul(PQLMS_TO_ICTCP, pqLms);\n}\n\n// ICtCp -\u003e scRGB\nfloat3 ICtCpToScRGB(float3 ictcp) {\n    float3 pqLms = mul(ICTCP_TO_PQLMS, ictcp);\n    // PQ decode to nits\n    float3 lms = float3(\n        PQ_EOTF(pqLms.x),\n        PQ_EOTF(pqLms.y),\n        PQ_EOTF(pqLms.z));\n    float3 xyz = mul(LMS_TO_XYZ_ICTCP, lms);\n    // Scale back from nits to scRGB (80 nits = 1.0)\n    xyz /= 80.0;\n    return XYZToScRGB(xyz);\n}\n\n// OKLab: linear sRGB -\u003e OKLab\nfloat3 LinearToOKLab(float3 c) {\n    float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;\n    float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;\n    float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;\n    float l_ = pow(max(l, 0.0), 1.0/3.0);\n    float m_ = pow(max(m, 0.0), 1.0/3.0);\n    float s_ = pow(max(s, 0.0), 1.0/3.0);\n    return float3(\n        0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,\n        1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,\n        0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_\n    );\n}\n\n// Gamut Source - generates all colors within a selected color gamut\n// Fixed coordinate system centered on D65 white point. Scale fits Rec.2020\n// so all three gamuts share the same spatial mapping.\n\ncbuffer constants : register(b0) {\n    float Gamut;        // 0=Rec.709, 1=DCI-P3, 2=Rec.2020, 3=Working Space\n    float Luminance;    // nits (default 80.0, maps to scRGB 1.0)\n    float OutputSize;   // pixels (default 1024)\n    float WsRedX_hidden;   float WsRedY_hidden;\n    float WsGreenX_hidden; float WsGreenY_hidden;\n    float WsBlueX_hidden;  float WsBlueY_hidden;\n};\n\nfloat4 main(\n    float4 pos : SV_POSITION,\n    float4 uv0 : TEXCOORD0) : SV_TARGET\n{\n    float size = max(OutputSize, 128.0);\n\n    // Select gamut primaries\n    float2 r, g, b;\n    if (Gamut \u003e 2.5)     { r = float2(WsRedX_hidden, WsRedY_hidden);\n                           g = float2(WsGreenX_hidden, WsGreenY_hidden);\n                           b = float2(WsBlueX_hidden, WsBlueY_hidden); }\n    else if (Gamut \u003e 1.5){ r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }\n    else if (Gamut \u003e 0.5){ r = GAMUT_P3_R;   g = GAMUT_P3_G;   b = GAMUT_P3_B; }\n    else                 { r = GAMUT_709_R;  g = GAMUT_709_G;  b = GAMUT_709_B; }\n\n    float2 center = D65_WHITE;\n    float halfExtent = 0.50;\n\n    float2 uv = uv0.xy / size;\n    float2 xy;\n    xy.x = center.x + (uv.x - 0.5) * 2.0 * halfExtent;\n    xy.y = center.y - (uv.y - 0.5) * 2.0 * halfExtent;\n\n    if (!PointInTriangle(xy, r, g, b))\n        return float4(0, 0, 0, 1.0);\n\n    float Y = Luminance / 80.0;\n    float3 xyY_val = float3(xy.x, xy.y, Y);\n    float3 xyz = xyYToXYZ(xyY_val);\n    float3 rgb = XYZToScRGB(xyz);\n\n    return float4(rgb, 1.0);\n}\n",
+                                           "inputNames":  [
+
+                                                          ],
+                                           "parameters":  [
+                                                              {
+                                                                  "name":  "Gamut",
+                                                                  "typeName":  "float",
+                                                                  "minValue":  0,
+                                                                  "maxValue":  3,
+                                                                  "step":  1,
+                                                                  "default":  {
+                                                                                  "name":  "Gamut",
+                                                                                  "type":  "float",
+                                                                                  "value":  0
+                                                                              },
+                                                                  "enumLabels":  [
+                                                                                     "Rec.709",
+                                                                                     "DCI-P3",
+                                                                                     "Rec.2020",
+                                                                                     "Working Space"
+                                                                                 ]
+                                                              },
+                                                              {
+                                                                  "name":  "Luminance",
+                                                                  "typeName":  "float",
+                                                                  "minValue":  0.0099999997764825821,
+                                                                  "maxValue":  10000,
+                                                                  "step":  10,
+                                                                  "default":  {
+                                                                                  "name":  "Luminance",
+                                                                                  "type":  "float",
+                                                                                  "value":  80
+                                                                              }
+                                                              },
+                                                              {
+                                                                  "name":  "OutputSize",
+                                                                  "typeName":  "float",
+                                                                  "minValue":  128,
+                                                                  "maxValue":  4096,
+                                                                  "step":  64,
+                                                                  "default":  {
+                                                                                  "name":  "OutputSize",
+                                                                                  "type":  "float",
+                                                                                  "value":  512
+                                                                              }
+                                                              }
+                                                          ],
+                                           "threadGroupX":  8,
+                                           "threadGroupY":  8,
+                                           "threadGroupZ":  1,
+                                           "analysisOutputType":  0,
+                                           "analysisOutputSize":  256,
+                                           "shaderLabEffectId":  "Gamut Source",
+                                           "shaderLabEffectVersion":  2
+                                       }
+                  }
+              ],
+    "edges":  [
+
+              ],
+    "nextId":  2
+}

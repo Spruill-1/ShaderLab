@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 #include "PipelineFormat.h"
 
 namespace ShaderLab::Rendering
@@ -38,7 +39,7 @@ namespace ShaderLab::Rendering
     // The tone mapper sits between the graph evaluator output and the
     // swap chain render target. It can be bypassed (None mode) or
     // switched at runtime.
-    class ToneMapper
+    class SHADERLAB_API ToneMapper
     {
     public:
         ToneMapper() = default;

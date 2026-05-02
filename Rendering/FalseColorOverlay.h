@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 
 namespace ShaderLab::Rendering
 {
@@ -37,7 +38,7 @@ namespace ShaderLab::Rendering
     //     (e.g. "any channel clipped" would require a custom shader).
     //   - TableTransfer clamps inputs to [0,1], so a pre-scale ColorMatrix is
     //     used to map the expected HDR range into [0,1] before the LUT lookup.
-    class FalseColorOverlay
+    class SHADERLAB_API FalseColorOverlay
     {
     public:
         FalseColorOverlay() = default;

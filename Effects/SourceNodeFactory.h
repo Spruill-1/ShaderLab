@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 #include "../Graph/EffectNode.h"
 #include "ImageLoader.h"
 #include "VideoSourceProvider.h"
@@ -16,10 +17,12 @@ namespace ShaderLab::Effects
     //
     // PrepareSourceNode must be called before graph evaluation to ensure
     // the node's cachedOutput is populated for downstream effects.
-    class SourceNodeFactory
+    class SHADERLAB_API SourceNodeFactory
     {
     public:
         SourceNodeFactory();
+        SourceNodeFactory(const SourceNodeFactory&) = delete;
+        SourceNodeFactory& operator=(const SourceNodeFactory&) = delete;
 
         // Create a Source node configured for image file loading.
         static Graph::EffectNode CreateImageSourceNode(

@@ -170,18 +170,9 @@
     <ClCompile Include="Controls\PixelInspectorController.cpp" />
     <ClCompile Include="Controls\PixelTraceController.cpp" />
     <ClCompile Include="Controls\ShaderEditorController.cpp" />
-    <ClCompile Include="Effects\CustomComputeShaderEffect.cpp" />
-    <ClCompile Include="Effects\CustomPixelShaderEffect.cpp" />
-    <ClCompile Include="Effects\EffectRegistry.cpp" />
-    <ClCompile Include="Effects\ImageLoader.cpp" />
-    <ClCompile Include="Effects\ShaderCompiler.cpp" />
-    <ClCompile Include="Effects\ShaderLabEffects.cpp" />
-    <ClCompile Include="Effects\VideoSourceProvider.cpp" />
-    <ClCompile Include="Effects\SourceNodeFactory.cpp" />
     <ClCompile Include="ShaderLab\McpHttpServer.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="Graph\EffectGraph.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
@@ -196,15 +187,7 @@
       <DependentUpon>EffectDesignerWindow.xaml</DependentUpon>
     </ClCompile>
     <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
-    <ClCompile Include="Rendering\DisplayMonitor.cpp" />
-    <ClCompile Include="Rendering\GraphEvaluator.cpp" />
-    <ClCompile Include="Rendering\GpuReduction.cpp" />
-    <ClCompile Include="Rendering\D3D11ComputeRunner.cpp" />
-    <ClCompile Include="Effects\StatisticsEffect.cpp" />
-    <ClCompile Include="Rendering\IccProfileParser.cpp" />
     <ClCompile Include="Rendering\RenderEngine.cpp" />
-    <ClCompile Include="Rendering\ToneMapper.cpp" />
-    <ClCompile Include="Rendering\FalseColorOverlay.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Midl Include="MainWindow.idl">
@@ -227,6 +210,13 @@
   </ItemGroup>
   <ItemGroup Condition="'$(DisableMsixProjectCapabilityAddedByProject)'!='true' and '$(EnableMsixTooling)'=='true'">
     <ProjectCapability Include="Msix" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="ShaderLabEngine.vcxproj">
+      <Project>{A7A1E0F1-665C-4D06-9AC7-6D6B6A0D0F01}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>true</LinkLibraryDependencies>
+    </ProjectReference>
   </ItemGroup>
   <ItemGroup>
     <None Include=".gitignore" />
@@ -255,6 +245,9 @@
     <Import Project="packages\Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\Microsoft.Windows.ImplementationLibrary.targets" Condition="Exists('packages\Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\Microsoft.Windows.ImplementationLibrary.targets')" />
     <Import Project="packages\Microsoft.Graphics.Win2D.1.3.0\build\native\Microsoft.Graphics.Win2D.targets" Condition="Exists('packages\Microsoft.Graphics.Win2D.1.3.0\build\native\Microsoft.Graphics.Win2D.targets')" />
   </ImportGroup>
+  <Target Name="CopyEngineRuntime" AfterTargets="Build">
+    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll')" />
+  </Target>
   <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">
     <PropertyGroup>
       <ErrorText>This project references NuGet package(s) that are missing on this computer. Use NuGet Package Restore to download them.  For more information, see http://go.microsoft.com/fwlink/?LinkID=322105. The missing file is {0}.</ErrorText>

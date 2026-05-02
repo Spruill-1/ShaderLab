@@ -246,11 +246,7 @@ namespace winrt::ShaderLab::implementation
         // Register custom D2D effects.
         winrt::com_ptr<ID2D1Factory1> factory1;
         d2dFactory->QueryInterface(factory1.put());
-        if (factory1)
-        {
-            ::ShaderLab::Effects::CustomPixelShaderEffect::RegisterEffect(factory1.get());
-            ::ShaderLab::Effects::CustomComputeShaderEffect::RegisterEffect(factory1.get());
-        }
+        ::ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
 
         wprintf(L"[CLI] Device created (%s)\n",
             driverType == D3D_DRIVER_TYPE_WARP ? L"WARP" : L"Hardware");
@@ -422,10 +418,7 @@ namespace winrt::ShaderLab::implementation
 
         winrt::com_ptr<ID2D1Factory1> factory1;
         d2dFactory->QueryInterface(factory1.put());
-        if (factory1) {
-            ::ShaderLab::Effects::CustomPixelShaderEffect::RegisterEffect(factory1.get());
-            ::ShaderLab::Effects::CustomComputeShaderEffect::RegisterEffect(factory1.get());
-        }
+        ::ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
 
         LOG("[TEST] Device created");
 

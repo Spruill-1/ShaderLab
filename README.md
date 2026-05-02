@@ -50,84 +50,38 @@ A WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging
 
 ```mermaid
 graph TB
-    subgraph UI["WinUI 3 / XAML"]
-        MW[MainWindow]
-        NGE[Node Graph Editor]
-        PP[Preview Panel<br/>SwapChainPanel]
-        SE[Shader Editor]
-        PI[Pixel Inspector]
-        PROPS[Properties Panel]
-        EDW[Effect Designer Window]
-        OW[Output Windows<br/>Multi-Output System]
+    subgraph App["ShaderLab.exe (WinUI 3 app)"]
+        MW[MainWindow / App]
+        UI[Controls + MCP + XAML]
+        RE[RenderEngine<br/>SwapChainPanel binding]
     end
 
-    subgraph Core["Core Engine"]
-        EG[EffectGraph<br/>DAG Model]
-        EVAL[Graph Evaluator<br/>Topological Sort]
-        PF[PipelineFormat<br/>scRGB FP16]
-        PARAM[Parameter Nodes<br/>Float/Int/Toggle/Gamut]
+    subgraph Engine["ShaderLabEngine.dll"]
+        EG[Graph/*]
+        EV[GraphEvaluator / ToneMapper / FalseColorOverlay]
+        FX[EffectRegistry / ShaderLabEffects / SourceNodeFactory]
+        IO[ImageLoader / VideoSourceProvider / ShaderCompiler]
+        MON[DisplayMonitor / ICC / GPU reduction]
     end
 
-    subgraph Rendering["Rendering Layer"]
-        D3D[D3D11 Device]
-        D2D[D2D1 Device Context]
-        SC[DXGI Swap Chain<br/>scRGB FP16]
-        W2D[Win2D Interop]
-        GPU[GpuReduction<br/>D3D11 Compute Dispatch]
+    subgraph Tests["ShaderLabTests.exe"]
+        TR[TestRunner main()]
     end
 
-    subgraph Effects["Effect System"]
-        SRC[Source Nodes<br/>WIC Images / Flood]
-        BIN[Built-in D2D Effects]
-        SLE[ShaderLab Effects<br/>18+ Versioned Analysis+Source]
-        PS[Custom Pixel Shaders<br/>ID2D1DrawTransform]
-        CS[Custom Compute Shaders<br/>ID2D1ComputeTransform]
-        STAT[StatisticsEffect<br/>D3D11 GPU Reduction]
-    end
-
-    subgraph Monitoring["Display Monitoring"]
-        DM[Display Change Monitor]
-        HDR[HDR/SDR Detection]
-        LUM[Max Luminance Query]
-        DP[Display Profile<br/>Simulated / Live]
-        ICC[ICC Profile Parser]
-    end
-
-    MW --> NGE
-    MW --> PP
-    MW --> SE
-    MW --> PI
-    MW --> PROPS
-    MW --> EDW
-    MW --> OW
-    NGE --> EG
-    EG --> EVAL
-    EVAL --> D2D
-    EVAL --> GPU
-    PF --> SC
-    PF --> EVAL
-    D3D --> D2D
-    D3D --> SC
-    D3D --> GPU
-    W2D --> D2D
-    SRC --> EG
-    BIN --> EG
-    SLE --> EG
-    PS --> EG
-    CS --> EG
-    PARAM --> EG
-    STAT --> EG
-    DM --> HDR
-    DM --> LUM
-    DM --> DP
-    ICC --> DP
-    DP --> PF
-    SE -.->|Hot Reload| PS
-    SE -.->|Hot Reload| CS
-    EDW -.->|Create/Update| PS
-    EDW -.->|Create/Update| CS
-    PI -.->|Read Back| EVAL
-    OW -.->|Independent Preview| EVAL
+    MW --> UI
+    UI --> RE
+    RE --> EV
+    UI --> EG
+    UI --> FX
+    UI --> MON
+    EV --> EG
+    EV --> FX
+    FX --> IO
+    TR --> EG
+    TR --> EV
+    TR --> FX
+    TR --> IO
+    TR --> MON
 ```
 
 ## Pipeline Format Strategy
@@ -374,6 +328,7 @@ flowchart TD
 | 38 | Parameter nodes as data-only graph elements | No shader, evaluator handles directly. Teal color, inline slider, don't switch preview. Four types: Float, Integer, Toggle, Gamut. | Day 6 |
 | 39 | CPU analysis → GPU reduction for Image Statistics | Moved from pixel shader (512K redundant reads) to CPU readback (exact, single pass) to D3D11 compute (GPU-resident, 32-byte readback). | Day 6 |
 | 40 | dc->Flush() for D2D→D3D11 texture handoff | D2D batches DrawImage commands until EndDraw/Flush. When rendering to a bitmap then reading it with D3D11 compute, Flush() must be called between DrawImage and D3D11 dispatch — otherwise D3D11 reads zeros from the uninitialized texture. Applied in both ComputeImageStatistics and DispatchUserD3D11Compute. | Day 7 |
+| 41 | Split engine code into ShaderLabEngine.dll | Graph/effect/rendering logic now builds once into a native DLL shared by the WinUI app and a standalone console runner. This removes WinUI from the test path, enables direct engine regression runs, and keeps RenderEngine/XAML-specific code isolated in the app project. | Day 8 |
 
 ---
 
@@ -388,6 +343,10 @@ flowchart TD
 1. Open `ShaderLab.slnx` in Visual Studio
 2. NuGet packages restore automatically
 3. Build → Debug x64
+4. Outputs:
+   - `x64\Debug\ShaderLabEngine\ShaderLabEngine.dll`
+   - `x64\Debug\ShaderLab\ShaderLab.exe`
+   - `x64\Debug\ShaderLabTests\ShaderLabTests.exe`
 
 ### Required Libraries (linked via vcxproj)
 
@@ -407,29 +366,35 @@ flowchart TD
 ```
 ShaderLab/
 ├── ShaderLab.slnx              # Solution file
-├── ShaderLab.vcxproj           # Project file (C++/WinRT, NuGet, MSIX)
+├── ShaderLab.vcxproj           # WinUI 3 app project (MSIX packaged app)
+├── ShaderLabEngine.vcxproj     # Shared native engine DLL project
+├── ShaderLabTests.vcxproj      # Standalone console test runner project
 ├── packages.config             # NuGet package manifest
 ├── Package.appxmanifest        # MSIX app identity
 ├── app.manifest                # DPI awareness, heap type
+├── EngineExport.h              # SHADERLAB_API import/export macro
 ├── Version.h                   # App version 1.1.0, graph format version 2
 ├── README.md                   # This file
 ├── CHANGELOG.md                # Version history
 │
-├── pch.h / pch.cpp             # Precompiled header (WinRT, D2D, D3D, Win2D, STL)
+├── pch.h / pch.cpp             # App PCH (WinRT, WinUI, D2D, D3D, Win2D, STL)
+├── pch_engine.h / pch_engine.cpp # Engine/Test PCH (WinRT base, D2D, D3D, MF, STL)
 ├── App.xaml / .h / .cpp        # Application entry point
 ├── MainWindow.xaml / .h / .cpp # Main window layout and initialization (~5000+ lines)
 ├── MainWindow.McpRoutes.cpp    # MCP server routes (~1400 lines)
 ├── MainWindow.idl              # WinRT interface definition
 ├── EffectDesignerWindow.xaml / .h / .cpp  # Effect Designer modal window
+├── Tests/
+│   └── TestRunner.cpp          # Standalone console test suite entry point
 │
-├── Graph/                      # Effect graph data model
+├── Graph/                      # Shared DLL: effect graph data model
 │   ├── NodeType.h              # NodeType enum (Source, BuiltInEffect, PixelShader, ComputeShader, Parameter, Output)
 │   ├── PropertyValue.h         # std::variant type for node properties (float, int, bool, float2-4, string, matrix, vector)
 │   ├── EffectNode.h            # EffectNode struct, ParameterDefinition, PropertyBinding, AnalysisFieldDef
 │   ├── EffectEdge.h            # EffectEdge struct (source/dest node + pin IDs)
 │   ├── EffectGraph.h           # EffectGraph class declaration (DAG, topo sort, JSON, versioning)
 │   └── EffectGraph.cpp         # EffectGraph implementation
-├── Rendering/                  # D3D/D2D device management, swap chain, pipeline
+├── Rendering/                  # Shared DLL rendering + analysis code (except RenderEngine)
 │   ├── DisplayInfo.h           # DisplayCapabilities struct + monitor primaries
 │   ├── DisplayMonitor.h        # DisplayMonitor class (WM_DISPLAYCHANGE + adapter-changed event + simulated profile)
 │   ├── DisplayMonitor.cpp      # DisplayMonitor implementation
@@ -437,8 +402,8 @@ ShaderLab/
 │   ├── IccProfileParser.h      # IccProfileParser class + IccProfileData struct
 │   ├── IccProfileParser.cpp    # ICC binary format parsing (v2/v4), XYZ→xy conversion, gamut detection
 │   ├── PipelineFormat.h        # PipelineFormat struct (scRGB FP16 always)
-│   ├── RenderEngine.h          # RenderEngine class (D3D11 + D2D1 + swap chain lifecycle)
-│   ├── RenderEngine.cpp        # RenderEngine implementation (device creation, resize, draw cycle)
+│   ├── RenderEngine.h          # App-only RenderEngine class (D3D11 + D2D1 + swap chain lifecycle)
+│   ├── RenderEngine.cpp        # App-only RenderEngine implementation (device creation, resize, draw cycle)
 │   ├── GraphEvaluator.h        # GraphEvaluator class (topological walk, effect cache, dirty gating, D3D11 dispatch)
 │   ├── GraphEvaluator.cpp      # GraphEvaluator implementation (per-node evaluation loop, needed-node pruning)
 │   ├── GpuReduction.h          # D3D11 compute reduction (32×32 thread group, groupshared memory, stride pattern)
@@ -463,6 +428,10 @@ ShaderLab/
 │   ├── CustomPixelShaderEffect.cpp # Effect registration, PrepareForRender, cbuffer packing from PropertyValue
 │   ├── CustomComputeShaderEffect.h   # ID2D1EffectImpl + ID2D1ComputeTransform for user compute shaders
 │   └── CustomComputeShaderEffect.cpp # Compute dispatch, CalculateThreadgroups, hardware feature check
+│
+├── x64\Debug\ShaderLabEngine/ # Engine DLL output
+├── x64\Debug\ShaderLab/       # WinUI app output
+├── x64\Debug\ShaderLabTests/  # Console test output
 ├── Controls/                   # Editor controllers and custom UI logic
 │   ├── OutputWindow.h              # Multi-output window (per-Output-node OS window, SwapChainPanel)
 │   ├── OutputWindow.cpp            # Independent pan/zoom/save, bidirectional sync with graph nodes

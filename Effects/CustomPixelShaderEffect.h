@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pch.h"
+#include "pch_engine.h"
+#include "../EngineExport.h"
 #include "ShaderCompiler.h"
 #include "../Graph/PropertyValue.h"
 
