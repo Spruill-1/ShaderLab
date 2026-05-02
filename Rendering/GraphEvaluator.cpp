@@ -100,9 +100,12 @@ namespace ShaderLab::Rendering
                         node->dirty = false;
                     }
 
-                    // The effect's output is an ID2D1Image.
+                    // The effect's output is an ID2D1Image. Take ownership so the
+                    // image survives D2D's internal pipeline churn (input toggles,
+                    // property reapply) until the effect itself is invalidated.
                     winrt::com_ptr<ID2D1Image> output;
                     effect->GetOutput(output.put());
+                    m_outputCache[nodeId] = output;
                     node->cachedOutput = output.get();
 
                     // For analysis effects (e.g., Histogram), force computation
@@ -295,6 +298,7 @@ namespace ShaderLab::Rendering
                     {
                         node->runtimeError = L"Auto-compile failed: " + result.ErrorMessage();
                         node->cachedOutput = nullptr;
+                        m_outputCache.erase(nodeId);
                         break;
                     }
                 }
@@ -304,6 +308,7 @@ namespace ShaderLab::Rendering
                 {
                     node->runtimeError = L"Failed to create D2D effect. Check effect registration.";
                     node->cachedOutput = nullptr;
+                    m_outputCache.erase(nodeId);
                     break;
                 }
                 node->runtimeError.clear();
@@ -368,6 +373,7 @@ namespace ShaderLab::Rendering
 
                     winrt::com_ptr<ID2D1Image> output;
                     effect->GetOutput(output.put());
+                    m_outputCache[nodeId] = output;
                     node->cachedOutput = output.get();
 
                     // Read back analysis data only when the node was dirty
@@ -388,6 +394,7 @@ namespace ShaderLab::Rendering
                     {
                         node->runtimeError = L"Shader not compiled. Open in Effect Designer and compile.";
                         node->cachedOutput = nullptr;
+                        m_outputCache.erase(nodeId);
                     }
                     else
                     {
@@ -399,6 +406,7 @@ namespace ShaderLab::Rendering
                         }
                         winrt::com_ptr<ID2D1Image> output;
                         effect->GetOutput(output.put());
+                        m_outputCache[nodeId] = output;
                         node->cachedOutput = output.get();
                     }
                 }
@@ -507,6 +515,7 @@ namespace ShaderLab::Rendering
     void GraphEvaluator::ReleaseCache()
     {
         m_effectCache.clear();
+        m_outputCache.clear();
         m_customImplCache.clear();
         m_d3d11RunnerCache.clear();
         m_imageComputeCache.clear();
@@ -514,13 +523,40 @@ namespace ShaderLab::Rendering
         m_dummySourceBitmap = nullptr;
     }
 
+    void GraphEvaluator::ReleaseCache(EffectGraph& graph)
+    {
+        ReleaseCache();
+        // EffectNode::cachedOutput is a non-owning raw pointer whose lifetime is
+        // owned by the caches we just cleared. Null every node's pointer so the
+        // render path can't dereference a freed ID2D1Image.
+        for (auto& node : const_cast<std::vector<EffectNode>&>(graph.Nodes()))
+        {
+            node.cachedOutput = nullptr;
+            node.dirty = true;
+        }
+    }
+
     void GraphEvaluator::InvalidateNode(uint32_t nodeId)
     {
         m_effectCache.erase(nodeId);
+        m_outputCache.erase(nodeId);
         m_d3d11RunnerCache.erase(nodeId);
         m_customImplCache.erase(nodeId);
         m_imageComputeCache.erase(nodeId);
         m_imageComputeTexCache.erase(nodeId);
+        // Note: caller must also clear EffectNode::cachedOutput on the node
+        // (the raw pointer it holds is now dangling). Prefer the graph-aware
+        // overload below.
+    }
+
+    void GraphEvaluator::InvalidateNode(EffectGraph& graph, uint32_t nodeId)
+    {
+        InvalidateNode(nodeId);
+        if (auto* node = graph.FindNode(nodeId))
+        {
+            node->cachedOutput = nullptr;
+            node->dirty = true;
+        }
     }
 
     void GraphEvaluator::ResolveSourceBindings(EffectGraph& graph)

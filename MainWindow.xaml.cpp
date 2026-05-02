@@ -100,6 +100,7 @@ namespace winrt::ShaderLab::implementation
                         it->second = val;
                 }
                 node.dirty = true;
+                node.cachedOutput = nullptr; // raw pointer is now dangling
                 m_graphEvaluator.InvalidateNode(node.id);
             }
             m_graph.MarkAllDirty();
@@ -328,7 +329,7 @@ namespace winrt::ShaderLab::implementation
         // Close all output windows.
         m_outputWindows.clear();
 
-        m_graphEvaluator.ReleaseCache();
+        m_graphEvaluator.ReleaseCache(m_graph);
         m_displayMonitor.Shutdown();
         m_renderEngine.Shutdown();
     }
@@ -544,7 +545,7 @@ namespace winrt::ShaderLab::implementation
         float savedPreviewPanY = m_previewPanY;
 
         // ---- NUKE EVERYTHING ----
-        m_graphEvaluator.ReleaseCache();
+        m_graphEvaluator.ReleaseCache(m_graph);
         m_sourceFactory.ReleaseCache();
         m_nodeGraphController.ReleaseDeviceResources();
         // Clear swap chain references from XAML panels before destroying them.
@@ -1084,7 +1085,11 @@ namespace winrt::ShaderLab::implementation
             auto loaded = ::ShaderLab::Graph::EffectGraph::FromJson(text);
 
             // Release stale evaluator caches before swapping the graph.
-            m_graphEvaluator.ReleaseCache();
+            // Use the graph-aware overload so the OUTGOING graph's nodes also
+            // have their dangling cachedOutput pointers cleared (defensive —
+            // the graph is about to be replaced, but a stray reference held
+            // elsewhere would still be unsafe).
+            m_graphEvaluator.ReleaseCache(m_graph);
             m_graph = std::move(loaded);
 
             ResetAfterGraphLoad();
@@ -1477,6 +1482,13 @@ namespace winrt::ShaderLab::implementation
     {
         const auto* node = m_graph.FindNode(nodeId);
         if (!node || !node->cachedOutput) return nullptr;
+
+        // Safety: cachedOutput is a non-owning raw pointer whose lifetime is
+        // owned by m_graphEvaluator's cache. If the node is dirty, the
+        // evaluator has not yet repopulated it this frame and the pointer
+        // may be dangling (released by InvalidateNode/ReleaseCache).
+        // The D2D debug layer (d2d1debug3.dll) traps the use-after-release.
+        if (node->dirty) return nullptr;
 
         // Don't render effects that have required inputs but none connected.
         if (!node->inputPins.empty())
@@ -3922,6 +3934,7 @@ namespace winrt::ShaderLab::implementation
                     }
 
                     n->dirty = true;
+                    n->cachedOutput = nullptr; // raw pointer is now dangling
                     m_graphEvaluator.InvalidateNode(capturedId);
                     m_graph.MarkAllDirty();
                     PopulatePreviewNodeSelector();
@@ -4375,6 +4388,7 @@ namespace winrt::ShaderLab::implementation
 
                     node->customEffect = std::move(def);
                     node->dirty = true;
+                    node->cachedOutput = nullptr; // shader changed -> output may be released
                     m_graph.MarkAllDirty();
                     m_graphEvaluator.UpdateNodeShader(nodeId, *node);
 
@@ -5353,6 +5367,14 @@ namespace winrt::ShaderLab::implementation
         {
             m_graph.RemoveNode(nodeId);
             m_graphEvaluator.InvalidateNode(nodeId);
+            // The deleted node owned a cachedOutput pointer that downstream
+            // nodes may have inherited via cached effect chains. Be paranoid:
+            // null every node's cachedOutput so the next evaluate rebuilds them.
+            for (auto& n : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+            {
+                n.cachedOutput = nullptr;
+                n.dirty = true;
+            }
             m_nodeGraphController.RebuildLayout();
             PopulatePreviewNodeSelector();
         }

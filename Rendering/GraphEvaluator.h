@@ -44,10 +44,15 @@ namespace ShaderLab::Rendering
         void ResolveSourceBindings(Graph::EffectGraph& graph);
 
         // Release all cached D2D effects (e.g., on device lost or graph clear).
+        // The graph-aware overload also clears every node's non-owning cachedOutput
+        // pointer so the render path can't dereference a freed effect.
         void ReleaseCache();
+        void ReleaseCache(Graph::EffectGraph& graph);
 
         // Invalidate the cached effect for a specific node (e.g., CLSID changed).
+        // The graph-aware overload also clears node.cachedOutput.
         void InvalidateNode(uint32_t nodeId);
+        void InvalidateNode(Graph::EffectGraph& graph, uint32_t nodeId);
 
         // Update an existing cached effect's shader bytecode in-place (for recompile).
         // If the effect isn't cached yet, does nothing (next Evaluate will create it).
@@ -84,6 +89,17 @@ namespace ShaderLab::Rendering
         // Per-node effect cache: nodeId → D2D effect.
         // Effects are reused across frames; only properties are updated.
         std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Effect>> m_effectCache;
+
+        // Per-node owning reference to each effect's output image.
+        // ID2D1Effect::GetOutput() returns an AddRef'd pointer; if we only stash
+        // the raw pointer in EffectNode::cachedOutput, the local com_ptr releases
+        // its ref at scope-exit. The image then survives only by whatever ref
+        // the effect holds internally -- and D2D will release/recreate the
+        // output proxy on operations like SetInput-toggle, leaving cachedOutput
+        // dangling until the next GetOutput. We hold an owning ref here so the
+        // image lives as long as the effect does. The D2D debug layer
+        // (d2d1debug3.dll) flags use-after-release otherwise.
+        std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Image>> m_outputCache;
 
         // Per-node custom effect impl cache for host-side API access.
         struct CustomEffectEntry

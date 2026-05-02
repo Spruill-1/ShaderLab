@@ -6,6 +6,18 @@ A WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging
 
 ---
 
+## First-Time Setup
+
+The project ships without a code-signing certificate (the `.pfx` is gitignored). On the first build, MSBuild automatically runs `scripts\EnsureDevCert.ps1`, which:
+
+1. Generates a self-signed `CodeSigningCert` with `Subject=CN=ShaderLab` (matching `Publisher` in `Package.appxmanifest`).
+2. Exports it to `ShaderLab_TemporaryKey.pfx` in the repo root.
+3. Imports it into `LocalMachine\TrustedPeople` if MSBuild is elevated, otherwise into `CurrentUser\TrustedPeople`.
+
+After that, F5 (Debug | x64, startup project = `ShaderLab`) deploys and launches the packaged app. To regenerate the cert (e.g., after expiry), delete `ShaderLab_TemporaryKey.pfx` and rebuild.
+
+---
+
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
