@@ -67,26 +67,23 @@ jobs:
           $stage = Join-Path $env:GITHUB_WORKSPACE 'release-stage'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-          # Locate any AppxManifest.xml under AppPackages — this marks the loose-file layout root.
-          $manifest = Get-ChildItem -Recurse -Path AppPackages -Filter 'AppxManifest.xml' -File `
+          # Find the VS-produced sideload bundle dir (contains the .msix + Dependencies\).
+          $msix = Get-ChildItem -Recurse -Path AppPackages -Filter '*.msix' -File `
             | Sort-Object FullName | Select-Object -First 1
-          if (-not $manifest) {
+          if (-not $msix) {
             Write-Host "Contents of AppPackages:" -ForegroundColor Yellow
             Get-ChildItem -Recurse -Path AppPackages | Select-Object FullName | Format-Table -AutoSize
-            throw "No AppxManifest.xml found under AppPackages."
+            throw "No .msix file found under AppPackages."
           }
-          $layoutDir = $manifest.Directory.FullName
-          Write-Host "Using layout: $layoutDir"
+          $bundleDir = $msix.Directory.FullName
+          Write-Host "Using bundle: $bundleDir"
 
-          # Copy layout + install script into a versioned folder, then zip it.
           $version = '${{ steps.ver.outputs.tag }}' -replace '^v',''
-          $bundleDir = Join-Path $stage "ShaderLab-$version"
-          Copy-Item -Recurse -Force $layoutDir $bundleDir
-          Copy-Item -Force scripts/Install.ps1 (Join-Path $bundleDir 'Install.ps1')
-
           $zip = Join-Path $stage "ShaderLab-$version-x64.zip"
+
+          # Copy install script alongside the msix, then zip the whole bundle.
+          Copy-Item -Force scripts/Install.ps1 (Join-Path $bundleDir 'Install.ps1')
           Compress-Archive -Path "$bundleDir\*" -DestinationPath $zip -Force
-          Remove-Item -Recurse -Force $bundleDir
 
           Get-ChildItem $stage | ForEach-Object { Write-Host "Staged: $($_.Name)" }
           "stage=$stage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append

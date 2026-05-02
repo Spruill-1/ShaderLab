@@ -8,7 +8,7 @@ A WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging
 
 ## Installing a Release Build
 
-Release builds are distributed as a **loose-file MSIX layout** — no signing certificate is required, but the user must enable Developer Mode.
+Release builds are distributed as an **unsigned MSIX package** — no signing certificate is required, but the user must enable Developer Mode.
 
 1. Enable Developer Mode: *Settings → Privacy & security → For developers → Developer Mode*.
 2. Download `ShaderLab-<version>-x64.zip` from the GitHub Releases page and extract it.
@@ -18,7 +18,7 @@ Release builds are distributed as a **loose-file MSIX layout** — no signing ce
    ```
 4. Launch ShaderLab from the Start menu.
 
-`Install.ps1` calls `Add-AppxPackage -Register AppxManifest.xml`, the same mechanism Visual Studio uses for F5 deploy. Windows skips signature validation for registered loose-file apps when Developer Mode is on, so no cert install is needed.
+`Install.ps1` calls `Add-AppxPackage -AllowUnsigned`, which installs unsigned MSIX packages on systems with Developer Mode enabled (Windows 10 1903+ / Windows 11). Dependency packages (Microsoft VCLibs, Windows App Runtime) bundled by Visual Studio are installed automatically first.
 
 When ShaderLab is published to the Microsoft Store, that flow won't require Developer Mode.
 

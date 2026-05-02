@@ -1,22 +1,18 @@
 <#
 .SYNOPSIS
-	Installs ShaderLab from a loose-file MSIX layout. No cert required.
+    Installs ShaderLab from an unsigned MSIX package. Requires Developer Mode.
 
 .DESCRIPTION
-	Registers the AppxManifest.xml directly. Requires Windows Developer Mode
-	(Settings → Privacy & security → For developers → Developer Mode).
+    Calls Add-AppxPackage with -AllowUnsigned, which lets Windows install an
+    unsigned MSIX when Developer Mode is on (Windows 10 1903+ / Windows 11).
+    No code-signing certificate is required.
 
-	This is the same mechanism Visual Studio uses for F5 deploy. No signing
-	certificate is needed because Windows treats registered loose-file apps
-	as developer-mode sideloads.
-
-.PARAMETER LayoutDir
-	Path to the AppX layout directory (containing AppxManifest.xml).
-	If omitted, looks for AppxManifest.xml next to this script.
+.PARAMETER MsixPath
+    Path to the .msix file. If omitted, looks for the first .msix next to this script.
 #>
 [CmdletBinding()]
 param(
-	[string] $LayoutDir = $PSScriptRoot
+    [string] $MsixPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,17 +21,36 @@ $ErrorActionPreference = 'Stop'
 $devKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
 $devMode = (Get-ItemProperty -Path $devKey -Name AllowDevelopmentWithoutDevLicense -ErrorAction SilentlyContinue).AllowDevelopmentWithoutDevLicense
 if ($devMode -ne 1) {
-	Write-Host 'ERROR: Windows Developer Mode is not enabled.' -ForegroundColor Red
-	Write-Host 'Enable it: Settings -> Privacy & security -> For developers -> Developer Mode.'
-	exit 1
+    Write-Host 'ERROR: Windows Developer Mode is not enabled.' -ForegroundColor Red
+    Write-Host 'Enable it: Settings -> Privacy & security -> For developers -> Developer Mode.'
+    exit 1
 }
 
-$manifest = Join-Path $LayoutDir 'AppxManifest.xml'
-if (-not (Test-Path $manifest)) {
-	Write-Host "ERROR: AppxManifest.xml not found at $manifest" -ForegroundColor Red
-	exit 1
+if (-not $MsixPath) {
+    $MsixPath = Get-ChildItem -Path $PSScriptRoot -Filter '*.msix' -File -Recurse `
+        | Sort-Object FullName | Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $MsixPath -or -not (Test-Path $MsixPath)) {
+    Write-Host "ERROR: No .msix file found. Pass -MsixPath '<path-to-msix>'." -ForegroundColor Red
+    exit 1
 }
 
-Write-Host "Registering ShaderLab from $manifest ..." -ForegroundColor Cyan
-Add-AppxPackage -Register $manifest -ForceApplicationShutdown
+Write-Host "Installing $MsixPath ..." -ForegroundColor Cyan
+
+# Install dependencies first (VCLibs UWPDesktop, WindowsAppRuntime).
+$depsDir = Join-Path (Split-Path $MsixPath -Parent) 'Dependencies'
+if (Test-Path $depsDir) {
+    $arch = $env:PROCESSOR_ARCHITECTURE.ToLower()
+    if ($arch -eq 'amd64') { $arch = 'x64' }
+    $archDir = Join-Path $depsDir $arch
+    if (Test-Path $archDir) {
+        Get-ChildItem -Path $archDir -Filter '*.appx' -File | ForEach-Object {
+            Write-Host "  Dependency: $($_.Name)" -ForegroundColor DarkGray
+            try { Add-AppxPackage -Path $_.FullName -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+}
+
+# Install the main package. -AllowUnsigned needs Developer Mode.
+Add-AppxPackage -Path $MsixPath -AllowUnsigned -ForceApplicationShutdown
 Write-Host 'Installed. Launch ShaderLab from the Start menu.' -ForegroundColor Green
