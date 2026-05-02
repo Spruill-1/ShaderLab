@@ -77,7 +77,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ShaderLab-${{ matrix.platform }}-${{ matrix.configuration }}
-          path: AppPackages/**/AppX/**
+          path: AppPackages/**
           if-no-files-found: warn
           retention-days: 14
 
