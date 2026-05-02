@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.configuration }} | ${{ matrix.platform }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Debug, Release]
+        platform: [x64]
+
+    env:
+      Solution_Path: ShaderLab.slnx
+      Configuration: ${{ matrix.configuration }}
+      Platform: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/packages.config', '**/*.vcxproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: NuGet restore
+        run: nuget restore "${{ env.Solution_Path }}" -SolutionDirectory .
+
+      - name: Build solution
+        shell: pwsh
+        run: |
+          msbuild "${{ env.Solution_Path }}" `
+            /p:Configuration=${{ env.Configuration }} `
+            /p:Platform=${{ env.Platform }} `
+            /p:AppxBundle=Never `
+            /p:AppxPackageSigningEnabled=false `
+            /p:GenerateAppxPackageOnBuild=true `
+            /p:UapAppxPackageBuildMode=SideloadOnly `
+            /m /nologo /v:minimal
+
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          $exe = "$env:GITHUB_WORKSPACE\${{ env.Platform }}\${{ env.Configuration }}\ShaderLabTests\ShaderLabTests.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "Test runner not found at $exe"
+            exit 1
+          }
+          & $exe --adapter warp
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "ShaderLabTests reported $LASTEXITCODE failure(s)"
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload AppX layout artifact
+        if: matrix.configuration == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShaderLab-${{ matrix.platform }}-${{ matrix.configuration }}
+          path: AppPackages/**/AppX/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ matrix.configuration }}-${{ matrix.platform }}
+          path: |
+            **/*.log
+            ${{ env.Platform }}/${{ env.Configuration }}/**/*.tlog
+          if-no-files-found: ignore
+          retention-days: 7

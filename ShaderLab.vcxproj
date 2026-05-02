@@ -223,8 +223,11 @@
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>
+    <None Include=".github\workflows\ci.yml" />
+    <None Include=".github\workflows\release.yml" />
     <None Include=".gitignore" />
     <None Include="packages.config" />
+    <None Include="scripts\Install.ps1" />
     <None Include="ShaderLab.vcxproj.filters" />
   </ItemGroup>
   <PropertyGroup Condition="'$(DisableHasPackageAndPublishMenuAddedByProject)'!='true' and '$(EnableMsixTooling)'=='true'">
@@ -256,17 +259,9 @@
     _ComputeAppxPackagePayload runs, otherwise the deployed package will be missing the dll
     and the launched app will fail with "ShaderLabEngine.dll was not found".
   -->
-  <Target Name="CopyEngineRuntime"
-          AfterTargets="Link"
-          BeforeTargets="_ComputeAppxPackagePayload;AfterBuild"
-          Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll')">
-    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll"
-          DestinationFolder="$(OutDir)"
-          SkipUnchangedFiles="true" />
-    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.pdb"
-          DestinationFolder="$(OutDir)"
-          SkipUnchangedFiles="true"
-          Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.pdb')" />
+  <Target Name="CopyEngineRuntime" AfterTargets="Link" BeforeTargets="_ComputeAppxPackagePayload;AfterBuild" Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll')">
+    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.pdb" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.pdb')" />
     <ItemGroup>
       <AppxPackagePayload Include="$(OutDir)ShaderLabEngine.dll">
         <TargetPath>ShaderLabEngine.dll</TargetPath>
@@ -313,18 +308,13 @@
     match the Publisher in Package.appxmanifest (CN=ShaderLab). Skipped if the .pfx already exists.
     See scripts\EnsureDevCert.ps1 for the actual generation logic.
   -->
-  <Target Name="EnsureDevSigningCertificate"
-          BeforeTargets="PrepareForBuild;_GenerateCurrentProjectAppxManifest;SignAppxPackage"
-          Condition="!Exists('$(MSBuildProjectDirectory)\$(PackageCertificateKeyFile)')">
+  <Target Name="EnsureDevSigningCertificate" BeforeTargets="PrepareForBuild;_GenerateCurrentProjectAppxManifest;SignAppxPackage" Condition="!Exists('$(MSBuildProjectDirectory)\$(PackageCertificateKeyFile)')">
     <Message Importance="high" Text="Generating local dev signing certificate: $(PackageCertificateKeyFile)" />
     <!-- Prefer PowerShell 7 (pwsh) when available; fall back to 64-bit Windows PowerShell. -->
-    <Exec Command="pwsh -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\scripts\EnsureDevCert.ps1&quot; -PfxPath &quot;$(MSBuildProjectDirectory)\$(PackageCertificateKeyFile)&quot; -Password &quot;$(PackageCertificatePassword)&quot;"
-          IgnoreExitCode="true" ContinueOnError="WarnAndContinue">
+    <Exec Command="pwsh -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\scripts\EnsureDevCert.ps1&quot; -PfxPath &quot;$(MSBuildProjectDirectory)\$(PackageCertificateKeyFile)&quot; -Password &quot;$(PackageCertificatePassword)&quot;" IgnoreExitCode="true" ContinueOnError="WarnAndContinue">
       <Output TaskParameter="ExitCode" PropertyName="_PwshExitCode" />
     </Exec>
-    <Exec Command="&quot;$(WinDir)\sysnative\WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\scripts\EnsureDevCert.ps1&quot; -PfxPath &quot;$(MSBuildProjectDirectory)\$(PackageCertificateKeyFile)&quot; -Password &quot;$(PackageCertificatePassword)&quot;"
-          Condition="'$(_PwshExitCode)' != '0' and Exists('$(WinDir)\sysnative\WindowsPowerShell\v1.0\powershell.exe')" />
-    <Exec Command="&quot;$(WinDir)\System32\WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\scripts\EnsureDevCert.ps1&quot; -PfxPath &quot;$(MSBuildProjectDirectory)\$(PackageCertificateKeyFile)&quot; -Password &quot;$(PackageCertificatePassword)&quot;"
-          Condition="'$(_PwshExitCode)' != '0' and !Exists('$(WinDir)\sysnative\WindowsPowerShell\v1.0\powershell.exe')" />
+    <Exec Command="&quot;$(WinDir)\sysnative\WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\scripts\EnsureDevCert.ps1&quot; -PfxPath &quot;$(MSBuildProjectDirectory)\$(PackageCertificateKeyFile)&quot; -Password &quot;$(PackageCertificatePassword)&quot;" Condition="'$(_PwshExitCode)' != '0' and Exists('$(WinDir)\sysnative\WindowsPowerShell\v1.0\powershell.exe')" />
+    <Exec Command="&quot;$(WinDir)\System32\WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\scripts\EnsureDevCert.ps1&quot; -PfxPath &quot;$(MSBuildProjectDirectory)\$(PackageCertificateKeyFile)&quot; -Password &quot;$(PackageCertificatePassword)&quot;" Condition="'$(_PwshExitCode)' != '0' and !Exists('$(WinDir)\sysnative\WindowsPowerShell\v1.0\powershell.exe')" />
   </Target>
 </Project>

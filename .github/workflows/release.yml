@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.1.0). Leave empty when triggered by tag push.'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: windows-latest
+
+    env:
+      Solution_Path: ShaderLab.slnx
+      Configuration: Release
+      Platform: x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $env:GITHUB_REF -replace '^refs/tags/',''
+          } elseif ('${{ github.event.inputs.version }}') {
+            '${{ github.event.inputs.version }}'
+          } else { 'v0.0.0-dev' }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Release tag: $tag"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: NuGet restore
+        run: nuget restore "${{ env.Solution_Path }}" -SolutionDirectory .
+
+      - name: Build loose-file MSIX layout
+        shell: pwsh
+        run: |
+          msbuild "${{ env.Solution_Path }}" `
+            /p:Configuration=${{ env.Configuration }} `
+            /p:Platform=${{ env.Platform }} `
+            /p:AppxBundle=Never `
+            /p:AppxPackageSigningEnabled=false `
+            /p:GenerateAppxPackageOnBuild=true `
+            /p:UapAppxPackageBuildMode=SideloadOnly `
+            /m /nologo /v:minimal
+
+      - name: Collect release artifacts
+        id: collect
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'release-stage'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          # Find the loose-file AppX layout produced by VS/MSBuild.
+          $layoutRoot = Get-ChildItem -Recurse -Path AppPackages -Directory -Filter 'AppX' `
+            | Sort-Object FullName | Select-Object -First 1
+          if (-not $layoutRoot) {
+            throw "No AppX layout directory found under AppPackages."
+          }
+          Write-Host "Using layout: $($layoutRoot.FullName)"
+
+          # Copy layout + install script into a versioned folder, then zip it.
+          $version = '${{ steps.ver.outputs.tag }}' -replace '^v',''
+          $bundleDir = Join-Path $stage "ShaderLab-$version"
+          Copy-Item -Recurse -Force $layoutRoot.FullName $bundleDir
+          Copy-Item -Force scripts/Install.ps1 (Join-Path $bundleDir 'Install.ps1')
+
+          $zip = Join-Path $stage "ShaderLab-$version-x64.zip"
+          Compress-Archive -Path "$bundleDir\*" -DestinationPath $zip -Force
+          Remove-Item -Recurse -Force $bundleDir
+
+          Get-ChildItem $stage | ForEach-Object { Write-Host "Staged: $($_.Name)" }
+          "stage=$stage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShaderLab-${{ steps.ver.outputs.tag }}
+          path: ${{ steps.collect.outputs.stage }}
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ShaderLab ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: ${{ steps.collect.outputs.stage }}/*

@@ -6,15 +6,27 @@ A WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging
 
 ---
 
-## First-Time Setup
+## Installing a Release Build
 
-The project ships without a code-signing certificate (the `.pfx` is gitignored). On the first build, MSBuild automatically runs `scripts\EnsureDevCert.ps1`, which:
+Release builds are distributed as a **loose-file MSIX layout** — no signing certificate is required, but the user must enable Developer Mode.
 
-1. Generates a self-signed `CodeSigningCert` with `Subject=CN=ShaderLab` (matching `Publisher` in `Package.appxmanifest`).
-2. Exports it to `ShaderLab_TemporaryKey.pfx` in the repo root.
-3. Imports it into `LocalMachine\TrustedPeople` if MSBuild is elevated, otherwise into `CurrentUser\TrustedPeople`.
+1. Enable Developer Mode: *Settings → Privacy & security → For developers → Developer Mode*.
+2. Download `ShaderLab-<version>-x64.zip` from the GitHub Releases page and extract it.
+3. From the extracted folder, run:
+   ```pwsh
+   .\Install.ps1
+   ```
+4. Launch ShaderLab from the Start menu.
 
-After that, F5 (Debug | x64, startup project = `ShaderLab`) deploys and launches the packaged app. To regenerate the cert (e.g., after expiry), delete `ShaderLab_TemporaryKey.pfx` and rebuild.
+`Install.ps1` calls `Add-AppxPackage -Register AppxManifest.xml`, the same mechanism Visual Studio uses for F5 deploy. Windows skips signature validation for registered loose-file apps when Developer Mode is on, so no cert install is needed.
+
+When ShaderLab is published to the Microsoft Store, that flow won't require Developer Mode.
+
+## Local Development Setup
+
+The project ships without a code-signing certificate (the `.pfx` is gitignored). On the first build, MSBuild automatically runs `scripts\EnsureDevCert.ps1`, which generates a self-signed cert and imports it into `TrustedPeople` for F5 deploy.
+
+After that, F5 (Debug | x64, startup project = `ShaderLab`) deploys and launches the packaged app. The dev cert is only used for local F5 deploy — it is **not** required for end-user install (see *Installing a Release Build* above).
 
 ---
 
