@@ -542,12 +542,35 @@ namespace ShaderLab::Controls
         // Auto-position if zero.
         if (canvasPos.x == 0.0f && canvasPos.y == 0.0f)
         {
-            canvasPos = { m_nextAutoX, m_nextAutoY };
-            m_nextAutoX += NodeWidth + 40.0f;
-            if (m_nextAutoX > 800.0f)
+            // Place new nodes at the center of the user's current viewport in
+            // canvas space, so they don't disappear off-screen when the user
+            // has panned/zoomed away from the origin. Stagger successive adds
+            // so a chain of additions doesn't stack on a single point.
+            float cx = (-m_panOffset.x + m_viewportW * 0.5f) / (m_zoom > 0.0f ? m_zoom : 1.0f);
+            float cy = (-m_panOffset.y + m_viewportH * 0.5f) / (m_zoom > 0.0f ? m_zoom : 1.0f);
+            float offset = static_cast<float>(m_autoStaggerCount % 8) * 24.0f;
+            canvasPos = { cx - NodeWidth * 0.5f + offset, cy - 30.0f + offset };
+            ++m_autoStaggerCount;
+
+            // Try to avoid landing exactly on top of an existing node.
+            if (m_graph)
             {
-                m_nextAutoX = 50.0f;
-                m_nextAutoY += 200.0f;
+                for (int attempt = 0; attempt < 8; ++attempt)
+                {
+                    bool overlap = false;
+                    for (const auto& n : m_graph->Nodes())
+                    {
+                        if (std::abs(n.position.x - canvasPos.x) < 8.0f &&
+                            std::abs(n.position.y - canvasPos.y) < 8.0f)
+                        {
+                            overlap = true;
+                            break;
+                        }
+                    }
+                    if (!overlap) break;
+                    canvasPos.x += 24.0f;
+                    canvasPos.y += 24.0f;
+                }
             }
         }
 

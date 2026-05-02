@@ -91,6 +91,10 @@ namespace ShaderLab::Controls
         void SetZoom(float zoom);
         float Zoom() const { return m_zoom; }
 
+        // Inform the controller of the current visible viewport size in pixels.
+        // Used to place auto-positioned new nodes in the user's current view.
+        void SetViewportSize(float w, float h) { m_viewportW = w; m_viewportH = h; }
+
         // ---- Interaction ----
 
         // Hit-test a canvas point. Returns the node ID under the point, or 0.
@@ -195,6 +199,11 @@ namespace ShaderLab::Controls
         // Auto-layout position for new nodes.
         float m_nextAutoX{ 50.0f };
         float m_nextAutoY{ 50.0f };
+        int   m_autoStaggerCount{ 0 };
+
+        // Visible viewport size in pixels (set by host on init/resize).
+        float m_viewportW{ 800.0f };
+        float m_viewportH{ 600.0f };
 
         // Cached D2D resources (created on first Render call).
         winrt::com_ptr<ID2D1SolidColorBrush> m_brushNode;

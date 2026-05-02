@@ -2056,6 +2056,10 @@ namespace winrt::ShaderLab::implementation
             D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
         dc->CreateBitmapFromDxgiSurface(surface.get(), bmpProps, m_graphRenderTarget.put());
+
+        m_nodeGraphController.SetViewportSize(
+            static_cast<float>(m_graphPanelWidth),
+            static_cast<float>(m_graphPanelHeight));
     }
 
     void MainWindow::ResizeGraphPanel(uint32_t w, uint32_t h)
@@ -2079,6 +2083,10 @@ namespace winrt::ShaderLab::implementation
             D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
         dc->CreateBitmapFromDxgiSurface(surface.get(), bmpProps, m_graphRenderTarget.put());
+
+        m_nodeGraphController.SetViewportSize(
+            static_cast<float>(m_graphPanelWidth),
+            static_cast<float>(m_graphPanelHeight));
     }
 
     void MainWindow::InitializeTraceSwatchPanel()
@@ -5377,6 +5385,15 @@ namespace winrt::ShaderLab::implementation
             }
             m_nodeGraphController.RebuildLayout();
             PopulatePreviewNodeSelector();
+        }
+        if (!closedNodeIds.empty())
+        {
+            // Force the next render tick so the graph panel repaints without
+            // the deleted Output node (otherwise the tick gate would skip
+            // rendering since no nodes are dirty and m_outputWindows is now
+            // smaller/empty).
+            m_forceRender = true;
+            m_nodeGraphController.SetNeedsRedraw();
         }
 
         auto* dc = m_renderEngine.D2DDeviceContext();
