@@ -76,22 +76,20 @@ jobs:
           $stage = Join-Path $env:GITHUB_WORKSPACE 'release-stage'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-          # Find the VS-produced sideload bundle dir (contains the .msix + Dependencies\).
-          # Filter to the matching platform to avoid picking up other-arch outputs.
+          # Find the VS-produced sideload bundle dir (contains the ShaderLab .msix
+          # plus a Dependencies\ subfolder). The matching .msix is the one named
+          # "ShaderLab*" sitting at the top level of its bundle dir — NOT one of
+          # the dependency packages that live under Dependencies\<arch>\.
           $platform = '${{ matrix.platform }}'
           $msbuildPlatform = '${{ matrix.msbuild_platform }}'
-          $msix = Get-ChildItem -Recurse -Path AppPackages -Filter '*.msix' -File `
-            | Where-Object { $_.FullName -match "_${msbuildPlatform}[_\\.]" -or $_.Directory.FullName -match "_${msbuildPlatform}_" } `
-            | Sort-Object FullName | Select-Object -First 1
-          if (-not $msix) {
-            # Fallback: pick first .msix whose parent folder name contains the platform.
-            $msix = Get-ChildItem -Recurse -Path AppPackages -Filter '*.msix' -File `
-              | Sort-Object FullName | Select-Object -First 1
-          }
+          $candidates = Get-ChildItem -Recurse -Path AppPackages -Filter 'ShaderLab*.msix' -File `
+            | Where-Object { $_.Directory.Parent.Name -ne 'Dependencies' -and $_.Directory.Parent.Parent.Name -ne 'Dependencies' } `
+            | Where-Object { $_.FullName -match "_${msbuildPlatform}[_\\.]" -or $_.Directory.Name -match "_${msbuildPlatform}_" }
+          $msix = $candidates | Sort-Object FullName | Select-Object -First 1
           if (-not $msix) {
             Write-Host "Contents of AppPackages:" -ForegroundColor Yellow
             Get-ChildItem -Recurse -Path AppPackages | Select-Object FullName | Format-Table -AutoSize
-            throw "No .msix file found under AppPackages."
+            throw "No ShaderLab*.msix file found under AppPackages for $msbuildPlatform."
           }
           $bundleDir = $msix.Directory.FullName
           Write-Host "Using bundle: $bundleDir"
