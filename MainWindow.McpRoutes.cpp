@@ -635,8 +635,8 @@ namespace winrt::ShaderLab::implementation
                         auto* dstNode = m_graph.FindNode(dstId);
                         std::wstring srcName = srcNode ? srcNode->name : std::format(L"Node {}", srcId);
                         std::wstring dstName = dstNode ? dstNode->name : std::format(L"Node {}", dstId);
-                        m_nodeLogs[dstId].Info(std::format(L"Input {} connected ← {} (pin {})", dstPin, srcName, srcPin));
-                        m_nodeLogs[srcId].Info(std::format(L"Output {} connected → {} (pin {})", srcPin, dstName, dstPin));
+                        m_nodeLogs[dstId].Info(std::format(L"Input {} connected from {} (pin {})", dstPin, srcName, srcPin));
+                        m_nodeLogs[srcId].Info(std::format(L"Output {} connected to {} (pin {})", srcPin, dstName, dstPin));
                     }
                     m_graph.MarkAllDirty();
                     m_nodeGraphController.AutoLayout();

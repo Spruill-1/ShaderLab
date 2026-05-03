@@ -1073,6 +1073,29 @@ namespace ShaderLab::Controls
                     m_brushText.get());
             }
 
+            // Math Expression: show the formula text under the header.
+            if (m_pinLabelFormat && m_brushText && node->customEffect.has_value() &&
+                node->customEffect->shaderLabEffectId == L"Math Expression")
+            {
+                auto eIt = node->properties.find(L"Expression");
+                if (eIt != node->properties.end())
+                {
+                    if (auto* s = std::get_if<std::wstring>(&eIt->second))
+                    {
+                        std::wstring display = L"= " + *s;
+                        D2D1_RECT_F exprRect = {
+                            visual.bounds.left + 6.0f,
+                            headerRect.bottom + 1.0f,
+                            visual.bounds.right - 6.0f,
+                            headerRect.bottom + 18.0f
+                        };
+                        m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                        dc->DrawText(display.c_str(), static_cast<UINT32>(display.size()),
+                            m_pinLabelFormat.get(), exprRect, m_brushText.get());
+                    }
+                }
+            }
+
             // Input pins (image).
             if (m_brushPin)
             {

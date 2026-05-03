@@ -8,23 +8,28 @@ A WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging
 
 ## Installing a Release Build
 
-Release builds are distributed as an **unsigned MSIX package** — no signing certificate is required, but the user must enable Developer Mode.
+Release builds are distributed as **unsigned MSIX packages** — no signing certificate is required, but the user must enable Developer Mode.
 
 1. Enable Developer Mode: *Settings → Privacy & security → For developers → Developer Mode*.
-2. Download `ShaderLab-<version>-x64.zip` from the GitHub Releases page and extract it.
-3. From the extracted folder, run:
+2. Download the architecture-matched zip from the GitHub Releases page:
+   - `ShaderLab-<version>-x64.zip` for AMD64/Intel
+   - `ShaderLab-<version>-arm64.zip` for ARM64 (e.g. Snapdragon X / Surface Pro)
+3. Extract and run from the extracted folder:
    ```pwsh
    .\Install.ps1
    ```
 4. Launch ShaderLab from the Start menu.
 
-`Install.ps1` calls `Add-AppxPackage -AllowUnsigned`, which installs unsigned MSIX packages on systems with Developer Mode enabled (Windows 10 1903+ / Windows 11). Dependency packages (Microsoft VCLibs, Windows App Runtime) bundled by Visual Studio are installed automatically first.
+`Install.ps1` calls `Add-AppxPackage -AllowUnsigned`, which installs unsigned MSIX packages on systems with Developer Mode enabled (Windows 10 1903+ / Windows 11). The script installs the bundled dependency packages (Microsoft VCLibs, Windows App Runtime) for the host architecture first, then the ShaderLab MSIX itself.
 
-When ShaderLab is published to the Microsoft Store, that flow won't require Developer Mode.
+**Why unsigned works**: the manifest's `Publisher` carries the special OID `2.25.311729368913984317654407730594956997722=1` (Windows' "unsigned namespace"), which is the prerequisite for `-AllowUnsigned`. The OID is injected by the release workflow only — the in-repo manifest stays plain `CN=ShaderLab` so signed F5 deploys keep working.
 
 ## Local Development Setup
 
-The project ships without a code-signing certificate (the `.pfx` is gitignored). On the first build, MSBuild automatically runs `scripts\EnsureDevCert.ps1`, which generates a self-signed cert and imports it into `TrustedPeople` for F5 deploy.
+The project ships without a code-signing certificate (the `.pfx` is gitignored). On the first build, MSBuild automatically runs:
+
+- **`scripts\EnsureDevCert.ps1`** — generates a self-signed cert (`CN=ShaderLab`) and imports it into `TrustedPeople` for F5 deploy.
+- **`scripts\EnsureExprTk.ps1`** — downloads `exprtk.hpp` (single-header math expression parser, MIT-licensed) into `third_party\exprtk\` for use by the `Numeric Expression` parameter node.
 
 After that, F5 (Debug | x64, startup project = `ShaderLab`) deploys and launches the packaged app. The dev cert is only used for local F5 deploy — it is **not** required for end-user install (see *Installing a Release Build* above).
 
@@ -39,31 +44,21 @@ After that, F5 (Debug | x64, startup project = `ShaderLab`) deploys and launches
 - [Display Profile Mocking](#display-profile-mocking)
 - [Topological Evaluation](#topological-evaluation)
 - [ShaderLab Built-in Effects](#shaderlab-built-in-effects)
+- [Numeric Expression Node (ExprTk)](#numeric-expression-node-exprtk)
+- [Parameter Nodes](#parameter-nodes)
 - [Compute Shader Analysis Pipeline](#compute-shader-analysis-pipeline)
 - [D2D / D3D11 Hybrid Compute System](#d2d--d3d11-hybrid-compute-system)
-  - [Problem](#problem)
-  - [COM Class Hierarchy](#com-class-hierarchy)
-  - [Data Flow](#data-flow-d2d--d3d11-handoff)
-  - [Three Effect Types Compared](#three-effect-types-compared)
-  - [Usage: Standalone D2D Application](#usage-standalone-d2d-application)
-  - [Usage: ShaderLab Evaluator](#usage-shaderlab-evaluator-optimized-path)
-  - [GPU Reduction Shader Pattern](#gpu-reduction-shader-pattern)
-  - [Known Limitations](#known-limitations)
+- [Property Bindings (Data Pins)](#property-bindings-data-pins)
 - [Effect Designer](#effect-designer)
-  - [Opening Built-in Effects](#opening-built-in-effects)
-  - [Export (Future)](#export-future)
-  - [Import from External Binary (Planned)](#import-from-external-binary-planned)
 - [Multi-Output Windows](#multi-output-windows)
 - [Animation System](#animation-system)
-- [Parameter Nodes](#parameter-nodes)
 - [Effect Versioning System](#effect-versioning-system)
 - [Conditional Parameter Visibility](#conditional-parameter-visibility)
 - [Working Space Integration](#working-space-integration)
 - [Image Statistics Effect](#image-statistics-effect)
-- [Copy / Paste Nodes](#copy--paste-nodes)
-- [Auto-Arrange](#auto-arrange)
-- [Node Graph Visual Enhancements](#node-graph-visual-enhancements)
+- [Graph Editor UX](#graph-editor-ux)
 - [MCP Server (AI Agent Integration)](#mcp-server-ai-agent-integration)
+- [Versioning](#versioning)
 - [Build Instructions](#build-instructions)
 - [Project Structure](#project-structure)
 - [Decision Log](#decision-log)
@@ -110,7 +105,7 @@ graph TB
 
 ## Pipeline Format Strategy
 
-The rendering pipeline always uses **scRGB FP16** (`DXGI_FORMAT_R16G16B16A16_FLOAT` with `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`). Linear floating-point preserves full HDR range and precision; scRGB covers the full BT.2020 gamut including negative values. DWM/ACM handles the final display conversion. There is no built-in tone mapper — users build tone mappers as graph effects for full accuracy by default.
+The rendering pipeline always uses **scRGB FP16** (`DXGI_FORMAT_R16G16B16A16_FLOAT` with `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`). Linear floating-point preserves full HDR range and precision; scRGB covers the full BT.2020 gamut including negative values. DWM/ACM handles the final display conversion to whatever the connected monitor reports. There is no fixed built-in tone mapper in the render path — users build tone mappers as graph effects (e.g. via the `D2D ColorMatrix`/`HdrToneMap`/`WhiteLevelAdjustment` chain), which keeps full HDR accuracy on by default and avoids accidental clipping.
 
 ## Effect Graph Model
 
@@ -149,7 +144,7 @@ classDiagram
         BuiltInEffect
         PixelShader
         ComputeShader
-        Parameter
+        D3D11ComputeShader
         Output
     }
 
@@ -157,6 +152,8 @@ classDiagram
     EffectGraph "1" *-- "*" EffectEdge
     EffectNode --> NodeType
 ```
+
+`NodeType::Output` carries no shader — it is a sink that the evaluator draws to. Parameter and clock nodes (Float / Integer / Toggle / Gamut / Clock / Numeric Expression) are stored as `ComputeShader`-typed nodes whose `customEffect.hlslSource` is empty; the evaluator special-cases them into a CPU-side data path (see [Parameter Nodes](#parameter-nodes) and [Numeric Expression Node](#numeric-expression-node-exprtk)).
 
 ## Display Monitoring
 
@@ -284,27 +281,34 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    START([Evaluate Graph]) --> PRUNE[Prune unneeded nodes<br/>Walk back from Output/Preview]
-    PRUNE --> TOPO[Topological Sort Needed Nodes]
+    START([Evaluate Graph]) --> PRUNE[Prune unneeded nodes<br/>Walk back from Output / Preview / Output windows]
+    PRUNE --> TOPO[Topological Sort<br/>image edges + binding edges + clock dependencies]
     TOPO --> LOOP{Next node?}
-    LOOP -->|Yes| CHECK{Node type?}
-    CHECK -->|Source| LOAD[Load image via WIC<br/>or create Flood fill]
-    CHECK -->|BuiltIn| D2D[Create D2D effect<br/>Set inputs from edges]
-    CHECK -->|PixelShader| PS[Create custom effect<br/>with ID2D1DrawTransform]
-    CHECK -->|ComputeShader| CS[Create custom effect<br/>with ID2D1ComputeTransform]
-    CHECK -->|D3D11Compute| D3D11[Render input to FP32 bitmap<br/>GetSurface → ID3D11Texture2D<br/>Dispatch D3D11 compute shader<br/>Read back result buffer]
-    CHECK -->|Parameter| PARAM[Populate analysis output<br/>from node properties]
-    CHECK -->|Output| OUT[Draw to render target]
-    LOAD --> CACHE[Cache ID2D1Image* output]
+    LOOP -->|Yes| RESOLVE[Resolve property bindings<br/>build effective properties map]
+    RESOLVE --> CHECK{Node kind?}
+    CHECK -->|Source| LOAD[WIC image / video / Flood<br/>via SourceNodeFactory]
+    CHECK -->|BuiltIn D2D| D2D[Reuse cached ID2D1Effect<br/>SetValue per dirty property<br/>Wire inputs from edges]
+    CHECK -->|PixelShader| PS[CustomPixelShaderEffect<br/>ID2D1DrawTransform]
+    CHECK -->|D2D ComputeShader| CS[CustomComputeShaderEffect<br/>ID2D1ComputeTransform per-tile dispatch]
+    CHECK -->|D3D11Compute| D3D11[Render upstream to FP32 bitmap<br/>dc->Flush<br/>D3D11 dispatch via D3D11ComputeRunner<br/>Read back analysis fields]
+    CHECK -->|Parameter| PARAM[Copy property values into<br/>analysisOutput.fields]
+    CHECK -->|Clock| CLK[Advance clockTime, write Time / Progress]
+    CHECK -->|NumericExpression| EXPR[Evaluate ExprTk expression<br/>over A..Z float inputs]
+    CHECK -->|Output| OUT[Render preview / per-Output-window draw]
+    LOAD --> CACHE[Cache ID2D1Image* output<br/>m_outputCache owns reference]
     D2D --> CACHE
     PS --> CACHE
     CS --> CACHE
     D3D11 --> CACHE
     PARAM --> CACHE
+    CLK --> CACHE
+    EXPR --> CACHE
     OUT --> CACHE
     CACHE --> LOOP
-    LOOP -->|No| PRESENT([Present to SwapChain])
+    LOOP -->|No| PRESENT([Present to SwapChain<br/>+ each OutputWindow])
 ```
+
+The evaluator runs at the **monitor's refresh rate** (clamped to 60–240 Hz) via a `DispatcherQueueTimer` whose `Interval` is set from `EnumDisplaySettings(ENUM_CURRENT_SETTINGS).dmDisplayFrequency`. 60 / 120 / 144 / 165 / 240 Hz panels and high-FPS video sources all run at their native cadence. The body is **dirty-gated**: `OnRenderTick` skips `RenderFrame` entirely unless any node is dirty, an output window is open, the preview wants a fit, or `m_forceRender` was set by user input. The interval is re-applied on every display change (so dragging the window across monitors picks up the new rate).
 
 ---
 
@@ -353,24 +357,44 @@ flowchart TD
 | 39 | CPU analysis → GPU reduction for Image Statistics | Moved from pixel shader (512K redundant reads) to CPU readback (exact, single pass) to D3D11 compute (GPU-resident, 32-byte readback). | Day 6 |
 | 40 | dc->Flush() for D2D→D3D11 texture handoff | D2D batches DrawImage commands until EndDraw/Flush. When rendering to a bitmap then reading it with D3D11 compute, Flush() must be called between DrawImage and D3D11 dispatch — otherwise D3D11 reads zeros from the uninitialized texture. Applied in both ComputeImageStatistics and DispatchUserD3D11Compute. | Day 7 |
 | 41 | Split engine code into ShaderLabEngine.dll | Graph/effect/rendering logic now builds once into a native DLL shared by the WinUI app and a standalone console runner. This removes WinUI from the test path, enables direct engine regression runs, and keeps RenderEngine/XAML-specific code isolated in the app project. | Day 8 |
+| 42 | Viewport-aware AddNode placement | New nodes created via toolbar / context menu / MCP land at the center of the current viewport (in graph coordinates) rather than the canvas origin, so they appear where the user is looking even after pan / zoom. | Day 9 |
+| 43 | Force-render on output-window close | Closing an OutputWindow deletes its Output node and explicitly bumps `m_forceRender`, so the dirty-gated render loop repaints once and the node disappears from the canvas immediately. | Day 9 |
+| 44 | Alt+click edge delete via bezier hit-test | `NodeGraphController::HitTestEdge` samples the cubic bezier of each edge with a small distance tolerance; Alt+click and right-click delete share the same `RemoveEdge` path for both image edges and orange data-binding edges. | Day 9 |
+| 45 | Multi-arch matrix release (x64 + ARM64) | `release.yml` runs MSBuild as a matrix; `Install.ps1` detects the host architecture, installs the bundled VCLibs / WinAppRuntime dependency MSIXes first, then the matching ShaderLab MSIX. Release zips are named `ShaderLab-<version>-<arch>.zip`. | Day 9 |
+| 46 | Inject unsigned-namespace OID only at release-build time | The Windows "unsigned namespace" OID `2.25.…` in `Publisher` is required by `Add-AppxPackage -AllowUnsigned` but breaks signed F5 deploy. Solution: keep `Package.appxmanifest` plain (`CN=ShaderLab`) in the repo; the release workflow inserts the OID immediately before MSBuild runs. | Day 9 |
+| 47 | Numeric Expression node via ExprTk single-header
+| 48 | ExprTk feature-disable macros for Release safety | The MSVC Release optimizer crashed in ExprTk's regex / IO paths on first evaluation. Defining `exprtk_disable_string_capabilities`, `exprtk_disable_rtl_io`, `exprtk_disable_rtl_io_file`, `exprtk_disable_rtl_vecops`, `exprtk_disable_enhanced_features`, and `exprtk_disable_caseinsensitivity` before `#include`-ing `exprtk.hpp` (with PCH disabled on `MathExpression.cpp`) keeps the math-only core and eliminates the crash. | Day 9 |
+| 49 | Switch ICC reader to mscms.dll | Removed the in-house ICC binary parser in favor of `OpenColorProfileW` + `GetColorProfileElement` (mscms.dll). We still interpret the small XYZType / textDescriptionType / multiLocalizedUnicodeType tag bodies, but mscms owns container layout, tag addressing, and v2/v4 version handling. Public `IccProfileParser::LoadFromFile` API and `IccProfileData` struct are unchanged. Engine link list gains `mscms.lib`. | Day 10 |
+| 50 | Refresh-rate-driven render loop (60\u2013240 Hz) | Render `DispatcherQueueTimer` interval is now derived from the active monitor's `dmDisplayFrequency` (via `MonitorFromWindow` \u2192 `GetMonitorInfoW` \u2192 `EnumDisplaySettingsW`), clamped to [60, 240] Hz, refreshed on every display change. 120 / 144 / 165 / 240 Hz panels and high-FPS video sources run at native cadence. Interval is set in microseconds so non-integer-ms periods stay accurate. | Day 10 |
 
 ---
 
 ## Build Instructions
 
 ### Prerequisites
-- Visual Studio 2022 17.8+ (with C++ Desktop and UWP workloads)
+- Visual Studio 2022 17.8+ **or** Visual Studio 2026 Insiders (with C++ Desktop and UWP workloads)
 - Windows App SDK 1.8
 - Windows 10 SDK (10.0.26100+)
+- PowerShell 5.1+ (for the pre-build scripts)
+- Internet access on first build (so `EnsureExprTk.ps1` can download `exprtk.hpp`)
 
 ### Build
-1. Open `ShaderLab.slnx` in Visual Studio
-2. NuGet packages restore automatically
-3. Build → Debug x64
-4. Outputs:
+1. Open `ShaderLab.slnx` in Visual Studio.
+2. Pre-build steps run automatically on first build:
+   - `scripts\EnsureDevCert.ps1` — generates and installs the local F5 dev cert.
+   - `scripts\EnsureExprTk.ps1` — downloads `exprtk.hpp` (MIT) into `third_party\exprtk\`.
+3. NuGet packages restore automatically.
+4. Build configurations:
+   - `Debug | x64`, `Release | x64`
+   - `Debug | ARM64`, `Release | ARM64`
+5. Outputs (per arch):
    - `x64\Debug\ShaderLabEngine\ShaderLabEngine.dll`
    - `x64\Debug\ShaderLab\ShaderLab.exe`
    - `x64\Debug\ShaderLabTests\ShaderLabTests.exe`
+
+### Releases
+
+GitHub Actions workflow `.github/workflows/release.yml` runs as a matrix (`x64`, `ARM64`). Just before MSBuild, the workflow injects the unsigned-namespace OID into the manifest's `Publisher` so that the resulting MSIX is installable via `Add-AppxPackage -AllowUnsigned`. The in-repo `Package.appxmanifest` keeps the plain `CN=ShaderLab` publisher so signed F5 deploys keep working.
 
 ### Required Libraries (linked via vcxproj)
 
@@ -382,6 +406,8 @@ flowchart TD
 | `d3dcompiler.lib` | Runtime HLSL compilation (D3DCompile) |
 | `dxguid.lib` | DirectX GUIDs (IID_ID2D1Factory, etc.) |
 | `windowscodecs.lib` | WIC image loading |
+| `mfplat.lib`, `mfreadwrite.lib`, `mfuuid.lib` | Media Foundation video source decoding |
+| `mscms.lib` | ICC profile reading (Image Color Management) |
 
 ---
 
@@ -397,7 +423,7 @@ ShaderLab/
 ├── Package.appxmanifest        # MSIX app identity
 ├── app.manifest                # DPI awareness, heap type
 ├── EngineExport.h              # SHADERLAB_API import/export macro
-├── Version.h                   # App version 1.1.0, graph format version 2
+├── Version.h                   # App version 1.2.1, graph format version 2
 ├── README.md                   # This file
 ├── CHANGELOG.md                # Version history
 │
@@ -424,7 +450,7 @@ ShaderLab/
 │   ├── DisplayMonitor.cpp      # DisplayMonitor implementation
 │   ├── DisplayProfile.h        # DisplayProfile struct, ChromaticityXY, GamutId, preset factory functions
 │   ├── IccProfileParser.h      # IccProfileParser class + IccProfileData struct
-│   ├── IccProfileParser.cpp    # ICC binary format parsing (v2/v4), XYZ→xy conversion, gamut detection
+│   ├── IccProfileParser.cpp    # mscms.dll-based ICC reader (OpenColorProfileW / GetColorProfileElement)
 │   ├── PipelineFormat.h        # PipelineFormat struct (scRGB FP16 always)
 │   ├── RenderEngine.h          # App-only RenderEngine class (D3D11 + D2D1 + swap chain lifecycle)
 │   ├── RenderEngine.cpp        # App-only RenderEngine implementation (device creation, resize, draw cycle)
@@ -433,7 +459,9 @@ ShaderLab/
 │   ├── GpuReduction.h          # D3D11 compute reduction (32×32 thread group, groupshared memory, stride pattern)
 │   ├── GpuReduction.cpp        # GpuReduction implementation (SRV creation, dispatch, 32-byte readback)
 │   ├── D3D11ComputeRunner.h    # Generic D3D11 compute dispatch runner for user-authored shaders
-│   └── D3D11ComputeRunner.cpp  # Compile, dispatch, readback via RWStructuredBuffer<float4>
+│   ├── D3D11ComputeRunner.cpp  # Compile, dispatch, readback via RWStructuredBuffer<float4>
+│   ├── MathExpression.h        # ExprTk-backed expression evaluator API (Numeric Expression node)
+│   └── MathExpression.cpp      # ExprTk include + feature-disable defines (PCH disabled on this TU)
 ├── Effects/                    # Built-in effect wrappers, custom effect base
 │   ├── ShaderLabEffects.h      # 18+ ShaderLab built-in effects (versioned) + shared color math HLSL library
 │   ├── ShaderLabEffects.cpp    # Effect registration, embedded HLSL, auto-compile, effectId/effectVersion
@@ -473,8 +501,16 @@ ShaderLab/
 ├── MainWindow.McpRoutes.cpp    # All MCP REST endpoints + JSON-RPC 2.0 handler
 ├── Shaders/                    # HLSL source files (user shaders)
 ├── Assets/                     # App icons, splash screen
-│
+├── third_party/
+│   └── exprtk/                 # exprtk.hpp (downloaded by EnsureExprTk.ps1, gitignored)
+├── scripts/
+│   ├── EnsureDevCert.ps1       # Generates + installs CN=ShaderLab dev cert for F5
+│   ├── EnsureExprTk.ps1        # Downloads exprtk.hpp on first build
+│   └── Install.ps1             # Per-arch unsigned-MSIX installer for end users
 ├── .github/
+│   ├── workflows/
+│   │   ├── ci.yml              # PR / push CI build + tests
+│   │   └── release.yml         # Tagged-release matrix (x64 + ARM64), OID injection, zip artifacts
 │   └── copilot-instructions.md
 ├── .context/
 │   └── resume.md               # Development resume point
@@ -533,60 +569,78 @@ void main(uint3 DTid : SV_DispatchThreadID) {
 
 ## ShaderLab Built-in Effects
 
-ShaderLab ships with **25+ built-in effects** implemented in `Effects/ShaderLabEffects.h/.cpp`. Each effect has its HLSL embedded as a string constant, compiled at first use, and shares a common color math library (BT.709/BT.2020/P3 matrices, PQ/HLG transfer functions, CIE xy conversions). Effects are versioned with `effectId` and `effectVersion` for stable upgrade paths.
+ShaderLab ships with **20+ built-in ShaderLab effects** implemented in `Effects/ShaderLabEffects.h/.cpp`, on top of the **40+ wrapped built-in D2D effects** in `Effects/EffectRegistry.cpp`. Each ShaderLab effect has its HLSL embedded as a string constant, compiled at first use via `ShaderCompiler`, and shares a common color math library (BT.709 / BT.2020 / DCI-P3 matrices, PQ / HLG transfer functions, CIE xy conversions, ICtCp). Every effect is versioned with `effectId` and `effectVersion` so saved graphs can be upgraded in place — see [Effect Versioning System](#effect-versioning-system).
 
 ### Analysis Effects
 
 | Effect | Type | Description |
 |--------|------|-------------|
-| Luminance Heatmap | Pixel Shader | False-color overlay mapping BT.709 luminance to Turbo/Inferno heat gradients |
-| Nit Map | Pixel Shader | Display-referred luminance visualization with nit-range zones |
-| Gamut Highlight | Pixel Shader | Highlights pixels outside a target gamut (sRGB, P3, BT.2020, or current monitor) |
-| CIE Chromaticity Plot | Pixel Shader | Plots image pixels on a CIE 1931 xy chromaticity diagram with gamut triangle overlays |
-| Vectorscope | Pixel Shader | YCbCr vectorscope visualization with graticule |
-| Waveform Monitor | Pixel Shader | RGB parade waveform display |
-| Delta E Comparator | Pixel Shader | Two-input CIEDE2000 perceptual color difference map |
-| Gamut Coverage | Pixel Shader | Percentage of target gamut volume covered by input image |
-| Split Comparison | Pixel Shader | Two-input side-by-side wipe with adjustable split position and divider line |
-| Image Statistics | D3D11 Compute | GPU-accelerated min/max/mean/median/P95 with 256-bin histogram (data-only node) |
+| Luminance Heatmap | Pixel Shader | False-color BT.709 luminance overlay (Turbo / Inferno gradients). |
+| Nit Map | Pixel Shader | Display-referred nit visualization with configurable luminance bands. |
+| Gamut Highlight | Pixel Shader | Highlights pixels outside a target gamut (sRGB / P3 / BT.2020 / current monitor). |
+| CIE Histogram | Compute Shader | 2D histogram of pixel chromaticity on the CIE xy plane. |
+| CIE Chromaticity Plot | Pixel Shader | Plots image pixels on a CIE 1931 xy diagram with gamut triangle overlays. |
+| Vectorscope | Pixel Shader | YCbCr vectorscope with graticule. |
+| Waveform Monitor | Pixel Shader | RGB parade waveform display. |
+| Delta E Comparator | Pixel Shader | Two-input CIEDE2000 perceptual difference map. |
+| Gamut Coverage | Pixel Shader | Percentage of target gamut volume covered by input. |
+| Split Comparison | Pixel Shader | Two-input wipe comparator with adjustable split & divider. |
+| Image Statistics | D3D11 Compute | GPU min / max / mean / median / P95 + 256-bin histogram (data-only node). |
 
 ### Color Processing Effects
 
 | Effect | Type | Description |
 |--------|------|-------------|
-| Gamut Map | Pixel Shader | CIE xy gamut mapping: Clip, Nearest, Compress to White, Fit Gamut modes |
-| Perceptual Gamut Map | Pixel Shader | ICtCp perceptual gamut mapping: Nearest on Shell, Compress to Neutral, Fit to Shell |
+| Gamut Map | Pixel Shader | CIE xy gamut mapping: Clip / Nearest / Compress to White / Fit Gamut. |
+| Perceptual Gamut Map | Pixel Shader | ICtCp perceptual mapping: Nearest on Shell / Compress to Neutral / Fit to Shell. |
 
-### Source Effects
+### Source / Generator Effects
 
 | Effect | Type | Description |
 |--------|------|-------------|
-| Gamut Source | Pixel Shader | Generates a swept gamut fill for a target color space |
-| Animated Gamut | Pixel Shader | Animated rotating gamut visualization (animatable) |
-| ICtCp Boundary | Pixel Shader | ICtCp gamut boundary visualization |
-| Color Checker | Pixel Shader | Macbeth ColorChecker pattern with accurate sRGB patches |
-| Zone Plate | Pixel Shader | Sine-wave zone plate for resolution/aliasing testing |
-| Gradient Generator | Pixel Shader | Configurable linear/radial gradient with HDR range |
-| HDR Test Pattern | Pixel Shader | Luminance step wedge from 0 to 10,000 nits |
-| Color Gamut Chart | Pixel Shader | Generates a full-gamut color sweep |
+| Gamut Source | Pixel Shader | Swept gamut fill for a target color space. |
+| ICtCp Boundary | Pixel Shader | ICtCp gamut boundary visualization. |
+| Color Checker | Pixel Shader | Macbeth ColorChecker pattern with accurate sRGB patches. |
+| Zone Plate | Pixel Shader | Sine-wave zone plate for resolution / aliasing testing. |
+| Gradient Generator | Pixel Shader | Configurable linear / radial gradient with HDR range. |
+| HDR Test Pattern | Pixel Shader | Luminance step wedge from 0 to 10,000 nits. |
 
-### Parameter Nodes
+### Data / Parameter Nodes
 
-| Type | Description |
+| Node | Description |
 |------|-------------|
-| Float Parameter | Continuous slider (teal node, inline slider on canvas) |
-| Integer Parameter | Discrete slider |
-| Toggle Parameter | Boolean on/off |
-| Gamut Parameter | Gamut selection dropdown |
+| Float Parameter | Continuous slider; teal node with inline canvas slider. |
+| Integer Parameter | Discrete slider. |
+| Toggle Parameter | Boolean on / off. |
+| Gamut Parameter | Gamut-id selector (sRGB / DCI-P3 / BT.2020 / Custom). |
+| Clock | Time source: outputs `Time` (seconds) and `Progress` (0–1 over a configurable duration). Drives the animation system. |
+| Numeric Expression | Single configurable math node powered by ExprTk; user-supplied formula evaluated against dynamic float inputs `A..Z`. Replaces the older Add / Subtract / Multiply / Divide / Min / Max nodes. See [below](#numeric-expression-node-exprtk). |
 
-## Versioning
+## Numeric Expression Node (ExprTk)
 
-ShaderLab uses a dual-version system defined in `Version.h`:
+A single, expression-driven math node replaces the legacy fixed-op math primitives. Implemented in `Rendering/MathExpression.{h,cpp}` (PCH disabled on the .cpp so the heavy ExprTk template instantiations don't leak into the rest of the engine TU).
 
-- **App version** (`1.1.0`): Displayed in title bar and status bar. Stored in saved graph files as `appVersion`.
-- **Graph format version** (`2`): Stored in saved graph files as `formatVersion`. Used for forward compatibility — loading a graph with a newer format version than the running app shows an error dialog.
+- **Dynamic inputs**: starts with one input `A`. Use the **➕ Add Input** button in the Properties panel to add `B`, `C`, … up to `Z` (26-input cap). Each row has an **✕** button to remove just that input.
+- **Expression**: a `TextBox` at the top of the Properties panel holds the formula. Examples:
+  - `A + B * C`
+  - `max(A, B, C)`
+  - `if (A > B, A, B)`
+  - `sin(A) * 0.5 + 0.5`
+  - `pow(clamp(A, 0, 1), 2.2)`
+- **Canvas display**: the formula is rendered under the node title as `= <expression>` so it's readable at a glance in the graph.
+- **Output**: a single `float` analysis field named `Result`, available on the orange data pin and bindable to any downstream scalar property.
+- **Errors**: parse / evaluation errors surface in the per-node log pane (`node_logs` MCP tool). The node short-circuits to `0.0` until the expression compiles cleanly.
+- **Persistence**: the expression and the live input list both round-trip through graph JSON.
 
-Saved JSON graphs include both versions for traceability.
+**ExprTk feature flags.** `Rendering/MathExpression.cpp` defines
+`exprtk_disable_string_capabilities`, `exprtk_disable_rtl_io`, `exprtk_disable_rtl_io_file`,
+`exprtk_disable_rtl_vecops`, `exprtk_disable_enhanced_features`, and
+`exprtk_disable_caseinsensitivity` *before* `#include`-ing `exprtk.hpp`. This trims the
+library to its math-only core; without these flags the MSVC Release optimizer was
+producing a 0xC0000005 in the regex / IO subsystems on first evaluation. Only finite
+scalar expressions are supported — no strings, files, or vector return values.
+
+## Property Bindings (Data Pins)
 
 Analysis output fields can be visually connected to downstream effect properties using **data pins** on the node graph canvas.
 
@@ -633,9 +687,9 @@ graph LR
 
 Each **Output** node in the graph gets its own OS window with an independent SwapChainPanel, pan/zoom, and save-to-file. Implemented in `Controls/OutputWindow.h/.cpp`.
 
-- **Bidirectional sync**: Closing the window deletes the Output node from the graph; deleting the Output node closes the window.
-- **Shared D2D device context**: All output windows share the same D3D11/D2D1 device stack from `RenderEngine`.
-- **Independent viewport**: Each window has its own pan/zoom transform, separate from the main preview panel.
+- **Bidirectional sync**: closing the window deletes the Output node from the graph; deleting the Output node closes the window. Window-close path forces a graph repaint so the node disappears from the canvas immediately, even when the dirty-gated render loop is otherwise idle.
+- **Shared D2D device context**: all output windows share the same D3D11/D2D1 device stack from `RenderEngine`.
+- **Independent viewport**: each window has its own pan/zoom transform, separate from the main preview panel.
 
 ## Animation System
 
@@ -650,11 +704,11 @@ ShaderLab supports animated parameters and video sources:
 
 Parameter nodes are data-only graph elements (no HLSL shader) that expose a single value for binding to downstream effect properties.
 
-- **Four types**: Float, Integer, Toggle, Gamut
-- **Teal color** on the node graph canvas
-- **Inline slider**: Rendered directly on the D2D canvas for quick adjustment
-- **No preview switch**: Clicking a parameter node does not change the preview target
-- **Evaluator-populated**: The graph evaluator populates analysis output fields directly from node properties (no shader dispatch)
+- **Five built-in parameter types**: Float, Integer, Toggle, Gamut, Clock. The formula-driven [Numeric Expression](#numeric-expression-node-exprtk) is parameter-like (also data-only, also produces a `Result` analysis field) but takes one or more `float` inputs.
+- **Teal color** on the node graph canvas.
+- **Inline slider**: rendered directly on the D2D canvas for quick adjustment (Float / Integer / Toggle / Gamut).
+- **No preview switch**: clicking a parameter node does not change the preview target.
+- **Evaluator-populated**: the graph evaluator populates analysis output fields directly from node properties (no shader dispatch).
 
 ## Effect Versioning System
 
@@ -673,6 +727,41 @@ Effect parameters support conditional visibility via the `visibleWhen` field on 
 - **Format**: `"ParamName == value"` (e.g., `"Mode == 1"`, `"EnableHDR == true"`)
 - **Hidden from UI**: When the condition is false, the parameter is hidden from both the Properties panel and data pins on the graph canvas.
 - **Dynamic**: Visibility re-evaluates whenever the controlling parameter changes.
+
+## Graph Editor UX
+
+### Adding nodes
+
+- **Toolbar / context menu**: new nodes are placed in the **center of the current viewport** (in graph coordinates), accounting for the user's pan / zoom — they no longer drop at canvas origin behind off-screen pans.
+- **Auto-arrange**: `Ctrl+L` (or toolbar button) sorts nodes by topological depth and lays them out in evenly-spaced columns.
+
+### Removing edges (Alt+click)
+
+- **Alt + Left-click** on any edge — image edge or orange data-binding edge — removes it. Hit-testing is done by sampling the cubic bezier with a small distance tolerance (`Controls/NodeGraphController.cpp::HitTestEdge`). The same path also handles right-click delete in the canvas context menu.
+
+### Copy / Paste
+
+- `Ctrl+C` / `Ctrl+V` copy the selected nodes (and any edges that fall entirely between them) into the clipboard, then paste with a small offset and fresh GUIDs.
+
+### Color coding by node kind
+
+| Color | Node kind |
+|-------|-----------|
+| Green | Source nodes (images, video, generators) |
+| Blue | Built-in D2D effects |
+| Red | Custom pixel shader effects |
+| Orange | Custom D2D compute shader effects |
+| Yellow | D3D11 compute shader effects |
+| Teal | Parameter / Clock / Numeric Expression |
+| Purple | Data-only analysis nodes (Image Statistics) |
+| Gray | Output nodes |
+
+### Inline data display
+
+- **Data pin values** are shown inline on the node canvas (current bound value).
+- **Enum labels**: enum-typed properties show their label (not raw integer) on data pins.
+- **Image input pin labels** are derived from effect input names (e.g., `Source`, `Destination`).
+- **“No Input”** text is displayed on image input pins with broken / missing connections.
 
 ## D2D / D3D11 Hybrid Compute System
 
@@ -1049,35 +1138,7 @@ The **Image Statistics** effect is a GPU-accelerated, data-only analysis node:
 
 ## Copy / Paste Nodes
 
-- **Ctrl+C / Ctrl+V**: Copy selected nodes and paste with offset.
-- **Deep copy**: Each pasted node gets a fresh GUID.
-- **Internal edge preservation**: Edges between copied nodes are preserved in the paste.
-
-## Auto-Arrange
-
-- **Ctrl+L** or toolbar button: Automatically arranges nodes in topological-depth columns.
-- Nodes are sorted by their topological depth (distance from source nodes) and arranged in evenly-spaced columns.
-
-## Node Graph Visual Enhancements
-
-### Color Coding by Node Type
-
-| Color | Node Type |
-|-------|-----------|
-| Green | Source nodes (images, generators) |
-| Blue | Built-in D2D effects |
-| Red | Custom pixel shader effects |
-| Orange | Custom compute shader effects |
-| Teal | Parameter nodes |
-| Purple | Data-only nodes (Image Statistics) |
-| Gray | Output nodes |
-
-### Inline Data Display
-
-- **Data pin values**: Shown inline on the node canvas (current bound value).
-- **Enum labels**: Enum-typed properties show their label (not raw integer) on data pins.
-- **Image input pin labels**: Derived from effect input names (e.g., "Source", "Destination").
-- **"No Input" text**: Displayed on image input pins with broken/missing connections.
+See [Graph Editor UX](#graph-editor-ux).
 
 ## MCP Server (AI Agent Integration)
 
@@ -1089,31 +1150,33 @@ ShaderLab includes an embedded HTTP server implementing the **Model Context Prot
 - Transport: Streamable HTTP (`POST /` for JSON-RPC)
 - Enable: MCP toggle in toolbar, `--mcp` flag, or `config.json`
 
-### Tools (21 total)
+### Tools (23 total)
 
 | Tool | Description |
 |------|-------------|
-| `graph_add_node` | Add built-in D2D or ShaderLab effect |
-| `graph_remove_node` | Remove a node |
-| `graph_connect` | Connect image pins |
-| `graph_disconnect` | Disconnect image pins |
-| `graph_set_property` | Set a node property |
-| `graph_get_node` | Get node details + analysis results |
-| `graph_save_json` | Serialize graph to JSON |
-| `graph_load_json` | Load graph from JSON |
-| `graph_clear` | Clear entire graph (keeps Output) |
-| `effect_compile` | Compile HLSL (+ optional analysisFields) |
-| `set_preview_node` | Set which node is previewed |
-| `render_capture` | Capture preview as PNG (HDR clipped to SDR) |
-| `registry_get_effect` | Get built-in effect metadata |
-| `graph_bind_property` | Bind property to analysis field |
-| `graph_unbind_property` | Remove binding |
-| `read_analysis_output` | Read typed analysis fields from compute node |
-| `read_pixel_trace` | Pixel trace at normalized coords (per-node values) |
-| `list_effects` | List all effects by category |
-| `graph_overview` | Compact graph summary (nodes, edges, preview) |
-| `get_display_info` | Display caps, active profile, pipeline, version |
-| `graph_rename_node` | Rename a node |
+| `graph_add_node` | Add built-in D2D or ShaderLab effect (placed at viewport center). |
+| `graph_remove_node` | Remove a node. |
+| `graph_rename_node` | Rename a node. |
+| `graph_connect` | Connect image pins. |
+| `graph_disconnect` | Disconnect image pins. |
+| `graph_set_property` | Set a node property. |
+| `graph_get_node` | Get node details + analysis results. |
+| `graph_save_json` | Serialize graph to JSON. |
+| `graph_load_json` | Load graph from JSON. |
+| `graph_clear` | Clear entire graph (keeps Output). |
+| `graph_overview` | Compact graph summary (nodes, edges, preview). |
+| `graph_bind_property` | Bind property to upstream analysis field. |
+| `graph_unbind_property` | Remove a property binding. |
+| `effect_compile` | Compile HLSL (+ optional analysisFields). |
+| `set_preview_node` | Set which node is previewed. |
+| `render_capture` | Capture preview as PNG (HDR clipped to SDR). |
+| `registry_get_effect` | Get built-in effect metadata. |
+| `read_analysis_output` | Read typed analysis fields from a compute / analysis / parameter node. |
+| `read_pixel_trace` | Pixel trace at normalized coords (per-node values). |
+| `list_effects` | List all effects by category. |
+| `get_display_info` | Display caps, active profile, pipeline, app version. |
+| `node_logs` | Per-node timestamped info / warning / error log entries. |
+| `perf_timings` | Per-node evaluation timings from the most recent frame. |
 
 ### Known Limitations
 
@@ -1121,3 +1184,4 @@ ShaderLab includes an embedded HTTP server implementing the **Model Context Prot
 - **FP16 precision**: Analysis readback values show minor quantization (e.g., 0.1 → 0.099976) due to the D2D output buffer using 16-bit float precision.
 - **`uint` cbuffer params don't work in D2D pixel shaders**: Values pack correctly in the constant buffer but the shader never sees updates. Use `float` with threshold comparisons (`> 0.5`, `> 1.5`) instead.
 - **HLSL optimizer removes unreferenced cbuffer vars**: With `D3DCOMPILE_WARNINGS_ARE_ERRORS`, variables not referenced on ALL code paths are optimized out. Read all cbuffer vars at top of `main()` before branches.
+- **ExprTk math-only subset**: Numeric Expression has the regex / IO / enhanced subsystems disabled (see [Numeric Expression Node](#numeric-expression-node-exprtk)). Expressions must produce finite scalar `float` results — no strings, no file I/O, no vector return values.

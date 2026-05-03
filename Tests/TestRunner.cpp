@@ -292,53 +292,152 @@ namespace
 
     void TestMathNodes()
     {
-        printf("\n=== Math Nodes ===\n");
+        printf("\n=== Numeric Expression Node ===\n");
         auto& registry = ShaderLab::Effects::ShaderLabEffects::Instance();
 
-        struct MathTest { const wchar_t* name; float a, b, expected; };
-        MathTest tests[] = {
-            { L"Add",      3.0f, 7.0f, 10.0f },
-            { L"Subtract", 10.0f, 3.0f, 7.0f },
-            { L"Multiply", 4.0f, 5.0f, 20.0f },
-            { L"Divide",   20.0f, 4.0f, 5.0f },
-            { L"Max",      3.0f, 7.0f, 7.0f },
-            { L"Min",      3.0f, 7.0f, 3.0f },
+        // Effect descriptor exists.
+        auto* desc = registry.FindByName(L"Numeric Expression");
+        TEST("DescriptorExists", desc != nullptr);
+        if (!desc) return;
+        TEST("StableEffectId", desc->effectId == L"Math Expression");
+
+        auto baseNode = ShaderLab::Effects::ShaderLabEffects::CreateNode(*desc);
+        TEST("DefaultHasOnlyA",
+            baseNode.properties.count(L"A") == 1 &&
+            baseNode.properties.count(L"B") == 0 &&
+            baseNode.properties.count(L"Expression") == 1);
+
+        // Each entry: expression + (name,value) pairs to set + expected result.
+        struct Case {
+            const wchar_t* name;
+            const wchar_t* expression;
+            std::vector<std::pair<const wchar_t*, float>> inputs;
+            float expected;
         };
-        for (const auto& t : tests)
+        Case cases[] = {
+            { L"Identity",         L"A",                 {{L"A", 7.5f}},                            7.5f },
+            { L"AddTwoInputs",     L"A + B",             {{L"A", 3.0f},{L"B", 4.0f}},               7.0f },
+            { L"SubtractMultiply", L"(A - B) * C",       {{L"A", 10.0f},{L"B", 4.0f},{L"C", 2.0f}}, 12.0f },
+            { L"MaxOfFour",        L"max(A, B, C, D)",   {{L"A", 1.0f},{L"B", 9.0f},{L"C", 3.0f},{L"D", 7.0f}}, 9.0f },
+            { L"FiveInputAvg",     L"(A + B + C + D + E) / 5",
+                                   {{L"A", 1.0f},{L"B", 2.0f},{L"C", 3.0f},{L"D", 4.0f},{L"E", 5.0f}}, 3.0f },
+            { L"SinPi",            L"sin(pi)",           {{L"A", 0.0f}},                            0.0f },
+            { L"Conditional",      L"if(A > B, A, B)",   {{L"A", 5.0f},{L"B", 3.0f}},               5.0f },
+        };
+
+        for (const auto& c : cases)
         {
             ShaderLab::Graph::EffectGraph g;
             ShaderLab::Effects::SourceNodeFactory sf;
+            auto node = ShaderLab::Effects::ShaderLabEffects::CreateNode(*desc);
+            // Add as many inputs as required (default has only A).
+            for (const auto& [pname, pval] : c.inputs)
+            {
+                if (node.properties.find(pname) == node.properties.end())
+                {
+                    ShaderLab::Graph::ParameterDefinition pd;
+                    pd.name = pname; pd.typeName = L"float"; pd.defaultValue = 0.0f;
+                    pd.minValue = -100000.0f; pd.maxValue = 100000.0f; pd.step = 0.1f;
+                    node.customEffect->parameters.push_back(std::move(pd));
+                    node.properties[pname] = 0.0f;
+                }
+                node.properties[pname] = pval;
+            }
+            node.properties[L"Expression"] = std::wstring(c.expression);
 
-            auto pA = ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Float Parameter"));
-            auto pB = ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(L"Float Parameter"));
-            auto math = ShaderLab::Effects::ShaderLabEffects::CreateNode(*registry.FindByName(t.name));
-
-            auto aId = g.AddNode(std::move(pA));
-            auto bId = g.AddNode(std::move(pB));
-            auto mathId = g.AddNode(std::move(math));
-
-            g.FindNode(aId)->properties[L"Value"] = t.a;
-            g.FindNode(bId)->properties[L"Value"] = t.b;
-            g.BindProperty(mathId, L"A", aId, L"Value", 0);
-            g.BindProperty(mathId, L"B", bId, L"Value", 0);
-
+            auto id = g.AddNode(std::move(node));
             Evaluate(g, sf);
 
-            auto* mn = g.FindNode(mathId);
+            auto* mn = g.FindNode(id);
             bool ok = false;
+            float got = 0.0f;
             if (mn) {
                 for (const auto& f : mn->analysisOutput.fields) {
-                    if (f.name == L"Result") {
-                        ok = std::abs(f.components[0] - t.expected) < 0.01f;
-                        break;
-                    }
+                    if (f.name == L"Result") { got = f.components[0]; break; }
                 }
+                ok = std::abs(got - c.expected) < 0.01f && mn->runtimeError.empty();
             }
-            std::string testName = "Math_";
-            for (const wchar_t* p = t.name; *p; ++p) testName += static_cast<char>(*p);
+            std::string testName = "Eval_";
+            for (const wchar_t* p = c.name; *p; ++p) testName += static_cast<char>(*p);
             TEST(testName.c_str(), ok);
         }
+
+        // Parse error path.
+        {
+            ShaderLab::Graph::EffectGraph g;
+            ShaderLab::Effects::SourceNodeFactory sf;
+            auto node = ShaderLab::Effects::ShaderLabEffects::CreateNode(*desc);
+            node.properties[L"Expression"] = std::wstring(L"A + + +");
+            auto id = g.AddNode(std::move(node));
+            Evaluate(g, sf);
+            auto* mn = g.FindNode(id);
+            TEST("ParseErrorReported", mn && !mn->runtimeError.empty());
+        }
+
+        // Add/remove inputs at the graph level (mirrors the UI flow).
+        {
+            ShaderLab::Graph::EffectGraph g;
+            auto node = ShaderLab::Effects::ShaderLabEffects::CreateNode(*desc);
+            auto id = g.AddNode(std::move(node));
+            auto* n = g.FindNode(id);
+
+            auto addInput = [&](const wchar_t* name) {
+                ShaderLab::Graph::ParameterDefinition pd;
+                pd.name = name; pd.typeName = L"float"; pd.defaultValue = 0.0f;
+                pd.minValue = -100000.0f; pd.maxValue = 100000.0f; pd.step = 0.1f;
+                n->customEffect->parameters.push_back(std::move(pd));
+                n->properties[name] = 0.0f;
+            };
+            addInput(L"B");
+            addInput(L"C");
+            TEST("AddInputs",
+                n->properties.count(L"B") == 1 && n->properties.count(L"C") == 1);
+
+            // Remove B.
+            std::erase_if(n->customEffect->parameters,
+                [](const auto& p) { return p.name == L"B"; });
+            n->properties.erase(L"B");
+            g.UnbindProperty(id, L"B");
+            TEST("RemoveInput",
+                n->properties.count(L"B") == 0 &&
+                n->properties.count(L"A") == 1 && n->properties.count(L"C") == 1);
+        }
+
+        // JSON round-trip with custom inputs.
+        {
+            ShaderLab::Graph::EffectGraph g;
+            auto node = ShaderLab::Effects::ShaderLabEffects::CreateNode(*desc);
+            // Add B and C, set values + expression.
+            for (const wchar_t* name : { L"B", L"C" })
+            {
+                ShaderLab::Graph::ParameterDefinition pd;
+                pd.name = name; pd.typeName = L"float"; pd.defaultValue = 0.0f;
+                pd.minValue = -100000.0f; pd.maxValue = 100000.0f; pd.step = 0.1f;
+                node.customEffect->parameters.push_back(std::move(pd));
+                node.properties[name] = 0.0f;
+            }
+            node.properties[L"A"] = 1.0f;
+            node.properties[L"B"] = 2.0f;
+            node.properties[L"C"] = 3.0f;
+            node.properties[L"Expression"] = std::wstring(L"A + B * C");
+            auto id = g.AddNode(std::move(node));
+
+            auto json = g.ToJson();
+            auto g2 = ShaderLab::Graph::EffectGraph::FromJson(json);
+
+            ShaderLab::Effects::SourceNodeFactory sf;
+            Evaluate(g2, sf);
+            auto* mn = g2.FindNode(id);
+            float got = 0.0f;
+            if (mn) {
+                for (const auto& f : mn->analysisOutput.fields)
+                    if (f.name == L"Result") { got = f.components[0]; break; }
+            }
+            TEST("JsonRoundTripInputsAndExpression",
+                mn && std::abs(got - 7.0f) < 0.01f); // 1 + 2*3 = 7
+        }
     }
+
 
     void TestClockNode()
     {

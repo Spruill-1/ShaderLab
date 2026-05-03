@@ -371,6 +371,9 @@ namespace winrt::ShaderLab::implementation
                 // pick up the new primaries.
                 m_graph.MarkAllDirty();
                 m_forceRender = true;
+                // Pick up new refresh rate (e.g. user changed displays
+                // or switched modes from 60 Hz to 144 Hz).
+                UpdateRenderTimerInterval();
                 UpdateStatusBar();
             });
         });
@@ -433,13 +436,13 @@ namespace winrt::ShaderLab::implementation
                 std::wstring dstName = dstNode ? dstNode->name : std::format(L"Node {}", dstId);
                 if (isData)
                 {
-                    m_nodeLogs[dstId].Info(std::format(L"Property bound ← {} (data pin)", srcName));
-                    m_nodeLogs[srcId].Info(std::format(L"Data output bound → {}", dstName));
+                    m_nodeLogs[dstId].Info(std::format(L"Property bound from {} (data pin)", srcName));
+                    m_nodeLogs[srcId].Info(std::format(L"Data output bound to {}", dstName));
                 }
                 else
                 {
-                    m_nodeLogs[dstId].Info(std::format(L"Input {} connected ← {}", dstPin, srcName));
-                    m_nodeLogs[srcId].Info(std::format(L"Output {} connected → {}", srcPin, dstName));
+                    m_nodeLogs[dstId].Info(std::format(L"Input {} connected from {}", dstPin, srcName));
+                    m_nodeLogs[srcId].Info(std::format(L"Output {} connected to {}", srcPin, dstName));
                 }
             });
 
@@ -449,12 +452,14 @@ namespace winrt::ShaderLab::implementation
             m_pixelTrace.Initialize(m_renderEngine.D3DDevice());
         }
 
-        // Start render loop.
+        // Start render loop. The interval tracks the monitor's refresh
+        // rate (clamped to 60..240 Hz), so 120 Hz / 144 Hz / 240 Hz panels
+        // and high-FPS video sources actually run at their native cadence.
         m_fpsTimePoint = std::chrono::steady_clock::now();
         m_lastRenderTick = m_fpsTimePoint;
         m_renderTimer = DispatcherQueue().CreateTimer();
-        m_renderTimer.Interval(std::chrono::milliseconds(16));
         m_renderTimer.Tick({ this, &MainWindow::OnRenderTick });
+        UpdateRenderTimerInterval();
         m_renderTimer.Start();
 
         // Initialize the node graph editor panel.
@@ -486,6 +491,53 @@ namespace winrt::ShaderLab::implementation
             else
                 GpuInfoText().Text(L"GPU: " + m_renderEngine.AdapterName());
         }
+    }
+
+    uint32_t MainWindow::QueryDisplayRefreshHz() const noexcept
+    {
+        // Use EnumDisplaySettings on the monitor that contains the app HWND.
+        // dmDisplayFrequency is reported in whole Hz; modern panels round to
+        // 60/120/144/165/240 etc. Returning 0 here is the "unknown" signal.
+        if (!m_hwnd)
+            return 0;
+
+        HMONITOR mon = MonitorFromWindow(m_hwnd, MONITOR_DEFAULTTOPRIMARY);
+        if (!mon)
+            return 0;
+
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (!::GetMonitorInfoW(mon, &mi))
+            return 0;
+
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        if (!::EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
+            return 0;
+
+        return dm.dmDisplayFrequency;
+    }
+
+    void MainWindow::UpdateRenderTimerInterval()
+    {
+        // Pick a target Hz from the active monitor, clamped to [60, 240].
+        // - 60 Hz floor: avoid laggy interactions on 30 Hz TV-out modes.
+        // - 240 Hz ceiling: dispatcher tick scheduling becomes noisy below
+        //   ~4 ms, and rendering faster than panel refresh is wasted work.
+        uint32_t hz = QueryDisplayRefreshHz();
+        if (hz < 60) hz = 60;
+        if (hz > 240) hz = 240;
+
+        if (hz == m_targetRefreshHz && m_renderTimer)
+            return;
+
+        m_targetRefreshHz = hz;
+
+        // Use microseconds so non-integer-ms periods (e.g. 144 Hz ~6.944 ms)
+        // don't get rounded to a slower or faster cadence than the panel.
+        const auto interval = std::chrono::microseconds(1'000'000 / hz);
+        if (m_renderTimer)
+            m_renderTimer.Interval(interval);
     }
 
     void MainWindow::OnGpuInfoTapped(
@@ -2825,10 +2877,49 @@ namespace winrt::ShaderLab::implementation
             propsHeader.Margin({ 0, 4, 0, 4 });
             panel.Children().Append(propsHeader);
 
+            // ---- Numeric Expression node: dedicated Expression editor + dynamic inputs ----
+            const bool isMathExpression = node->customEffect.has_value() &&
+                node->customEffect->shaderLabEffectId == L"Math Expression";
+            if (isMathExpression)
+            {
+                auto exprLabel = Controls::TextBlock();
+                exprLabel.Text(L"Expression");
+                exprLabel.FontSize(12);
+                exprLabel.Margin({ 0, 6, 0, 2 });
+                panel.Children().Append(exprLabel);
+
+                std::wstring exprText;
+                auto eIt = node->properties.find(L"Expression");
+                if (eIt != node->properties.end())
+                    if (auto* s = std::get_if<std::wstring>(&eIt->second)) exprText = *s;
+
+                auto exprBox = Controls::TextBox();
+                exprBox.Text(winrt::hstring(exprText));
+                exprBox.AcceptsReturn(false);
+                exprBox.FontFamily(Media::FontFamily(L"Consolas"));
+                exprBox.Margin({ 0, 0, 0, 8 });
+                uint32_t mathId = capturedId;
+                exprBox.TextChanged([this, mathId](auto&& sender, auto&&)
+                {
+                    auto* n = m_graph.FindNode(mathId);
+                    if (!n) return;
+                    auto box = sender.template as<Controls::TextBox>();
+                    n->properties[L"Expression"] = std::wstring(box.Text().c_str());
+                    n->dirty = true;
+                    m_graph.MarkAllDirty();
+                    m_forceRender = true;
+                    m_nodeGraphController.SetNeedsRedraw();
+                });
+                panel.Children().Append(exprBox);
+            }
+
             for (const auto& [key, value] : node->properties)
             {
                 // Skip internal metadata that shouldn't appear as UI properties.
                 if (key == L"analysisFields" || key == L"propertyBindings")
+                    continue;
+                // Math Expression: Expression is rendered above as a dedicated control.
+                if (isMathExpression && key == L"Expression")
                     continue;
                 // Skip hidden properties (convention: name ends with _hidden).
                 if (key.size() > 7 && key.ends_with(L"_hidden"))
@@ -2881,6 +2972,34 @@ namespace winrt::ShaderLab::implementation
                 labelRow.Orientation(Controls::Orientation::Horizontal);
                 labelRow.Spacing(6);
                 labelRow.Children().Append(propLabel);
+
+                // Math Expression: per-input "X" button to remove this variable.
+                // Only show on float input parameters (A, B, ...), and never if
+                // it is the last remaining input.
+                if (isMathExpression && std::holds_alternative<float>(value))
+                {
+                    int floatInputCount = 0;
+                    if (node->customEffect.has_value())
+                    {
+                        for (const auto& p : node->customEffect->parameters)
+                            if (p.typeName == L"float") ++floatInputCount;
+                    }
+                    if (floatInputCount > 1)
+                    {
+                        auto removeBtn = Controls::Button();
+                        removeBtn.Content(winrt::box_value(L"\u2715"));
+                        removeBtn.FontSize(10);
+                        removeBtn.MinWidth(24);
+                        removeBtn.Padding({ 4, 0, 4, 0 });
+                        std::wstring removeKey = capturedKey;
+                        uint32_t removeNodeId = capturedId;
+                        removeBtn.Click([this, removeNodeId, removeKey](auto&&, auto&&)
+                        {
+                            RemoveMathExpressionInput(removeNodeId, removeKey);
+                        });
+                        labelRow.Children().Append(removeBtn);
+                    }
+                }
 
                 if (isBound)
                 {
@@ -3978,6 +4097,22 @@ namespace winrt::ShaderLab::implementation
         // "Show Logs" button at the bottom of properties panel.
         if (node)
         {
+            // Math Expression: "+ Add Input" button just above Show Logs.
+            if (node->customEffect.has_value() &&
+                node->customEffect->shaderLabEffectId == L"Math Expression")
+            {
+                auto addBtn = Controls::Button();
+                addBtn.Content(winrt::box_value(L"\u2795  Add Input"));
+                addBtn.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+                addBtn.Margin({ 0, 12, 0, 0 });
+                uint32_t addNodeId = node->id;
+                addBtn.Click([this, addNodeId](auto&&, auto&&)
+                {
+                    AddMathExpressionInput(addNodeId);
+                });
+                panel.Children().Append(addBtn);
+            }
+
             auto logBtn = Controls::Button();
             logBtn.Content(winrt::box_value(L"\xE7BA  Show Logs"));
             logBtn.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
@@ -3988,6 +4123,68 @@ namespace winrt::ShaderLab::implementation
             });
             panel.Children().Append(logBtn);
         }
+    }
+
+    void MainWindow::AddMathExpressionInput(uint32_t nodeId)
+    {
+        auto* node = m_graph.FindNode(nodeId);
+        if (!node || !node->customEffect.has_value()) return;
+        if (node->customEffect->shaderLabEffectId != L"Math Expression") return;
+
+        // Find the next unused single-letter name A..Z.
+        std::wstring nextName;
+        for (wchar_t ch = L'A'; ch <= L'Z'; ++ch)
+        {
+            std::wstring candidate(1, ch);
+            if (node->properties.find(candidate) == node->properties.end())
+            {
+                nextName = candidate;
+                break;
+            }
+        }
+        if (nextName.empty()) return;  // 26 inputs already; bail out silently.
+
+        ::ShaderLab::Graph::ParameterDefinition pd;
+        pd.name = nextName;
+        pd.typeName = L"float";
+        pd.defaultValue = 0.0f;
+        pd.minValue = -100000.0f;
+        pd.maxValue = 100000.0f;
+        pd.step = 0.1f;
+        node->customEffect->parameters.push_back(std::move(pd));
+        node->properties[nextName] = 0.0f;
+
+        node->dirty = true;
+        m_graph.MarkAllDirty();
+        m_nodeGraphController.RebuildLayout();
+        m_forceRender = true;
+        UpdatePropertiesPanel();
+    }
+
+    void MainWindow::RemoveMathExpressionInput(uint32_t nodeId, const std::wstring& paramName)
+    {
+        auto* node = m_graph.FindNode(nodeId);
+        if (!node || !node->customEffect.has_value()) return;
+        if (node->customEffect->shaderLabEffectId != L"Math Expression") return;
+        if (paramName == L"Expression") return;  // never remove the formula.
+
+        // Refuse to remove the last remaining input.
+        int floatInputs = 0;
+        for (const auto& p : node->customEffect->parameters)
+            if (p.typeName == L"float") ++floatInputs;
+        if (floatInputs <= 1) return;
+
+        // Drop the parameter definition + property + any binding on this slot.
+        std::erase_if(node->customEffect->parameters,
+            [&paramName](const auto& p) { return p.name == paramName; });
+        node->properties.erase(paramName);
+        m_graph.UnbindProperty(nodeId, paramName);
+
+        node->dirty = true;
+        m_graph.MarkAllDirty();
+        m_nodeGraphController.RebuildLayout();
+        m_forceRender = true;
+        UpdatePropertiesPanel();
     }
 
     void MainWindow::ShowCurveEditorDialog(

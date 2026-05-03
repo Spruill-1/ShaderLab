@@ -168,6 +168,15 @@ namespace winrt::ShaderLab::implementation
         std::chrono::steady_clock::time_point m_fpsTimePoint;
         std::chrono::steady_clock::time_point m_lastRenderTick;
 
+        // Render cadence: target 1 / monitor refresh, clamped to [60, 240] Hz.
+        // Refreshed on init and on every display change so a 120/144/240 Hz
+        // panel actually drives the render loop at its native rate. Going
+        // higher than display refresh wastes work; going lower than 60 Hz
+        // makes interactions feel laggy on unusual modes (e.g. 30 Hz TV out).
+        uint32_t m_targetRefreshHz{ 60 };
+        uint32_t QueryDisplayRefreshHz() const noexcept;
+        void UpdateRenderTimerInterval();
+
         // Per-frame performance timings (microseconds, rolling averages).
         struct FrameTimings {
             double totalUs{};
@@ -246,6 +255,8 @@ namespace winrt::ShaderLab::implementation
         D2D1_POINT_2F m_graphPanOrigin{};
         void UpdatePropertiesPanel();
         void ShowCurveEditorDialog(uint32_t nodeId, const std::wstring& propertyKey, std::function<void()> markDirty);
+        void AddMathExpressionInput(uint32_t nodeId);
+        void RemoveMathExpressionInput(uint32_t nodeId, const std::wstring& paramName);
         winrt::fire_and_forget BrowseImageForSourceNode(uint32_t nodeId);
         winrt::fire_and_forget BrowseVideoForSourceNode();
         winrt::fire_and_forget BrowseVideoForExistingNode(uint32_t nodeId);

@@ -230,24 +230,38 @@ namespace ShaderLab::Rendering
                             node->customEffect->shaderLabEffectId == L"Math Expression")
                     {
                         // Numeric Expression node: evaluate the user-supplied
-                        // formula with A..E bound to the corresponding props.
+                        // formula with each declared float parameter (A, B, C, ...)
+                        // bound by name. Inputs are dynamic — the parameter list
+                        // on the node defines which variables exist.
                         std::wstring expr;
                         auto eIt = node->properties.find(L"Expression");
                         if (eIt != node->properties.end())
                             if (auto* s = std::get_if<std::wstring>(&eIt->second)) expr = *s;
 
-                        const wchar_t* names[] = { L"A", L"B", L"C", L"D", L"E" };
-                        float vals[5] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-                        for (size_t i = 0; i < 5; ++i)
+                        std::vector<std::wstring> nameStrs;
+                        std::vector<const wchar_t*> namePtrs;
+                        std::vector<float> vals;
+                        nameStrs.reserve(node->customEffect->parameters.size());
+                        namePtrs.reserve(node->customEffect->parameters.size());
+                        vals.reserve(node->customEffect->parameters.size());
+                        for (const auto& p : node->customEffect->parameters)
                         {
-                            auto it = node->properties.find(names[i]);
+                            if (p.name == L"Expression") continue;
+                            if (p.typeName != L"float") continue;
+                            float v = 0.0f;
+                            auto it = node->properties.find(p.name);
                             if (it != node->properties.end())
-                                if (auto* f = std::get_if<float>(&it->second)) vals[i] = *f;
+                                if (auto* f = std::get_if<float>(&it->second)) v = *f;
+                            nameStrs.push_back(p.name);
+                            vals.push_back(v);
                         }
+                        for (auto& n : nameStrs) namePtrs.push_back(n.c_str());
 
                         float result = 0.0f;
                         std::wstring err;
-                        bool ok = EvaluateMathExpression(expr, names, vals, 5, result, &err);
+                        bool ok = EvaluateMathExpression(
+                            expr, namePtrs.data(), vals.data(), vals.size(),
+                            result, &err);
                         node->runtimeError = ok ? std::wstring{} : err;
 
                         AnalysisFieldValue fv;

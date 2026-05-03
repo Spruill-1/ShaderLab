@@ -2706,12 +2706,8 @@ void main(uint3 GTid : SV_GroupThreadID)
             desc.category = L"Parameter";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.parameters = {
-                { L"Expression", L"string", std::wstring(L"A + B"), 0.0f, 0.0f, 0.0f },
+                { L"Expression", L"string", std::wstring(L"A"), 0.0f, 0.0f, 0.0f },
                 { L"A", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
-                { L"B", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
-                { L"C", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
-                { L"D", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
-                { L"E", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
             };
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
             desc.analysisFields = {
