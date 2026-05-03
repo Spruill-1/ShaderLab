@@ -6,7 +6,18 @@
 #include <unordered_map>
 #include <mutex>
 
-// ExprTk pulls in <cmath>, <regex>, etc. Suppress its own warnings.
+// Strip down ExprTk to the math-only feature set. The disabled subsystems
+// pull in <regex> and other heavy machinery that have known crash bugs in
+// MSVC Release. We don't use any of them; numeric expressions only need
+// the arithmetic, trig, and conditional operators.
+#define exprtk_disable_string_capabilities
+#define exprtk_disable_rtl_io
+#define exprtk_disable_rtl_io_file
+#define exprtk_disable_rtl_vecops
+#define exprtk_disable_enhanced_features
+#define exprtk_disable_caseinsensitivity
+
+// ExprTk pulls in <cmath>, etc. Suppress its own warnings.
 #pragma warning(push)
 #pragma warning(disable: 4100 4127 4244 4267 4456 4457 4458 4459 4505 4701 4702 4715 4996 26439 26451 26495 26498 26800 26819)
 #include "exprtk.hpp"
