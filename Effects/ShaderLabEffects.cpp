@@ -2694,27 +2694,24 @@ void main(uint3 GTid : SV_GroupThreadID)
             m_effects.push_back(std::move(desc));
         }
 
-        // ---- Math Parameter Nodes ----
-        // Each takes two float inputs (A, B) and outputs Result.
-        struct MathOp { std::wstring name; std::wstring id; };
-        MathOp mathOps[] = {
-            { L"Max",      L"Math Max" },
-            { L"Min",      L"Math Min" },
-            { L"Add",      L"Math Add" },
-            { L"Subtract", L"Math Subtract" },
-            { L"Multiply", L"Math Multiply" },
-            { L"Divide",   L"Math Divide" },
-        };
-        for (const auto& op : mathOps)
+        // ---- Numeric Expression Parameter Node ----
+        // A single configurable math node that evaluates a user-provided
+        // expression with up to 5 named scalar inputs. Replaces the older
+        // Add/Subtract/Multiply/Divide/Min/Max nodes — all of those are
+        // expressible as a one-line formula here (e.g. "max(A,B)", "A*B+C").
         {
             ShaderLabEffectDescriptor desc;
-            desc.name = op.name;
-            desc.effectId = op.id; desc.effectVersion = 1;
+            desc.name = L"Numeric Expression";
+            desc.effectId = L"Math Expression"; desc.effectVersion = 1;
             desc.category = L"Parameter";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.parameters = {
+                { L"Expression", L"string", std::wstring(L"A + B"), 0.0f, 0.0f, 0.0f },
                 { L"A", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
                 { L"B", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
+                { L"C", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
+                { L"D", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
+                { L"E", L"float", 0.0f, -100000.0f, 100000.0f, 0.1f },
             };
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
             desc.analysisFields = {

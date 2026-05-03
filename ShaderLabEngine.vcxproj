@@ -65,7 +65,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)third_party\exprtk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch_engine.h</PrecompiledHeaderFile>
       <PrecompiledHeaderOutputFile>$(IntDir)pch_engine.pch</PrecompiledHeaderOutputFile>
@@ -112,6 +112,7 @@
     <ClInclude Include="Rendering\GpuReduction.h" />
     <ClInclude Include="Rendering\GraphEvaluator.h" />
     <ClInclude Include="Rendering\IccProfileParser.h" />
+    <ClInclude Include="Rendering\MathExpression.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
     <ClInclude Include="Rendering\ToneMapper.h" />
     <ClInclude Include="Effects\CustomComputeShaderEffect.h" />
@@ -136,6 +137,10 @@
     <ClCompile Include="Rendering\GpuReduction.cpp" />
     <ClCompile Include="Rendering\GraphEvaluator.cpp" />
     <ClCompile Include="Rendering\IccProfileParser.cpp" />
+    <ClCompile Include="Rendering\MathExpression.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
     <ClCompile Include="Rendering\ToneMapper.cpp" />
     <ClCompile Include="Effects\CustomComputeShaderEffect.cpp" />
     <ClCompile Include="Effects\CustomPixelShaderEffect.cpp" />
@@ -160,5 +165,9 @@
     <Error Condition="!Exists('packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets'))" />
     <Error Condition="!Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props'))" />
     <Error Condition="!Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets'))" />
+  </Target>
+
+  <Target Name="EnsureExprTk" BeforeTargets="ClCompile" Inputs="scripts\EnsureExprTk.ps1" Outputs="$(ProjectDir)third_party\exprtk\exprtk.hpp">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\EnsureExprTk.ps1&quot; -TargetDir &quot;$(ProjectDir)third_party\exprtk&quot;" />
   </Target>
 </Project>

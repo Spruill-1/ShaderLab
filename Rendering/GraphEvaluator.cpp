@@ -2,6 +2,7 @@
 #include "GraphEvaluator.h"
 #include "../Effects/ShaderCompiler.h"
 #include "../Effects/StatisticsEffect.h"
+#include "MathExpression.h"
 
 using namespace ShaderLab::Graph;
 
@@ -226,25 +227,28 @@ namespace ShaderLab::Rendering
                     }
                     else if (node->customEffect.has_value() &&
                             !node->customEffect->shaderLabEffectId.empty() &&
-                            node->customEffect->shaderLabEffectId.starts_with(L"Math "))
+                            node->customEffect->shaderLabEffectId == L"Math Expression")
                     {
-                        // Math parameter nodes: compute Result from A and B.
-                        float a = 0.0f, b = 0.0f;
-                        auto aIt = node->properties.find(L"A");
-                        if (aIt != node->properties.end())
-                            if (auto* f = std::get_if<float>(&aIt->second)) a = *f;
-                        auto bIt = node->properties.find(L"B");
-                        if (bIt != node->properties.end())
-                            if (auto* f = std::get_if<float>(&bIt->second)) b = *f;
+                        // Numeric Expression node: evaluate the user-supplied
+                        // formula with A..E bound to the corresponding props.
+                        std::wstring expr;
+                        auto eIt = node->properties.find(L"Expression");
+                        if (eIt != node->properties.end())
+                            if (auto* s = std::get_if<std::wstring>(&eIt->second)) expr = *s;
+
+                        const wchar_t* names[] = { L"A", L"B", L"C", L"D", L"E" };
+                        float vals[5] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+                        for (size_t i = 0; i < 5; ++i)
+                        {
+                            auto it = node->properties.find(names[i]);
+                            if (it != node->properties.end())
+                                if (auto* f = std::get_if<float>(&it->second)) vals[i] = *f;
+                        }
 
                         float result = 0.0f;
-                        auto& opId = node->customEffect->shaderLabEffectId;
-                        if (opId == L"Math Max")       result = (std::max)(a, b);
-                        else if (opId == L"Math Min")  result = (std::min)(a, b);
-                        else if (opId == L"Math Add")  result = a + b;
-                        else if (opId == L"Math Subtract") result = a - b;
-                        else if (opId == L"Math Multiply") result = a * b;
-                        else if (opId == L"Math Divide")   result = (std::abs(b) > 1e-10f) ? a / b : 0.0f;
+                        std::wstring err;
+                        bool ok = EvaluateMathExpression(expr, names, vals, 5, result, &err);
+                        node->runtimeError = ok ? std::wstring{} : err;
 
                         AnalysisFieldValue fv;
                         fv.name = L"Result";
