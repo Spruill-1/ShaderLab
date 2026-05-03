@@ -1505,6 +1505,190 @@ namespace ShaderLab::Controls
         return 0;
     }
 
+    namespace
+    {
+        // Squared distance from a point to a cubic bezier, sampled.
+        float DistanceToBezierSqr(D2D1_POINT_2F p,
+            D2D1_POINT_2F a, D2D1_POINT_2F b, D2D1_POINT_2F c, D2D1_POINT_2F d)
+        {
+            constexpr int kSamples = 24;
+            float best = (std::numeric_limits<float>::max)();
+            for (int i = 0; i <= kSamples; ++i)
+            {
+                float t = static_cast<float>(i) / kSamples;
+                float u = 1.0f - t;
+                float bx = u*u*u*a.x + 3*u*u*t*b.x + 3*u*t*t*c.x + t*t*t*d.x;
+                float by = u*u*u*a.y + 3*u*u*t*b.y + 3*u*t*t*c.y + t*t*t*d.y;
+                float dx = p.x - bx, dy = p.y - by;
+                float d2 = dx*dx + dy*dy;
+                if (d2 < best) best = d2;
+            }
+            return best;
+        }
+    }
+
+    NodeGraphController::EdgeHit
+    NodeGraphController::HitTestEdge(D2D1_POINT_2F canvasPoint, float tolerance) const
+    {
+        EdgeHit best{};
+        if (!m_graph) return best;
+
+        const float tol2 = tolerance * tolerance;
+        float bestDist = tol2;
+
+        // Image edges.
+        for (const auto& edge : m_graph->Edges())
+        {
+            auto srcIt = m_visuals.find(edge.sourceNodeId);
+            auto dstIt = m_visuals.find(edge.destNodeId);
+            if (srcIt == m_visuals.end() || dstIt == m_visuals.end()) continue;
+            if (edge.sourcePin >= srcIt->second.outputPinPositions.size()) continue;
+            if (edge.destPin >= dstIt->second.inputPinPositions.size()) continue;
+
+            D2D1_POINT_2F start = srcIt->second.outputPinPositions[edge.sourcePin];
+            D2D1_POINT_2F end   = dstIt->second.inputPinPositions[edge.destPin];
+            float dx = (end.x - start.x) * 0.4f;
+            D2D1_POINT_2F cp1 = { start.x + dx, start.y };
+            D2D1_POINT_2F cp2 = { end.x - dx, end.y };
+
+            float d2 = DistanceToBezierSqr(canvasPoint, start, cp1, cp2, end);
+            if (d2 < bestDist)
+            {
+                bestDist = d2;
+                best = EdgeHit{ true, false,
+                    edge.sourceNodeId, edge.sourcePin,
+                    edge.destNodeId, edge.destPin,
+                    {}, {} };
+            }
+        }
+
+        // Data binding edges.
+        for (const auto& node : m_graph->Nodes())
+        {
+            auto dstIt = m_visuals.find(node.id);
+            if (dstIt == m_visuals.end()) continue;
+
+            for (const auto& [propName, binding] : node.propertyBindings)
+            {
+                D2D1_POINT_2F end{};
+                bool foundDst = false;
+                for (uint32_t i = 0; i < dstIt->second.dataInputPinNames.size(); ++i)
+                {
+                    if (dstIt->second.dataInputPinNames[i] == propName &&
+                        i < dstIt->second.dataInputPinPositions.size())
+                    { end = dstIt->second.dataInputPinPositions[i]; foundDst = true; break; }
+                }
+                if (!foundDst) continue;
+
+                struct SrcRef { uint32_t nodeId; std::wstring field; };
+                std::vector<SrcRef> srcRefs;
+                if (binding.wholeArray)
+                    srcRefs.push_back({ binding.wholeArraySourceNodeId, binding.wholeArraySourceFieldName });
+                else
+                {
+                    for (const auto& src : binding.sources)
+                    {
+                        if (!src.has_value()) continue;
+                        bool dup = false;
+                        for (const auto& r : srcRefs)
+                            if (r.nodeId == src->sourceNodeId && r.field == src->sourceFieldName)
+                            { dup = true; break; }
+                        if (!dup) srcRefs.push_back({ src->sourceNodeId, src->sourceFieldName });
+                    }
+                }
+
+                for (const auto& ref : srcRefs)
+                {
+                    auto srcIt = m_visuals.find(ref.nodeId);
+                    if (srcIt == m_visuals.end()) continue;
+
+                    D2D1_POINT_2F start{};
+                    bool foundSrc = false;
+                    for (uint32_t i = 0; i < srcIt->second.dataOutputPinNames.size(); ++i)
+                    {
+                        if (srcIt->second.dataOutputPinNames[i] == ref.field &&
+                            i < srcIt->second.dataOutputPinPositions.size())
+                        { start = srcIt->second.dataOutputPinPositions[i]; foundSrc = true; break; }
+                    }
+                    if (!foundSrc) continue;
+
+                    float bdx = (end.x - start.x) * 0.4f;
+                    D2D1_POINT_2F cp1 = { start.x + bdx, start.y };
+                    D2D1_POINT_2F cp2 = { end.x - bdx, end.y };
+                    float d2 = DistanceToBezierSqr(canvasPoint, start, cp1, cp2, end);
+                    if (d2 < bestDist)
+                    {
+                        bestDist = d2;
+                        best = EdgeHit{ true, true, ref.nodeId, 0, node.id, 0,
+                                        propName, ref.field };
+                    }
+                }
+            }
+        }
+
+        return best;
+    }
+
+    bool NodeGraphController::RemoveEdge(const EdgeHit& hit)
+    {
+        if (!hit.found || !m_graph) return false;
+
+        if (!hit.isDataBinding)
+        {
+            bool ok = m_graph->Disconnect(
+                hit.sourceNodeId, hit.sourcePin,
+                hit.destNodeId, hit.destPin);
+            if (ok)
+            {
+                m_needsRedraw = true;
+            }
+            return ok;
+        }
+
+        // Data binding: clear sources from this binding that reference the
+        // hit's source node + field. If nothing remains, unbind the property.
+        auto* destNode = m_graph->FindNode(hit.destNodeId);
+        if (!destNode) return false;
+        auto bIt = destNode->propertyBindings.find(hit.destPropertyName);
+        if (bIt == destNode->propertyBindings.end()) return false;
+
+        auto& binding = bIt->second;
+        bool removeAll = false;
+        if (binding.wholeArray)
+        {
+            removeAll = (binding.wholeArraySourceNodeId == hit.sourceNodeId &&
+                         binding.wholeArraySourceFieldName == hit.sourceFieldName);
+        }
+        else
+        {
+            bool anyLeft = false;
+            for (auto& src : binding.sources)
+            {
+                if (src.has_value() &&
+                    src->sourceNodeId == hit.sourceNodeId &&
+                    src->sourceFieldName == hit.sourceFieldName)
+                {
+                    src.reset();
+                }
+                else if (src.has_value())
+                {
+                    anyLeft = true;
+                }
+            }
+            removeAll = !anyLeft;
+        }
+
+        if (removeAll)
+            m_graph->UnbindProperty(hit.destNodeId, hit.destPropertyName);
+        else
+        {
+            destNode->dirty = true;
+            m_graph->MarkAllDirty();
+        }
+        m_needsRedraw = true;
+        return true;
+    }
+
     bool NodeGraphController::UpdateSliderDrag(uint32_t nodeId, D2D1_POINT_2F canvasPoint)
     {
         auto vIt = m_visuals.find(nodeId);

@@ -2343,6 +2343,27 @@ namespace winrt::ShaderLab::implementation
             return;
         }
 
+        // Alt+Click on an edge (image or data binding) removes that edge.
+        {
+            auto altState = winrt::Microsoft::UI::Input::InputKeyboardSource::GetKeyStateForCurrentThread(
+                winrt::Windows::System::VirtualKey::Menu); // Menu == Alt
+            bool altDown = (static_cast<uint32_t>(altState) &
+                static_cast<uint32_t>(winrt::Windows::UI::Core::CoreVirtualKeyStates::Down)) != 0;
+            if (altDown)
+            {
+                auto hit = m_nodeGraphController.HitTestEdge(canvasPoint, 8.0f);
+                if (hit.found && m_nodeGraphController.RemoveEdge(hit))
+                {
+                    m_graph.MarkAllDirty();
+                    m_nodeGraphController.RebuildLayout();
+                    m_forceRender = true;
+                    UpdatePropertiesPanel();
+                    args.Handled(true);
+                    return;
+                }
+            }
+        }
+
         // Check for node hit (select + start drag).
         uint32_t hitNodeId = m_nodeGraphController.HitTestNode(canvasPoint);
         if (hitNodeId != 0)

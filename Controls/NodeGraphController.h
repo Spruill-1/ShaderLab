@@ -111,6 +111,28 @@ namespace ShaderLab::Controls
         // Hit-test for play/pause button on clock nodes. Returns node ID or 0.
         uint32_t HitTestPlayButton(D2D1_POINT_2F canvasPoint) const;
 
+        // Result of HitTestEdge.
+        struct EdgeHit
+        {
+            bool found{ false };
+            bool isDataBinding{ false };
+            // Image edge fields (when !isDataBinding).
+            uint32_t sourceNodeId{ 0 };
+            uint32_t sourcePin{ 0 };
+            uint32_t destNodeId{ 0 };
+            uint32_t destPin{ 0 };
+            // Data binding fields (when isDataBinding).
+            std::wstring destPropertyName;
+            std::wstring sourceFieldName;  // for unique-source disambiguation
+        };
+
+        // Hit-test for an edge (image or data binding) under the given canvas
+        // point. Returns the closest hit within tolerance, or {found=false}.
+        EdgeHit HitTestEdge(D2D1_POINT_2F canvasPoint, float tolerance = 6.0f) const;
+
+        // Remove the given edge from the graph. Returns true on success.
+        bool RemoveEdge(const EdgeHit& hit);
+
         // Update slider value from canvas X position during drag.
         // Returns true if value changed.
         bool UpdateSliderDrag(uint32_t nodeId, D2D1_POINT_2F canvasPoint);
