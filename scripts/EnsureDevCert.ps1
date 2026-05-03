@@ -3,15 +3,16 @@
 # This script is invoked automatically by the EnsureDevSigningCertificate target
 # in ShaderLab.vcxproj on a fresh clone. It can also be run manually.
 #
-# The Subject CN must match the Publisher in Package.appxmanifest. Note we
-# include the unsigned-namespace OID so the same identity works for both
-# signed local-deploy (cert subject matches) and unsigned MSIX install
-# (Add-AppxPackage -AllowUnsigned only accepts publishers under this OID).
+# The Subject CN must match the Publisher in Package.appxmanifest (CN=ShaderLab).
+# We deliberately do NOT add the unsigned-namespace OID here — that OID is
+# only for unsigned MSIX install via Add-AppxPackage -AllowUnsigned, and
+# Windows refuses to register a *signed* package with that OID. The release
+# workflow rewrites the manifest to add the OID right before packaging.
 [CmdletBinding()]
 param(
 	[Parameter(Mandatory = $true)] [string] $PfxPath,
 	[Parameter(Mandatory = $true)] [string] $Password,
-	[string] $Subject = 'CN=ShaderLab, OID.2.25.311729368913984317654407730594956997722=1',
+	[string] $Subject = 'CN=ShaderLab',
 	[string] $FriendlyName = 'ShaderLab Dev Cert'
 )
 

@@ -57,6 +57,19 @@ jobs:
       - name: NuGet restore
         run: nuget restore "${{ env.Solution_Path }}" -SolutionDirectory .
 
+      - name: Inject unsigned-namespace OID into manifest
+        shell: pwsh
+        run: |
+          # Add-AppxPackage -AllowUnsigned only accepts packages whose
+          # Publisher contains this magic OID. We don't keep it in the
+          # checked-in manifest because Windows refuses to register
+          # *signed* packages with the OID, breaking local F5 deploy.
+          $manifest = 'Package.appxmanifest'
+          (Get-Content $manifest -Raw) `
+            -replace 'Publisher="CN=ShaderLab"', 'Publisher="CN=ShaderLab, OID.2.25.311729368913984317654407730594956997722=1"' `
+            | Set-Content $manifest -NoNewline
+          Select-String -Path $manifest -Pattern 'Publisher='
+
       - name: Build loose-file MSIX layout
         shell: pwsh
         run: |
