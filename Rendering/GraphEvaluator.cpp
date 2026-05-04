@@ -270,6 +270,42 @@ namespace ShaderLab::Rendering
                         fv.components[0] = result;
                         node->analysisOutput.fields.push_back(std::move(fv));
                     }
+                    else if (node->customEffect.has_value() &&
+                            !node->customEffect->shaderLabEffectId.empty() &&
+                            node->customEffect->shaderLabEffectId == L"Random")
+                    {
+                        // Random Parameter Node: hash the Seed float into a
+                        // uniform float in [0, 1). Pure function of the seed,
+                        // so identical seeds reproduce identical output and
+                        // any change to the seed (e.g. tick of an upstream
+                        // Clock) yields a new well-mixed value. Uses a
+                        // SplitMix64-style integer mixer on the bit pattern
+                        // of the float — much better distribution than a
+                        // raw `sinf(seed)` trick and stays deterministic
+                        // across builds / architectures.
+                        float seed = 0.0f;
+                        auto sIt = node->properties.find(L"Seed");
+                        if (sIt != node->properties.end())
+                            if (auto* f = std::get_if<float>(&sIt->second)) seed = *f;
+
+                        uint32_t bits = 0;
+                        std::memcpy(&bits, &seed, sizeof(bits));
+                        uint64_t z = static_cast<uint64_t>(bits) * 0x9E3779B97F4A7C15ULL
+                                     + 0xBF58476D1CE4E5B9ULL;
+                        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+                        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+                        z =  z ^ (z >> 31);
+                        // Take the top 24 bits and divide into [0, 1) so the
+                        // result has the full mantissa precision of a float.
+                        const uint32_t mantissa = static_cast<uint32_t>(z >> 40);
+                        const float result01 = static_cast<float>(mantissa) / 16777216.0f;
+
+                        AnalysisFieldValue fv;
+                        fv.name = L"Result";
+                        fv.type = AnalysisFieldType::Float;
+                        fv.components[0] = result01;
+                        node->analysisOutput.fields.push_back(std::move(fv));
+                    }
                     else
                     {
                         // Regular parameter nodes: copy property values.

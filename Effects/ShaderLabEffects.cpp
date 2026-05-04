@@ -2715,5 +2715,28 @@ void main(uint3 GTid : SV_GroupThreadID)
             };
             m_effects.push_back(std::move(desc));
         }
+
+        // ---- Random Parameter Node ----
+        // Takes a single float Seed and produces a deterministic, well-mixed
+        // float in [0, 1]. The output is a pure function of the seed value:
+        // whenever the upstream value changes (e.g. driven by a Clock or
+        // Numeric Expression), a fresh random number is produced; identical
+        // seeds always reproduce the same output, which keeps graphs and
+        // pixel-trace results deterministic.
+        {
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Random";
+            desc.effectId = L"Random"; desc.effectVersion = 1;
+            desc.category = L"Parameter";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.parameters = {
+                { L"Seed", L"float", 0.0f, -1000000.0f, 1000000.0f, 0.01f },
+            };
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                { L"Result", Graph::AnalysisFieldType::Float },
+            };
+            m_effects.push_back(std::move(desc));
+        }
     }
 }

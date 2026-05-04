@@ -423,7 +423,7 @@ ShaderLab/
 ├── Package.appxmanifest        # MSIX app identity
 ├── app.manifest                # DPI awareness, heap type
 ├── EngineExport.h              # SHADERLAB_API import/export macro
-├── Version.h                   # App version 1.2.1, graph format version 2
+├── Version.h                   # App version 1.2.2, graph format version 2
 ├── README.md                   # This file
 ├── CHANGELOG.md                # Version history
 │
@@ -615,6 +615,7 @@ ShaderLab ships with **20+ built-in ShaderLab effects** implemented in `Effects/
 | Gamut Parameter | Gamut-id selector (sRGB / DCI-P3 / BT.2020 / Custom). |
 | Clock | Time source: outputs `Time` (seconds) and `Progress` (0–1 over a configurable duration). Drives the animation system. |
 | Numeric Expression | Single configurable math node powered by ExprTk; user-supplied formula evaluated against dynamic float inputs `A..Z`. Replaces the older Add / Subtract / Multiply / Divide / Min / Max nodes. See [below](#numeric-expression-node-exprtk). |
+| Random | Takes a single `Seed` float input and outputs a deterministic, well-mixed `Result` in `[0, 1)`. The output is a pure function of the seed (SplitMix64-style integer mixer on the float's bit pattern), so identical seeds always reproduce identical values and any change — e.g. a tick from an upstream Clock or Numeric Expression — yields a fresh random number. |
 
 ## Numeric Expression Node (ExprTk)
 

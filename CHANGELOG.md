@@ -3,6 +3,11 @@
 All notable changes to ShaderLab will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.2] - 2026-05-02
+
+### Added
+- **Random parameter node**: takes a single `Seed` float input and outputs a deterministic, well-mixed `Result` in `[0, 1)`. The output is a pure function of the seed (SplitMix64-style integer mixer on the float's bit pattern), so identical seeds reproduce identical values and any change to the seed (e.g. a tick from an upstream Clock or Numeric Expression) yields a fresh random number. Implemented in `Rendering/GraphEvaluator.cpp`; registered in `Effects/ShaderLabEffects.cpp` (`effectId = "Random"`).
+
 ## [1.2.1] - 2026-05-01
 
 ### Added
