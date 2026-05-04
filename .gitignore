@@ -91,3 +91,10 @@ third_party/
 
 enc_temp_folder/
 
+
+# MSIX build staging output (regenerated each build)
+AppX/
+
+# Stray test outputs
+output.jxr
+
