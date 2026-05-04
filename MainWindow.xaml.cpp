@@ -1495,7 +1495,7 @@ namespace winrt::ShaderLab::implementation
             XC::CheckBox cb;
             cb.Content(winrt::box_value(winrt::hstring(
                 L"Embed referenced images / videos / ICC files inside the .effectgraph")));
-            cb.IsChecked(winrt::Windows::Foundation::IReference<bool>(m_embedMedia));
+            cb.IsChecked(winrt::box_value(m_embedMedia));
             XC::TextBlock blurb;
             blurb.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap);
             blurb.Opacity(0.7);

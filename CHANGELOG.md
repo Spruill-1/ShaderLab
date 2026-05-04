@@ -3,6 +3,11 @@
 All notable changes to ShaderLab will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.6] - 2026-05-04
+
+### Fixed
+- Save As crashed (`0xC000027B` — unhandled exception in coroutine `SaveGraphAsAsync`) when the user kept the *Embed referenced media* checkbox checked. The embed-media `ContentDialog` was initializing the checkbox with `IReference<bool>(m_embedMedia)`, whose `void*` constructor reinterprets a `bool` as a WinRT interface pointer rather than boxing it. Replaced with the canonical `winrt::box_value(m_embedMedia)`.
+
 ## [1.2.5] - 2026-05-04
 
 ### Added
