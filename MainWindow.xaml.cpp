@@ -24,7 +24,6 @@ namespace winrt::ShaderLab::implementation
         Title(std::wstring(L"ShaderLab v") + ::ShaderLab::VersionString + L" \u2014 HDR Shader Effect Development");
         // After Title() we'll refresh from RefreshTitleBar() once a graph
         // is loaded; the initial state is "Untitled".
-        AppVersionText().Text(std::wstring(L"v") + ::ShaderLab::VersionString);
 
         m_hwnd = GetWindowHandle();
 
@@ -465,12 +464,9 @@ namespace winrt::ShaderLab::implementation
 
         UpdateStatusBar();
 
-        // Set version text: app version + effect library version.
-        {
-            auto& lib = ::ShaderLab::Effects::ShaderLabEffects::Instance();
-            AppVersionText().Text(std::wstring(L"v") + ::ShaderLab::VersionString
-                + L"  (effects lib v" + std::to_wstring(lib.LibraryVersion()) + L")");
-        }
+        // Refresh title bar now that the effect library is loaded so the
+        // title shows both the app and effect-library version.
+        RefreshTitleBar();
 
         m_nodeGraphController.SetGraph(&m_graph);
         m_nodeGraphController.SetConnectionCallback(
@@ -1182,14 +1178,17 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::RefreshTitleBar()
     {
-        // Title format: "<filename>[*] - ShaderLab <version>". The
-        // unsaved star is the standard editor convention; the
-        // filename is derived from m_currentFilePath if known, else
-        // "Untitled".
+        // Title format: "<filename>[*] - ShaderLab <version> (effects lib vN)".
+        // The unsaved star is the standard editor convention; the filename
+        // is derived from m_currentFilePath if known, else "Untitled". The
+        // effect-library version moved here from the status bar to free up
+        // room for the FPS readout on the right.
         std::wstring base = m_currentFilePath.empty() ? std::wstring(L"Untitled") :
             std::filesystem::path(m_currentFilePath).filename().wstring();
+        auto& lib = ::ShaderLab::Effects::ShaderLabEffects::Instance();
         std::wstring title = base + (m_unsavedChanges ? L"*" : L"")
-            + L" - ShaderLab " + ::ShaderLab::VersionString;
+            + L" - ShaderLab " + ::ShaderLab::VersionString
+            + L" (effects lib v" + std::to_wstring(lib.LibraryVersion()) + L")";
         try { Title(winrt::hstring(title)); } catch (...) {}
     }
 
@@ -2010,6 +2009,12 @@ namespace winrt::ShaderLab::implementation
                         m_graph.MarkAllDirty();
                         m_nodeGraphController.RebuildLayout();
                         PopulatePreviewNodeSelector();
+                        // Force a render tick that triggers the post-eval
+                        // RebuildLayout, which is what reveals on-node UI
+                        // (Clock play/pause + slider) for newly-added
+                        // parameter nodes. Without this the user has to
+                        // click the node before the controls appear.
+                        m_forceRender = true;
                     });
 
                     subItem.Items().Append(menuItem);
@@ -3150,7 +3155,12 @@ namespace winrt::ShaderLab::implementation
                 m_previewNodeId = hitNodeId;
 
             m_forceRender = true;
-            FitPreviewToView();
+            // Defer the fit until the next eval populates cachedOutput. On
+            // the very first selection of a node (before its first eval),
+            // GetPreviewImageBounds() returns an empty rect, so an immediate
+            // FitPreviewToView() lands on the wrong zoom. The deferred path
+            // in OnRenderTick re-fits once bounds are available.
+            m_needsFitPreview = true;
             UpdatePreviewOverlay();
         }
         else

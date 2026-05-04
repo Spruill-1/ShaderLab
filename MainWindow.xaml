@@ -293,15 +293,12 @@
                        Style="{StaticResource CaptionTextBlockStyle}"
                        FontFamily="Cascadia Mono, Consolas, Courier New" />
 
-            <TextBlock x:Name="AppVersionText" Grid.Column="6"
-                       Text="v1.1.0"
-                       Margin="0,0,16,0"
-                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
-                       Style="{StaticResource CaptionTextBlockStyle}" />
-            <TextBlock x:Name="FpsText" Grid.Column="7"
+            <TextBlock x:Name="FpsText" Grid.Column="6"
                        Text="FPS: --"
                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                        Style="{StaticResource CaptionTextBlockStyle}" />
+            <TextBlock x:Name="AppVersionText" Grid.Column="7"
+                       Visibility="Collapsed" />
         </Grid>
     </Grid>
 </Window>
