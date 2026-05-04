@@ -506,6 +506,11 @@ namespace winrt::ShaderLab::implementation
         // Initialize the node graph editor panel.
         InitializeGraphPanel();
 
+        // Sweep %TEMP% for ShaderLab-* media dirs left behind by a
+        // crashed prior instance and offer to delete them. Runs after
+        // panel init so the dialog has a XamlRoot to attach to.
+        ReapStaleMediaDirsAsync();
+
         // If the app was launched via file double-click, load that
         // graph now that rendering is wired up.
         if (!m_pendingOpenPath.empty())
@@ -1643,6 +1648,10 @@ namespace winrt::ShaderLab::implementation
                     && std::filesystem::exists(loadResult->extractDir))
                 {
                     m_extractedMediaDirs.push_back(loadResult->extractDir);
+                    // Touch heartbeat immediately so a concurrent
+                    // instance starting up doesn't reap us.
+                    TouchHeartbeats();
+                    StartHeartbeatTimer();
                 }
 
                 ResetAfterGraphLoad();
@@ -1695,6 +1704,128 @@ namespace winrt::ShaderLab::implementation
             case winrt::Microsoft::UI::Xaml::Controls::ContentDialogResult::Secondary: co_return 1; // Discard
             default:                                                                   co_return 2; // Cancel
         }
+    }
+
+    // ---- Heartbeat / temp-dir reaper ----------------------------------------
+    //
+    // Every extracted .effectgraph media dir gets a .heartbeat file
+    // that we touch every HeartbeatIntervalSec. On startup we scan
+    // %TEMP% for ShaderLab-* directories whose .heartbeat (or, if
+    // missing, mtime of the dir itself) is older than HeartbeatStaleSec
+    // -- those are crash leftovers and we offer to delete them.
+
+    void MainWindow::StartHeartbeatTimer()
+    {
+        if (m_heartbeatTimer) return;
+        m_heartbeatTimer = DispatcherQueue().CreateTimer();
+        m_heartbeatTimer.Interval(std::chrono::seconds(HeartbeatIntervalSec));
+        m_heartbeatTimer.Tick([this](auto&&, auto&&) { TouchHeartbeats(); });
+        m_heartbeatTimer.Start();
+    }
+
+    void MainWindow::TouchHeartbeats()
+    {
+        // Write the current FILETIME into <dir>\.heartbeat. Cheap
+        // (one tiny file write per loaded graph, every minute) and
+        // resilient to clock skew because we only compare against
+        // FILETIMEs from the same machine.
+        FILETIME now{};
+        ::GetSystemTimeAsFileTime(&now);
+        for (const auto& d : m_extractedMediaDirs)
+        {
+            std::error_code ec;
+            if (!std::filesystem::exists(d, ec)) continue;
+            std::wstring path = d + L"\\.heartbeat";
+            HANDLE h = ::CreateFileW(path.c_str(),
+                GENERIC_WRITE, 0, nullptr,
+                CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+            if (h == INVALID_HANDLE_VALUE) continue;
+            DWORD written = 0;
+            ::WriteFile(h, &now, sizeof(now), &written, nullptr);
+            ::CloseHandle(h);
+        }
+    }
+
+    winrt::fire_and_forget MainWindow::ReapStaleMediaDirsAsync()
+    {
+        auto strong = get_strong();
+
+        // Snapshot %TEMP% and look for ShaderLab-* directories that
+        // either have no .heartbeat or whose heartbeat is older than
+        // HeartbeatStaleSec. Anything matching is from a crashed
+        // instance (or a previous version that didn't write
+        // heartbeats); offer to delete the lot.
+        wchar_t tempBuf[MAX_PATH + 1]{};
+        DWORD len = ::GetTempPathW(MAX_PATH, tempBuf);
+        if (len == 0) co_return;
+        std::wstring tempRoot(tempBuf, len);
+
+        std::vector<std::wstring> stale;
+        FILETIME nowFt{};
+        ::GetSystemTimeAsFileTime(&nowFt);
+        const uint64_t now = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
+        const uint64_t staleTicks = static_cast<uint64_t>(HeartbeatStaleSec) * 10'000'000ULL;
+
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(tempRoot, ec))
+        {
+            if (ec) break;
+            if (!entry.is_directory(ec)) continue;
+            const auto name = entry.path().filename().wstring();
+            if (!name.starts_with(L"ShaderLab-")) continue;
+
+            // Determine the dir's "last touched" time. Prefer the
+            // .heartbeat file's mtime; fall back to the directory's
+            // own mtime so directories from older builds (which
+            // didn't write heartbeats) still get reaped.
+            FILETIME ft{};
+            std::wstring beat = entry.path().wstring() + L"\\.heartbeat";
+            HANDLE h = ::CreateFileW(beat.c_str(),
+                GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_HIDDEN, nullptr);
+            if (h != INVALID_HANDLE_VALUE)
+            {
+                ::GetFileTime(h, nullptr, nullptr, &ft);
+                ::CloseHandle(h);
+            }
+            else
+            {
+                WIN32_FILE_ATTRIBUTE_DATA fad{};
+                if (::GetFileAttributesExW(entry.path().c_str(), GetFileExInfoStandard, &fad))
+                    ft = fad.ftLastWriteTime;
+            }
+            const uint64_t touched = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+            if (touched == 0 || (now > touched && (now - touched) > staleTicks))
+                stale.push_back(entry.path().wstring());
+        }
+
+        if (stale.empty()) co_return;
+
+        namespace XC = winrt::Microsoft::UI::Xaml::Controls;
+        XC::ContentDialog dialog;
+        dialog.XamlRoot(this->Content().XamlRoot());
+        dialog.Title(winrt::box_value(L"Clean up old graph media?"));
+
+        std::wstring msg = std::format(
+            L"Found {} ShaderLab media folder{} in your %TEMP% from a "
+            L"previous session that didn't shut down cleanly. They are "
+            L"only useful while the graph that produced them is open.\n\nDelete them now?",
+            stale.size(), stale.size() == 1 ? L"" : L"s");
+        XC::TextBlock blurb;
+        blurb.Text(winrt::hstring(msg));
+        blurb.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap);
+        dialog.Content(blurb);
+        dialog.PrimaryButtonText(L"Delete");
+        dialog.CloseButtonText(L"Keep");
+        dialog.DefaultButton(XC::ContentDialogButton::Primary);
+
+        auto result = co_await dialog.ShowAsync();
+        if (result != XC::ContentDialogResult::Primary) co_return;
+
+        co_await winrt::resume_background();
+        std::error_code rmEc;
+        for (const auto& d : stale)
+            std::filesystem::remove_all(d, rmEc);
     }
 
     void MainWindow::ResetAfterGraphLoad(bool reopenOutputWindows)

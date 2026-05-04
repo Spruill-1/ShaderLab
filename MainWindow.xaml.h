@@ -159,6 +159,19 @@ namespace winrt::ShaderLab::implementation
         // loaded .effectgraph archives. Cleaned up at shutdown so the
         // user's %TEMP% doesn't accumulate stale graph media.
         std::vector<std::wstring> m_extractedMediaDirs;
+
+        // Heartbeat: every HeartbeatIntervalSec we touch a sentinel
+        // file inside each extracted dir so a future instance can
+        // tell our dirs from orphans left behind by a crash.
+        winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer m_heartbeatTimer{ nullptr };
+        static constexpr uint32_t HeartbeatIntervalSec = 60;
+        static constexpr uint32_t HeartbeatStaleSec = 150; // > 2x interval
+        void StartHeartbeatTimer();
+        void TouchHeartbeats();
+        // Scan %TEMP% for ShaderLab-* dirs whose heartbeat is older
+        // than HeartbeatStaleSec. If any are found, prompt the user
+        // once at startup to clean them up.
+        winrt::fire_and_forget ReapStaleMediaDirsAsync();
         void PopulateAddNodeFlyout();
         void OnAddEffectNode(const ::ShaderLab::Effects::EffectDescriptor& desc);
         void OnAddImageSourceClicked(
