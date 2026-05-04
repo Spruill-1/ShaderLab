@@ -128,6 +128,12 @@ namespace winrt::ShaderLab::implementation
         // write failed. Public-ish so the close-confirmation dialog can
         // call it on the "Save" branch.
         bool SaveGraphToCurrentPath();
+        // Async wrapper used by the close-confirmation flow so the
+        // dialog can co_await the embed-progress UI.
+        winrt::Windows::Foundation::IAsyncAction SaveGraphToCurrentPathAsync();
+        // Run a save with a modal progress dialog. Reuses
+        // m_currentFilePath / m_embedMedia.
+        winrt::Windows::Foundation::IAsyncAction RunSaveWithProgressAsync();
         // Mark the current graph as having unsaved edits. Cheap; call it
         // from any user-driven mutation site. Resets on save / load / new.
         void MarkUnsaved();
@@ -143,6 +149,16 @@ namespace winrt::ShaderLab::implementation
         // the user picks a destination via Save As / open).
         std::wstring m_currentFilePath;
         bool m_unsavedChanges{ false };
+
+        // User preference: embed referenced media inside the .effectgraph
+        // zip. Default true; reset by checkbox in the save flow. Sticky
+        // across saves of the same window.
+        bool m_embedMedia{ true };
+
+        // Directories holding files extracted from the most recently
+        // loaded .effectgraph archives. Cleaned up at shutdown so the
+        // user's %TEMP% doesn't accumulate stale graph media.
+        std::vector<std::wstring> m_extractedMediaDirs;
         void PopulateAddNodeFlyout();
         void OnAddEffectNode(const ::ShaderLab::Effects::EffectDescriptor& desc);
         void OnAddImageSourceClicked(

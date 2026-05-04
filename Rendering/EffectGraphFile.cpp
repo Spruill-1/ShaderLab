@@ -225,16 +225,28 @@ namespace
 
 namespace ShaderLab::Rendering
 {
-	bool EffectGraphFile::Save(const std::wstring& path, const std::wstring& graphJson)
+	bool EffectGraphFile::Save(const std::wstring& path,
+							   const std::wstring& graphJson,
+							   const std::vector<MediaEntry>& media,
+							   const ProgressCallback& progress)
 	{
 		const std::string jsonUtf8 = Utf16ToUtf8(graphJson);
 
-		// Two ZIP entries: the JSON payload and a placeholder folder.
-		// The folder is empty today; future versions will populate it
-		// with embedded media (images, video, ICC) so the same .effectgraph
-		// can be opened on a different machine without external paths.
+		// Total step count for progress: 1 (graph.json) + N media files.
+		const uint32_t total = 1 + static_cast<uint32_t>(media.size());
+		uint32_t step = 0;
+		auto report = [&](const std::wstring& msg) -> bool
+		{
+			if (progress) return progress(step, total, msg);
+			return true;
+		};
+
+		// Build the in-memory entry list. graph.json + optional media.
 		std::vector<PendingEntry> entries;
-		entries.reserve(2);
+		entries.reserve(2 + media.size());
+
+		++step;
+		if (!report(L"graph.json")) return false;
 		{
 			PendingEntry e;
 			e.name = "graph.json";
@@ -242,8 +254,47 @@ namespace ShaderLab::Rendering
 			entries.push_back(std::move(e));
 		}
 		{
+			// Always emit the media/ folder marker -- even when no
+			// files are embedded -- so external zip tools render the
+			// folder consistently.
 			PendingEntry e;
-			e.name = "media/"; // trailing slash marks an empty folder
+			e.name = "media/";
+			entries.push_back(std::move(e));
+		}
+
+		for (const auto& m : media)
+		{
+			++step;
+			if (!report(std::filesystem::path(m.sourcePath).filename().wstring()))
+				return false;
+
+			PendingEntry e;
+			e.name = Utf16ToUtf8(m.zipEntryName);
+
+			// Read the source file into memory. Media files (images
+			// / video) can be tens or hundreds of MB; we still slurp
+			// them whole because writing a stored ZIP entry needs the
+			// CRC and size up front. If this becomes a problem we
+			// can stream by hashing first then re-reading.
+			HANDLE hf = ::CreateFileW(m.sourcePath.c_str(),
+				GENERIC_READ, FILE_SHARE_READ, nullptr,
+				OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (hf == INVALID_HANDLE_VALUE) return false;
+			LARGE_INTEGER fsz{};
+			if (!::GetFileSizeEx(hf, &fsz) || fsz.QuadPart > 0xFFFFFFFFLL)
+			{
+				::CloseHandle(hf);
+				return false; // 4 GB cap (no ZIP64)
+			}
+			e.data.resize(static_cast<size_t>(fsz.QuadPart));
+			DWORD rd = 0;
+			if (!::ReadFile(hf, e.data.data(), static_cast<DWORD>(e.data.size()), &rd, nullptr)
+				|| rd != e.data.size())
+			{
+				::CloseHandle(hf);
+				return false;
+			}
+			::CloseHandle(hf);
 			entries.push_back(std::move(e));
 		}
 
@@ -276,11 +327,15 @@ namespace ShaderLab::Rendering
 		return ok;
 	}
 
-	std::optional<std::wstring> EffectGraphFile::Load(const std::wstring& path)
+	std::optional<EffectGraphFile::LoadResult> EffectGraphFile::Load(
+		const std::wstring& path,
+		const std::wstring& extractDirRoot,
+		const ProgressCallback& progress)
 	{
-		// Slurp the whole file -- effect graphs are small (kB to a
-		// few MB once media embedding lands). Streaming the central
-		// directory would just complicate the parser for no gain.
+		// Slurp the whole file. Effect graphs with embedded media can
+		// hit hundreds of MB (HDR clips, etc.) but we still expect to
+		// fit in RAM -- streaming would complicate the central-dir
+		// walk for no real benefit on modern hardware.
 		HANDLE h = ::CreateFileW(
 			path.c_str(),
 			GENERIC_READ, FILE_SHARE_READ, nullptr,
@@ -304,42 +359,124 @@ namespace ShaderLab::Rendering
 		}
 		::CloseHandle(h);
 
-		// Walk local file headers from the start. Faster than scanning
-		// for the EOCD because we only need one entry and we know it's
-		// first; if it's not we'll still iterate forward.
+		// First pass: count entries and find graph.json so we can
+		// report meaningful progress totals.
+		struct ParsedEntry
+		{
+			std::string name;
+			size_t dataOff;
+			uint32_t size;
+		};
+		std::vector<ParsedEntry> parsed;
+		parsed.reserve(8);
+
 		size_t pos = 0;
 		while (pos + sizeof(LocalFileHeader) <= buf.size())
 		{
 			uint32_t sig = 0;
 			std::memcpy(&sig, buf.data() + pos, 4);
-			if (sig != kLocalSig)
-				break; // hit central directory or junk -- stop
+			if (sig != kLocalSig) break;
 
 			LocalFileHeader hdr{};
 			std::memcpy(&hdr, buf.data() + pos, sizeof(hdr));
-
-			if (hdr.compressionMethod != 0) // we only support stored
-				return std::nullopt;
+			if (hdr.compressionMethod != 0) return std::nullopt;
 
 			const size_t nameOff = pos + sizeof(hdr);
 			const size_t dataOff = nameOff + hdr.fileNameLength + hdr.extraFieldLength;
 			const size_t dataEnd = dataOff + hdr.compressedSize;
-			if (dataEnd > buf.size())
-				return std::nullopt;
+			if (dataEnd > buf.size()) return std::nullopt;
 
 			const char* nameP = reinterpret_cast<const char*>(buf.data() + nameOff);
-			std::string name(nameP, hdr.fileNameLength);
-
-			if (name == "graph.json")
-			{
-				return Utf8ToUtf16(
-					reinterpret_cast<const char*>(buf.data() + dataOff),
-					hdr.compressedSize);
-			}
+			ParsedEntry pe;
+			pe.name.assign(nameP, hdr.fileNameLength);
+			pe.dataOff = dataOff;
+			pe.size = hdr.compressedSize;
+			parsed.push_back(std::move(pe));
 
 			pos = dataEnd;
 		}
 
-		return std::nullopt;
+		// Find graph.json.
+		std::optional<std::wstring> graphJson;
+		for (const auto& e : parsed)
+			if (e.name == "graph.json")
+				graphJson = Utf8ToUtf16(reinterpret_cast<const char*>(buf.data() + e.dataOff), e.size);
+		if (!graphJson.has_value())
+			return std::nullopt;
+
+		// Allocate a unique extraction directory under extractDirRoot.
+		// GUID-based name to avoid clashes between concurrent loads.
+		std::wstring extractDir;
+		{
+			GUID g{};
+			::CoCreateGuid(&g);
+			wchar_t guidStr[64]{};
+			swprintf_s(guidStr, L"ShaderLab-%08X%04X%04X-%02X%02X",
+				g.Data1, g.Data2, g.Data3, g.Data4[0], g.Data4[1]);
+			extractDir = extractDirRoot;
+			if (!extractDir.empty() && extractDir.back() != L'\\' && extractDir.back() != L'/')
+				extractDir.push_back(L'\\');
+			extractDir += guidStr;
+		}
+
+		LoadResult result;
+		result.graphJson = std::move(*graphJson);
+		result.extractDir = extractDir;
+
+		// Count media files for progress reporting.
+		uint32_t mediaCount = 0;
+		for (const auto& e : parsed)
+			if (e.name.starts_with("media/") && e.name.size() > 6 && e.name.back() != '/')
+				++mediaCount;
+
+		const uint32_t total = 1 + mediaCount; // graph.json + media files
+		uint32_t step = 0;
+		auto report = [&](const std::wstring& msg) -> bool
+		{
+			if (progress) return progress(step, total, msg);
+			return true;
+		};
+
+		++step;
+		if (!report(L"graph.json")) return std::nullopt;
+
+		if (mediaCount > 0)
+		{
+			// Create the extraction directory only if we actually
+			// have files to extract -- avoids spamming temp.
+			std::filesystem::create_directories(extractDir);
+		}
+
+		for (const auto& e : parsed)
+		{
+			if (!e.name.starts_with("media/")) continue;
+			if (e.name.size() <= 6 || e.name.back() == '/') continue; // skip the dir marker
+
+			const std::wstring nameW = Utf8ToUtf16(e.name.c_str(), e.name.size());
+			// strip the "media/" prefix (6 chars) for the on-disk name
+			const std::wstring fileName = nameW.substr(6);
+
+			++step;
+			if (!report(fileName)) return std::nullopt;
+
+			const std::wstring outPath = extractDir + L'\\' + fileName;
+			HANDLE hf = ::CreateFileW(outPath.c_str(),
+				GENERIC_WRITE, 0, nullptr,
+				CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (hf == INVALID_HANDLE_VALUE) return std::nullopt;
+			DWORD wrote = 0;
+			const bool ok = ::WriteFile(hf, buf.data() + e.dataOff, e.size, &wrote, nullptr)
+							&& wrote == e.size;
+			::CloseHandle(hf);
+			if (!ok) return std::nullopt;
+
+			// mediaMap key uses the canonical "media://<name>" token
+			// that the saver wrote into shaderPath. Loader rewrites
+			// any node whose path matches to outPath.
+			result.mediaMap[L"media://" + fileName] = outPath;
+		}
+
+		return result;
 	}
 }
+
