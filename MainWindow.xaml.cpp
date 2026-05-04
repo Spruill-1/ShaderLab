@@ -1329,9 +1329,15 @@ namespace winrt::ShaderLab::implementation
 
         // Show the dialog asynchronously, then yield once so XAML
         // gets a chance to lay it out before the synchronous save
-        // hogs the UI thread.
+        // hogs the UI thread. resume_after resumes on a threadpool
+        // thread, so capture the UI apartment first and hop back to
+        // it before we touch any XAML / agile-bound state -- otherwise
+        // the progress callback's TextBlock / ProgressBar mutations
+        // raise RPC_E_WRONG_THREAD.
+        winrt::apartment_context ui_thread;
         auto showOp = dialog.ShowAsync();
         co_await winrt::resume_after(std::chrono::milliseconds(16));
+        co_await ui_thread;
 
         // Build media entries + rewritten JSON exactly like the sync
         // path, then drive a single synchronous save with a progress
@@ -1577,9 +1583,13 @@ namespace winrt::ShaderLab::implementation
 
         // Show the progress dialog, yield once for layout, then run
         // the load synchronously on the UI thread (same rationale as
-        // the save path: avoids RPC_E_WRONG_THREAD).
+        // the save path: avoids RPC_E_WRONG_THREAD). resume_after
+        // resumes on a threadpool thread, so capture and restore the
+        // UI apartment around the wait.
+        winrt::apartment_context ui_thread;
         auto showOp = dialog.ShowAsync();
         co_await winrt::resume_after(std::chrono::milliseconds(16));
+        co_await ui_thread;
 
         wchar_t tempBuf[MAX_PATH + 1]{};
         DWORD len = ::GetTempPathW(MAX_PATH, tempBuf);

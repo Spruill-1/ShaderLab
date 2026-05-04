@@ -390,9 +390,47 @@ float4 main(
 }
 )HLSL";
 
-    // -----------------------------------------------------------------------
-    // Registry
-    // -----------------------------------------------------------------------
+    static const std::string s_luminanceHighlightHLSL = R"HLSL(
+// Luminance Highlight
+// Mirrors Gamut Highlight's structure: pixels whose luminance falls
+// outside [MinNits, MaxNits] (or inside, depending on Mode) are tinted
+// with an overlay color. Useful for spotting clipped highlights, crushed
+// shadows, or verifying that an effect chain keeps content within a
+// target nit range.
+Texture2D Source : register(t0);
+
+cbuffer constants : register(b0) {
+    float MinNits;
+    float MaxNits;
+    float OverlayR;
+    float OverlayG;
+    float OverlayB;
+    float OverlayStrength;
+    float Mode; // 0 = Out-of-Range, 1 = In-Range
+};
+
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    float4 color = Source.Load(int3(uv0.xy, 0));
+    if (color.a < 0.001) return color;
+
+    // ScRGBLuminanceNits: scRGB luminance * 80 (1.0 = 80 nits SDR white).
+    float nits = ScRGBLuminanceNits(color.rgb);
+
+    // Defensive: a degenerate range (Min >= Max) collapses to "everything
+    // is out-of-range" so the user gets immediate visual feedback rather
+    // than a silently empty overlay.
+    bool outOfRange = (MinNits >= MaxNits) || (nits < MinNits) || (nits > MaxNits);
+    bool highlight = (Mode > 0.5) ? !outOfRange : outOfRange;
+    if (highlight) {
+        float3 overlay = float3(OverlayR, OverlayG, OverlayB);
+        color.rgb = lerp(color.rgb, overlay, OverlayStrength);
+    }
+    return color;
+}
+)HLSL";
 
     ShaderLabEffects& ShaderLabEffects::Instance()
     {
@@ -530,6 +568,31 @@ float4 main(
                 { L"PrimRedX_hidden",   0.64f }, { L"PrimRedY_hidden",   0.33f },
                 { L"PrimGreenX_hidden", 0.30f }, { L"PrimGreenY_hidden", 0.60f },
                 { L"PrimBlueX_hidden",  0.15f }, { L"PrimBlueY_hidden",  0.06f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Luminance Highlight ----
+        // Range-based companion to Gamut Highlight: tints pixels whose
+        // luminance (in nits) falls outside [MinNits, MaxNits]. The Mode
+        // toggle inverts the test so the user can isolate either the
+        // out-of-range or in-range pixels.
+        {
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Luminance Highlight";
+            desc.effectId = L"Luminance Highlight"; desc.effectVersion = 1;
+            desc.category = L"Analysis";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + s_luminanceHighlightHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"MinNits",         L"float", 0.0f,   0.0f, 10000.0f, 1.0f },
+                { L"MaxNits",         L"float", 100.0f, 0.0f, 10000.0f, 1.0f },
+                { L"OverlayR",        L"float", 1.0f,   0.0f, 1.0f, 0.01f },
+                { L"OverlayG",        L"float", 0.0f,   0.0f, 1.0f, 0.01f },
+                { L"OverlayB",        L"float", 1.0f,   0.0f, 1.0f, 0.01f },
+                { L"OverlayStrength", L"float", 0.7f,   0.0f, 1.0f, 0.01f },
+                { L"Mode",            L"float", 0.0f,   0.0f, 1.0f, 1.0f, { L"Out-of-Range", L"In-Range" } },
             };
             m_effects.push_back(std::move(desc));
         }

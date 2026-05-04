@@ -65,7 +65,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)third_party\exprtk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)third_party\exprtk;$(ProjectDir)third_party\miniz;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch_engine.h</PrecompiledHeaderFile>
       <PrecompiledHeaderOutputFile>$(IntDir)pch_engine.pch</PrecompiledHeaderOutputFile>
@@ -153,6 +153,11 @@
     <ClCompile Include="Effects\SourceNodeFactory.cpp" />
     <ClCompile Include="Effects\StatisticsEffect.cpp" />
     <ClCompile Include="Effects\VideoSourceProvider.cpp" />
+    <ClCompile Include="third_party\miniz\miniz.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <CompileAs>CompileAsC</CompileAs>
+      <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
@@ -171,5 +176,9 @@
 
   <Target Name="EnsureExprTk" BeforeTargets="ClCompile" Inputs="scripts\EnsureExprTk.ps1" Outputs="$(ProjectDir)third_party\exprtk\exprtk.hpp">
     <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\EnsureExprTk.ps1&quot; -TargetDir &quot;$(ProjectDir)third_party\exprtk&quot;" />
+  </Target>
+
+  <Target Name="EnsureMiniz" BeforeTargets="PrepareForBuild" Inputs="scripts\EnsureMiniz.ps1" Outputs="$(ProjectDir)third_party\miniz\miniz.c;$(ProjectDir)third_party\miniz\miniz.h">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\EnsureMiniz.ps1&quot; -TargetDir &quot;$(ProjectDir)third_party\miniz&quot;" />
   </Target>
 </Project>

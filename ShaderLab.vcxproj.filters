@@ -17,13 +17,11 @@
       <UniqueIdentifier>{A1E28C87-1D94-4BAA-9B68-5C43B0E9F248}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
-
   <!-- Header Files -->
   <ItemGroup>
     <ClInclude Include="pch.h" />
     <ClInclude Include="App.xaml.h" />
     <ClInclude Include="MainWindow.xaml.h" />
-
     <ClInclude Include="Graph\NodeType.h">
       <Filter>Graph</Filter>
     </ClInclude>
@@ -39,7 +37,6 @@
     <ClInclude Include="Graph\EffectGraph.h">
       <Filter>Graph</Filter>
     </ClInclude>
-
     <ClInclude Include="Rendering\DisplayInfo.h">
       <Filter>Rendering</Filter>
     </ClInclude>
@@ -73,7 +70,6 @@
     <ClInclude Include="Rendering\FalseColorOverlay.h">
       <Filter>Rendering</Filter>
     </ClInclude>
-
     <ClInclude Include="Effects\ImageLoader.h">
       <Filter>Effects</Filter>
     </ClInclude>
@@ -104,7 +100,6 @@
     <ClInclude Include="Effects\StatisticsEffect.h">
       <Filter>Effects</Filter>
     </ClInclude>
-
     <ClInclude Include="Controls\ShaderEditorController.h">
       <Filter>Controls</Filter>
     </ClInclude>
@@ -126,72 +121,18 @@
     <ClInclude Include="Controls\PixelTraceController.h">
       <Filter>Controls</Filter>
     </ClInclude>
+    <ClInclude Include="Version.h" />
+    <ClInclude Include="ShaderLab\McpHttpServer.h" />
   </ItemGroup>
-
   <!-- Source Files -->
   <ItemGroup>
     <ClCompile Include="pch.cpp" />
     <ClCompile Include="App.xaml.cpp" />
     <ClCompile Include="MainWindow.xaml.cpp" />
     <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
-
-    <ClCompile Include="Graph\EffectGraph.cpp">
-      <Filter>Graph</Filter>
-    </ClCompile>
-
-    <ClCompile Include="Rendering\DisplayMonitor.cpp">
-      <Filter>Rendering</Filter>
-    </ClCompile>
-    <ClCompile Include="Rendering\IccProfileParser.cpp">
-      <Filter>Rendering</Filter>
-    </ClCompile>
     <ClCompile Include="Rendering\RenderEngine.cpp">
       <Filter>Rendering</Filter>
     </ClCompile>
-    <ClCompile Include="Rendering\GraphEvaluator.cpp">
-      <Filter>Rendering</Filter>
-    </ClCompile>
-    <ClCompile Include="Rendering\GpuReduction.cpp">
-      <Filter>Rendering</Filter>
-    </ClCompile>
-    <ClCompile Include="Rendering\D3D11ComputeRunner.cpp">
-      <Filter>Rendering</Filter>
-    </ClCompile>
-    <ClCompile Include="Rendering\ToneMapper.cpp">
-      <Filter>Rendering</Filter>
-    </ClCompile>
-    <ClCompile Include="Rendering\FalseColorOverlay.cpp">
-      <Filter>Rendering</Filter>
-    </ClCompile>
-
-    <ClCompile Include="Effects\ImageLoader.cpp">
-      <Filter>Effects</Filter>
-    </ClCompile>
-    <ClCompile Include="Effects\SourceNodeFactory.cpp">
-      <Filter>Effects</Filter>
-    </ClCompile>
-    <ClCompile Include="Effects\EffectRegistry.cpp">
-      <Filter>Effects</Filter>
-    </ClCompile>
-    <ClCompile Include="Effects\ShaderCompiler.cpp">
-      <Filter>Effects</Filter>
-    </ClCompile>
-    <ClCompile Include="Effects\ShaderLabEffects.cpp">
-      <Filter>Effects</Filter>
-    </ClCompile>
-    <ClCompile Include="Effects\VideoSourceProvider.cpp">
-      <Filter>Effects</Filter>
-    </ClCompile>
-    <ClCompile Include="Effects\CustomPixelShaderEffect.cpp">
-      <Filter>Effects</Filter>
-    </ClCompile>
-    <ClCompile Include="Effects\CustomComputeShaderEffect.cpp">
-      <Filter>Effects</Filter>
-    </ClCompile>
-    <ClCompile Include="Effects\StatisticsEffect.cpp">
-      <Filter>Effects</Filter>
-    </ClCompile>
-
     <ClCompile Include="Controls\ShaderEditorController.cpp">
       <Filter>Controls</Filter>
     </ClCompile>
@@ -210,19 +151,18 @@
     <ClCompile Include="Controls\PixelTraceController.cpp">
       <Filter>Controls</Filter>
     </ClCompile>
+    <ClCompile Include="ShaderLab\McpHttpServer.cpp" />
+    <ClCompile Include="MainWindow.McpRoutes.cpp" />
   </ItemGroup>
-
   <!-- XAML -->
   <ItemGroup>
     <ApplicationDefinition Include="App.xaml" />
     <Page Include="MainWindow.xaml" />
   </ItemGroup>
-
   <!-- IDL -->
   <ItemGroup>
     <Midl Include="MainWindow.idl" />
   </ItemGroup>
-
   <!-- Assets -->
   <ItemGroup>
     <Image Include="Assets\LockScreenLogo.scale-200.png">
@@ -247,11 +187,23 @@
       <Filter>Assets</Filter>
     </Image>
   </ItemGroup>
-
   <!-- Other -->
   <ItemGroup>
     <None Include="packages.config" />
     <Manifest Include="app.manifest" />
     <AppxManifest Include="Package.appxmanifest" />
+    <None Include=".github\workflows\ci.yml" />
+    <None Include=".github\workflows\release.yml" />
+    <None Include=".gitignore" />
+    <None Include="scripts\Install.ps1" />
+    <None Include="ShaderLab.vcxproj.filters" />
+    <None Include="scripts\EnsureMiniz.ps1" />
+  </ItemGroup>
+  <ItemGroup>
+    <Natvis Include="$(MSBuildThisFileDirectory)..\..\natvis\wil.natvis" />
+    <Natvis Include="$(MSBuildThisFileDirectory)..\..\natvis\wil.natstepfilter" />
+  </ItemGroup>
+  <ItemGroup>
+    <Page Include="EffectDesignerWindow.xaml" />
   </ItemGroup>
 </Project>

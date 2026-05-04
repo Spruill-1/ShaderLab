@@ -7,8 +7,8 @@ namespace ShaderLab::Rendering
 {
 	// EffectGraphFile -- read/write of the .effectgraph container.
 	//
-	// The on-disk format is a standard ZIP archive (PKZIP, "store"
-	// method, no compression) with two well-known entries:
+	// The on-disk format is a standard ZIP archive (PKZIP) with two
+	// well-known entries:
 	//
 	//   graph.json   -- the EffectGraph JSON serialization.
 	//   media/       -- (optional) embedded source files (images,
@@ -18,10 +18,13 @@ namespace ShaderLab::Rendering
 	//                   loader can rewrite them to extracted temp
 	//                   paths without ambiguity.
 	//
-	// The writer / reader use only Win32 APIs (CreateFileW, ReadFile,
-	// WriteFile) -- no third-party dependencies. Entries are stored
-	// uncompressed; ZIP just gives us a single-file container with
-	// CRC validation that any tool can inspect.
+	// Compression: every entry is run through miniz DEFLATE (ZIP
+	// method 8). Entries where deflate actually saves space keep the
+	// compressed payload; entries where it doesn't (already-compressed
+	// MP4 / PNG / JPEG / JXR, etc.) silently fall back to method 0
+	// (stored) per-entry, so the archive is never bigger than just
+	// concatenating the inputs. Any standard unzip tool can list and
+	// extract the archive.
 
 	class SHADERLAB_API EffectGraphFile
 	{

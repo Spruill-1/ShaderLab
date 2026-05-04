@@ -1,6 +1,16 @@
 #include "pch_engine.h"
 #include "EffectGraphFile.h"
 
+// miniz: vendored at build time by EnsureMiniz.ps1 -> third_party/miniz.
+// We use only its DEFLATE codec (tdefl_compress_mem_to_heap /
+// tinfl_decompress_mem_to_heap); the surrounding ZIP container is still
+// our own minimal writer/reader, which already tracks per-entry
+// compression method, CRC32, and sizes.
+#define MINIZ_NO_ARCHIVE_APIS
+#define MINIZ_NO_STDIO
+#define MINIZ_NO_TIME
+#include "miniz.h"
+
 // Minimal ZIP "store" (method=0) reader/writer.
 //
 // We only ever read or write archives produced by this code, so the
@@ -22,28 +32,23 @@
 // pod structs. Each struct is #pragma pack(1) so the compiler doesn't
 // pad them.
 //
-// Compression: every entry currently ships uncompressed (ZIP method 0).
-// The format is structured so a future revision can mix in compressed
-// entries without breaking compatibility:
+// Compression: every entry is offered to miniz DEFLATE. Per-entry
+// fallback: if the deflated bytes aren't smaller than the raw bytes,
+// TryCompressEntry resets the entry to method 0 (stored) so the
+// archive never grows. This means already-compressed inputs (MP4 /
+// PNG / JPEG / JXR / ...) cost a one-time deflate pass and end up
+// stored, while compressible inputs (BMP, uncompressed TIFF, raw
+// HDR/EXR, ICC, JSON) get real savings without us maintaining a
+// per-extension allowlist.
 //
-//   * The writer picks a per-entry compression method via PickMethodFor()
-//     based on filename extension; ShouldCompress() returns true only for
-//     known-compressible types (JSON, BMP, TIF, HDR, EXR, ICC) and false
-//     for already entropy-coded types (MP4, MKV, MOV, AVI, WMV, WEBM,
-//     M4V, PNG, JPG, JXR). Today PickMethodFor always returns 0 since we
-//     don't ship a deflate implementation. When we add one, only that
-//     function changes -- WriteLocalEntry / WriteCentralEntry already
-//     write `e.method` per-entry to both the local and central headers.
-//   * PendingEntry tracks both `data` (uncompressed) and an unused
-//     `compressed` byte vector. The writer emits whichever is non-empty;
-//     CRC32 always covers the *uncompressed* bytes per ZIP spec.
-//   * The reader rejects any compressionMethod != 0 today. When deflate
-//     support lands, that branch grows a method 8 path; everything
-//     upstream of the compression byte stream stays unchanged.
-//   * We deliberately do not use vendored or in-box-but-unofficial
-//     compression APIs. A future version that ships its own deflate
-//     (or links zlib) can plug straight into PickMethodFor() and the
-//     two header sites without touching the public format.
+//   * Compression uses miniz's tdefl_compress_mem_to_heap with the
+//     default probe count (~zlib level 6). The output is raw DEFLATE
+//     (no zlib header), which is exactly what ZIP method 8 expects.
+//   * Decompression uses miniz's tinfl_decompress_mem_to_heap. The
+//     reader accepts both method 0 (forward-compatible with old
+//     archives) and method 8.
+//   * miniz is vendored at build time (third_party/miniz, MIT
+//     licensed) by EnsureMiniz.ps1 -- the source is not checked in.
 
 namespace
 {
@@ -204,51 +209,57 @@ namespace
 		}
 	};
 
-	// Pick which entries are worth compressing. Filename-extension based
-	// because we have no good content sniffer here, and the savings
-	// distribution is dominated by the obvious cases:
-	//   * Already entropy-coded (mp4/mkv/mov/avi/wmv/webm/m4v/png/jpg/jxr,
-	//     ...) -- deflate typically saves <1% and slows the save
-	//     proportionally to the file size. Always store.
-	//   * Compressible (JSON, BMP, TIF/TIFF uncompressed, HDR, EXR, ICC,
-	//     ICM, ...) -- deflate routinely saves 30-90%. Worth doing
-	//     when we have a compressor.
-	bool ShouldCompress(std::wstring_view filename)
+	// Pick which entries to attempt compression on. We try everything
+	// and let TryCompressEntry's "did it actually shrink?" check do
+	// the per-entry filtering. Deflating already-compressed media
+	// (MP4/PNG/JPEG/JXR) typically expands by <0.1% before being
+	// rejected, so the CPU cost is bounded and we never bloat the
+	// archive. Files that DO compress well (BMP, uncompressed TIFF,
+	// raw HDR/EXR, ICC profiles, JSON, ...) get the savings without
+	// us having to maintain an extension allowlist.
+	bool ShouldCompress(std::wstring_view /*filename*/)
 	{
-		auto dot = filename.find_last_of(L'.');
-		if (dot == std::wstring_view::npos) return false;
-		std::wstring ext{ filename.substr(dot) };
-		for (auto& c : ext) c = static_cast<wchar_t>(::towlower(c));
-		// Known-compressed media: skip deflate entirely.
-		static const wchar_t* kSkip[] = {
-			L".mp4", L".mkv", L".mov", L".avi", L".wmv", L".webm", L".m4v", L".ts",
-			L".png", L".jpg", L".jpeg", L".jxr", L".wdp",
-			L".zip", L".7z", L".rar", L".gz", L".xz", L".zst",
-		};
-		for (auto* s : kSkip) if (ext == s) return false;
-		// Known-text/raw types: compress when we're able.
-		static const wchar_t* kCompress[] = {
-			L".json", L".bmp", L".tif", L".tiff", L".hdr", L".exr",
-			L".icc", L".icm", L".txt", L".xml", L".csv", L".hlsl",
-		};
-		for (auto* s : kCompress) if (ext == s) return true;
-		// Unknown extension: be conservative and store.
-		return false;
+		return true;
 	}
 
-	// Decide on a compression method for this entry. Today we have no
-	// deflate implementation linked in, so this always returns 0 (store)
-	// even when ShouldCompress would say yes. When a deflate codec is
-	// added (zlib, vendored miniz, etc.), the only change here is to
-	// return 8 (deflate) and have the caller fill PendingEntry.compressed
-	// with the deflated payload. The on-disk format is unchanged: ZIP
-	// has always carried compressionMethod per-entry.
+	// Decide on a compression method for this entry. Returns 8 (deflate)
+	// for entries that ShouldCompress flags as worth it; the caller is
+	// responsible for filling PendingEntry.compressed via miniz before
+	// writing. Returns 0 (store) otherwise.
 	uint16_t PickMethodFor(std::wstring_view filename)
 	{
-		// Hook reserved for future use. Touch the predicate so the
-		// compiler keeps it referenced while compression is disabled.
-		(void)ShouldCompress(filename);
-		return 0;
+		return ShouldCompress(filename) ? 8 : 0;
+	}
+
+	// Try to compress e.data into e.compressed via miniz raw DEFLATE
+	// (which is exactly what ZIP method 8 expects). Falls back to
+	// method 0 (store) when the deflated output isn't actually smaller
+	// or the compressor errors out -- ZIP allows mixing methods, so a
+	// noisy file just stays stored.
+	void TryCompressEntry(PendingEntry& e)
+	{
+		if (e.method == 0 || e.data.empty()) return;
+
+		size_t outSize = 0;
+		// TDEFL_DEFAULT_MAX_PROBES (~128) is the same balance zlib level 6
+		// uses; good ratio without becoming slow on large media. We do NOT
+		// pass TDEFL_WRITE_ZLIB_HEADER -- ZIP method 8 stores raw DEFLATE
+		// streams, not zlib-wrapped ones.
+		void* deflated = tdefl_compress_mem_to_heap(
+			e.data.data(), e.data.size(), &outSize,
+			TDEFL_DEFAULT_MAX_PROBES);
+		if (!deflated || outSize == 0 || outSize >= e.data.size())
+		{
+			if (deflated) mz_free(deflated);
+			e.method = 0;
+			e.compressed.clear();
+			return;
+		}
+
+		e.compressed.assign(
+			static_cast<const uint8_t*>(deflated),
+			static_cast<const uint8_t*>(deflated) + outSize);
+		mz_free(deflated);
 	}
 
 	bool WriteLocalEntry(HANDLE h, PendingEntry& e, uint32_t& cursor)
@@ -382,14 +393,16 @@ namespace ShaderLab::Rendering
 			entries.push_back(std::move(e));
 		}
 
-		// Pick a compression method per entry. Today this is always 0
-		// (no compressor linked); a future revision adds the deflated
-		// payload to PendingEntry.compressed and sets method = 8 here.
+		// Pick a compression method per entry, then run miniz on the
+		// ones that ShouldCompress flagged. PickMethodFor returns 8 for
+		// compressible types; TryCompressEntry falls back to method 0
+		// per-entry if deflate doesn't actually shrink the bytes.
 		for (auto& e : entries)
 		{
 			const std::wstring nameW = std::filesystem::path(
 				std::string_view(e.name)).filename().wstring();
 			e.method = PickMethodFor(nameW);
+			TryCompressEntry(e);
 		}
 
 		HANDLE h = ::CreateFileW(
@@ -459,7 +472,9 @@ namespace ShaderLab::Rendering
 		{
 			std::string name;
 			size_t dataOff;
-			uint32_t size;
+			uint32_t size;             // compressed size on disk
+			uint32_t uncompressedSize; // logical size after inflate
+			uint16_t method;           // 0 = stored, 8 = deflate
 		};
 		std::vector<ParsedEntry> parsed;
 		parsed.reserve(8);
@@ -473,10 +488,11 @@ namespace ShaderLab::Rendering
 
 			LocalFileHeader hdr{};
 			std::memcpy(&hdr, buf.data() + pos, sizeof(hdr));
-			// We only emit method 0 today. When deflate (method 8) is
-			// added, this branch grows a decoder; existing archives
-			// continue to work because their entries are all method 0.
-			if (hdr.compressionMethod != 0) return std::nullopt;
+			// Supported methods: 0 (store) and 8 (deflate). Anything
+			// else is from a future revision and we refuse the archive
+			// rather than silently mis-decoding.
+			if (hdr.compressionMethod != 0 && hdr.compressionMethod != 8)
+				return std::nullopt;
 
 			const size_t nameOff = pos + sizeof(hdr);
 			const size_t dataOff = nameOff + hdr.fileNameLength + hdr.extraFieldLength;
@@ -488,16 +504,55 @@ namespace ShaderLab::Rendering
 			pe.name.assign(nameP, hdr.fileNameLength);
 			pe.dataOff = dataOff;
 			pe.size = hdr.compressedSize;
+			pe.uncompressedSize = hdr.uncompressedSize;
+			pe.method = hdr.compressionMethod;
 			parsed.push_back(std::move(pe));
 
 			pos = dataEnd;
 		}
 
+		// Helper: produce the uncompressed bytes of a parsed entry.
+		// Stored entries (method 0) are returned as a view-by-copy of the
+		// raw payload; deflated entries (method 8) are inflated through
+		// miniz into a freshly-allocated buffer. Returns empty on error.
+		auto inflateEntry = [&](const ParsedEntry& e) -> std::vector<uint8_t>
+		{
+			std::vector<uint8_t> out;
+			if (e.method == 0)
+			{
+				out.assign(buf.data() + e.dataOff,
+					buf.data() + e.dataOff + e.size);
+				return out;
+			}
+			// Method 8: raw DEFLATE. miniz's tinfl_decompress_mem_to_heap
+			// is the symmetric inverse of tdefl_compress_mem_to_heap that
+			// we used on save -- no zlib header, no checksum trailer.
+			size_t outSize = 0;
+			void* inflated = tinfl_decompress_mem_to_heap(
+				buf.data() + e.dataOff, e.size, &outSize, 0);
+			if (!inflated) return out;
+			if (e.uncompressedSize != 0 && outSize != e.uncompressedSize)
+			{
+				mz_free(inflated);
+				return out;
+			}
+			out.assign(
+				static_cast<const uint8_t*>(inflated),
+				static_cast<const uint8_t*>(inflated) + outSize);
+			mz_free(inflated);
+			return out;
+		};
+
 		// Find graph.json.
 		std::optional<std::wstring> graphJson;
 		for (const auto& e : parsed)
-			if (e.name == "graph.json")
-				graphJson = Utf8ToUtf16(reinterpret_cast<const char*>(buf.data() + e.dataOff), e.size);
+		{
+			if (e.name != "graph.json") continue;
+			auto bytes = inflateEntry(e);
+			if (bytes.empty() && e.uncompressedSize > 0) return std::nullopt;
+			graphJson = Utf8ToUtf16(
+				reinterpret_cast<const char*>(bytes.data()), bytes.size());
+		}
 		if (!graphJson.has_value())
 			return std::nullopt;
 
@@ -557,13 +612,16 @@ namespace ShaderLab::Rendering
 			if (!report(fileName)) return std::nullopt;
 
 			const std::wstring outPath = extractDir + L'\\' + fileName;
+			auto bytes = inflateEntry(e);
+			if (bytes.empty() && e.uncompressedSize > 0) return std::nullopt;
 			HANDLE hf = ::CreateFileW(outPath.c_str(),
 				GENERIC_WRITE, 0, nullptr,
 				CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 			if (hf == INVALID_HANDLE_VALUE) return std::nullopt;
 			DWORD wrote = 0;
-			const bool ok = ::WriteFile(hf, buf.data() + e.dataOff, e.size, &wrote, nullptr)
-							&& wrote == e.size;
+			const bool ok = ::WriteFile(hf, bytes.data(),
+								static_cast<DWORD>(bytes.size()), &wrote, nullptr)
+							&& wrote == bytes.size();
 			::CloseHandle(hf);
 			if (!ok) return std::nullopt;
 

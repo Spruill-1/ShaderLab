@@ -227,6 +227,7 @@
     <None Include=".github\workflows\release.yml" />
     <None Include=".gitignore" />
     <None Include="packages.config" />
+    <None Include="scripts\EnsureMiniz.ps1" />
     <None Include="scripts\Install.ps1" />
     <None Include="ShaderLab.vcxproj.filters" />
   </ItemGroup>
