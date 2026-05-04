@@ -110,7 +110,7 @@ The tone mapping system (`Rendering/ToneMapper.h/.cpp`) and color correction are
 - **Effect registry**: Singleton with 40+ built-in D2D effects across 9 categories. Case-insensitive name lookup.
 - **ShaderLab effects library**: 20+ built-in effects in `Effects/ShaderLabEffects.h/.cpp` (Analysis + Color Processing + Source/Generator + Parameter / Clock / Numeric Expression). Embedded HLSL with shared color math. Auto-compiled at first use.
 - **MCP server**: 23-tool JSON-RPC 2.0 server on port 47808 for AI agent integration. Routes in `MainWindow.McpRoutes.cpp`.
-- **Versioning**: `Version.h` defines app version (1.2.2) and graph format version (2). Both stored in saved graphs. Forward compatibility check on load.
+- **Versioning**: `Version.h` defines app version (1.2.3) and graph format version (2). Both stored in saved graphs. Forward compatibility check on load.
 - **Dirty-gated render loop**: `DispatcherQueueTimer` at 16ms (~60 FPS). Skips evaluate when no nodes changed. Analysis readback only on dirty frames.
 - **Ctrl+Enter** compiles shader from the editor TextBox.
 

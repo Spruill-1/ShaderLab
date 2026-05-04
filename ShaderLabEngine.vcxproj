@@ -108,6 +108,7 @@
     <ClInclude Include="Rendering\DisplayInfo.h" />
     <ClInclude Include="Rendering\DisplayMonitor.h" />
     <ClInclude Include="Rendering\DisplayProfile.h" />
+    <ClInclude Include="Rendering\EffectGraphFile.h" />
     <ClInclude Include="Rendering\FalseColorOverlay.h" />
     <ClInclude Include="Rendering\GpuReduction.h" />
     <ClInclude Include="Rendering\GraphEvaluator.h" />
@@ -137,6 +138,7 @@
     <ClCompile Include="Rendering\GpuReduction.cpp" />
     <ClCompile Include="Rendering\GraphEvaluator.cpp" />
     <ClCompile Include="Rendering\IccProfileParser.cpp" />
+    <ClCompile Include="Rendering\EffectGraphFile.cpp" />
     <ClCompile Include="Rendering\MathExpression.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>

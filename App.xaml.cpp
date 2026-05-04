@@ -128,6 +128,33 @@ namespace winrt::ShaderLab::implementation
             impl->SetAutoStartMcp(true);
         impl->SetDevicePreference(devicePref);
 
+        // File activation: when the user double-clicks a .effectgraph
+        // file in Explorer, the OS launches us with the file path on
+        // the command line. We just scan for it here -- proper
+        // Microsoft.Windows.AppLifecycle activation routing isn't
+        // worth the WinAppSDK reunion glue for a single argument.
+        {
+            int argc = 0;
+            wchar_t** argv = ::CommandLineToArgvW(GetCommandLineW(), &argc);
+            if (argv)
+            {
+                for (int i = 1; i < argc; ++i)
+                {
+                    std::wstring a = argv[i];
+                    // Skip our own flags.
+                    if (a.starts_with(L"--")) continue;
+                    auto lower = a;
+                    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+                    if (lower.ends_with(L".effectgraph"))
+                    {
+                        impl->SetPendingOpenPath(a);
+                        break;
+                    }
+                }
+                ::LocalFree(argv);
+            }
+        }
+
         window = mw;
         window.Activate();
     }

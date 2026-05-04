@@ -6,6 +6,7 @@
 
 #include "Rendering/PipelineFormat.h"
 #include "Rendering/IccProfileParser.h"
+#include "Rendering/EffectGraphFile.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/StatisticsEffect.h"
 #include "Version.h"
@@ -21,6 +22,8 @@ namespace winrt::ShaderLab::implementation
         InitializeComponent();
 
         Title(std::wstring(L"ShaderLab v") + ::ShaderLab::VersionString + L" \u2014 HDR Shader Effect Development");
+        // After Title() we'll refresh from RefreshTitleBar() once a graph
+        // is loaded; the initial state is "Untitled".
         AppVersionText().Text(std::wstring(L"v") + ::ShaderLab::VersionString);
 
         m_hwnd = GetWindowHandle();
@@ -34,6 +37,42 @@ namespace winrt::ShaderLab::implementation
             // Force exit so output windows don't keep us running.
             ::PostQuitMessage(0);
         });
+
+        // Cancellable close: prompt the user when there are unsaved
+        // changes. AppWindow.Closing is the WinUI 3 hook that can take
+        // a deferral (so we can show an async dialog and decide whether
+        // to allow the close after the user picks an option).
+        this->AppWindow().Closing(
+            [this](auto&&, winrt::Microsoft::UI::Windowing::AppWindowClosingEventArgs const& args)
+            {
+                if (m_isShuttingDown || !m_unsavedChanges) return;
+                args.Cancel(true);
+
+                // Defer the actual decision until after the user picks an
+                // option in the dialog. We can't co_await inside the
+                // event handler itself, so kick off a fire-and-forget
+                // continuation that re-issues Close() after the dialog
+                // resolves.
+                [](MainWindow* self) -> winrt::fire_and_forget
+                {
+                    auto strong = self->get_strong();
+                    int32_t choice = co_await self->PromptUnsavedChangesAsync();
+                    if (choice == 2) co_return; // Cancel -> stay open
+                    if (choice == 0)            // Save then close
+                    {
+                        if (!self->m_currentFilePath.empty())
+                            self->SaveGraphToCurrentPath();
+                        else
+                            co_await self->SaveGraphAsAsync();
+                        // If the user backed out of the picker, don't close.
+                        if (self->m_unsavedChanges) co_return;
+                    }
+                    // Discard or successful save -> bypass the gate and
+                    // close for real.
+                    self->m_unsavedChanges = false;
+                    self->Close();
+                }(this);
+            });
 
         // Wire up event handlers (safe before panel is loaded).
         PreviewPanel().SizeChanged({ this, &MainWindow::OnPreviewSizeChanged });
@@ -245,6 +284,7 @@ namespace winrt::ShaderLab::implementation
                 m_nodeGraphController.RebuildLayout();
                 PopulatePreviewNodeSelector();
                 UpdatePropertiesPanel();
+                MarkUnsaved();
 
                 // Reset preview to Output node.
                 for (const auto& n : m_graph.Nodes())
@@ -424,7 +464,8 @@ namespace winrt::ShaderLab::implementation
         // Set version text: app version + effect library version.
         {
             auto& lib = ::ShaderLab::Effects::ShaderLabEffects::Instance();
-            AppVersionText().Text(std::format(L"v1.1.0  (effects lib v{})", lib.LibraryVersion()));
+            AppVersionText().Text(std::wstring(L"v") + ::ShaderLab::VersionString
+                + L"  (effects lib v" + std::to_wstring(lib.LibraryVersion()) + L")");
         }
 
         m_nodeGraphController.SetGraph(&m_graph);
@@ -444,6 +485,7 @@ namespace winrt::ShaderLab::implementation
                     m_nodeLogs[dstId].Info(std::format(L"Input {} connected from {}", dstPin, srcName));
                     m_nodeLogs[srcId].Info(std::format(L"Output {} connected to {}", srcPin, dstName));
                 }
+                MarkUnsaved();
             });
 
         if (m_renderEngine.D3DDevice())
@@ -464,6 +506,19 @@ namespace winrt::ShaderLab::implementation
 
         // Initialize the node graph editor panel.
         InitializeGraphPanel();
+
+        // If the app was launched via file double-click, load that
+        // graph now that rendering is wired up.
+        if (!m_pendingOpenPath.empty())
+        {
+            auto path = std::move(m_pendingOpenPath);
+            m_pendingOpenPath.clear();
+            LoadGraphFromPathAsync(winrt::hstring(path));
+        }
+        else
+        {
+            RefreshTitleBar();
+        }
     }
 
     void MainWindow::UpdateStatusBar()
@@ -1093,29 +1148,102 @@ namespace winrt::ShaderLab::implementation
         LoadGraphAsync();
     }
 
+    void MainWindow::OnSaveAccelerator(
+        winrt::Microsoft::UI::Xaml::Input::KeyboardAccelerator const& /*sender*/,
+        winrt::Microsoft::UI::Xaml::Input::KeyboardAcceleratorInvokedEventArgs const& args)
+    {
+        args.Handled(true);
+        SaveGraphAsync();
+    }
+
+    void MainWindow::OnSaveAsAccelerator(
+        winrt::Microsoft::UI::Xaml::Input::KeyboardAccelerator const& /*sender*/,
+        winrt::Microsoft::UI::Xaml::Input::KeyboardAcceleratorInvokedEventArgs const& args)
+    {
+        args.Handled(true);
+        SaveGraphAsAsync();
+    }
+
+    void MainWindow::MarkUnsaved()
+    {
+        if (m_unsavedChanges) return;
+        m_unsavedChanges = true;
+        RefreshTitleBar();
+    }
+
+    void MainWindow::RefreshTitleBar()
+    {
+        // Title format: "<filename>[*] - ShaderLab <version>". The
+        // unsaved star is the standard editor convention; the
+        // filename is derived from m_currentFilePath if known, else
+        // "Untitled".
+        std::wstring base = m_currentFilePath.empty() ? std::wstring(L"Untitled") :
+            std::filesystem::path(m_currentFilePath).filename().wstring();
+        std::wstring title = base + (m_unsavedChanges ? L"*" : L"")
+            + L" - ShaderLab " + ::ShaderLab::VersionString;
+        try { Title(winrt::hstring(title)); } catch (...) {}
+    }
+
+    bool MainWindow::SaveGraphToCurrentPath()
+    {
+        if (m_currentFilePath.empty()) return false;
+        try
+        {
+            auto json = m_graph.ToJson();
+            const bool ok = ::ShaderLab::Rendering::EffectGraphFile::Save(
+                m_currentFilePath, std::wstring(json));
+            if (ok)
+            {
+                m_unsavedChanges = false;
+                RefreshTitleBar();
+                PipelineFormatText().Text(
+                    L"Graph saved: " +
+                    winrt::hstring(std::filesystem::path(m_currentFilePath).filename().wstring()));
+            }
+            else
+            {
+                PipelineFormatText().Text(L"Error: Failed to save graph");
+            }
+            return ok;
+        }
+        catch (...)
+        {
+            PipelineFormatText().Text(L"Error: Failed to save graph");
+            return false;
+        }
+    }
+
     winrt::fire_and_forget MainWindow::SaveGraphAsync()
+    {
+        auto strong = get_strong();
+        // If we already have a destination from a previous save / load,
+        // overwrite silently -- this is the standard "Ctrl+S" path.
+        if (!m_currentFilePath.empty())
+        {
+            SaveGraphToCurrentPath();
+            co_return;
+        }
+        co_await SaveGraphAsAsync();
+    }
+
+    winrt::Windows::Foundation::IAsyncAction MainWindow::SaveGraphAsAsync()
     {
         auto strong = get_strong();
 
         winrt::Windows::Storage::Pickers::FileSavePicker picker;
         picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
         picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::DocumentsLibrary);
-        picker.SuggestedFileName(L"graph");
-        picker.FileTypeChoices().Insert(L"JSON Graph", winrt::single_threaded_vector<winrt::hstring>({ L".json" }));
+        picker.SuggestedFileName(
+            m_currentFilePath.empty() ? winrt::hstring(L"graph") :
+            winrt::hstring(std::filesystem::path(m_currentFilePath).stem().wstring()));
+        picker.FileTypeChoices().Insert(L"ShaderLab Graph",
+            winrt::single_threaded_vector<winrt::hstring>({ L".effectgraph" }));
 
         auto file = co_await picker.PickSaveFileAsync();
         if (!file) co_return;
 
-        try
-        {
-            auto json = m_graph.ToJson();
-            co_await winrt::Windows::Storage::FileIO::WriteTextAsync(file, json);
-            PipelineFormatText().Text(L"Graph saved: " + file.Name());
-        }
-        catch (...)
-        {
-            PipelineFormatText().Text(L"Error: Failed to save graph");
-        }
+        m_currentFilePath = std::wstring(file.Path());
+        SaveGraphToCurrentPath();
     }
 
     winrt::fire_and_forget MainWindow::LoadGraphAsync()
@@ -1125,27 +1253,37 @@ namespace winrt::ShaderLab::implementation
         winrt::Windows::Storage::Pickers::FileOpenPicker picker;
         picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
         picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::DocumentsLibrary);
-        picker.FileTypeFilter().Append(L".json");
+        picker.FileTypeFilter().Append(L".effectgraph");
 
         auto file = co_await picker.PickSingleFileAsync();
         if (!file) co_return;
 
+        co_await LoadGraphFromPathAsync(file.Path());
+    }
+
+    winrt::Windows::Foundation::IAsyncAction MainWindow::LoadGraphFromPathAsync(winrt::hstring path)
+    {
+        auto strong = get_strong();
+        std::wstring pathStr(path);
         std::wstring versionError;
+        std::wstring fileName = std::filesystem::path(pathStr).filename().wstring();
+
         try
         {
-            auto text = co_await winrt::Windows::Storage::FileIO::ReadTextAsync(file);
-            auto loaded = ::ShaderLab::Graph::EffectGraph::FromJson(text);
+            auto loadedJson = ::ShaderLab::Rendering::EffectGraphFile::Load(pathStr);
+            if (!loadedJson.has_value())
+                throw std::runtime_error("Could not read graph.json from .effectgraph");
 
-            // Release stale evaluator caches before swapping the graph.
-            // Use the graph-aware overload so the OUTGOING graph's nodes also
-            // have their dangling cachedOutput pointers cleared (defensive —
-            // the graph is about to be replaced, but a stray reference held
-            // elsewhere would still be unsafe).
+            auto loaded = ::ShaderLab::Graph::EffectGraph::FromJson(winrt::hstring(*loadedJson));
+
             m_graphEvaluator.ReleaseCache(m_graph);
             m_graph = std::move(loaded);
+            m_currentFilePath = pathStr;
+            m_unsavedChanges = false;
 
             ResetAfterGraphLoad();
-            PipelineFormatText().Text(L"Graph loaded: " + file.Name());
+            RefreshTitleBar();
+            PipelineFormatText().Text(L"Graph loaded: " + winrt::hstring(fileName));
         }
         catch (const std::runtime_error& ex)
         {
@@ -1168,6 +1306,29 @@ namespace winrt::ShaderLab::implementation
             dialog.Content(winrt::box_value(winrt::hstring(versionError)));
             dialog.CloseButtonText(L"OK");
             co_await dialog.ShowAsync();
+        }
+    }
+
+    winrt::Windows::Foundation::IAsyncOperation<int32_t> MainWindow::PromptUnsavedChangesAsync()
+    {
+        auto strong = get_strong();
+        auto dialog = winrt::Microsoft::UI::Xaml::Controls::ContentDialog();
+        dialog.XamlRoot(this->Content().XamlRoot());
+        dialog.Title(winrt::box_value(L"Unsaved changes"));
+        std::wstring fname = m_currentFilePath.empty() ? std::wstring(L"this graph") :
+            std::filesystem::path(m_currentFilePath).filename().wstring();
+        dialog.Content(winrt::box_value(winrt::hstring(
+            L"You have unsaved changes to " + fname + L". Save before closing?")));
+        dialog.PrimaryButtonText(L"Save");
+        dialog.SecondaryButtonText(L"Discard");
+        dialog.CloseButtonText(L"Cancel");
+        dialog.DefaultButton(winrt::Microsoft::UI::Xaml::Controls::ContentDialogButton::Primary);
+        auto result = co_await dialog.ShowAsync();
+        switch (result)
+        {
+            case winrt::Microsoft::UI::Xaml::Controls::ContentDialogResult::Primary:   co_return 0; // Save
+            case winrt::Microsoft::UI::Xaml::Controls::ContentDialogResult::Secondary: co_return 1; // Discard
+            default:                                                                   co_return 2; // Cancel
         }
     }
 
@@ -1524,6 +1685,7 @@ namespace winrt::ShaderLab::implementation
         m_graph.MarkAllDirty();
         m_nodeGraphController.RebuildLayout();
         PopulatePreviewNodeSelector();
+        MarkUnsaved();
     }
 
     // -----------------------------------------------------------------------
@@ -2410,6 +2572,7 @@ namespace winrt::ShaderLab::implementation
                     m_nodeGraphController.RebuildLayout();
                     m_forceRender = true;
                     UpdatePropertiesPanel();
+                    MarkUnsaved();
                     args.Handled(true);
                     return;
                 }
@@ -5612,6 +5775,7 @@ namespace winrt::ShaderLab::implementation
             // smaller/empty).
             m_forceRender = true;
             m_nodeGraphController.SetNeedsRedraw();
+            MarkUnsaved();
         }
 
         auto* dc = m_renderEngine.D2DDeviceContext();

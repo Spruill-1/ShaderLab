@@ -32,6 +32,10 @@ namespace winrt::ShaderLab::implementation
         // Device preference (set from --gpu / --warp command-line flags).
         void SetDevicePreference(::ShaderLab::Rendering::DevicePreference pref) { m_devicePref = pref; }
 
+        // File path passed on the command line via Explorer FTA.
+        // Loaded after rendering is initialized.
+        void SetPendingOpenPath(std::wstring path) { m_pendingOpenPath = std::move(path); }
+
         // XAML-bound event handlers (must be public for generated code).
         void OnColumnSplitterPointerPressed(
             winrt::Windows::Foundation::IInspectable const& sender,
@@ -51,6 +55,12 @@ namespace winrt::ShaderLab::implementation
         winrt::fire_and_forget OnNodeGraphDrop(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::DragEventArgs const& args);
+        void OnSaveAccelerator(
+            winrt::Microsoft::UI::Xaml::Input::KeyboardAccelerator const& sender,
+            winrt::Microsoft::UI::Xaml::Input::KeyboardAcceleratorInvokedEventArgs const& args);
+        void OnSaveAsAccelerator(
+            winrt::Microsoft::UI::Xaml::Input::KeyboardAccelerator const& sender,
+            winrt::Microsoft::UI::Xaml::Input::KeyboardAcceleratorInvokedEventArgs const& args);
 
     private:
         HWND GetWindowHandle();
@@ -108,8 +118,31 @@ namespace winrt::ShaderLab::implementation
         void OnLoadGraphClicked(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        // Save the current graph; if no file path is known, prompts via picker.
         winrt::fire_and_forget SaveGraphAsync();
+        // Always prompts via picker, even if a path is known.
+        winrt::Windows::Foundation::IAsyncAction SaveGraphAsAsync();
         winrt::fire_and_forget LoadGraphAsync();
+        // Quietly write the graph to disk at the previously-picked path.
+        // Returns true if the write succeeded; false if no path or the
+        // write failed. Public-ish so the close-confirmation dialog can
+        // call it on the "Save" branch.
+        bool SaveGraphToCurrentPath();
+        // Mark the current graph as having unsaved edits. Cheap; call it
+        // from any user-driven mutation site. Resets on save / load / new.
+        void MarkUnsaved();
+        // Async confirmation dialog used by AppWindow Closing handler.
+        // Returns 0 = save (then proceed), 1 = discard, 2 = cancel.
+        winrt::Windows::Foundation::IAsyncOperation<int32_t> PromptUnsavedChangesAsync();
+        void RefreshTitleBar();
+        // Load a .effectgraph (or legacy .json) from a known path. Used by
+        // file activation (double-click in Explorer) and by the picker.
+        winrt::Windows::Foundation::IAsyncAction LoadGraphFromPathAsync(winrt::hstring path);
+
+        // Path of the most recently saved or loaded graph (empty until
+        // the user picks a destination via Save As / open).
+        std::wstring m_currentFilePath;
+        bool m_unsavedChanges{ false };
         void PopulateAddNodeFlyout();
         void OnAddEffectNode(const ::ShaderLab::Effects::EffectDescriptor& desc);
         void OnAddImageSourceClicked(
@@ -284,6 +317,7 @@ namespace winrt::ShaderLab::implementation
         std::unique_ptr<::ShaderLab::McpHttpServer> m_mcpServer;
         bool m_autoStartMcp{ false };
         ::ShaderLab::Rendering::DevicePreference m_devicePref{ ::ShaderLab::Rendering::DevicePreference::Default };
+        std::wstring m_pendingOpenPath; // file path from Explorer FTA, loaded after init
         void SetupMcpRoutes();
         template<typename F> auto DispatchSync(F&& fn) -> decltype(fn());
 

@@ -29,13 +29,20 @@
               BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
               BorderThickness="0,0,0,1">
             <StackPanel Orientation="Horizontal" Spacing="4">
-                <Button x:Name="SaveGraphButton" ToolTipService.ToolTip="Save Graph">
+                <Button x:Name="SaveGraphButton" ToolTipService.ToolTip="Save Graph (Ctrl+S, Ctrl+Shift+S = Save As)">
+                    <Button.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control" Key="S" Invoked="OnSaveAccelerator" />
+                        <KeyboardAccelerator Modifiers="Control,Shift" Key="S" Invoked="OnSaveAsAccelerator" />
+                    </Button.KeyboardAccelerators>
                     <StackPanel Orientation="Horizontal" Spacing="6">
                         <FontIcon Glyph="&#xE74E;" FontSize="14" />
                         <TextBlock Text="Save Graph" />
                     </StackPanel>
                 </Button>
-                <Button x:Name="LoadGraphButton" ToolTipService.ToolTip="Load Graph">
+                <Button x:Name="LoadGraphButton" ToolTipService.ToolTip="Load Graph (Ctrl+O)">
+                    <Button.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control" Key="O" />
+                    </Button.KeyboardAccelerators>
                     <StackPanel Orientation="Horizontal" Spacing="6">
                         <FontIcon Glyph="&#xE8E5;" FontSize="14" />
                         <TextBlock Text="Load Graph" />

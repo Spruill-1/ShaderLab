@@ -9,7 +9,7 @@
   <Identity
     Name="ShaderLab"
     Publisher="CN=ShaderLab"
-    Version="1.2.2.0" />
+    Version="1.2.3.0" />
 
   <mp:PhoneIdentity PhoneProductId="a1b2c3d4-e5f6-7890-abcd-ef1234567890" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
@@ -41,6 +41,17 @@
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.scale-200.png"/>
         <uap:SplashScreen Image="Assets\SplashScreen.scale-200.png"/>
       </uap:VisualElements>
+      <Extensions>
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap:FileTypeAssociation Name="effectgraph">
+            <uap:DisplayName>ShaderLab Effect Graph</uap:DisplayName>
+            <uap:Logo>Assets\Square44x44Logo.scale-200.png</uap:Logo>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.effectgraph</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap:FileTypeAssociation>
+        </uap:Extension>
+      </Extensions>
     </Application>
   </Applications>
 
