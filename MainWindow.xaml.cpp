@@ -5830,9 +5830,18 @@ namespace winrt::ShaderLab::implementation
         {
             if (!m_logWindows.empty())
                 UpdateLogWindows();
-            // Refresh properties panel for live bound/animated values.
+            // Refresh properties panel only when the selected node actually has
+            // a property binding whose live value can change frame to frame.
+            // Without this guard, video playback (which dirties graph nodes
+            // every frame) caused a 4 Hz rebuild of the entire properties
+            // panel -- visibly jittering Slider/NumberBox widths as auto-sized
+            // controls re-laid out.
             if (m_selectedNodeId != 0 && m_graph.HasDirtyNodes())
-                UpdatePropertiesPanel();
+            {
+                auto* selNode = m_graph.FindNode(m_selectedNodeId);
+                if (selNode && !selNode->propertyBindings.empty())
+                    UpdatePropertiesPanel();
+            }
         }
         if (elapsed >= 1000)
         {
