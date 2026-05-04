@@ -108,7 +108,12 @@ namespace winrt::ShaderLab::implementation
         LoadGraphButton().Click({ this, &MainWindow::OnLoadGraphClicked });
         AutoArrangeButton().Click([this](auto&&, auto&&)
         {
+            // Reset viewport so the laid-out nodes are visible even if the
+            // user had zoomed/panned the canvas off-screen.
+            m_nodeGraphController.SetZoom(1.0f);
+            m_nodeGraphController.SetPanOffset(0.0f, 0.0f);
             m_nodeGraphController.AutoLayout();
+            m_nodeGraphController.SetNeedsRedraw();
             m_forceRender = true;
         });
         UpdateAllEffectsButton().Click([this](auto&&, auto&&)
