@@ -21,6 +21,29 @@
 // in-memory layout on x86/x64/ARM64 Windows so we just reinterpret_cast
 // pod structs. Each struct is #pragma pack(1) so the compiler doesn't
 // pad them.
+//
+// Compression: every entry currently ships uncompressed (ZIP method 0).
+// The format is structured so a future revision can mix in compressed
+// entries without breaking compatibility:
+//
+//   * The writer picks a per-entry compression method via PickMethodFor()
+//     based on filename extension; ShouldCompress() returns true only for
+//     known-compressible types (JSON, BMP, TIF, HDR, EXR, ICC) and false
+//     for already entropy-coded types (MP4, MKV, MOV, AVI, WMV, WEBM,
+//     M4V, PNG, JPG, JXR). Today PickMethodFor always returns 0 since we
+//     don't ship a deflate implementation. When we add one, only that
+//     function changes -- WriteLocalEntry / WriteCentralEntry already
+//     write `e.method` per-entry to both the local and central headers.
+//   * PendingEntry tracks both `data` (uncompressed) and an unused
+//     `compressed` byte vector. The writer emits whichever is non-empty;
+//     CRC32 always covers the *uncompressed* bytes per ZIP spec.
+//   * The reader rejects any compressionMethod != 0 today. When deflate
+//     support lands, that branch grows a method 8 path; everything
+//     upstream of the compression byte stream stays unchanged.
+//   * We deliberately do not use vendored or in-box-but-unofficial
+//     compression APIs. A future version that ships its own deflate
+//     (or links zlib) can plug straight into PickMethodFor() and the
+//     two header sites without touching the public format.
 
 namespace
 {
@@ -164,35 +187,96 @@ namespace
 	struct PendingEntry
 	{
 		std::string name;            // UTF-8, may contain '/' and end with '/'
-		std::vector<uint8_t> data;   // empty for directory markers
+		std::vector<uint8_t> data;   // uncompressed payload (empty for dir markers)
+		std::vector<uint8_t> compressed; // populated when method != 0; written instead of data
+		uint16_t method{ 0 };        // ZIP compression method (0 = store, 8 = deflate, ...)
 		uint32_t crc{};
 		uint32_t localHeaderOffset{};
+
+		// Bytes actually written for this entry's payload.
+		uint32_t PayloadSize() const noexcept
+		{
+			return static_cast<uint32_t>(method == 0 ? data.size() : compressed.size());
+		}
+		const uint8_t* PayloadData() const noexcept
+		{
+			return method == 0 ? data.data() : compressed.data();
+		}
 	};
+
+	// Pick which entries are worth compressing. Filename-extension based
+	// because we have no good content sniffer here, and the savings
+	// distribution is dominated by the obvious cases:
+	//   * Already entropy-coded (mp4/mkv/mov/avi/wmv/webm/m4v/png/jpg/jxr,
+	//     ...) -- deflate typically saves <1% and slows the save
+	//     proportionally to the file size. Always store.
+	//   * Compressible (JSON, BMP, TIF/TIFF uncompressed, HDR, EXR, ICC,
+	//     ICM, ...) -- deflate routinely saves 30-90%. Worth doing
+	//     when we have a compressor.
+	bool ShouldCompress(std::wstring_view filename)
+	{
+		auto dot = filename.find_last_of(L'.');
+		if (dot == std::wstring_view::npos) return false;
+		std::wstring ext{ filename.substr(dot) };
+		for (auto& c : ext) c = static_cast<wchar_t>(::towlower(c));
+		// Known-compressed media: skip deflate entirely.
+		static const wchar_t* kSkip[] = {
+			L".mp4", L".mkv", L".mov", L".avi", L".wmv", L".webm", L".m4v", L".ts",
+			L".png", L".jpg", L".jpeg", L".jxr", L".wdp",
+			L".zip", L".7z", L".rar", L".gz", L".xz", L".zst",
+		};
+		for (auto* s : kSkip) if (ext == s) return false;
+		// Known-text/raw types: compress when we're able.
+		static const wchar_t* kCompress[] = {
+			L".json", L".bmp", L".tif", L".tiff", L".hdr", L".exr",
+			L".icc", L".icm", L".txt", L".xml", L".csv", L".hlsl",
+		};
+		for (auto* s : kCompress) if (ext == s) return true;
+		// Unknown extension: be conservative and store.
+		return false;
+	}
+
+	// Decide on a compression method for this entry. Today we have no
+	// deflate implementation linked in, so this always returns 0 (store)
+	// even when ShouldCompress would say yes. When a deflate codec is
+	// added (zlib, vendored miniz, etc.), the only change here is to
+	// return 8 (deflate) and have the caller fill PendingEntry.compressed
+	// with the deflated payload. The on-disk format is unchanged: ZIP
+	// has always carried compressionMethod per-entry.
+	uint16_t PickMethodFor(std::wstring_view filename)
+	{
+		// Hook reserved for future use. Touch the predicate so the
+		// compiler keeps it referenced while compression is disabled.
+		(void)ShouldCompress(filename);
+		return 0;
+	}
 
 	bool WriteLocalEntry(HANDLE h, PendingEntry& e, uint32_t& cursor)
 	{
 		e.localHeaderOffset = cursor;
+		// CRC32 is always over the uncompressed bytes per ZIP spec,
+		// regardless of method.
 		e.crc = Crc32(e.data.data(), e.data.size());
 
 		LocalFileHeader hdr{};
 		hdr.signature = kLocalSig;
 		hdr.versionNeeded = 20;
 		hdr.generalPurposeFlag = 0x0800; // UTF-8 names
-		hdr.compressionMethod = 0;
+		hdr.compressionMethod = e.method;
 		hdr.lastModFileTime = 0;
 		hdr.lastModFileDate = (1 << 9) | (1 << 5) | 1; // 1980-01-01
 		hdr.crc32 = e.crc;
-		hdr.compressedSize = static_cast<uint32_t>(e.data.size());
+		hdr.compressedSize = e.PayloadSize();
 		hdr.uncompressedSize = static_cast<uint32_t>(e.data.size());
 		hdr.fileNameLength = static_cast<uint16_t>(e.name.size());
 		hdr.extraFieldLength = 0;
 
 		if (!WriteAll(h, &hdr, sizeof(hdr))) return false;
 		if (!WriteAll(h, e.name.data(), e.name.size())) return false;
-		if (!e.data.empty() && !WriteAll(h, e.data.data(), e.data.size())) return false;
+		const uint32_t payloadSize = e.PayloadSize();
+		if (payloadSize > 0 && !WriteAll(h, e.PayloadData(), payloadSize)) return false;
 
-		cursor += sizeof(hdr) + static_cast<uint32_t>(e.name.size())
-				+ static_cast<uint32_t>(e.data.size());
+		cursor += sizeof(hdr) + static_cast<uint32_t>(e.name.size()) + payloadSize;
 		return true;
 	}
 
@@ -203,11 +287,11 @@ namespace
 		cd.versionMadeBy = 20;
 		cd.versionNeeded = 20;
 		cd.generalPurposeFlag = 0x0800;
-		cd.compressionMethod = 0;
+		cd.compressionMethod = e.method;
 		cd.lastModFileTime = 0;
 		cd.lastModFileDate = (1 << 9) | (1 << 5) | 1;
 		cd.crc32 = e.crc;
-		cd.compressedSize = static_cast<uint32_t>(e.data.size());
+		cd.compressedSize = e.PayloadSize();
 		cd.uncompressedSize = static_cast<uint32_t>(e.data.size());
 		cd.fileNameLength = static_cast<uint16_t>(e.name.size());
 		// External attributes: directory entry sets the MS-DOS dir bit
@@ -298,6 +382,16 @@ namespace ShaderLab::Rendering
 			entries.push_back(std::move(e));
 		}
 
+		// Pick a compression method per entry. Today this is always 0
+		// (no compressor linked); a future revision adds the deflated
+		// payload to PendingEntry.compressed and sets method = 8 here.
+		for (auto& e : entries)
+		{
+			const std::wstring nameW = std::filesystem::path(
+				std::string_view(e.name)).filename().wstring();
+			e.method = PickMethodFor(nameW);
+		}
+
 		HANDLE h = ::CreateFileW(
 			path.c_str(),
 			GENERIC_WRITE, 0, nullptr,
@@ -379,6 +473,9 @@ namespace ShaderLab::Rendering
 
 			LocalFileHeader hdr{};
 			std::memcpy(&hdr, buf.data() + pos, sizeof(hdr));
+			// We only emit method 0 today. When deflate (method 8) is
+			// added, this branch grows a decoder; existing archives
+			// continue to work because their entries are all method 0.
 			if (hdr.compressionMethod != 0) return std::nullopt;
 
 			const size_t nameOff = pos + sizeof(hdr);

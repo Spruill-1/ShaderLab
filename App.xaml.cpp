@@ -122,6 +122,106 @@ namespace winrt::ShaderLab::implementation
             return;
         }
 
+        // ---- Reap mode: scan %TEMP% for orphaned ShaderLab media dirs ----
+        // and delete any whose .heartbeat (or directory mtime, for legacy
+        // dirs without a heartbeat) is older than the staleness threshold.
+        // Useful for CI / scripted regression: no UI, no prompt, exits
+        // with the count of dirs reaped.
+        if (cmdLine.find(L"--reap-now") != std::wstring::npos)
+        {
+            // Standard staleness threshold: 2.5 x heartbeat interval. Keep
+            // this default in sync with MainWindow::HeartbeatStaleSec.
+            uint64_t staleSec = 150;
+
+            // Optional --reap-stale-sec=<N> override for tests that don't
+            // want to wait through the default window.
+            {
+                auto p = cmdLine.find(L"--reap-stale-sec=");
+                if (p != std::wstring::npos)
+                {
+                    p += wcslen(L"--reap-stale-sec=");
+                    auto end = cmdLine.find(L' ', p);
+                    auto str = cmdLine.substr(p, end - p);
+                    try
+                    {
+                        staleSec = std::stoull(str);
+                    }
+                    catch (...) {}
+                }
+            }
+
+            wchar_t tempBuf[MAX_PATH + 1]{};
+            DWORD len = ::GetTempPathW(MAX_PATH, tempBuf);
+            uint32_t reaped = 0;
+            if (len > 0)
+            {
+                std::wstring tempRoot(tempBuf, len);
+
+                FILETIME nowFt{};
+                ::GetSystemTimeAsFileTime(&nowFt);
+                const uint64_t now = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32)
+                                   | nowFt.dwLowDateTime;
+                const uint64_t staleTicks = staleSec * 10'000'000ULL;
+
+                // Allocate / use stderr for status reporting.
+                if (!AttachConsole(ATTACH_PARENT_PROCESS))
+                    AllocConsole();
+                FILE* fp = nullptr;
+                freopen_s(&fp, "CONOUT$", "w", stderr);
+
+                std::error_code ec;
+                for (const auto& entry : std::filesystem::directory_iterator(tempRoot, ec))
+                {
+                    if (ec) break;
+                    if (!entry.is_directory(ec)) continue;
+                    const auto name = entry.path().filename().wstring();
+                    if (!name.starts_with(L"ShaderLab-")) continue;
+
+                    FILETIME ft{};
+                    std::wstring beat = entry.path().wstring() + L"\\.heartbeat";
+                    HANDLE h = ::CreateFileW(beat.c_str(),
+                        GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_HIDDEN, nullptr);
+                    if (h != INVALID_HANDLE_VALUE)
+                    {
+                        ::GetFileTime(h, nullptr, nullptr, &ft);
+                        ::CloseHandle(h);
+                    }
+                    else
+                    {
+                        WIN32_FILE_ATTRIBUTE_DATA fad{};
+                        if (::GetFileAttributesExW(entry.path().c_str(),
+                            GetFileExInfoStandard, &fad))
+                            ft = fad.ftLastWriteTime;
+                    }
+                    const uint64_t touched =
+                        (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+                    if (touched != 0 && (now <= touched || (now - touched) <= staleTicks))
+                    {
+                        fwprintf(stderr, L"[reap] keep   %s (fresh)\n", name.c_str());
+                        continue;
+                    }
+
+                    std::error_code rmEc;
+                    std::filesystem::remove_all(entry.path(), rmEc);
+                    if (rmEc)
+                    {
+                        fwprintf(stderr, L"[reap] FAIL   %s (%hs)\n",
+                            name.c_str(), rmEc.message().c_str());
+                    }
+                    else
+                    {
+                        fwprintf(stderr, L"[reap] delete %s\n", name.c_str());
+                        ++reaped;
+                    }
+                }
+                fwprintf(stderr, L"[reap] done; %u folder%s removed\n",
+                    reaped, reaped == 1 ? L"" : L"s");
+            }
+            ExitProcess(reaped);
+            return;
+        }
+
         auto mw = make<MainWindow>();
         auto* impl = winrt::get_self<MainWindow>(mw);
         if (autoMcp)

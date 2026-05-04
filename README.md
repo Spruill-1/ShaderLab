@@ -423,7 +423,7 @@ ShaderLab/
 ├── Package.appxmanifest        # MSIX app identity
 ├── app.manifest                # DPI awareness, heap type
 ├── EngineExport.h              # SHADERLAB_API import/export macro
-├── Version.h                   # App version 1.2.6, graph format version 2
+├── Version.h                   # App version 1.2.7, graph format version 2
 ├── README.md                   # This file
 ├── CHANGELOG.md                # Version history
 │

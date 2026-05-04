@@ -1302,8 +1302,14 @@ namespace winrt::ShaderLab::implementation
         auto strong = get_strong();
         if (m_currentFilePath.empty()) co_return;
 
-        // Build the progress dialog up front. We re-use it for both
-        // the size estimate (showing 0%) and the actual save loop.
+        // Build a lightweight progress dialog. The save runs on the UI
+        // thread (it's normally a few hundred ms even with embedded
+        // media), and the progress callback updates the dialog text
+        // synchronously between zip entries. Doing the save on a
+        // background thread tripped RPC_E_WRONG_THREAD because the
+        // EffectGraphFile::Save path touches non-agile XAML/Storage
+        // objects indirectly; keeping it on the UI thread side-steps
+        // that entire class of marshalling bug.
         namespace XC = winrt::Microsoft::UI::Xaml::Controls;
         XC::ContentDialog dialog;
         dialog.XamlRoot(this->Content().XamlRoot());
@@ -1314,117 +1320,101 @@ namespace winrt::ShaderLab::implementation
         statusLine.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
         XC::ProgressBar bar;
         bar.IsIndeterminate(false);
-        bar.Minimum(0);
-        bar.Maximum(1);
-        bar.Value(0);
-        bar.Width(360);
+        bar.Minimum(0); bar.Maximum(1); bar.Value(0); bar.Width(360);
         XC::StackPanel sp;
         sp.Spacing(8);
         sp.Children().Append(statusLine);
         sp.Children().Append(bar);
         dialog.Content(sp);
 
-        // Run the actual save on a background thread so the UI thread
-        // stays free to repaint the progress dialog. The progress
-        // callback bounces every update back to the UI thread.
-        auto dispatcher = this->DispatcherQueue();
-        std::atomic<bool> finished{ false };
-        std::atomic<bool> ok{ false };
-
-        auto saveTask = [this, &finished, &ok, statusLine, bar, dispatcher]() mutable
-            -> winrt::fire_and_forget
-        {
-            co_await winrt::resume_background();
-
-            // Reuse the shaderPath rewriting logic from the sync path
-            // by calling SaveGraphToCurrentPath -- but that doesn't
-            // expose a progress callback. Inline the same logic here
-            // with progress hooks.
-            std::vector<::ShaderLab::Rendering::EffectGraphFile::MediaEntry> media;
-            std::map<uint32_t, std::wstring> rewriteToToken;
-            if (m_embedMedia)
-            {
-                std::set<std::wstring> usedNames;
-                for (const auto& n : m_graph.Nodes())
-                {
-                    if (n.type != ::ShaderLab::Graph::NodeType::Source) continue;
-                    if (!n.shaderPath.has_value()) continue;
-                    const std::wstring& p = n.shaderPath.value();
-                    if (p.empty() || p.starts_with(L"media://")) continue;
-                    if (!std::filesystem::exists(p)) continue;
-
-                    std::wstring base = std::filesystem::path(p).filename().wstring();
-                    std::wstring name = base;
-                    int suffix = 2;
-                    while (usedNames.count(name))
-                    {
-                        auto stem = std::filesystem::path(base).stem().wstring();
-                        auto ext = std::filesystem::path(base).extension().wstring();
-                        name = stem + L"-" + std::to_wstring(suffix++) + ext;
-                    }
-                    usedNames.insert(name);
-
-                    ::ShaderLab::Rendering::EffectGraphFile::MediaEntry me;
-                    me.zipEntryName = L"media/" + name;
-                    me.sourcePath = p;
-                    media.push_back(std::move(me));
-                    rewriteToToken[n.id] = L"media://" + name;
-                }
-            }
-
-            std::wstring jsonText;
-            if (rewriteToToken.empty())
-            {
-                jsonText = std::wstring(m_graph.ToJson());
-            }
-            else
-            {
-                ::ShaderLab::Graph::EffectGraph clone = m_graph;
-                for (auto& n : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(clone.Nodes()))
-                {
-                    auto it = rewriteToToken.find(n.id);
-                    if (it == rewriteToToken.end()) continue;
-                    n.shaderPath = it->second;
-                    auto pit = n.properties.find(L"shaderPath");
-                    if (pit != n.properties.end())
-                        pit->second = it->second;
-                }
-                jsonText = std::wstring(clone.ToJson());
-            }
-
-            auto progressCb = [statusLine, bar, dispatcher]
-                (uint32_t cur, uint32_t total, const std::wstring& msg) -> bool
-            {
-                dispatcher.TryEnqueue([statusLine, bar, cur, total, msg]() mutable
-                {
-                    bar.Maximum(static_cast<double>(total));
-                    bar.Value(static_cast<double>(cur));
-                    statusLine.Text(winrt::hstring(msg));
-                });
-                return true;
-            };
-
-            const bool result = ::ShaderLab::Rendering::EffectGraphFile::Save(
-                m_currentFilePath, jsonText, media, progressCb);
-            ok.store(result, std::memory_order_release);
-            finished.store(true, std::memory_order_release);
-            dispatcher.TryEnqueue([this](){ /* wake UI thread to close dialog */ });
-        };
-        saveTask();
-
-        // Show the dialog; while the user looks at it the save runs
-        // in the background. The dialog auto-closes when finished.
+        // Show the dialog asynchronously, then yield once so XAML
+        // gets a chance to lay it out before the synchronous save
+        // hogs the UI thread.
         auto showOp = dialog.ShowAsync();
-        // Poll completion -- ContentDialog has no programmatic close
-        // method that races cleanly with ShowAsync, so we close it
-        // by hiding when the worker signals done.
-        while (!finished.load(std::memory_order_acquire))
-            co_await winrt::resume_after(std::chrono::milliseconds(33));
+        co_await winrt::resume_after(std::chrono::milliseconds(16));
+
+        // Build media entries + rewritten JSON exactly like the sync
+        // path, then drive a single synchronous save with a progress
+        // callback that updates the dialog in-place.
+        std::vector<::ShaderLab::Rendering::EffectGraphFile::MediaEntry> media;
+        std::map<uint32_t, std::wstring> rewriteToToken;
+        if (m_embedMedia)
+        {
+            std::set<std::wstring> usedNames;
+            for (const auto& n : m_graph.Nodes())
+            {
+                if (n.type != ::ShaderLab::Graph::NodeType::Source) continue;
+                if (!n.shaderPath.has_value()) continue;
+                const std::wstring& p = n.shaderPath.value();
+                if (p.empty() || p.starts_with(L"media://")) continue;
+                if (!std::filesystem::exists(p)) continue;
+
+                std::wstring base = std::filesystem::path(p).filename().wstring();
+                std::wstring name = base;
+                int suffix = 2;
+                while (usedNames.count(name))
+                {
+                    auto stem = std::filesystem::path(base).stem().wstring();
+                    auto ext = std::filesystem::path(base).extension().wstring();
+                    name = stem + L"-" + std::to_wstring(suffix++) + ext;
+                }
+                usedNames.insert(name);
+
+                ::ShaderLab::Rendering::EffectGraphFile::MediaEntry me;
+                me.zipEntryName = L"media/" + name;
+                me.sourcePath = p;
+                media.push_back(std::move(me));
+                rewriteToToken[n.id] = L"media://" + name;
+            }
+        }
+
+        std::wstring jsonText;
+        if (rewriteToToken.empty())
+        {
+            jsonText = std::wstring(m_graph.ToJson());
+        }
+        else
+        {
+            ::ShaderLab::Graph::EffectGraph clone = m_graph;
+            for (auto& n : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(clone.Nodes()))
+            {
+                auto it = rewriteToToken.find(n.id);
+                if (it == rewriteToToken.end()) continue;
+                n.shaderPath = it->second;
+                auto pit = n.properties.find(L"shaderPath");
+                if (pit != n.properties.end())
+                    pit->second = it->second;
+            }
+            jsonText = std::wstring(clone.ToJson());
+        }
+
+        // Synchronous progress callback: directly mutate the XAML
+        // controls (we're on the UI thread) and return true to keep
+        // saving.
+        auto progressCb = [&statusLine, &bar]
+            (uint32_t cur, uint32_t total, const std::wstring& msg) -> bool
+        {
+            bar.Maximum(static_cast<double>(total));
+            bar.Value(static_cast<double>(cur));
+            statusLine.Text(winrt::hstring(msg));
+            return true;
+        };
+
+        bool ok = false;
+        try
+        {
+            ok = ::ShaderLab::Rendering::EffectGraphFile::Save(
+                m_currentFilePath, jsonText, media, progressCb);
+        }
+        catch (...)
+        {
+            ok = false;
+        }
 
         dialog.Hide();
-        co_await showOp; // ensure ShowAsync's continuation has run
+        co_await showOp;
 
-        if (ok.load())
+        if (ok)
         {
             m_unsavedChanges = false;
             RefreshTitleBar();
@@ -1441,14 +1431,31 @@ namespace winrt::ShaderLab::implementation
     winrt::fire_and_forget MainWindow::SaveGraphAsync()
     {
         auto strong = get_strong();
-        // If we already have a destination from a previous save / load,
-        // overwrite silently -- this is the standard "Ctrl+S" path.
-        if (!m_currentFilePath.empty())
+        try
         {
-            co_await RunSaveWithProgressAsync();
-            co_return;
+            // If we already have a destination from a previous save / load,
+            // overwrite silently -- this is the standard "Ctrl+S" path.
+            if (!m_currentFilePath.empty())
+            {
+                co_await RunSaveWithProgressAsync();
+                co_return;
+            }
+            co_await SaveGraphAsAsync();
         }
-        co_await SaveGraphAsAsync();
+        catch (winrt::hresult_error const& e)
+        {
+            try
+            {
+                PipelineFormatText().Text(
+                    winrt::hstring(L"Save failed: ") + e.message());
+            }
+            catch (...) {}
+        }
+        catch (...)
+        {
+            try { PipelineFormatText().Text(L"Save failed: unknown error"); }
+            catch (...) {}
+        }
     }
 
     winrt::Windows::Foundation::IAsyncAction MainWindow::SaveGraphAsAsync()
@@ -1495,7 +1502,9 @@ namespace winrt::ShaderLab::implementation
             XC::CheckBox cb;
             cb.Content(winrt::box_value(winrt::hstring(
                 L"Embed referenced images / videos / ICC files inside the .effectgraph")));
-            cb.IsChecked(winrt::box_value(m_embedMedia));
+            // Default to last-used preference. We deliberately don't pre-set
+            // IsChecked via IReference<bool> -- that path has been fragile in
+            // this WinRT version. Users can toggle and we read it back below.
             XC::TextBlock blurb;
             blurb.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap);
             blurb.Opacity(0.7);
@@ -1563,50 +1572,37 @@ namespace winrt::ShaderLab::implementation
         dialog.Content(sp);
 
         auto dispatcher = this->DispatcherQueue();
-        std::atomic<bool> finished{ false };
         std::optional<::ShaderLab::Rendering::EffectGraphFile::LoadResult> loadResult;
         std::wstring loadError;
 
-        auto loadTask = [pathStr, &finished, &loadResult, &loadError, statusLine, bar, dispatcher]() mutable
-            -> winrt::fire_and_forget
-        {
-            co_await winrt::resume_background();
-
-            // Resolve %TEMP% on the worker thread; GetTempPathW is
-            // safe to call anywhere.
-            wchar_t tempBuf[MAX_PATH + 1]{};
-            DWORD len = ::GetTempPathW(MAX_PATH, tempBuf);
-            std::wstring tempRoot = (len > 0) ? std::wstring(tempBuf, len) : std::wstring(L".\\");
-
-            auto progressCb = [statusLine, bar, dispatcher]
-                (uint32_t cur, uint32_t total, const std::wstring& msg) -> bool
-            {
-                dispatcher.TryEnqueue([statusLine, bar, cur, total, msg]() mutable
-                {
-                    bar.Maximum(static_cast<double>(total));
-                    bar.Value(static_cast<double>(cur));
-                    statusLine.Text(winrt::hstring(msg));
-                });
-                return true;
-            };
-
-            try
-            {
-                auto r = ::ShaderLab::Rendering::EffectGraphFile::Load(pathStr, tempRoot, progressCb);
-                if (r.has_value()) loadResult = std::move(r);
-                else loadError = L"Could not read graph from .effectgraph";
-            }
-            catch (const std::exception& ex) { loadError = winrt::to_hstring(ex.what()); }
-            catch (...)                       { loadError = L"Unknown load failure"; }
-
-            finished.store(true, std::memory_order_release);
-            dispatcher.TryEnqueue([](){});
-        };
-        loadTask();
-
+        // Show the progress dialog, yield once for layout, then run
+        // the load synchronously on the UI thread (same rationale as
+        // the save path: avoids RPC_E_WRONG_THREAD).
         auto showOp = dialog.ShowAsync();
-        while (!finished.load(std::memory_order_acquire))
-            co_await winrt::resume_after(std::chrono::milliseconds(33));
+        co_await winrt::resume_after(std::chrono::milliseconds(16));
+
+        wchar_t tempBuf[MAX_PATH + 1]{};
+        DWORD len = ::GetTempPathW(MAX_PATH, tempBuf);
+        std::wstring tempRoot = (len > 0) ? std::wstring(tempBuf, len) : std::wstring(L".\\");
+
+        auto progressCb = [&statusLine, &bar]
+            (uint32_t cur, uint32_t total, const std::wstring& msg) -> bool
+        {
+            bar.Maximum(static_cast<double>(total));
+            bar.Value(static_cast<double>(cur));
+            statusLine.Text(winrt::hstring(msg));
+            return true;
+        };
+
+        try
+        {
+            auto r = ::ShaderLab::Rendering::EffectGraphFile::Load(pathStr, tempRoot, progressCb);
+            if (r.has_value()) loadResult = std::move(r);
+            else loadError = L"Could not read graph from .effectgraph";
+        }
+        catch (const std::exception& ex) { loadError = winrt::to_hstring(ex.what()); }
+        catch (...)                       { loadError = L"Unknown load failure"; }
+
         dialog.Hide();
         co_await showOp;
 
