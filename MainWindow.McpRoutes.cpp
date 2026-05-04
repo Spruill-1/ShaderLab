@@ -188,10 +188,11 @@ static std::string NodeToJson(const ::ShaderLab::Graph::EffectNode& node)
         !node.analysisOutput.fields.empty())
     {
         json += ",\"analysisResults\":[";
-        bool first = true;
+        bool firstField = true;
         for (const auto& fv : node.analysisOutput.fields)
         {
-            if (!first) json += ",";
+            if (!firstField) json += ",";
+            firstField = false;
             json += "{\"name\":\"" + ToUtf8(fv.name) + "\"";
             if (!::ShaderLab::Graph::AnalysisFieldIsArray(fv.type))
             {
@@ -1036,7 +1037,6 @@ namespace winrt::ShaderLab::implementation
                 // Parse nodeId and optional /logs suffix from path.
                 // Expected: /node/{id}/logs or /node/{id}/logs?since={seq}
                 auto stripped = path.substr(6); // remove "/node/"
-                auto slashPos = stripped.find(L'/');
                 uint32_t nodeId = 0;
                 try { nodeId = static_cast<uint32_t>(std::stoi(stripped)); } catch (...) {
                     return { 400, R"({"error":"Invalid node ID"})" };

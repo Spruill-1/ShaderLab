@@ -2273,8 +2273,6 @@ namespace winrt::ShaderLab::implementation
 
                     auto imgBounds = GetPreviewImageBounds();
                     float dpiScale = (std::max)(1.0f, PreviewPanel().CompositionScaleX());
-                    float imgDipX = (m_traceClickDipX - m_previewPanX) / m_previewZoom;
-                    float imgDipY = (m_traceClickDipY - m_previewPanY) / m_previewZoom;
                     float iW = imgBounds.right - imgBounds.left;
                     float iH = imgBounds.bottom - imgBounds.top;
                     if (iW <= 0 || iW > 100000.0f) { auto vp = PreviewViewportDips(); iW = vp.width; }
@@ -2375,9 +2373,8 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
         auto point = args.GetCurrentPoint(PreviewPanel());
-        bool isPixelTraceTab = (BottomTabView().SelectedIndex() == 1);
 
-        // Left or middle button → start pan (click without drag triggers pixel trace on release).
+        // Left or middle button → start pan
         if (point.Properties().IsMiddleButtonPressed() || point.Properties().IsLeftButtonPressed())
         {
             m_isPreviewPanning = true;
@@ -2694,7 +2691,7 @@ namespace winrt::ShaderLab::implementation
     // -----------------------------------------------------------------------
 
     void MainWindow::OnPreviewPointerMoved(
-        winrt::Windows::Foundation::IInspectable const& sender,
+        winrt::Windows::Foundation::IInspectable const& /*sender*/,
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
         if (!m_renderEngine.IsInitialized()) return;
