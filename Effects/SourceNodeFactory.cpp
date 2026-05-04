@@ -249,6 +249,7 @@ namespace ShaderLab::Effects
         m_bitmapCache.clear();
         m_floodCache.clear();
         m_videoCache.clear();
+        m_lastClockTime.clear();
     }
 
     bool SourceNodeFactory::HasPlayingVideo() const
@@ -321,10 +322,25 @@ namespace ShaderLab::Effects
 
             if (clockDriven)
             {
+                // Detect a paused Clock: bound Time hasn't advanced since
+                // the last tick. Without this, Tick() free-runs the decoder
+                // and the next iteration's Seek() snaps it back, producing
+                // a ~1s loop while the user thinks the video is static.
+                auto lcIt = m_lastClockTime.find(id);
+                bool clockAdvanced = (lcIt == m_lastClockTime.end()) ||
+                    std::abs(seekTime - lcIt->second) > 1e-6;
+                m_lastClockTime[id] = seekTime;
+
+                if (!clockAdvanced)
+                {
+                    // Hold the current frame at exactly seekTime.
+                    if (std::abs(diff) > frameDur * 0.5)
+                        provider->Seek(seekTime);
+                }
                 // Only seek for actual jumps: backward or very large skip (>5s).
                 // Never seek for small forward gaps — sequential decode catches up
                 // naturally and avoids expensive keyframe re-decode on scene changes.
-                if (diff < -frameDur || diff > 5.0)
+                else if (diff < -frameDur || diff > 5.0)
                 {
                     provider->Seek(seekTime);
                 }

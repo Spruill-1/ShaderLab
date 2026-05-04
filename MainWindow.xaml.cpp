@@ -1333,12 +1333,10 @@ namespace winrt::ShaderLab::implementation
         dialog.Content(sp);
 
         // Show the dialog asynchronously, then yield once so XAML
-        // gets a chance to lay it out before the synchronous save
-        // hogs the UI thread. resume_after resumes on a threadpool
-        // thread, so capture the UI apartment first and hop back to
-        // it before we touch any XAML / agile-bound state -- otherwise
-        // the progress callback's TextBlock / ProgressBar mutations
-        // raise RPC_E_WRONG_THREAD.
+        // gets a chance to lay it out before kicking off the save on
+        // a background thread. Progress callbacks marshal back to the
+        // UI thread via DispatcherQueue so the bar actually animates
+        // while miniz is compressing media.
         winrt::apartment_context ui_thread;
         auto showOp = dialog.ShowAsync();
         co_await winrt::resume_after(std::chrono::milliseconds(16));
@@ -1399,28 +1397,42 @@ namespace winrt::ShaderLab::implementation
             jsonText = std::wstring(clone.ToJson());
         }
 
-        // Synchronous progress callback: directly mutate the XAML
-        // controls (we're on the UI thread) and return true to keep
-        // saving.
-        auto progressCb = [&statusLine, &bar]
+        // Synchronous progress callback: marshal each update back to
+        // the UI thread via DispatcherQueue so the dialog actually
+        // animates while the background save runs. The callback
+        // itself returns immediately -- we don't wait for the marshal
+        // to complete (best-effort visual feedback, latest value
+        // wins).
+        auto dispatcher = this->DispatcherQueue();
+        auto progressCb = [dispatcher, statusLine, bar]
             (uint32_t cur, uint32_t total, const std::wstring& msg) -> bool
         {
-            bar.Maximum(static_cast<double>(total));
-            bar.Value(static_cast<double>(cur));
-            statusLine.Text(winrt::hstring(msg));
+            dispatcher.TryEnqueue([statusLine, bar, cur, total, msg]() {
+                bar.Maximum(static_cast<double>(total));
+                bar.Value(static_cast<double>(cur));
+                statusLine.Text(winrt::hstring(msg));
+            });
             return true;
         };
 
+        // Run the actual save on a threadpool thread. EffectGraphFile::Save
+        // is pure native code (file IO + miniz) -- no XAML or WinRT
+        // marshalling -- so this is safe. Without this, miniz blocks the
+        // UI thread for tens of seconds on large media payloads and the
+        // ProgressBar never repaints.
+        std::wstring path = m_currentFilePath;
         bool ok = false;
+        co_await winrt::resume_background();
         try
         {
             ok = ::ShaderLab::Rendering::EffectGraphFile::Save(
-                m_currentFilePath, jsonText, media, progressCb);
+                path, jsonText, media, progressCb);
         }
         catch (...)
         {
             ok = false;
         }
+        co_await ui_thread;
 
         dialog.Hide();
         co_await showOp;
@@ -1587,10 +1599,8 @@ namespace winrt::ShaderLab::implementation
         std::wstring loadError;
 
         // Show the progress dialog, yield once for layout, then run
-        // the load synchronously on the UI thread (same rationale as
-        // the save path: avoids RPC_E_WRONG_THREAD). resume_after
-        // resumes on a threadpool thread, so capture and restore the
-        // UI apartment around the wait.
+        // the load on a background thread so miniz inflate doesn't
+        // freeze the UI on big media archives.
         winrt::apartment_context ui_thread;
         auto showOp = dialog.ShowAsync();
         co_await winrt::resume_after(std::chrono::milliseconds(16));
@@ -1600,15 +1610,18 @@ namespace winrt::ShaderLab::implementation
         DWORD len = ::GetTempPathW(MAX_PATH, tempBuf);
         std::wstring tempRoot = (len > 0) ? std::wstring(tempBuf, len) : std::wstring(L".\\");
 
-        auto progressCb = [&statusLine, &bar]
+        auto progressCb = [dispatcher, statusLine, bar]
             (uint32_t cur, uint32_t total, const std::wstring& msg) -> bool
         {
-            bar.Maximum(static_cast<double>(total));
-            bar.Value(static_cast<double>(cur));
-            statusLine.Text(winrt::hstring(msg));
+            dispatcher.TryEnqueue([statusLine, bar, cur, total, msg]() {
+                bar.Maximum(static_cast<double>(total));
+                bar.Value(static_cast<double>(cur));
+                statusLine.Text(winrt::hstring(msg));
+            });
             return true;
         };
 
+        co_await winrt::resume_background();
         try
         {
             auto r = ::ShaderLab::Rendering::EffectGraphFile::Load(pathStr, tempRoot, progressCb);
@@ -1617,6 +1630,7 @@ namespace winrt::ShaderLab::implementation
         }
         catch (const std::exception& ex) { loadError = winrt::to_hstring(ex.what()); }
         catch (...)                       { loadError = L"Unknown load failure"; }
+        co_await ui_thread;
 
         dialog.Hide();
         co_await showOp;

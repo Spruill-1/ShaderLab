@@ -82,5 +82,10 @@ namespace ShaderLab::Effects
 
         // Cached video providers: nodeId → video provider.
         std::unordered_map<uint32_t, std::unique_ptr<VideoSourceProvider>> m_videoCache;
+
+        // Last clock-driven seek time per node — used to detect a paused
+        // Clock so the video doesn't free-run when the bound Time stops
+        // advancing. NaN means "no prior sample".
+        std::unordered_map<uint32_t, double> m_lastClockTime;
     };
 }
