@@ -5914,7 +5914,7 @@ namespace winrt::ShaderLab::implementation
 
                     const ::ShaderLab::Rendering::DisplayProfile* src = nullptr;
                     if (gamutVal < 0.5f)        src = &liveProfile;   // Current Monitor
-                    else if (gamutVal > 3.5f)   src = &activeProfile;  // Preview Mode
+                    else if (gamutVal > 3.5f)   src = &activeProfile;  // Working Space
 
                     if (src)
                     {
@@ -5980,6 +5980,41 @@ namespace winrt::ShaderLab::implementation
                     node.properties[L"WsBlueX_hidden"]  = ws.primaryBlue.x;
                     node.properties[L"WsBlueY_hidden"]  = ws.primaryBlue.y;
                     if (changed) node.dirty = true;
+                }
+
+                // Inject monitor luminance range into Luminance Highlight.
+                // Mode 0 (Current Monitor) uses the live display; mode 7
+                // (Working Space) uses the active simulated profile. Other
+                // modes ignore these values, but we still keep them fresh
+                // so a mode change picks up the latest range immediately.
+                if (node.name == L"Luminance Highlight")
+                {
+                    auto rangeIt = node.properties.find(L"TargetRange");
+                    float rangeVal = 0.0f;
+                    if (rangeIt != node.properties.end())
+                        if (auto* f = std::get_if<float>(&rangeIt->second)) rangeVal = *f;
+
+                    const ::ShaderLab::Rendering::DisplayProfile* src = nullptr;
+                    if (rangeVal < 0.5f)        src = &liveProfile;    // Current Monitor
+                    else if (rangeVal > 6.5f)   src = &activeProfile;  // Working Space
+
+                    if (src)
+                    {
+                        auto getF = [&](const std::wstring& k) -> float {
+                            auto it = node.properties.find(k);
+                            if (it != node.properties.end())
+                                if (auto* f = std::get_if<float>(&it->second)) return *f;
+                            return 0.0f;
+                        };
+                        float newMin = src->caps.minLuminanceNits;
+                        float newMax = src->caps.maxLuminanceNits;
+                        bool changed = std::abs(getF(L"MonMinNits_hidden") - newMin) > 0.001f
+                            || std::abs(getF(L"MonMaxNits_hidden") - newMax) > 0.001f;
+
+                        node.properties[L"MonMinNits_hidden"] = newMin;
+                        node.properties[L"MonMaxNits_hidden"] = newMax;
+                        if (changed) node.dirty = true;
+                    }
                 }
             }
         }

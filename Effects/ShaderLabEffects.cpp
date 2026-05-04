@@ -314,11 +314,11 @@ float4 main(
     static const std::string s_outOfGamutHLSL = R"HLSL(
 // Gamut Highlight
 // TargetGamut modes:
-//   0 = Current Monitor (primaries injected by host)
+//   0 = Current Monitor (primaries injected by host from live display)
 //   1 = Rec.709
 //   2 = DCI-P3
 //   3 = Rec.2020
-//   4 = Preview Mode (primaries follow Display dropdown)
+//   4 = Working Space (primaries follow active/simulated Display profile)
 Texture2D Source : register(t0);
 
 cbuffer constants : register(b0) {
@@ -367,7 +367,7 @@ float4 main(
     } else if (TargetGamut > 2.5 && TargetGamut < 3.5) {
         targetRGB = mul(XYZ_TO_REC2020, xyz);
     } else {
-        // Current Monitor (0) or Preview Mode (4): chromaticity triangle test
+        // Current Monitor (0) or Working Space (4): chromaticity triangle test
         float sum = xyz.x + xyz.y + xyz.z;
         float2 xy = (sum > 0.0001) ? float2(xyz.x / sum, xyz.y / sum) : D65_WHITE;
         float2 v0 = mb - mr, v1 = mg - mr, v2 = xy - mr;
@@ -392,14 +392,24 @@ float4 main(
 
     static const std::string s_luminanceHighlightHLSL = R"HLSL(
 // Luminance Highlight
-// Mirrors Gamut Highlight's structure: pixels whose luminance falls
-// outside [MinNits, MaxNits] (or inside, depending on Mode) are tinted
-// with an overlay color. Useful for spotting clipped highlights, crushed
-// shadows, or verifying that an effect chain keeps content within a
-// target nit range.
+// Mirrors Gamut Highlight: pixels whose luminance falls outside the
+// active nit range (or inside, depending on Mode) are tinted with an
+// overlay color.
+//
+// TargetRange selects the [min,max] nit window:
+//   0 = Current Monitor (host injects MonMinNits_hidden / MonMaxNits_hidden
+//                        from the live display's DXGI luminance)
+//   1 = SDR              (0 .. 80 nits)
+//   2 = HDR 400          (0 .. 400 nits)
+//   3 = HDR 1000         (0 .. 1000 nits)
+//   4 = HDR 4000         (0 .. 4000 nits)
+//   5 = HDR 10000        (0 .. 10000 nits)
+//   6 = Custom           (use MinNits / MaxNits sliders directly)
+//   7 = Working Space    (host injects from the active/simulated display)
 Texture2D Source : register(t0);
 
 cbuffer constants : register(b0) {
+    float TargetRange;
     float MinNits;
     float MaxNits;
     float OverlayR;
@@ -407,6 +417,9 @@ cbuffer constants : register(b0) {
     float OverlayB;
     float OverlayStrength;
     float Mode; // 0 = Out-of-Range, 1 = In-Range
+    // Host-injected monitor luminance range (used by modes 0 and 7).
+    float MonMinNits_hidden;
+    float MonMaxNits_hidden;
 };
 
 float4 main(
@@ -419,10 +432,37 @@ float4 main(
     // ScRGBLuminanceNits: scRGB luminance * 80 (1.0 = 80 nits SDR white).
     float nits = ScRGBLuminanceNits(color.rgb);
 
-    // Defensive: a degenerate range (Min >= Max) collapses to "everything
-    // is out-of-range" so the user gets immediate visual feedback rather
-    // than a silently empty overlay.
-    bool outOfRange = (MinNits >= MaxNits) || (nits < MinNits) || (nits > MaxNits);
+    // Force compiler to keep hidden cbuffer entries (D2D won't update them
+    // otherwise — same trick as Gamut Highlight).
+    float monMin = MonMinNits_hidden;
+    float monMax = MonMaxNits_hidden;
+
+    // Pick effective range.
+    float effMin = MinNits;
+    float effMax = MaxNits;
+    if (TargetRange < 0.5) {              // Current Monitor
+        effMin = monMin;
+        effMax = monMax;
+    } else if (TargetRange < 1.5) {       // SDR
+        effMin = 0.0;   effMax = 80.0;
+    } else if (TargetRange < 2.5) {       // HDR 400
+        effMin = 0.0;   effMax = 400.0;
+    } else if (TargetRange < 3.5) {       // HDR 1000
+        effMin = 0.0;   effMax = 1000.0;
+    } else if (TargetRange < 4.5) {       // HDR 4000
+        effMin = 0.0;   effMax = 4000.0;
+    } else if (TargetRange < 5.5) {       // HDR 10000
+        effMin = 0.0;   effMax = 10000.0;
+    } else if (TargetRange < 6.5) {       // Custom
+        effMin = MinNits;
+        effMax = MaxNits;
+    } else {                               // Working Space
+        effMin = monMin;
+        effMax = monMax;
+    }
+
+    // Defensive: degenerate range collapses to "everything out-of-range".
+    bool outOfRange = (effMin >= effMax) || (nits < effMin) || (nits > effMax);
     bool highlight = (Mode > 0.5) ? !outOfRange : outOfRange;
     if (highlight) {
         float3 overlay = float3(OverlayR, OverlayG, OverlayB);
@@ -550,13 +590,13 @@ float4 main(
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Highlight";
-            desc.effectId = L"Gamut Highlight"; desc.effectVersion = 1;
+            desc.effectId = L"Gamut Highlight"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + s_outOfGamutHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"TargetGamut",     L"float", 0.0f, 0.0f, 4.0f, 1.0f, { L"Current Monitor", L"Rec.709", L"DCI-P3", L"Rec.2020", L"Preview Mode" } },
+                { L"TargetGamut",     L"float", 0.0f, 0.0f, 4.0f, 1.0f, { L"Current Monitor", L"Rec.709", L"DCI-P3", L"Rec.2020", L"Working Space" } },
                 { L"OverlayR",        L"float", 1.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayG",        L"float", 0.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayB",        L"float", 1.0f,  0.0f, 1.0f, 0.01f },
@@ -574,18 +614,23 @@ float4 main(
 
         // ---- Luminance Highlight ----
         // Range-based companion to Gamut Highlight: tints pixels whose
-        // luminance (in nits) falls outside [MinNits, MaxNits]. The Mode
+        // luminance (in nits) falls outside the active nit range. The Mode
         // toggle inverts the test so the user can isolate either the
-        // out-of-range or in-range pixels.
+        // out-of-range or in-range pixels. TargetRange picks among the
+        // current monitor's reported luminance, common HDR presets, a
+        // user-specified Custom range, or the Preview-Mode display.
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Luminance Highlight";
-            desc.effectId = L"Luminance Highlight"; desc.effectVersion = 1;
+            desc.effectId = L"Luminance Highlight"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + s_luminanceHighlightHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
+                { L"TargetRange",     L"float", 0.0f,   0.0f, 7.0f, 1.0f,
+                    { L"Current Monitor", L"SDR (0-80)", L"HDR 400", L"HDR 1000",
+                      L"HDR 4000", L"HDR 10000", L"Custom", L"Working Space" } },
                 { L"MinNits",         L"float", 0.0f,   0.0f, 10000.0f, 1.0f },
                 { L"MaxNits",         L"float", 100.0f, 0.0f, 10000.0f, 1.0f },
                 { L"OverlayR",        L"float", 1.0f,   0.0f, 1.0f, 0.01f },
@@ -593,6 +638,11 @@ float4 main(
                 { L"OverlayB",        L"float", 1.0f,   0.0f, 1.0f, 0.01f },
                 { L"OverlayStrength", L"float", 0.7f,   0.0f, 1.0f, 0.01f },
                 { L"Mode",            L"float", 0.0f,   0.0f, 1.0f, 1.0f, { L"Out-of-Range", L"In-Range" } },
+            };
+            // Hidden: host injects current/preview monitor luminance range.
+            desc.hiddenDefaults = {
+                { L"MonMinNits_hidden", 0.0f },
+                { L"MonMaxNits_hidden", 1000.0f },
             };
             m_effects.push_back(std::move(desc));
         }
