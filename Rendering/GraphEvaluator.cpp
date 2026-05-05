@@ -34,6 +34,25 @@ namespace ShaderLab::Rendering
 
         ID2D1Image* finalOutput = nullptr;
 
+        // Propagate dirty downstream in topological order. If any node is
+        // dirty at the start of this frame (e.g. a Source whose video frame
+        // just uploaded, or a node whose property changed), every node it
+        // feeds is also dirty — they need to re-evaluate against the new
+        // upstream output. Without this, analysis-only compute nodes
+        // (Channel/Luminance/Chromaticity Statistics) freeze their fields
+        // on the first frame because their own properties never change
+        // even as the input image content does.
+        for (uint32_t nodeId : order)
+        {
+            auto* n = graph.FindNode(nodeId);
+            if (!n || !n->dirty) continue;
+            for (const auto* edge : graph.GetOutputEdges(nodeId))
+            {
+                if (auto* dn = graph.FindNode(edge->destNodeId))
+                    dn->dirty = true;
+            }
+        }
+
         for (uint32_t nodeId : order)
         {
             EffectNode* node = graph.FindNode(nodeId);
@@ -1469,7 +1488,13 @@ namespace ShaderLab::Rendering
         ID2D1Image* inputImage)
     {
         if (!dc || !inputImage) return;
-        if (!node.customEffect.has_value() || !node.customEffect->isCompiled()) return;
+        if (!node.customEffect.has_value()) return;
+        // NOTE: do NOT early-out when !isCompiled(). D3D11 compute shaders
+        // are compiled lazily by the runner inside this function, so on
+        // the first dispatch isCompiled() is necessarily false; bailing
+        // here would create a chicken-and-egg loop where the bytecode is
+        // never populated. The runner->CompileShader call below sets up
+        // m_shader and the def.compiledBytecode field for next time.
 
         auto& def = node.customEffect.value();
         uint32_t fieldCount = 0;
@@ -1536,7 +1561,18 @@ namespace ShaderLab::Rendering
             std::string hlslUtf8 = winrt::to_string(def.hlslSource);
             for (auto& ch : hlslUtf8) { if (ch == '\r') ch = '\n'; }
             if (!runner->CompileShader(hlslUtf8))
+            {
+                node.runtimeError = runner->GetCompileError().empty()
+                    ? L"D3D11 compute shader compile failed"
+                    : runner->GetCompileError();
                 return;
+            }
+            // Persist bytecode on the definition so the cbuffer reflection
+            // path below (and the UI's "compiled" indicator) can see it.
+            // Without this, def.compiledBytecode stays empty for D3D11
+            // compute effects and user properties never reach the GPU.
+            def.compiledBytecode = runner->GetCompiledBytecode();
+            node.runtimeError.clear();
         }
 
         // Pack cbuffer from node properties (offset 8+, Width/Height auto-injected by runner).
@@ -1572,16 +1608,39 @@ namespace ShaderLab::Rendering
                             uint32_t destOff = varDesc.StartOffset - 8;
                             if (destOff + varDesc.Size > cbData.size()) continue;
 
+                            // Reflect the variable's HLSL scalar type so we
+                            // can convert PropertyValue -> the cbuffer's
+                            // declared representation. Without this a float
+                            // 1.0f written into a `uint` slot lands as the
+                            // bit pattern 0x3F800000 (1065353216), not 1.
+                            D3D11_SHADER_TYPE_DESC typeDesc{};
+                            auto* varType = var->GetType();
+                            D3D_SHADER_VARIABLE_TYPE scalarType = D3D_SVT_FLOAT;
+                            if (varType && SUCCEEDED(varType->GetDesc(&typeDesc)))
+                                scalarType = typeDesc.Type;
+
                             const auto& pv = propIt->second;
-                            if (auto* f = std::get_if<float>(&pv))
-                                memcpy(cbData.data() + destOff, f, 4);
-                            else if (auto* i = std::get_if<int32_t>(&pv))
-                                memcpy(cbData.data() + destOff, i, 4);
-                            else if (auto* u = std::get_if<uint32_t>(&pv))
-                                memcpy(cbData.data() + destOff, u, 4);
-                            else if (auto* b = std::get_if<bool>(&pv))
+                            auto pvAsFloat = [&pv]() -> float {
+                                if (auto* f = std::get_if<float>(&pv))    return *f;
+                                if (auto* i = std::get_if<int32_t>(&pv))  return static_cast<float>(*i);
+                                if (auto* u = std::get_if<uint32_t>(&pv)) return static_cast<float>(*u);
+                                if (auto* b = std::get_if<bool>(&pv))     return *b ? 1.0f : 0.0f;
+                                return 0.0f;
+                            };
+
+                            if (scalarType == D3D_SVT_UINT || scalarType == D3D_SVT_BOOL)
                             {
-                                uint32_t val = *b ? 1u : 0u;
+                                uint32_t val = static_cast<uint32_t>(pvAsFloat());
+                                memcpy(cbData.data() + destOff, &val, 4);
+                            }
+                            else if (scalarType == D3D_SVT_INT)
+                            {
+                                int32_t val = static_cast<int32_t>(pvAsFloat());
+                                memcpy(cbData.data() + destOff, &val, 4);
+                            }
+                            else
+                            {
+                                float val = pvAsFloat();
                                 memcpy(cbData.data() + destOff, &val, 4);
                             }
                         }

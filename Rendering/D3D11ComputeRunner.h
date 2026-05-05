@@ -25,10 +25,17 @@ namespace ShaderLab::Rendering
 
         // Compile a compute shader from HLSL source.
         // Returns true on success. Call GetCompileError() on failure.
+        // On success, GetCompiledBytecode() returns the bytecode blob —
+        // the caller should store it on the CustomEffectDefinition so
+        // downstream cbuffer reflection (in DispatchUserD3D11Compute)
+        // can pack user properties at the correct offsets.
         bool CompileShader(const std::string& hlslSource);
 
         // Get the last compile error message.
         const std::wstring& GetCompileError() const { return m_compileError; }
+
+        // Get the compiled bytecode (empty until CompileShader succeeds).
+        const std::vector<uint8_t>& GetCompiledBytecode() const { return m_bytecode; }
 
         // Dispatch the compiled shader on an input texture.
         // cbufferData: user constant buffer bytes (Width/Height prepended automatically).
@@ -46,6 +53,7 @@ namespace ShaderLab::Rendering
         winrt::com_ptr<ID3D11Device> m_device;
         winrt::com_ptr<ID3D11DeviceContext> m_context;
         winrt::com_ptr<ID3D11ComputeShader> m_shader;
+        std::vector<uint8_t> m_bytecode;
 
         // Result buffer (RWStructuredBuffer<float4>)
         winrt::com_ptr<ID3D11Buffer> m_resultBuffer;

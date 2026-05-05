@@ -13,6 +13,7 @@ namespace ShaderLab::Rendering
     bool D3D11ComputeRunner::CompileShader(const std::string& hlslSource)
     {
         m_shader = nullptr;
+        m_bytecode.clear();
         m_compileError.clear();
 
         winrt::com_ptr<ID3DBlob> blob, errors;
@@ -46,6 +47,10 @@ namespace ShaderLab::Rendering
             m_compileError = L"CreateComputeShader failed.";
             return false;
         }
+
+        // Stash bytecode so callers can run D3DReflect for cbuffer layout.
+        const auto* src = static_cast<const uint8_t*>(blob->GetBufferPointer());
+        m_bytecode.assign(src, src + blob->GetBufferSize());
 
         return true;
     }

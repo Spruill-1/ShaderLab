@@ -40,57 +40,7 @@ namespace winrt::ShaderLab::implementation
         });
         AddAnalysisFieldButton().Click([this](auto&&, auto&&)
         {
-            auto panel = AnalysisFieldsPanel();
-            auto row = Controls::StackPanel();
-            row.Orientation(Controls::Orientation::Horizontal);
-            row.Spacing(4);
-
-            auto nameBox = Controls::TextBox();
-            nameBox.PlaceholderText(L"Field Name");
-            nameBox.MinWidth(120);
-            row.Children().Append(nameBox);
-
-            auto typeCombo = Controls::ComboBox();
-            typeCombo.Items().Append(box_value(L"Float"));
-            typeCombo.Items().Append(box_value(L"Float2"));
-            typeCombo.Items().Append(box_value(L"Float3"));
-            typeCombo.Items().Append(box_value(L"Float4"));
-            typeCombo.Items().Append(box_value(L"Float Array"));
-            typeCombo.Items().Append(box_value(L"Float2 Array"));
-            typeCombo.Items().Append(box_value(L"Float3 Array"));
-            typeCombo.Items().Append(box_value(L"Float4 Array"));
-            typeCombo.SelectedIndex(0);
-            typeCombo.MinWidth(110);
-            row.Children().Append(typeCombo);
-
-            auto lenBox = Controls::NumberBox();
-            lenBox.Header(box_value(L"Length"));
-            lenBox.Value(0);
-            lenBox.Minimum(0);
-            lenBox.Maximum(4096);
-            lenBox.Width(80);
-            lenBox.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
-            lenBox.Visibility(Visibility::Collapsed);
-            row.Children().Append(lenBox);
-
-            // Show length only for array types.
-            typeCombo.SelectionChanged([lenBox](auto&& sender, auto&&) {
-                auto c = sender.template as<Controls::ComboBox>();
-                lenBox.Visibility(c.SelectedIndex() >= 4
-                    ? Visibility::Visible : Visibility::Collapsed);
-            });
-
-            auto removeBtn = Controls::Button();
-            removeBtn.Content(box_value(L"\xE711"));
-            removeBtn.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Segoe Fluent Icons"));
-            removeBtn.Click([row, panel](auto&&, auto&&) {
-                uint32_t i = 0;
-                if (panel.Children().IndexOf(row, i))
-                    panel.Children().RemoveAt(i);
-            });
-            row.Children().Append(removeBtn);
-
-            panel.Children().Append(row);
+            AppendAnalysisFieldRow();
         });
 
         HlslEditorBox().PreviewKeyDown([this](auto&&, Input::KeyRoutedEventArgs const& args)
@@ -168,6 +118,63 @@ namespace winrt::ShaderLab::implementation
         row.Children().Append(removeBtn);
 
         panel.Children().Append(row);
+    }
+
+    winrt::Microsoft::UI::Xaml::Controls::StackPanel
+    EffectDesignerWindow::AppendAnalysisFieldRow()
+    {
+        auto panel = AnalysisFieldsPanel();
+        auto row = Controls::StackPanel();
+        row.Orientation(Controls::Orientation::Horizontal);
+        row.Spacing(4);
+
+        auto nameBox = Controls::TextBox();
+        nameBox.PlaceholderText(L"Field Name");
+        nameBox.MinWidth(120);
+        row.Children().Append(nameBox);
+
+        auto typeCombo = Controls::ComboBox();
+        typeCombo.Items().Append(box_value(L"Float"));
+        typeCombo.Items().Append(box_value(L"Float2"));
+        typeCombo.Items().Append(box_value(L"Float3"));
+        typeCombo.Items().Append(box_value(L"Float4"));
+        typeCombo.Items().Append(box_value(L"Float Array"));
+        typeCombo.Items().Append(box_value(L"Float2 Array"));
+        typeCombo.Items().Append(box_value(L"Float3 Array"));
+        typeCombo.Items().Append(box_value(L"Float4 Array"));
+        typeCombo.SelectedIndex(0);
+        typeCombo.MinWidth(110);
+        row.Children().Append(typeCombo);
+
+        auto lenBox = Controls::NumberBox();
+        lenBox.Header(box_value(L"Length"));
+        lenBox.Value(0);
+        lenBox.Minimum(0);
+        lenBox.Maximum(4096);
+        lenBox.Width(80);
+        lenBox.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
+        lenBox.Visibility(Visibility::Collapsed);
+        row.Children().Append(lenBox);
+
+        // Show length only for array types.
+        typeCombo.SelectionChanged([lenBox](auto&& sender, auto&&) {
+            auto c = sender.template as<Controls::ComboBox>();
+            lenBox.Visibility(c.SelectedIndex() >= 4
+                ? Visibility::Visible : Visibility::Collapsed);
+        });
+
+        auto removeBtn = Controls::Button();
+        removeBtn.Content(box_value(L"\xE711"));
+        removeBtn.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Segoe Fluent Icons"));
+        removeBtn.Click([row, panel](auto&&, auto&&) {
+            uint32_t i = 0;
+            if (panel.Children().IndexOf(row, i))
+                panel.Children().RemoveAt(i);
+        });
+        row.Children().Append(removeBtn);
+
+        panel.Children().Append(row);
+        return row;
     }
 
     void EffectDesignerWindow::OnAddParam(
@@ -1236,6 +1243,59 @@ namespace winrt::ShaderLab::implementation
             ThreadGroupY().Value(def.threadGroupY);
             ThreadGroupZ().Value(def.threadGroupZ);
         }
+
+        // Output type + analysis fields. Map AnalysisOutputType -> selector
+        // index (None=0, Histogram=1, Float Buffer=2, Typed Analysis=3) so
+        // opening a built-in ShaderLab effect (or any saved custom effect)
+        // shows the same output configuration the developer originally
+        // declared, instead of the empty default.
+        {
+            int selIdx = 0;
+            switch (def.analysisOutputType)
+            {
+            case ::ShaderLab::Graph::AnalysisOutputType::None:        selIdx = 0; break;
+            case ::ShaderLab::Graph::AnalysisOutputType::Histogram:   selIdx = 1; break;
+            case ::ShaderLab::Graph::AnalysisOutputType::FloatBuffer: selIdx = 2; break;
+            case ::ShaderLab::Graph::AnalysisOutputType::Typed:       selIdx = 3; break;
+            }
+            OutputTypeSelector().SelectedIndex(selIdx);
+        }
+
+        // Repopulate the Typed Analysis field rows from the definition,
+        // matching the manual-add layout (TextBox, ComboBox, NumberBox).
+        AnalysisFieldsPanel().Children().Clear();
+        if (def.analysisOutputType == ::ShaderLab::Graph::AnalysisOutputType::Typed)
+        {
+            for (const auto& fd : def.analysisFields)
+            {
+                auto row = AppendAnalysisFieldRow();
+
+                if (auto nameBox = row.Children().GetAt(0).try_as<Controls::TextBox>())
+                    nameBox.Text(winrt::hstring(fd.name));
+
+                int typeIdx = 0;
+                switch (fd.type)
+                {
+                case ::ShaderLab::Graph::AnalysisFieldType::Float:        typeIdx = 0; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float2:       typeIdx = 1; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float3:       typeIdx = 2; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float4:       typeIdx = 3; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::FloatArray:   typeIdx = 4; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float2Array:  typeIdx = 5; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float3Array:  typeIdx = 6; break;
+                case ::ShaderLab::Graph::AnalysisFieldType::Float4Array:  typeIdx = 7; break;
+                }
+                if (auto typeCombo = row.Children().GetAt(1).try_as<Controls::ComboBox>())
+                    typeCombo.SelectedIndex(typeIdx);
+
+                if (auto lenBox = row.Children().GetAt(2).try_as<Controls::NumberBox>())
+                    lenBox.Value(static_cast<double>(fd.arrayLength));
+            }
+        }
+        AnalysisFieldsSection().Visibility(
+            def.analysisOutputType == ::ShaderLab::Graph::AnalysisOutputType::Typed
+            ? Visibility::Visible : Visibility::Collapsed);
+
         // If no source exists (built-in effects that use hardcoded paths),
         // generate a scaffold so the developer sees representative HLSL.
         std::wstring hlslToShow = def.hlslSource;

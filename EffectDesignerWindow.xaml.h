@@ -46,6 +46,12 @@ namespace winrt::ShaderLab::implementation
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
 
+        // Append one Typed Analysis field row to AnalysisFieldsPanel and
+        // return it. Used by both the "+ Add Field" button click handler
+        // and LoadDefinition (when restoring fields from a saved or
+        // built-in effect definition).
+        winrt::Microsoft::UI::Xaml::Controls::StackPanel AppendAnalysisFieldRow();
+
         // Build a CustomEffectDefinition from the current UI state.
         ::ShaderLab::Graph::CustomEffectDefinition BuildDefinition();
 
