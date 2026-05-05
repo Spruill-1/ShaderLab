@@ -1,0 +1,10 @@
+{
+  "inputs": [],
+  "servers": {
+    "ShaderLab": {
+      "type": "http",
+      "url": "http://localhost:47808/",
+      "headers": {}
+    }
+  }
+}

@@ -1994,7 +1994,22 @@ namespace winrt::ShaderLab::implementation
                 subItem.Text(winrt::hstring(cat));
 
                 auto effects = slRegistry.ByCategory(cat);
+
+                // Group effects by their optional `subcategory` field. The
+                // analysis category in particular has 16+ entries; folding
+                // them into Highlights / Scopes / Statistics / Gamut Mapping
+                // / Comparison sub-trees makes the flyout navigable. Effects
+                // without a subcategory remain at the top level.
+                std::map<std::wstring, std::vector<const ::ShaderLab::Effects::ShaderLabEffectDescriptor*>> grouped;
+                std::vector<const ::ShaderLab::Effects::ShaderLabEffectDescriptor*> ungrouped;
                 for (const auto* desc : effects)
+                {
+                    if (desc->subcategory.empty()) ungrouped.push_back(desc);
+                    else grouped[desc->subcategory].push_back(desc);
+                }
+
+                auto addEffectItem = [this](MUX::MenuFlyoutSubItem& parent,
+                                            const ::ShaderLab::Effects::ShaderLabEffectDescriptor* desc)
                 {
                     auto menuItem = MUX::MenuFlyoutItem();
                     menuItem.Text(winrt::hstring(desc->name));
@@ -2016,9 +2031,21 @@ namespace winrt::ShaderLab::implementation
                         // click the node before the controls appear.
                         m_forceRender = true;
                     });
+                    parent.Items().Append(menuItem);
+                };
 
-                    subItem.Items().Append(menuItem);
+                // Sub-trees first (sorted by name for stable ordering).
+                for (auto& [subName, subList] : grouped)
+                {
+                    auto subSub = MUX::MenuFlyoutSubItem();
+                    subSub.Text(winrt::hstring(subName));
+                    for (const auto* desc : subList)
+                        addEffectItem(subSub, desc);
+                    subItem.Items().Append(subSub);
                 }
+                // Then ungrouped effects directly under the category.
+                for (const auto* desc : ungrouped)
+                    addEffectItem(subItem, desc);
 
                 slGroup.Items().Append(subItem);
 
@@ -6014,6 +6041,35 @@ namespace winrt::ShaderLab::implementation
                     node.properties[L"WsGreenY_hidden"] = ws.primaryGreen.y;
                     node.properties[L"WsBlueX_hidden"]  = ws.primaryBlue.x;
                     node.properties[L"WsBlueY_hidden"]  = ws.primaryBlue.y;
+                    if (changed) node.dirty = true;
+                }
+
+                // Inject SDR white level (nits) into any node that asks
+                // for it. The current monitor's value comes from the live
+                // OS-reported white level (Windows "SDR content brightness"
+                // slider when HDR is on, 80 nits otherwise); a simulated
+                // profile substitutes its preset value. Effects pick the
+                // canonical key `SdrWhiteNits_hidden`.
+                if (node.properties.count(L"SdrWhiteNits_hidden") ||
+                    node.properties.count(L"WsSdrWhiteNits_hidden"))
+                {
+                    auto getF = [&](const std::wstring& k) -> float {
+                        auto it = node.properties.find(k);
+                        if (it != node.properties.end())
+                            if (auto* f = std::get_if<float>(&it->second)) return *f;
+                        return 0.0f;
+                    };
+                    float liveSdr = liveProfile.caps.sdrWhiteLevelNits;
+                    float wsSdr   = activeProfile.caps.sdrWhiteLevelNits;
+                    bool changed =
+                        (node.properties.count(L"SdrWhiteNits_hidden") &&
+                         std::abs(getF(L"SdrWhiteNits_hidden") - liveSdr) > 0.001f) ||
+                        (node.properties.count(L"WsSdrWhiteNits_hidden") &&
+                         std::abs(getF(L"WsSdrWhiteNits_hidden") - wsSdr) > 0.001f);
+                    if (node.properties.count(L"SdrWhiteNits_hidden"))
+                        node.properties[L"SdrWhiteNits_hidden"] = liveSdr;
+                    if (node.properties.count(L"WsSdrWhiteNits_hidden"))
+                        node.properties[L"WsSdrWhiteNits_hidden"] = wsSdr;
                     if (changed) node.dirty = true;
                 }
 

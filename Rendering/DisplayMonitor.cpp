@@ -94,13 +94,15 @@ namespace ShaderLab::Rendering
             caps.whitePointX   = desc.WhitePoint[0];
             caps.whitePointY   = desc.WhitePoint[1];
 
-            // SDR white level: when HDR is on, this value matters for
-            // tone-mapping the SDR-reference white to the correct nit level.
-            // DXGI doesn't surface it directly in OUTPUT_DESC1; the
-            // canonical way is DwmGetWindowAttribute(DWMWA_SDR_WHITE_LEVEL)
-            // but that requires a top-level HWND at runtime. Fall back to
-            // the D3D11 SDR reference-white. For now, use 80 nits default.
-            caps.sdrWhiteLevelNits = 80.0f;
+            // SDR white level: when HDR is on, this controls the nit value
+            // that scRGB 1.0 (a.k.a. SDR reference white) maps to on the
+            // display. Read it from the OS via DisplayConfigGetDeviceInfo
+            // so it tracks the user's Windows Settings -> Display -> HDR ->
+            // "SDR content brightness" slider. The returned SDRWhiteLevel
+            // is in 1/1000ths of 80 nits, per Microsoft's documentation.
+            // Fallback to 80 nits when the call isn't available (older
+            // Windows builds, non-DXGI outputs, virtual displays).
+            caps.sdrWhiteLevelNits = QuerySdrWhiteLevelForOutput(output.get());
         }
 
         return caps;
@@ -142,6 +144,75 @@ namespace ShaderLab::Rendering
         }
 
         return nullptr;
+    }
+
+    // -----------------------------------------------------------------------
+    // SDR white level query (DisplayConfig)
+    // -----------------------------------------------------------------------
+
+    float DisplayMonitor::QuerySdrWhiteLevelForOutput(IDXGIOutput6* output)
+    {
+        // Default: 80 nits == scRGB 1.0 reference. Returned on any failure
+        // path (older Windows, virtual outputs, no DXGI desc).
+        constexpr float kDefaultNits = 80.0f;
+        if (!output) return kDefaultNits;
+
+        DXGI_OUTPUT_DESC desc{};
+        if (FAILED(output->GetDesc(&desc)) || desc.Monitor == nullptr)
+            return kDefaultNits;
+
+        // Resolve HMONITOR -> GDI device name -> source mode -> target.
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (!::GetMonitorInfoW(desc.Monitor, &mi))
+            return kDefaultNits;
+
+        UINT32 pathCount = 0;
+        UINT32 modeCount = 0;
+        if (::GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
+            return kDefaultNits;
+
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+        if (::QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                                 &pathCount, paths.data(),
+                                 &modeCount, modes.data(),
+                                 nullptr) != ERROR_SUCCESS)
+            return kDefaultNits;
+        paths.resize(pathCount);
+        modes.resize(modeCount);
+
+        for (const auto& path : paths)
+        {
+            // Match by GDI device name on the source.
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName{};
+            srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            srcName.header.size = sizeof(srcName);
+            srcName.header.adapterId = path.sourceInfo.adapterId;
+            srcName.header.id = path.sourceInfo.id;
+            if (::DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
+                continue;
+            if (wcscmp(srcName.viewGdiDeviceName, mi.szDevice) != 0)
+                continue;
+
+            // SDRWhiteLevel is reported in 1/1000ths of 80 nits, i.e.
+            // nits = SDRWhiteLevel / 1000.0 * 80.0. Confirmed by the
+            // documented sample on Microsoft Learn.
+            DISPLAYCONFIG_SDR_WHITE_LEVEL whiteLevel{};
+            whiteLevel.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            whiteLevel.header.size = sizeof(whiteLevel);
+            whiteLevel.header.adapterId = path.targetInfo.adapterId;
+            whiteLevel.header.id = path.targetInfo.id;
+            if (::DisplayConfigGetDeviceInfo(&whiteLevel.header) != ERROR_SUCCESS)
+                return kDefaultNits;
+
+            const float nits = static_cast<float>(whiteLevel.SDRWhiteLevel) / 1000.0f * 80.0f;
+            if (nits >= 40.0f && nits <= 480.0f)  // sanity-clamp to the slider's UI range
+                return nits;
+            return kDefaultNits;
+        }
+
+        return kDefaultNits;
     }
 
     // -----------------------------------------------------------------------

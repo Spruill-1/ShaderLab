@@ -48,7 +48,14 @@ namespace ShaderLab::Rendering
 
         std::wstring LuminanceString() const
         {
-            return std::format(L"{:.0f} nits", maxLuminanceNits);
+            // Show both peak and SDR-reference white. SDR white drives any
+            // pipeline that needs to know "what nit level does scRGB 1.0
+            // resolve to" (everything in the new ICtCp suite, plus the
+            // built-in tone mapper). Reading the live OS value is what
+            // makes the suite track the user's "SDR content brightness"
+            // slider in Windows Settings without a manual override.
+            return std::format(L"{:.0f} nits (SDR white {:.0f})",
+                maxLuminanceNits, sdrWhiteLevelNits);
         }
     };
 

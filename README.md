@@ -179,6 +179,10 @@ sequenceDiagram
     DM->>App: Update status bar
 ```
 
+### SDR white level
+
+`DisplayCapabilities::sdrWhiteLevelNits` is queried from the OS via `DisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL)`, decoded as `nits = SDRWhiteLevel / 1000 * 80`. This value tracks the user's **Settings → Display → HDR → "SDR content brightness"** slider when HDR is on; when HDR is off it falls back to 80 nits. Effects that need to know the nit value of scRGB 1.0 (the entire ICtCp suite, plus the built-in tone mapper) opt in by declaring `SdrWhiteNits_hidden` (current monitor) or `WsSdrWhiteNits_hidden` (active simulated / working-space profile) in their `hiddenDefaults` — the host writes the live value every frame using the same change-detected pattern as `MonMaxNits_hidden` and `WsRedX_hidden`. Selecting a simulated `DisplayProfile` preset overrides the value via the existing profile path.
+
 ## Display Profile Mocking
 
 Allows overriding the live display's characteristics with values from a preset or ICC profile, enabling tone mapping development targeting arbitrary displays without physical hardware.
@@ -592,7 +596,19 @@ ShaderLab ships with **20+ built-in ShaderLab effects** implemented in `Effects/
 | Effect | Type | Description |
 |--------|------|-------------|
 | Gamut Map | Pixel Shader | CIE xy gamut mapping: Clip / Nearest / Compress to White / Fit Gamut. |
-| Perceptual Gamut Map | Pixel Shader | ICtCp perceptual mapping: Nearest on Shell / Compress to Neutral / Fit to Shell. |
+| ICtCp Gamut Map | Pixel Shader | Perceptual gamut mapping in BT.2100 ICtCp space: Nearest on Shell / Compress to Neutral / Fit to Shell. (Renamed from `Perceptual Gamut Map` in v1.3.8 — old graphs load via legacy alias.) |
+
+### Tone Mapping Effects (ICtCp suite)
+
+A growing set of HDR↔SDR operators built around BT.2100 ICtCp. The key property: I (intensity) is decoupled from Ct/Cp (chromaticity), so compressing or expanding I alone preserves hue and saturation by construction. This is the design thesis of the suite: things that need to be carefully done in linear RGB or CIE xyY (per-channel hue shifts, gamut excursions, chromaticity drift) reduce to one-line manipulations of I in ICtCp.
+
+| Effect | Type | Description |
+|--------|------|-------------|
+| ICtCp Round-Trip Validator | Pixel Shader | Diagnostic: outputs `\|scRGB→ICtCp→scRGB - in\| × Gain`. Should render black on a correct image; non-zero output indicates a bug in the ICtCp conversion. |
+| ICtCp Tone Map (HDR → SDR) | Pixel Shader | I-channel Reinhard compression. Source / target peaks specified in nits; Ct/Cp pass through unchanged. |
+| ICtCp Inverse Tone Map (SDR → HDR) | Pixel Shader | Mirror of the above; inverse Reinhard expands SDR-anchored content into the HDR peak. |
+
+Each tone-mapping effect declares `SdrWhiteNits_hidden` so the host writes the live OS-reported SDR white level (the *Settings → Display → HDR → "SDR content brightness"* slider value) into the cbuffer every frame. Future variants (BT.2390, hue-preserving ACES, adaptive) will live in this same subcategory.
 
 ### Source / Generator Effects
 

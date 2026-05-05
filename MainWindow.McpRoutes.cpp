@@ -260,6 +260,18 @@ namespace winrt::ShaderLab::implementation
             m_mcpServer = std::make_unique<::ShaderLab::McpHttpServer>();
 
         // =====================================================================
+        // GET /  — Health check / probe (some MCP clients GET / before POST).
+        // =====================================================================
+        m_mcpServer->AddRoute(L"GET", L"/", [](const std::wstring& path, const std::string&)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            // Only match exact "/" — longer GET paths fall through to other routes.
+            if (path != L"/")
+                return { 404, R"({"error":"Not found"})" };
+            return { 200, R"({"name":"shaderlab","transport":"streamable-http","endpoint":"POST /"})" };
+        });
+
+        // =====================================================================
         // GET /context  — System prompt / onboarding for calling agents
         // =====================================================================
         m_mcpServer->AddRoute(L"GET", L"/context", [](const std::wstring&, const std::string&)
@@ -1354,8 +1366,24 @@ namespace winrt::ShaderLab::implementation
         {
             try
             {
-                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+                {
+                    std::string preview = body.size() > 512 ? body.substr(0, 512) + "..." : body;
+                    OutputDebugStringA(("[MCP] POST / body: " + preview + "\n").c_str());
+                }
+                winrt::Windows::Data::Json::JsonObject jobj{ nullptr };
+                if (!winrt::Windows::Data::Json::JsonObject::TryParse(winrt::to_hstring(body), jobj))
+                {
+                    OutputDebugStringA(("[MCP] POST / parse error. bodySize=" + std::to_string(body.size())
+                        + " raw=[" + body + "]\n").c_str());
+                    return { 200, R"({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}})" };
+                }
+                if (!jobj.HasKey(L"method"))
+                {
+                    OutputDebugStringA("[MCP] POST / missing method field\n");
+                    return { 200, R"({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}})" };
+                }
                 auto method = ToUtf8(std::wstring(jobj.GetNamedString(L"method")));
+                OutputDebugStringA(("[MCP] method=" + method + "\n").c_str());
                 auto id = jobj.HasKey(L"id") ? jobj.GetNamedValue(L"id") : winrt::Windows::Data::Json::JsonValue::CreateNullValue();
                 std::string idStr;
                 if (id.ValueType() == winrt::Windows::Data::Json::JsonValueType::Number)
@@ -1390,7 +1418,12 @@ namespace winrt::ShaderLab::implementation
                 // ---- notifications/initialized (no response needed but we ack) ----
                 if (method == "notifications/initialized")
                 {
-                    return { 200, "" };
+                    return { 202, "" };
+                }
+                // Any other notification (no id, method starts with "notifications/")
+                if (method.rfind("notifications/", 0) == 0)
+                {
+                    return { 202, "" };
                 }
 
                 // ---- tools/list ----

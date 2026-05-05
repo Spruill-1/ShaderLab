@@ -76,7 +76,7 @@ namespace ShaderLab::Rendering
         p.caps.hdrEnabled = false;
         p.caps.bitsPerColor = 8;
         p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-        p.caps.sdrWhiteLevelNits = 80.0f;
+        p.caps.sdrWhiteLevelNits = 100.0f;
         p.caps.maxLuminanceNits = 270.0f;
         p.caps.minLuminanceNits = 0.5f;
         p.caps.maxFullFrameLuminanceNits = 270.0f;
@@ -92,7 +92,7 @@ namespace ShaderLab::Rendering
         p.caps.hdrEnabled = true;
         p.caps.bitsPerColor = 10;
         p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-        p.caps.sdrWhiteLevelNits = 80.0f;
+        p.caps.sdrWhiteLevelNits = 203.0f;
         p.caps.maxLuminanceNits = 600.0f;
         p.caps.minLuminanceNits = 0.05f;
         p.caps.maxFullFrameLuminanceNits = 500.0f;
@@ -113,7 +113,7 @@ namespace ShaderLab::Rendering
         p.caps.hdrEnabled = true;
         p.caps.bitsPerColor = 10;
         p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-        p.caps.sdrWhiteLevelNits = 80.0f;
+        p.caps.sdrWhiteLevelNits = 203.0f;
         p.caps.maxLuminanceNits = 1000.0f;
         p.caps.minLuminanceNits = 0.05f;
         p.caps.maxFullFrameLuminanceNits = 600.0f;
@@ -134,7 +134,7 @@ namespace ShaderLab::Rendering
         p.caps.hdrEnabled = true;
         p.caps.bitsPerColor = 10;
         p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-        p.caps.sdrWhiteLevelNits = 80.0f;
+        p.caps.sdrWhiteLevelNits = 203.0f;
         p.caps.maxLuminanceNits = 1000.0f;
         p.caps.minLuminanceNits = 0.005f;
         p.caps.maxFullFrameLuminanceNits = 600.0f;
@@ -155,7 +155,7 @@ namespace ShaderLab::Rendering
         p.caps.hdrEnabled = true;
         p.caps.bitsPerColor = 10;
         p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-        p.caps.sdrWhiteLevelNits = 80.0f;
+        p.caps.sdrWhiteLevelNits = 203.0f;
         p.caps.maxLuminanceNits = 4000.0f;
         p.caps.minLuminanceNits = 0.005f;
         p.caps.maxFullFrameLuminanceNits = 1000.0f;

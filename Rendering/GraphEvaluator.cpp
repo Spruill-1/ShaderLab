@@ -542,21 +542,15 @@ namespace ShaderLab::Rendering
                 continue;
             }
 
-            // Built-in Image Statistics uses the hardcoded GpuReduction path,
-            // but only if the user hasn't recompiled via Effect Designer.
-            // Once recompiled, the user's shader runs through D3D11ComputeRunner.
-            bool isBuiltinStats = node->customEffect.has_value() &&
-                node->customEffect->shaderLabEffectId == L"Image Statistics" &&
-                !node->customEffect->isCompiled();
-
-            if (isBuiltinStats)
-            {
-                ComputeImageStatistics(dc, *node, deferred.inputImage);
-            }
-            else
-            {
-                DispatchUserD3D11Compute(dc, *node, deferred.inputImage);
-            }
+            // All ShaderLab compute-shader effects flow through the
+            // generic D3D11ComputeRunner path. There used to be a
+            // hardcoded fast-path here for the legacy "Image Statistics"
+            // effect via ComputeImageStatistics + GpuReduction; that
+            // effect was split into Channel/Luminance/Chromaticity
+            // Statistics, all of which use the per-shader cbuffer
+            // dispatched by DispatchUserD3D11Compute. New compute
+            // effects need no special-casing in the host.
+            DispatchUserD3D11Compute(dc, *node, deferred.inputImage);
         }
         m_deferredCompute.clear();
         return true;

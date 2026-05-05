@@ -10,7 +10,11 @@ namespace ShaderLab::Effects
     struct ShaderLabEffectDescriptor
     {
         std::wstring name;
-        std::wstring category;      // "Analysis" or "Source"
+        std::wstring category;      // "Analysis", "Source", "Parameter"
+        std::wstring subcategory;   // Optional second-tier grouping under
+                                    // category (e.g. "Highlights", "Scopes",
+                                    // "Gamut Mapping"). Empty = ungrouped,
+                                    // shown directly under the category.
         Graph::CustomShaderType shaderType{ Graph::CustomShaderType::PixelShader };
 
         // Stable identifier and version for upgrade detection.

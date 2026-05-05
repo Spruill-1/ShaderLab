@@ -136,6 +136,8 @@ namespace ShaderLab
     {
         SOCKET s = static_cast<SOCKET>(clientSock);
 
+        try
+        {
         // Read the full HTTP request (up to 64KB).
         std::string raw;
         raw.resize(65536);
@@ -154,6 +156,31 @@ namespace ShaderLab
             auto headerEnd = sv.find("\r\n\r\n");
             if (headerEnd != std::string_view::npos)
             {
+                // Detect Transfer-Encoding: chunked (case-insensitive).
+                bool chunked = false;
+                {
+                    std::string headersLower(sv.substr(0, headerEnd));
+                    for (auto& c : headersLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    auto tePos = headersLower.find("transfer-encoding:");
+                    if (tePos != std::string::npos)
+                    {
+                        auto teEnd = headersLower.find("\r\n", tePos);
+                        if (teEnd != std::string::npos &&
+                            headersLower.find("chunked", tePos, teEnd - tePos) != std::string::npos)
+                        {
+                            chunked = true;
+                        }
+                    }
+                }
+
+                if (chunked)
+                {
+                    // Done when we've seen the terminating "0\r\n\r\n" chunk.
+                    if (sv.find("\r\n0\r\n\r\n", headerEnd) != std::string_view::npos)
+                        break;
+                    continue;
+                }
+
                 // Check Content-Length for body.
                 auto clPos = sv.find("Content-Length:");
                 if (clPos == std::string_view::npos)
@@ -210,6 +237,37 @@ namespace ShaderLab
             auto headerEnd = raw.find("\r\n\r\n");
             if (headerEnd != std::string::npos && headerEnd + 4 < raw.size())
                 body = raw.substr(headerEnd + 4);
+
+            // If chunked, decode chunks into the actual payload.
+            std::string headersBlock = (headerEnd != std::string::npos) ? raw.substr(0, headerEnd) : std::string{};
+            std::string headersLower = headersBlock;
+            for (auto& c : headersLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (headersLower.find("transfer-encoding:") != std::string::npos &&
+                headersLower.find("chunked") != std::string::npos)
+            {
+                std::string decoded;
+                size_t i = 0;
+                while (i < body.size())
+                {
+                    auto crlf = body.find("\r\n", i);
+                    if (crlf == std::string::npos) break;
+                    std::string sizeLine = body.substr(i, crlf - i);
+                    // Strip optional chunk extensions after ';'.
+                    auto semi = sizeLine.find(';');
+                    if (semi != std::string::npos) sizeLine.resize(semi);
+                    size_t chunkSize = 0;
+                    try { chunkSize = std::stoul(sizeLine, nullptr, 16); }
+                    catch (...) { break; }
+                    i = crlf + 2;
+                    if (chunkSize == 0) break;
+                    if (i + chunkSize > body.size()) break;
+                    decoded.append(body, i, chunkSize);
+                    i += chunkSize;
+                    if (i + 2 <= body.size() && body[i] == '\r' && body[i + 1] == '\n')
+                        i += 2;
+                }
+                body = std::move(decoded);
+            }
         }
 
         // Handle CORS preflight.
@@ -228,10 +286,29 @@ namespace ShaderLab
         }
 
         // Route and respond.
+        {
+            std::string mlog(method.begin(), method.end());
+            std::string plog(path.begin(), path.end());
+            OutputDebugStringA(("[MCP] " + mlog + " " + plog + " (body=" + std::to_string(body.size()) + "B)\n").c_str());
+            // Log headers for diagnosing parse failures (one-shot, capped).
+            auto headerEnd = raw.find("\r\n\r\n");
+            std::string headers = (headerEnd != std::string::npos) ? raw.substr(0, headerEnd) : raw;
+            if (headers.size() > 1024) headers.resize(1024);
+            OutputDebugStringA(("[MCP] headers:\n" + headers + "\n").c_str());
+        }
         Response resp = RouteRequest(method, path, body);
 
-        std::string statusText = (resp.statusCode == 200) ? "OK" :
-                                  (resp.statusCode == 404) ? "Not Found" : "Error";
+        std::string statusText;
+        switch (resp.statusCode)
+        {
+        case 200: statusText = "OK"; break;
+        case 202: statusText = "Accepted"; break;
+        case 204: statusText = "No Content"; break;
+        case 400: statusText = "Bad Request"; break;
+        case 404: statusText = "Not Found"; break;
+        case 500: statusText = "Internal Server Error"; break;
+        default:  statusText = "Error"; break;
+        }
         std::string httpResp = std::format(
             "HTTP/1.1 {} {}\r\n"
             "Content-Type: {}\r\n"
@@ -244,6 +321,20 @@ namespace ShaderLab
 
         send(s, httpResp.data(), static_cast<int>(httpResp.size()), 0);
         closesocket(s);
+        }
+        catch (const std::exception& ex)
+        {
+            OutputDebugStringA((std::string("[MCP] HandleConnection std::exception: ") + ex.what() + "\n").c_str());
+            try { closesocket(s); } catch (...) {}
+        }
+        catch (...)
+        {
+            // Last-resort barrier: any escaping exception (winrt::hresult_error,
+            // SEH translation, etc.) tearing down the listener thread can crash
+            // the process. Swallow + log + close the socket.
+            OutputDebugStringW(L"[MCP] HandleConnection: unhandled non-standard exception\n");
+            try { closesocket(s); } catch (...) {}
+        }
     }
 
     McpHttpServer::Response McpHttpServer::RouteRequest(
@@ -272,6 +363,14 @@ namespace ShaderLab
             catch (const std::exception& ex)
             {
                 return { 500, std::string(R"({"error":")") + ex.what() + R"("})" };
+            }
+            catch (...)
+            {
+                // winrt::hresult_error and SEH translations land here. The
+                // route handler must not allow these to escape because they
+                // would unwind off the listener thread and (with /EHa) can
+                // take the process with them.
+                return { 500, R"({"error":"Unhandled non-standard exception in route handler"})" };
             }
         }
 

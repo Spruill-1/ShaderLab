@@ -81,6 +81,12 @@ namespace ShaderLab::Rendering
         // Find the IDXGIOutput6 that covers the app window.
         winrt::com_ptr<IDXGIOutput6> GetOutputForWindow() const;
 
+        // Query the OS for the SDR white-level (in nits) on the display
+        // that hosts the given output. Reads the same value as the
+        // Windows Settings -> Display -> HDR -> "SDR content brightness"
+        // slider via DisplayConfigGetDeviceInfo. Returns 80.0f on failure.
+        static float QuerySdrWhiteLevelForOutput(IDXGIOutput6* output);
+
         HWND                            m_appHwnd{ nullptr };
         HWND                            m_msgHwnd{ nullptr };
         ATOM                            m_wndClass{ 0 };

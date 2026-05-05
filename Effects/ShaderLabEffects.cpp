@@ -276,6 +276,51 @@ float3 LinearToOKLab(float3 c) {
         0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
     );
 }
+
+// ---- I-channel (PQ-encoded nits) helpers for ICtCp tone mapping ----
+// In BT.2100 ICtCp, I is a weighted PQ-encoded sum of LMS. For
+// chromaticity-preserving operations (compress / expand only I, leave
+// Ct/Cp), it is standard to treat I as if it were PQ(neutral_nits) and
+// design the curve in nits-via-PQ space. This is what BT.2390 does.
+
+// Convert a nit value to its corresponding I coordinate.
+float NitsToI(float nits) {
+    return PQ_InvEOTF(max(nits, 0.0));
+}
+
+// Convert an I coordinate back to nits.
+float IToNits(float I) {
+    return PQ_EOTF(I);
+}
+
+// Reinhard compression on I, expressed in I-space directly. Anchored
+// Möbius: maps 0 -> 0 and peakIn_I -> peakOut_I exactly, with f'(0)=1
+// (linear at the low end) and smooth rolloff near peakIn. Both peaks
+// are I coordinates (PQ values). For HDR -> SDR pass peakIn = HDR_I,
+// peakOut = SDR_I. Inputs above peakIn_I are clamped so the curve
+// can't walk past its anchor onto the rising branch beyond peakIn.
+float ReinhardCompressI(float I, float peakIn_I, float peakOut_I) {
+    float pp = peakIn_I * peakOut_I;
+    if (pp <= 1e-12) return 0.0;
+    float Ic = clamp(I, 0.0, peakIn_I);
+    float denom = pp + Ic * (peakIn_I - peakOut_I);
+    return Ic * pp / max(denom, 1e-12);
+}
+
+// Inverse of ReinhardCompressI: given an I value in [0, peakOut_I]
+// returns the I in [0, peakIn_I] that would compress to it. Same
+// peakIn/peakOut convention as ReinhardCompressI: peakIn is the
+// *uncompressed* range, peakOut is the *compressed* range. For
+// SDR -> HDR expansion callers pass peakIn = HDR_I, peakOut = SDR_I.
+// Inputs above peakOut_I are clamped so the curve saturates at peakIn
+// rather than racing toward the asymptote.
+float ReinhardExpandI(float I, float peakIn_I, float peakOut_I) {
+    float pp = peakIn_I * peakOut_I;
+    if (pp <= 1e-12) return 0.0;
+    float Ic = clamp(I, 0.0, peakOut_I);
+    float denom = pp - Ic * (peakIn_I - peakOut_I);
+    return Ic * pp / max(denom, 1e-12);
+}
 )HLSL";
 
     const std::string& GetColorMathHLSL()
@@ -496,6 +541,12 @@ float4 main(
         for (const auto& e : m_effects)
             if (e.effectId == effectId)
                 return &e;
+        // Legacy ID aliases: rename history. Saved graphs may reference
+        // the old name; resolve them transparently so old .effectgraph
+        // files keep loading and the "Update Effect" prompt fires once
+        // they're loaded.
+        if (effectId == L"Perceptual Gamut Map")
+            return FindById(L"ICtCp Gamut Map");
         return nullptr;
     }
 
@@ -575,6 +626,7 @@ float4 main(
             desc.name = L"Luminance Heatmap";
             desc.effectId = L"Luminance Heatmap"; desc.effectVersion = 1;
             desc.category = L"Analysis";
+            desc.subcategory = L"Highlights";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + s_luminanceHeatmapHLSL;
             desc.inputNames = { L"Source" };
@@ -592,6 +644,7 @@ float4 main(
             desc.name = L"Gamut Highlight";
             desc.effectId = L"Gamut Highlight"; desc.effectVersion = 2;
             desc.category = L"Analysis";
+            desc.subcategory = L"Highlights";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + s_outOfGamutHLSL;
             desc.inputNames = { L"Source" };
@@ -624,6 +677,7 @@ float4 main(
             desc.name = L"Luminance Highlight";
             desc.effectId = L"Luminance Highlight"; desc.effectVersion = 3;
             desc.category = L"Analysis";
+            desc.subcategory = L"Highlights";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + s_luminanceHighlightHLSL;
             desc.inputNames = { L"Source" };
@@ -768,6 +822,7 @@ void main(uint3 GTid : SV_GroupThreadID) {
             desc.name = L"CIE Histogram";
             desc.effectId = L"CIE Histogram"; desc.effectVersion = 1;
             desc.category = L"Analysis";
+            desc.subcategory = L"Scopes";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
             desc.hlslSource = cieHistHLSL;
             desc.inputNames = { L"Source" };
@@ -962,6 +1017,7 @@ float4 main(
             desc.name = L"CIE Chromaticity Plot";
             desc.effectId = L"CIE Chromaticity Plot"; desc.effectVersion = 4;
             desc.category = L"Analysis";
+            desc.subcategory = L"Scopes";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + ciePlotHLSL;
             desc.inputNames = { L"Histogram" };
@@ -1378,6 +1434,7 @@ float4 main(
             desc.name = L"Vectorscope";
             desc.effectId = L"Vectorscope"; desc.effectVersion = 1;
             desc.category = L"Analysis";
+            desc.subcategory = L"Scopes";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + vectorscopeHLSL;
             desc.inputNames = { L"Source" };
@@ -1529,6 +1586,7 @@ float4 main(
             desc.name = L"Delta E Comparator";
             desc.effectId = L"Delta E Comparator"; desc.effectVersion = 2;
             desc.category = L"Analysis";
+            desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + deltaEHLSL;
             desc.inputNames = { L"Reference", L"Test" };
@@ -1581,6 +1639,7 @@ float4 main(
             desc.name = L"Nit Map";
             desc.effectId = L"Nit Map"; desc.effectVersion = 1;
             desc.category = L"Analysis";
+            desc.subcategory = L"Highlights";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + falseColorHLSL;
             desc.inputNames = { L"Source" };
@@ -1713,7 +1772,8 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Waveform Monitor";
-            desc.effectId = L"Waveform Monitor"; desc.effectVersion = 2;
+            desc.subcategory = L"Scopes";
+            desc.effectId = L"Waveform Monitor"; desc.effectVersion = 1;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + waveformHLSL;
@@ -2062,6 +2122,7 @@ float4 main(
             desc.name = L"Gamut Map";
             desc.effectId = L"Gamut Map"; desc.effectVersion = 3;
             desc.category = L"Analysis";
+            desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutMapHLSL;
             desc.inputNames = { L"Source" };
@@ -2079,10 +2140,10 @@ float4 main(
             m_effects.push_back(std::move(desc));
         }
 
-        // ---- Perceptual Gamut Map (ICtCp) ----
+        // ---- ICtCp Gamut Map ----
         {
             static const std::string perceptualGamutMapHLSL = R"HLSL(
-// Perceptual Gamut Map - gamut mapping in ICtCp space.
+// ICtCp Gamut Map - perceptual gamut mapping in BT.2100 ICtCp space.
 // Samples the target gamut boundary as a polygon in the Ct/Cp plane
 // at the pixel's intensity level, then maps out-of-gamut pixels.
 
@@ -2303,9 +2364,10 @@ float4 main(
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
-            desc.name = L"Perceptual Gamut Map";
-            desc.effectId = L"Perceptual Gamut Map"; desc.effectVersion = 7;
+            desc.name = L"ICtCp Gamut Map";
+            desc.effectId = L"ICtCp Gamut Map"; desc.effectVersion = 8;
             desc.category = L"Analysis";
+            desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + perceptualGamutMapHLSL;
             desc.inputNames = { L"Source" };
@@ -2428,6 +2490,7 @@ float4 main(
             desc.name = L"ICtCp Boundary";
             desc.effectId = L"ICtCp Boundary"; desc.effectVersion = 2;
             desc.category = L"Analysis";
+            desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + ictcpBoundaryHLSL;
             desc.inputNames = { L"Source" };
@@ -2440,6 +2503,283 @@ float4 main(
                 { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },
                 { L"WsGreenX_hidden", 0.30f }, { L"WsGreenY_hidden", 0.60f },
                 { L"WsBlueX_hidden", 0.15f }, { L"WsBlueY_hidden", 0.06f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- ICtCp Round-Trip Validator ----
+        // Diagnostic effect: passes input through scRGB -> ICtCp -> scRGB
+        // and outputs |out - in| * Gain. A correct implementation renders
+        // black (modulo FP16 precision); any non-trivial color means the
+        // ICtCp matrices or PQ helpers are wrong, and downstream tone-
+        // mapping effects are untrustworthy.
+        {
+            static const std::string ictcpRoundTripHLSL = R"HLSL(
+// ICtCp Round-Trip Validator
+Texture2D Source : register(t0);
+SamplerState Sampler : register(s0);
+
+cbuffer constants : register(b0) {
+    float Gain;       // default 1000
+};
+
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
+{
+    float4 color = Source.Load(int3(uv, 0));
+    float3 ictcp = ScRGBToICtCp(color.rgb);
+    float3 back  = ICtCpToScRGB(ictcp);
+    float3 diff  = abs(back - color.rgb) * Gain;
+    return float4(diff, 1.0);
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"ICtCp Round-Trip Validator";
+            desc.effectId = L"ICtCp Round-Trip Validator"; desc.effectVersion = 3;
+            desc.category = L"Analysis";
+            desc.subcategory = L"Tone Mapping";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + ictcpRoundTripHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"Gain", L"float", 1000.0f, 1.0f, 100000.0f, 10.0f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- ICtCp Tone Map (HDR -> SDR) ----
+        // Compresses I-channel only via Reinhard, leaving Ct/Cp untouched
+        // so hue and saturation are preserved by construction. Both peaks
+        // are in nits and converted to I-coordinates (PQ values) before
+        // the curve is applied.
+        {
+            static const std::string ictcpToneMapHLSL = R"HLSL(
+// ICtCp Tone Map (HDR -> SDR), I-channel Reinhard
+Texture2D Source : register(t0);
+SamplerState Sampler : register(s0);
+
+cbuffer constants : register(b0) {
+    float SourcePeakNits;        // typical 1000-10000
+    float TargetPeakNits;        // SDR target; used when SdrWhiteSource = 0
+    float SdrWhiteSource;        // 0 = User Value, 1 = Working Space
+    float Strength;              // 0..1 lerp from identity to compressed
+    float WsSdrWhiteNits_hidden; // host-injected: active working-space SDR white
+                                 //   (= live monitor when no preset selected,
+                                 //    or preset's SDR white when one is)
+};
+
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
+{
+    float wsNits = WsSdrWhiteNits_hidden;        // bind to silence DXC
+    float src    = SdrWhiteSource;               // bind
+    float targetNits = (src > 0.5) ? wsNits : TargetPeakNits;
+
+    float4 color = Source.Load(int3(uv, 0));
+    float3 ictcp = ScRGBToICtCp(color.rgb);
+
+    float peakIn  = NitsToI(SourcePeakNits);
+    float peakOut = NitsToI(targetNits);
+    float compressed = ReinhardCompressI(ictcp.x, peakIn, peakOut);
+    ictcp.x = lerp(ictcp.x, compressed, saturate(Strength));
+
+    float3 outRgb = ICtCpToScRGB(ictcp);
+    return float4(outRgb, color.a);
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"ICtCp Tone Map (HDR -> SDR)";
+            desc.effectId = L"ICtCp Tone Map"; desc.effectVersion = 8;
+            desc.category = L"Analysis";
+            desc.subcategory = L"Tone Mapping";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + ictcpToneMapHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"SourcePeakNits", L"float", 1000.0f, 100.0f, 10000.0f, 50.0f },
+                { L"TargetPeakNits", L"float", 203.0f, 80.0f, 500.0f, 1.0f },
+                { L"SdrWhiteSource", L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"User Value", L"Working Space" } },
+                { L"Strength",       L"float", 1.0f, 0.0f, 1.0f, 0.05f },
+            };
+            // Hidden: host writes the active working-space SDR white
+            // every frame. "Working Space" in the SdrWhiteSource enum
+            // pulls from this; with the Current Monitor profile
+            // selected (the default) it equals the live OS-reported
+            // value, otherwise it equals the chosen preset / ICC.
+            desc.hiddenDefaults = {
+                { L"WsSdrWhiteNits_hidden", 80.0f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- ICtCp Inverse Tone Map (SDR -> HDR) ----
+        // Inverse Reinhard on I; expands SDR-anchored content into the
+        // HDR peak. Mirror of ICtCp Tone Map; Ct/Cp unchanged.
+        {
+            static const std::string ictcpInverseToneMapHLSL = R"HLSL(
+// ICtCp Inverse Tone Map (SDR -> HDR), I-channel inverse Reinhard
+Texture2D Source : register(t0);
+SamplerState Sampler : register(s0);
+
+cbuffer constants : register(b0) {
+    float SourcePeakNits;        // SDR source; used when SdrWhiteSource = 0
+    float TargetPeakNits;        // typical 1000-10000
+    float SdrWhiteSource;        // 0 = User Value, 1 = Working Space
+    float Strength;              // 0..1 lerp from identity to expanded
+    float WsSdrWhiteNits_hidden;
+};
+
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
+{
+    float wsNits = WsSdrWhiteNits_hidden;
+    float src    = SdrWhiteSource;
+    float sourceNits = (src > 0.5) ? wsNits : SourcePeakNits;
+
+    float4 color = Source.Load(int3(uv, 0));
+    float3 ictcp = ScRGBToICtCp(color.rgb);
+
+    // Inverse of ReinhardCompressI(x, peakIn=HDR, peakOut=SDR):
+    // for SDR -> HDR expansion we feed the *compressed* (SDR) range as
+    // peakOut and the *expanded* (HDR) range as peakIn. The input I lives
+    // in [0, peakOut_I] (SDR range) and the helper returns an I in
+    // [0, peakIn_I] (HDR range).
+    float sdrI = NitsToI(sourceNits);
+    float hdrI = NitsToI(TargetPeakNits);
+    float expanded = ReinhardExpandI(ictcp.x, hdrI, sdrI);
+    ictcp.x = lerp(ictcp.x, expanded, saturate(Strength));
+
+    float3 outRgb = ICtCpToScRGB(ictcp);
+    return float4(outRgb, color.a);
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"ICtCp Inverse Tone Map (SDR -> HDR)";
+            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 9;
+            desc.category = L"Analysis";
+            desc.subcategory = L"Tone Mapping";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + ictcpInverseToneMapHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"SourcePeakNits", L"float", 203.0f, 80.0f, 500.0f, 1.0f },
+                { L"TargetPeakNits", L"float", 1000.0f, 100.0f, 10000.0f, 50.0f },
+                { L"SdrWhiteSource", L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"User Value", L"Working Space" } },
+                { L"Strength",       L"float", 1.0f, 0.0f, 1.0f, 0.05f },
+            };
+            desc.hiddenDefaults = {
+                { L"WsSdrWhiteNits_hidden", 80.0f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- ICtCp Saturation ----
+        // Scale Ct/Cp uniformly. Hue and luminance are unchanged because
+        // the (Ct, Cp) chromaticity vector is just multiplied; this is
+        // the reason ICtCp exists. Saturation = 1 is identity, > 1
+        // boosts, < 1 desaturates, 0 -> grayscale.
+        {
+            static const std::string ictcpSaturationHLSL = R"HLSL(
+// ICtCp Saturation — uniform Ct/Cp scale (hue + luminance preserved)
+Texture2D Source : register(t0);
+SamplerState Sampler : register(s0);
+
+cbuffer constants : register(b0) {
+    float Saturation;   // 1.0 = identity, 0.0 = grayscale, >1 = boosted
+};
+
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
+{
+    float4 color = Source.Load(int3(uv, 0));
+    float3 ictcp = ScRGBToICtCp(color.rgb);
+    ictcp.y *= Saturation;
+    ictcp.z *= Saturation;
+    float3 outRgb = ICtCpToScRGB(ictcp);
+    return float4(outRgb, color.a);
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"ICtCp Saturation";
+            desc.effectId = L"ICtCp Saturation"; desc.effectVersion = 2;
+            desc.category = L"Analysis";
+            desc.subcategory = L"Tone Mapping";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + ictcpSaturationHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"Saturation", L"float", 1.0f, 0.0f, 4.0f, 0.05f },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- ICtCp Highlight Desaturation ----
+        // Smooth desaturation as I rises — the standard "filmic
+        // highlight rolloff" trick. Below KneeNits the image is
+        // unchanged; between KneeNits and PeakNits the saturation
+        // multiplier ramps from 1 toward (1 - Amount); above PeakNits
+        // the saturation is fully attenuated. Pairs naturally with
+        // ICtCp Tone Map: tone-map first, then desat the highlights.
+        {
+            static const std::string ictcpHighlightDesatHLSL = R"HLSL(
+// ICtCp Highlight Desaturation — smooth Ct/Cp rolloff vs. I
+Texture2D Source : register(t0);
+SamplerState Sampler : register(s0);
+
+cbuffer constants : register(b0) {
+    float KneeNits;     // start of the rolloff (e.g. 200)
+    float PeakNits;     // end of the rolloff       (e.g. 1000)
+    float Amount;       // [0..1], how far to desaturate at peak (1 = grayscale at peak)
+    float SdrWhiteSource;        // 0 = User Value (Knee/Peak literal), 1 = Working Space (= WsSdrWhiteNits_hidden)
+    float WsSdrWhiteNits_hidden; // host-injected working-space SDR white
+};
+
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
+{
+    float wsNits = WsSdrWhiteNits_hidden;
+    float src    = SdrWhiteSource;
+
+    // Working-space mode: Knee = working-space SDR white,
+    // Peak = working-space SDR white * (PeakNits / KneeNits) so the
+    // user's stored ratio (e.g. 1000/200 = 5x) follows the active
+    // profile. Falls back to literal nits when in User Value mode.
+    float knee = KneeNits;
+    float peak = PeakNits;
+    if (src > 0.5)
+    {
+        float ratio = (KneeNits > 0.0) ? (PeakNits / KneeNits) : 5.0;
+        knee = wsNits;
+        peak = wsNits * ratio;
+    }
+
+    float4 color = Source.Load(int3(uv, 0));
+    float3 ictcp = ScRGBToICtCp(color.rgb);
+
+    // Map I (PQ) back to nits
+    // way the user's parameters mean what they say even though the
+    // I axis is non-linear.
+    float nits = IToNits(ictcp.x);
+    float t = saturate((nits - knee) / max(peak - knee, 1e-3));
+    float scale = 1.0 - saturate(Amount) * smoothstep(0.0, 1.0, t);
+
+    ictcp.y *= scale;
+    ictcp.z *= scale;
+    float3 outRgb = ICtCpToScRGB(ictcp);
+    return float4(outRgb, color.a);
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"ICtCp Highlight Desaturation";
+            desc.effectId = L"ICtCp Highlight Desaturation"; desc.effectVersion = 2;
+            desc.category = L"Analysis";
+            desc.subcategory = L"Tone Mapping";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + ictcpHighlightDesatHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"KneeNits",       L"float", 200.0f,  10.0f, 5000.0f, 10.0f },
+                { L"PeakNits",       L"float", 1000.0f, 50.0f, 10000.0f, 50.0f },
+                { L"Amount",         L"float", 1.0f,    0.0f,  1.0f,    0.05f },
+                { L"SdrWhiteSource", L"float", 1.0f,    0.0f,  1.0f,    1.0f, { L"User Value", L"Working Space" } },
+            };
+            desc.hiddenDefaults = {
+                { L"WsSdrWhiteNits_hidden", 80.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2498,6 +2838,7 @@ float4 main(
             desc.name = L"Split Comparison";
             desc.effectId = L"Split Comparison"; desc.effectVersion = 1;
             desc.category = L"Analysis";
+            desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + splitCompareHLSL;
             desc.inputNames = { L"ImageA", L"ImageB" };
@@ -2514,23 +2855,17 @@ float4 main(
         // Built-in path uses GpuReduction (RWBuffer<uint>); user-modified path
         // uses D3D11ComputeRunner (RWStructuredBuffer<float4>) via Effect Designer.
         {
-            static const std::string imageStatsHLSL = R"HLSL(
-// Image Statistics - D3D11 Compute Shader
+            static const std::string channelStatsHLSL = R"HLSL(
+// Channel Statistics - D3D11 Compute Shader
+// Population stats for a single colour channel (R/G/B/A). For
+// per-luminance stats use Luminance Statistics; for chromaticity stats
+// use Chromaticity Statistics.
+//
 // 32x32 = 1024 threads, dispatched as (1,1,1).
 // Each thread strides across the full image, reduces in groupshared,
 // then thread 0 computes median/P95 from a 256-bin histogram CDF.
 //
-// Output: RWStructuredBuffer<float4> — one float4 per analysis field.
-//   Result[0].x = Min
-//   Result[1].x = Max
-//   Result[2].x = Mean
-//   Result[3].x = Median  (from histogram CDF)
-//   Result[4].x = P95     (from histogram CDF)
-//   Result[5].x = Samples
-//   Result[6].x = Nonzero%
-//
-// Width and Height are auto-injected at cbuffer offset 0.
-// Channel and NonzeroOnly are user parameters at offset 8.
+// Result[0..6]: Min, Max, Mean, Median, P95, Samples, Nonzero%
 
 Texture2D<float4> Source : register(t0);
 RWStructuredBuffer<float4> Result : register(u0);
@@ -2539,7 +2874,7 @@ cbuffer Constants : register(b0)
 {
     uint Width;
     uint Height;
-    uint Channel;      // 0=luminance, 1=R, 2=G, 3=B, 4=A
+    uint Channel;      // 0=R, 1=G, 2=B, 3=A
     uint NonzeroOnly;  // 0=all, 1=nonzero only
 };
 
@@ -2558,12 +2893,10 @@ groupshared uint  gs_hist[HIST_BINS];
 
 float GetValue(float4 pix, uint ch)
 {
-    float result = 0.2126 * pix.r + 0.7152 * pix.g + 0.0722 * pix.b;
-    if (ch == 1) result = pix.r;
-    else if (ch == 2) result = pix.g;
-    else if (ch == 3) result = pix.b;
-    else if (ch == 4) result = pix.a;
-    return result;
+    if (ch == 0) return pix.r;
+    if (ch == 1) return pix.g;
+    if (ch == 2) return pix.b;
+    return pix.a;
 }
 
 [numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
@@ -2571,7 +2904,6 @@ void main(uint3 GTid : SV_GroupThreadID)
 {
     uint tid = GTid.x + GTid.y * GROUP_SIZE;
 
-    // Clear shared histogram.
     for (uint bi = tid; bi < HIST_BINS; bi += THREAD_COUNT)
         gs_hist[bi] = 0;
     GroupMemoryBarrierWithGroupSync();
@@ -2583,7 +2915,6 @@ void main(uint3 GTid : SV_GroupThreadID)
     uint  tTotal = 0;
     uint  tNonzero = 0;
 
-    // Stride across entire image.
     for (uint y = GTid.y; y < Height; y += GROUP_SIZE)
     {
         for (uint x = GTid.x; x < Width; x += GROUP_SIZE)
@@ -2594,7 +2925,6 @@ void main(uint3 GTid : SV_GroupThreadID)
             tTotal++;
             bool nz = abs(v) > 0.0001;
             if (nz) tNonzero++;
-
             if (NonzeroOnly == 1 && !nz) continue;
 
             tMin = min(tMin, v);
@@ -2602,7 +2932,6 @@ void main(uint3 GTid : SV_GroupThreadID)
             tSum += v;
             tCount++;
 
-            // Histogram bin.
             float normalized = saturate(v / HIST_MAX);
             uint bin = min((uint)(normalized * 255.0), 255u);
             InterlockedAdd(gs_hist[bin], 1u);
@@ -2615,10 +2944,8 @@ void main(uint3 GTid : SV_GroupThreadID)
     gs_count[tid] = tCount;
     gs_total[tid] = tTotal;
     gs_nonzero[tid] = tNonzero;
-
     GroupMemoryBarrierWithGroupSync();
 
-    // Parallel reduction.
     for (uint stride = THREAD_COUNT / 2; stride > 0; stride >>= 1)
     {
         if (tid < stride)
@@ -2633,7 +2960,6 @@ void main(uint3 GTid : SV_GroupThreadID)
         GroupMemoryBarrierWithGroupSync();
     }
 
-    // Thread 0 computes final stats and writes results.
     if (tid == 0)
     {
         float fMin = gs_min[0];
@@ -2643,7 +2969,6 @@ void main(uint3 GTid : SV_GroupThreadID)
         uint  nonzeroPixels = gs_nonzero[0];
         float fMean = (totalSamples > 0) ? (gs_sum[0] / float(totalSamples)) : 0.0;
 
-        // Compute median and P95 from histogram CDF.
         float fMedian = 0.0;
         float fP95 = 0.0;
         uint medianTarget = totalSamples / 2;
@@ -2656,21 +2981,12 @@ void main(uint3 GTid : SV_GroupThreadID)
         {
             cumulative += gs_hist[b];
             float binValue = (float(b) + 0.5) / 255.0 * HIST_MAX;
-            if (!foundMedian && cumulative >= medianTarget)
-            {
-                fMedian = binValue;
-                foundMedian = true;
-            }
-            if (!foundP95 && cumulative >= p95Target)
-            {
-                fP95 = binValue;
-                foundP95 = true;
-            }
+            if (!foundMedian && cumulative >= medianTarget) { fMedian = binValue; foundMedian = true; }
+            if (!foundP95    && cumulative >= p95Target)    { fP95 = binValue;    foundP95 = true; }
         }
 
         float nonzeroPct = (totalPixels > 0)
-            ? float(nonzeroPixels) / float(totalPixels)
-            : 0.0;
+            ? float(nonzeroPixels) / float(totalPixels) : 0.0;
 
         Result[0] = float4(fMin, 0, 0, 0);
         Result[1] = float4(fMax, 0, 0, 0);
@@ -2682,17 +2998,17 @@ void main(uint3 GTid : SV_GroupThreadID)
     }
 }
 )HLSL";
-
             ShaderLabEffectDescriptor desc;
-            desc.name = L"Image Statistics";
-            desc.effectId = L"Image Statistics"; desc.effectVersion = 7;
+            desc.name = L"Channel Statistics";
+            desc.effectId = L"Channel Statistics"; desc.effectVersion = 1;
             desc.category = L"Analysis";
+            desc.subcategory = L"Statistics";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
-            desc.hlslSource = imageStatsHLSL;
+            desc.hlslSource = channelStatsHLSL;
             desc.dataOnly = true;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"Channel",     L"float", 0.0f, 0.0f, 4.0f, 1.0f, { L"Luminance", L"Red", L"Green", L"Blue", L"Alpha" } },
+                { L"Channel",     L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Red", L"Green", L"Blue", L"Alpha" } },
                 { L"NonzeroOnly", L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"All Pixels", L"Nonzero Only" } },
             };
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
@@ -2704,6 +3020,338 @@ void main(uint3 GTid : SV_GroupThreadID)
                 { L"P95",      Graph::AnalysisFieldType::Float },
                 { L"Samples",  Graph::AnalysisFieldType::Float },
                 { L"Nonzero%", Graph::AnalysisFieldType::Float },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Luminance Statistics ----
+        // Population stats on BT.709 luminance, with HDR-aware extras
+        // for adaptive tone mapping. Histogram is log-spaced (8 decades
+        // covering ~0.001..10000 nits) so percentiles stay accurate at
+        // the bright end where adaptive tone mapping cares the most.
+        {
+            static const std::string luminanceStatsHLSL = R"HLSL(
+// Luminance Statistics - D3D11 Compute Shader
+// Outputs (in nits when Units = 1, normalized otherwise):
+//   Min, Max, Mean, Median, P95, P99, AvgLog, ClippedFraction, Samples
+//
+// Units enum:
+//   0 = Normalized (scRGB Y, where 1.0 = SDR white = 80 nits)
+//   1 = Nits (Y * 80)
+//
+// ClippedFraction: fraction of pixels whose luminance >= ClipNits.
+// ClipSource enum:
+//   0 = User Value (ClipNits literal)
+//   1 = Working Space (ClipNits = WsSdrWhiteNits_hidden, BT.2408 default)
+
+Texture2D<float4> Source : register(t0);
+RWStructuredBuffer<float4> Result : register(u0);
+
+cbuffer Constants : register(b0)
+{
+    uint Width;
+    uint Height;
+    uint Units;        // 0 = Normalized, 1 = Nits
+    uint ClipSource;   // 0 = User Value, 1 = Working Space
+    float ClipNits;
+    float WsSdrWhiteNits_hidden;
+    // Padding to multiple of 16 bytes if needed.
+};
+
+#define GROUP_SIZE 32
+#define THREAD_COUNT (GROUP_SIZE * GROUP_SIZE)
+#define HIST_BINS 256
+
+// Log-spaced histogram covers 8 decades: 1e-2 .. 1e6 nits.
+// nits = 10^(LOG_MIN + (bin / HIST_BINS) * LOG_RANGE)
+#define LOG_MIN   -2.0
+#define LOG_RANGE 8.0
+
+groupshared float gs_min[THREAD_COUNT];
+groupshared float gs_max[THREAD_COUNT];
+groupshared float gs_sum[THREAD_COUNT];
+groupshared float gs_logsum[THREAD_COUNT];
+groupshared uint  gs_count[THREAD_COUNT];
+groupshared uint  gs_clipped[THREAD_COUNT];
+groupshared uint  gs_hist[HIST_BINS];
+
+[numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
+void main(uint3 GTid : SV_GroupThreadID)
+{
+    uint tid = GTid.x + GTid.y * GROUP_SIZE;
+
+    for (uint bi = tid; bi < HIST_BINS; bi += THREAD_COUNT)
+        gs_hist[bi] = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Resolve clip threshold (always in nits internally).
+    float clipNitsResolved = ClipNits;
+    if (ClipSource == 1) clipNitsResolved = WsSdrWhiteNits_hidden;
+
+    float tMin = 1e30;
+    float tMax = -1e30;
+    float tSum = 0;       // sum of nit values
+    float tLogSum = 0;    // sum of log10(nits) for AvgLog
+    uint  tCount = 0;
+    uint  tClipped = 0;
+
+    for (uint y = GTid.y; y < Height; y += GROUP_SIZE)
+    {
+        for (uint x = GTid.x; x < Width; x += GROUP_SIZE)
+        {
+            float4 pix = Source.Load(int3(x, y, 0));
+            float Y = max(0.0, dot(pix.rgb, float3(0.2126, 0.7152, 0.0722)));
+            float nits = Y * 80.0;
+
+            tCount++;
+            tMin = min(tMin, nits);
+            tMax = max(tMax, nits);
+            tSum += nits;
+            tLogSum += log10(max(nits, 1e-4));
+            if (nits >= clipNitsResolved) tClipped++;
+
+            float lv = log10(max(nits, 1e-4));
+            float t = (lv - LOG_MIN) / LOG_RANGE;
+            uint bin = clamp((uint)(saturate(t) * (HIST_BINS - 1)), 0u, (uint)(HIST_BINS - 1));
+            InterlockedAdd(gs_hist[bin], 1u);
+        }
+    }
+
+    gs_min[tid] = tMin;
+    gs_max[tid] = tMax;
+    gs_sum[tid] = tSum;
+    gs_logsum[tid] = tLogSum;
+    gs_count[tid] = tCount;
+    gs_clipped[tid] = tClipped;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint stride = THREAD_COUNT / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            gs_min[tid] = min(gs_min[tid], gs_min[tid + stride]);
+            gs_max[tid] = max(gs_max[tid], gs_max[tid + stride]);
+            gs_sum[tid] += gs_sum[tid + stride];
+            gs_logsum[tid] += gs_logsum[tid + stride];
+            gs_count[tid] += gs_count[tid + stride];
+            gs_clipped[tid] += gs_clipped[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (tid == 0)
+    {
+        uint  totalSamples = gs_count[0];
+        float fMin = gs_min[0];
+        float fMax = gs_max[0];
+        float fMean   = (totalSamples > 0) ? (gs_sum[0]    / float(totalSamples)) : 0.0;
+        float fAvgLogLog = (totalSamples > 0) ? (gs_logsum[0] / float(totalSamples)) : 0.0;
+        float fAvgLog = pow(10.0, fAvgLogLog);  // geometric mean in nits
+
+        // Histogram CDF -> percentiles (in log-domain bin centres).
+        float fMedian = 0.0;
+        float fP95 = 0.0;
+        float fP99 = 0.0;
+        uint medianTarget = totalSamples / 2;
+        uint p95Target = (uint)(totalSamples * 0.95);
+        uint p99Target = (uint)(totalSamples * 0.99);
+        uint cumulative = 0;
+        bool foundMedian = false, foundP95 = false, foundP99 = false;
+
+        for (uint b = 0; b < HIST_BINS; b++)
+        {
+            cumulative += gs_hist[b];
+            float binLog = LOG_MIN + (float(b) + 0.5) / float(HIST_BINS) * LOG_RANGE;
+            float binNits = pow(10.0, binLog);
+            if (!foundMedian && cumulative >= medianTarget) { fMedian = binNits; foundMedian = true; }
+            if (!foundP95    && cumulative >= p95Target)    { fP95 = binNits;    foundP95 = true; }
+            if (!foundP99    && cumulative >= p99Target)    { fP99 = binNits;    foundP99 = true; }
+        }
+
+        float clippedFrac = (totalSamples > 0)
+            ? float(gs_clipped[0]) / float(totalSamples) : 0.0;
+
+        // Convert to normalized (scRGB Y) if requested.
+        float scale = (Units == 1) ? 1.0 : (1.0 / 80.0);
+
+        Result[0] = float4(fMin    * scale, 0, 0, 0);
+        Result[1] = float4(fMax    * scale, 0, 0, 0);
+        Result[2] = float4(fMean   * scale, 0, 0, 0);
+        Result[3] = float4(fMedian * scale, 0, 0, 0);
+        Result[4] = float4(fP95    * scale, 0, 0, 0);
+        Result[5] = float4(fP99    * scale, 0, 0, 0);
+        Result[6] = float4(fAvgLog * scale, 0, 0, 0);
+        Result[7] = float4(clippedFrac, 0, 0, 0);
+        Result[8] = float4(float(totalSamples), 0, 0, 0);
+    }
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Luminance Statistics";
+            desc.effectId = L"Luminance Statistics"; desc.effectVersion = 1;
+            desc.category = L"Analysis";
+            desc.subcategory = L"Statistics";
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hlslSource = luminanceStatsHLSL;
+            desc.dataOnly = true;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"Units",      L"float", 1.0f,    0.0f, 1.0f,    1.0f, { L"Normalized", L"Nits" } },
+                { L"ClipSource", L"float", 1.0f,    0.0f, 1.0f,    1.0f, { L"User Value", L"Working Space" } },
+                { L"ClipNits",   L"float", 203.0f, 10.0f, 10000.0f, 1.0f },
+            };
+            desc.hiddenDefaults = {
+                { L"WsSdrWhiteNits_hidden", 80.0f },
+            };
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                { L"Min",             Graph::AnalysisFieldType::Float },
+                { L"Max",             Graph::AnalysisFieldType::Float },
+                { L"Mean",            Graph::AnalysisFieldType::Float },
+                { L"Median",          Graph::AnalysisFieldType::Float },
+                { L"P95",             Graph::AnalysisFieldType::Float },
+                { L"P99",             Graph::AnalysisFieldType::Float },
+                { L"AvgLog",          Graph::AnalysisFieldType::Float },
+                { L"ClippedFraction", Graph::AnalysisFieldType::Float },
+                { L"Samples",         Graph::AnalysisFieldType::Float },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Chromaticity Statistics ----
+        // ICtCp-domain stats: average and peak chroma, mean hue. Free in
+        // ICtCp and meaningful precisely because Ct/Cp distance is
+        // perceptually uniform — so MeanChroma corresponds to "how
+        // saturated the image looks" in a way no RGB-domain stat does.
+        {
+            static const std::string chromaStatsHLSL = R"HLSL(
+// Chromaticity Statistics - D3D11 Compute Shader
+// All stats computed in BT.2100 ICtCp.
+// Result fields:
+//   [0] MeanCt
+//   [1] MeanCp
+//   [2] MeanChroma   = mean of length(Ct, Cp)
+//   [3] MaxChroma
+//   [4] MeanHueDeg   = degrees from atan2(Cp, Ct), wrapped 0..360
+//   [5] Samples
+
+Texture2D<float4> Source : register(t0);
+RWStructuredBuffer<float4> Result : register(u0);
+
+cbuffer Constants : register(b0)
+{
+    uint Width;
+    uint Height;
+};
+
+#define GROUP_SIZE 32
+#define THREAD_COUNT (GROUP_SIZE * GROUP_SIZE)
+
+groupshared float gs_ct[THREAD_COUNT];
+groupshared float gs_cp[THREAD_COUNT];
+groupshared float gs_chroma[THREAD_COUNT];
+groupshared float gs_chromaMax[THREAD_COUNT];
+groupshared float gs_huex[THREAD_COUNT];   // accumulator for mean-of-angles via unit vectors
+groupshared float gs_huey[THREAD_COUNT];
+groupshared uint  gs_count[THREAD_COUNT];
+
+[numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
+void main(uint3 GTid : SV_GroupThreadID)
+{
+    uint tid = GTid.x + GTid.y * GROUP_SIZE;
+
+    float tCt = 0, tCp = 0;
+    float tChroma = 0;
+    float tChromaMax = 0;
+    float tHx = 0, tHy = 0;
+    uint  tCount = 0;
+
+    for (uint y = GTid.y; y < Height; y += GROUP_SIZE)
+    {
+        for (uint x = GTid.x; x < Width; x += GROUP_SIZE)
+        {
+            float4 pix = Source.Load(int3(x, y, 0));
+            float3 ictcp = ScRGBToICtCp(pix.rgb);
+            float ct = ictcp.y;
+            float cp = ictcp.z;
+            float chroma = sqrt(ct * ct + cp * cp);
+
+            tCt += ct;
+            tCp += cp;
+            tChroma += chroma;
+            tChromaMax = max(tChromaMax, chroma);
+            // Mean of angles via unit-vector sum (the only correct way).
+            if (chroma > 1e-6) {
+                tHx += ct / chroma;
+                tHy += cp / chroma;
+            }
+            tCount++;
+        }
+    }
+
+    gs_ct[tid] = tCt;
+    gs_cp[tid] = tCp;
+    gs_chroma[tid] = tChroma;
+    gs_chromaMax[tid] = tChromaMax;
+    gs_huex[tid] = tHx;
+    gs_huey[tid] = tHy;
+    gs_count[tid] = tCount;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint stride = THREAD_COUNT / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            gs_ct[tid] += gs_ct[tid + stride];
+            gs_cp[tid] += gs_cp[tid + stride];
+            gs_chroma[tid] += gs_chroma[tid + stride];
+            gs_chromaMax[tid] = max(gs_chromaMax[tid], gs_chromaMax[tid + stride]);
+            gs_huex[tid] += gs_huex[tid + stride];
+            gs_huey[tid] += gs_huey[tid + stride];
+            gs_count[tid] += gs_count[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (tid == 0)
+    {
+        uint  N = gs_count[0];
+        float invN = (N > 0) ? (1.0 / float(N)) : 0.0;
+        float meanCt = gs_ct[0] * invN;
+        float meanCp = gs_cp[0] * invN;
+        float meanChroma = gs_chroma[0] * invN;
+        float maxChroma = gs_chromaMax[0];
+
+        float angle = atan2(gs_huey[0], gs_huex[0]);  // radians, [-pi, pi]
+        float deg = degrees(angle);
+        if (deg < 0.0) deg += 360.0;
+
+        Result[0] = float4(meanCt, 0, 0, 0);
+        Result[1] = float4(meanCp, 0, 0, 0);
+        Result[2] = float4(meanChroma, 0, 0, 0);
+        Result[3] = float4(maxChroma, 0, 0, 0);
+        Result[4] = float4(deg, 0, 0, 0);
+        Result[5] = float4(float(N), 0, 0, 0);
+    }
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Chromaticity Statistics";
+            desc.effectId = L"Chromaticity Statistics"; desc.effectVersion = 1;
+            desc.category = L"Analysis";
+            desc.subcategory = L"Statistics";
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hlslSource = colorMath + chromaStatsHLSL;
+            desc.dataOnly = true;
+            desc.inputNames = { L"Source" };
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                { L"MeanCt",     Graph::AnalysisFieldType::Float },
+                { L"MeanCp",     Graph::AnalysisFieldType::Float },
+                { L"MeanChroma", Graph::AnalysisFieldType::Float },
+                { L"MaxChroma",  Graph::AnalysisFieldType::Float },
+                { L"MeanHueDeg", Graph::AnalysisFieldType::Float },
+                { L"Samples",    Graph::AnalysisFieldType::Float },
             };
             m_effects.push_back(std::move(desc));
         }
