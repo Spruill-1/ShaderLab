@@ -126,7 +126,7 @@ Active development centers on **tone-mapping and color-correction effects author
 
 These are critical lessons learned during development. Any AI agent generating or modifying D2D custom effect code **must** account for these:
 
-1. **`uint` cbuffer params DON'T WORK in D2D pixel shaders** — values pack correctly in the constant buffer but the shader never sees updates. Use `float` with threshold comparisons (`> 0.5`, `> 1.5`) instead.
+1. **Typed cbuffer pack (Phase 3+)**: `uint`, `int`, and `bool` cbuffer slots in HLSL are now packed correctly even when the corresponding `PropertyValue` is stored as `float` (the default for enum-style parameters). The `Effects::PackPropertyToCBuffer` helper reflects each cbuffer variable's `D3D_SHADER_VARIABLE_TYPE` and converts via `static_cast<uint32_t>` / `<int32_t>` / `BOOL` before writing. So you *can* declare `uint Mode` in HLSL and use clean `if (Mode == 1)` comparisons. **Pre-Phase-3 historical convention** (still works, used by all existing ShaderLab effects): declare enums as `float` in HLSL with `> 0.5` / `> 1.5` threshold comparisons. New effects can use either; mixing within one effect is fine.
 2. **HLSL compiler with `D3DCOMPILE_WARNINGS_ARE_ERRORS` optimizes out cbuffer variables** not referenced on ALL code paths. Read all cbuffer vars at top of `main()` before any branches.
 3. **D2D custom effects need TWO evaluation passes** for newly created effects — first creates/initializes, second produces correct output. Don't expect correct output on the first frame after creation.
 4. **`RegisterWithInputCount` requires `inputCount >= 1`**. Zero-input source effects must use a hidden dummy bitmap input.

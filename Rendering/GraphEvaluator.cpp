@@ -1957,24 +1957,23 @@ namespace ShaderLab::Rendering
                                 auto it = node.properties.find(name);
                                 if (it != node.properties.end())
                                 {
-                                    // Check reflection type to handle float→uint conversion.
                                     auto* typeInfo = var->GetType();
                                     D3D11_SHADER_TYPE_DESC typeDesc{};
-                                    bool isUintVar = false;
+                                    D3D_SHADER_VARIABLE_TYPE hlslType = D3D_SVT_FLOAT;
+                                    UINT cols = 1;
                                     if (typeInfo && SUCCEEDED(typeInfo->GetDesc(&typeDesc)))
-                                        isUintVar = (typeDesc.Type == D3D_SVT_UINT || typeDesc.Type == D3D_SVT_INT);
-
-                                    if (auto* f = std::get_if<float>(&it->second))
                                     {
-                                        if (isUintVar) {
-                                            uint32_t u = static_cast<uint32_t>(*f);
-                                            memcpy(cb + varDesc.StartOffset, &u, 4);
-                                        } else {
-                                            memcpy(cb + varDesc.StartOffset, f, 4);
-                                        }
+                                        hlslType = typeDesc.Type;
+                                        cols = typeDesc.Columns;
                                     }
-                                    else if (auto* u = std::get_if<uint32_t>(&it->second))
-                                        memcpy(cb + varDesc.StartOffset, u, 4);
+                                    // Typed pack (Phase 3): converts float
+                                    // PropertyValue -> uint/int/bool slot per
+                                    // the declared HLSL cbuffer type.
+                                    uint32_t remaining = (varDesc.StartOffset < cbDesc2.Size)
+                                        ? (cbDesc2.Size - varDesc.StartOffset) : 0u;
+                                    ShaderLab::Effects::PackPropertyToCBuffer(
+                                        cb + varDesc.StartOffset, remaining,
+                                        hlslType, cols, it->second);
                                 }
                             }
                         }

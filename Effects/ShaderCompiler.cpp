@@ -1,5 +1,6 @@
 #include "pch_engine.h"
 #include "ShaderCompiler.h"
+#include "../Graph/PropertyValue.h"
 
 namespace ShaderLab::Effects
 {
@@ -182,5 +183,122 @@ namespace ShaderLab::Effects
             return Reflect(blob.get());
         }
         return result;
+    }
+
+    // ----- Typed PropertyValue -> cbuffer pack ---------------------------------
+
+    namespace
+    {
+        // Convert a float source value to the HLSL slot type and write it.
+        // Returns the bytes written.
+        uint32_t WriteScalarConverted(BYTE* dest, uint32_t remaining,
+            D3D_SHADER_VARIABLE_TYPE hlslType, float src)
+        {
+            switch (hlslType)
+            {
+            case D3D_SVT_UINT:
+            {
+                if (remaining < sizeof(uint32_t)) return 0;
+                uint32_t u = static_cast<uint32_t>(src);
+                memcpy(dest, &u, sizeof(uint32_t));
+                return sizeof(uint32_t);
+            }
+            case D3D_SVT_INT:
+            {
+                if (remaining < sizeof(int32_t)) return 0;
+                int32_t i = static_cast<int32_t>(src);
+                memcpy(dest, &i, sizeof(int32_t));
+                return sizeof(int32_t);
+            }
+            case D3D_SVT_BOOL:
+            {
+                if (remaining < sizeof(BOOL)) return 0;
+                BOOL b = (src > 0.5f) ? TRUE : FALSE;
+                memcpy(dest, &b, sizeof(BOOL));
+                return sizeof(BOOL);
+            }
+            case D3D_SVT_FLOAT:
+            default:
+                if (remaining < sizeof(float)) return 0;
+                memcpy(dest, &src, sizeof(float));
+                return sizeof(float);
+            }
+        }
+    }
+
+    bool PackPropertyToCBuffer(BYTE* dest, uint32_t remaining,
+        D3D_SHADER_VARIABLE_TYPE hlslType, uint32_t hlslColumns,
+        const Graph::PropertyValue& value)
+    {
+        if (!dest || remaining == 0) return false;
+        if (hlslColumns == 0) hlslColumns = 1;
+
+        return std::visit([dest, remaining, hlslType, hlslColumns](auto&& v) -> bool
+        {
+            using T = std::decay_t<decltype(v)>;
+            using namespace winrt::Windows::Foundation::Numerics;
+
+            // Scalars (single-column slots): convert through float for
+            // float/int/uint/bool slot types so the property's stored
+            // representation doesn't dictate the bytes written. Vector
+            // slot types receive scalar-broadcast in the .x component
+            // only — matching the prior behavior (no broadcast was done).
+            if constexpr (std::is_same_v<T, float>)
+            {
+                return WriteScalarConverted(dest, remaining, hlslType, v) > 0;
+            }
+            else if constexpr (std::is_same_v<T, int32_t>)
+            {
+                return WriteScalarConverted(dest, remaining, hlslType,
+                    static_cast<float>(v)) > 0;
+            }
+            else if constexpr (std::is_same_v<T, uint32_t>)
+            {
+                // uint property: if the slot is also uint/int, write the
+                // raw value (don't lose precision via float). If the slot
+                // is float, convert.
+                if (hlslType == D3D_SVT_UINT || hlslType == D3D_SVT_INT)
+                {
+                    if (remaining < sizeof(uint32_t)) return false;
+                    memcpy(dest, &v, sizeof(uint32_t));
+                    return true;
+                }
+                return WriteScalarConverted(dest, remaining, hlslType,
+                    static_cast<float>(v)) > 0;
+            }
+            else if constexpr (std::is_same_v<T, bool>)
+            {
+                return WriteScalarConverted(dest, remaining, hlslType,
+                    v ? 1.0f : 0.0f) > 0;
+            }
+            else if constexpr (std::is_same_v<T, float2>)
+            {
+                if (remaining < sizeof(float) * 2) return false;
+                memcpy(dest, &v.x, sizeof(float));
+                memcpy(dest + sizeof(float), &v.y, sizeof(float));
+                return true;
+            }
+            else if constexpr (std::is_same_v<T, float3>)
+            {
+                if (remaining < sizeof(float) * 3) return false;
+                memcpy(dest, &v.x, sizeof(float));
+                memcpy(dest + sizeof(float), &v.y, sizeof(float));
+                memcpy(dest + sizeof(float) * 2, &v.z, sizeof(float));
+                return true;
+            }
+            else if constexpr (std::is_same_v<T, float4>)
+            {
+                if (remaining < sizeof(float) * 4) return false;
+                memcpy(dest, &v.x, sizeof(float));
+                memcpy(dest + sizeof(float), &v.y, sizeof(float));
+                memcpy(dest + sizeof(float) * 2, &v.z, sizeof(float));
+                memcpy(dest + sizeof(float) * 3, &v.w, sizeof(float));
+                return true;
+            }
+            // std::wstring / matrix / vector<float>: not packable as a
+            // simple cbuffer slot. Caller handles array bindings via
+            // separate paths.
+            return false;
+        }, value);
     }
 }
