@@ -122,3 +122,7 @@ jobs:
             exit $LASTEXITCODE
           }
 
+      - name: Run headless smoke
+        shell: pwsh
+        run: .\Tests\RunHeadlessSmoke.ps1 -Configuration Debug -Platform x64
+

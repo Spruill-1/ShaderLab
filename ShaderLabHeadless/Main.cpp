@@ -1,0 +1,444 @@
+// ShaderLabHeadless — console host for the ShaderLab engine
+// ============================================================
+//
+// Render any node of an .effectgraph (JSON) to a PNG file with no
+// SwapChainPanel / WinUI dependency. Phase 7 deliverable. The Phase 7
+// spike (Tests/TestRunner.cpp::TestHeadlessReadback, commit 9f14401)
+// proved a single ID3D11Device + ID2D1DeviceContext is enough to
+// evaluate a graph and read pixels back; this binary packages that
+// capability as a CLI so the empirical fidelity loop (Working Space +
+// Delta E + Luminance Statistics) can run without a logged-in user.
+//
+// Usage:
+//     ShaderLabHeadless --graph PATH --node ID --output PNG_PATH [options]
+//
+// Required arguments:
+//     --graph PATH    .effectgraph JSON file (zip/embedded media not yet supported)
+//     --node ID       Numeric node id from the graph to render
+//     --output PATH   PNG output path
+//
+// Options:
+//     --width N       Output width in pixels (default: 1024)
+//     --height N      Output height in pixels (default: 1024)
+//     --adapter X     'warp' or 'default' (default: 'default'; CI uses warp)
+//     --port N        MCP port (reserved for the full Phase 7 MCP migration; not yet active)
+//
+// Exit code: 0 on success, non-zero on any failure.
+//
+// **Not yet implemented (queued for future work):**
+//   * .effectgraph zip archives with embedded media (only plain JSON for v1)
+//   * MCP HTTP server (the full move from MainWindow.McpRoutes.cpp is queued)
+//   * --script JSON file for batch parameter sweeps
+//   * HDR-preserving JXR output (PNG truncates above 1.0 scRGB)
+//
+// What it DOES prove: the engine, graph evaluator, custom-effect cache,
+// and pixel readback path all work without any UI thread or swap chain.
+
+#include "pch_engine.h"
+#include "EngineExport.h"
+#include "Graph/EffectGraph.h"
+#include "Rendering/GraphEvaluator.h"
+#include "Effects/EffectRegistry.h"
+#include "Effects/SourceNodeFactory.h"
+#include "Effects/ShaderLabEffects.h"
+
+#include <wincodec.h>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
+
+namespace
+{
+    struct Args
+    {
+        std::wstring graphPath;
+        uint32_t     nodeId{ 0 };
+        bool         hasNodeId{ false };
+        std::wstring outputPath;
+        uint32_t     width{ 1024 };
+        uint32_t     height{ 1024 };
+        bool         useWarp{ false };
+        uint16_t     mcpPort{ 47809 };  // q-p7-mcp-port-conflict default
+    };
+
+    void PrintUsage(const wchar_t* exeName)
+    {
+        std::wprintf(
+L"Usage: %ls --graph PATH --node ID --output PNG_PATH [options]\n"
+L"\n"
+L"Required:\n"
+L"  --graph PATH    .effectgraph JSON file\n"
+L"  --node ID       Numeric node id to render\n"
+L"  --output PATH   PNG output path\n"
+L"\n"
+L"Options:\n"
+L"  --width N       Output width (default: 1024)\n"
+L"  --height N      Output height (default: 1024)\n"
+L"  --adapter X     'warp' or 'default' (default: default)\n"
+L"  --port N        Reserved for MCP server (default: 47809)\n",
+            exeName);
+    }
+
+    // Bare-bones argv parsing. Each flag takes one positional argument.
+    // Unknown flags fail closed with a usage hint so typos don't silently
+    // produce wrong output.
+    bool ParseArgs(int argc, wchar_t* argv[], Args& out)
+    {
+        for (int i = 1; i < argc; ++i)
+        {
+            std::wstring_view a = argv[i];
+            auto needNext = [&](const wchar_t* name) -> wchar_t* {
+                if (i + 1 >= argc) {
+                    std::wprintf(L"ERROR: %ls requires an argument\n", name);
+                    return nullptr;
+                }
+                return argv[++i];
+            };
+            if (a == L"--graph")        { auto v = needNext(L"--graph"); if (!v) return false; out.graphPath = v; }
+            else if (a == L"--node")    { auto v = needNext(L"--node"); if (!v) return false; out.nodeId = static_cast<uint32_t>(std::wcstoul(v, nullptr, 10)); out.hasNodeId = true; }
+            else if (a == L"--output")  { auto v = needNext(L"--output"); if (!v) return false; out.outputPath = v; }
+            else if (a == L"--width")   { auto v = needNext(L"--width"); if (!v) return false; out.width = static_cast<uint32_t>(std::wcstoul(v, nullptr, 10)); }
+            else if (a == L"--height")  { auto v = needNext(L"--height"); if (!v) return false; out.height = static_cast<uint32_t>(std::wcstoul(v, nullptr, 10)); }
+            else if (a == L"--adapter") { auto v = needNext(L"--adapter"); if (!v) return false; out.useWarp = (std::wstring_view{v} == L"warp"); }
+            else if (a == L"--port")    { auto v = needNext(L"--port"); if (!v) return false; out.mcpPort = static_cast<uint16_t>(std::wcstoul(v, nullptr, 10)); }
+            else if (a == L"--help" || a == L"-h" || a == L"-?") { PrintUsage(argv[0]); return false; }
+            else { std::wprintf(L"ERROR: unknown argument '%ls'\n", argv[i]); return false; }
+        }
+        if (out.graphPath.empty() || out.outputPath.empty() || !out.hasNodeId)
+        {
+            std::wprintf(L"ERROR: --graph, --node, and --output are required\n");
+            return false;
+        }
+        return true;
+    }
+
+    // Read entire file into a string. Returns empty string on failure
+    // (caller checks). Strips a leading UTF-8 BOM if present so the JSON
+    // parser doesn't fail on it; .effectgraph files saved by the GUI app
+    // start with a BOM.
+    std::string ReadFileUtf8(const std::wstring& path)
+    {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return {};
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        std::string s = ss.str();
+        if (s.size() >= 3 &&
+            static_cast<uint8_t>(s[0]) == 0xEF &&
+            static_cast<uint8_t>(s[1]) == 0xBB &&
+            static_cast<uint8_t>(s[2]) == 0xBF)
+        {
+            s.erase(0, 3);
+        }
+        return s;
+    }
+
+    // Encode an FP32 RGBA buffer as PNG via WIC. PNG is 8-bit per channel;
+    // values are gamma-encoded sRGB after a clamp to [0, 1]. This is lossy
+    // for HDR scRGB output (anything above 1.0 saturates to 255). For HDR
+    // fidelity, switch to JXR (D2D's native FP16 path) -- queued.
+    HRESULT SaveFp32AsPng(IWICImagingFactory* wic,
+        const float* rgba, uint32_t w, uint32_t h, uint32_t pitchBytes,
+        const std::wstring& path)
+    {
+        // Convert FP32 RGBA to sRGB-gamma 8-bit BGRA.
+        std::vector<uint8_t> bgra(static_cast<size_t>(w) * h * 4);
+        auto sRgbEncode = [](float c) -> uint8_t {
+            float clamped = c < 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
+            float enc = (clamped <= 0.0031308f)
+                ? clamped * 12.92f
+                : 1.055f * std::pow(clamped, 1.0f / 2.4f) - 0.055f;
+            int v = static_cast<int>(enc * 255.0f + 0.5f);
+            return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+        };
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            const float* srcRow = reinterpret_cast<const float*>(
+                reinterpret_cast<const uint8_t*>(rgba) + y * pitchBytes);
+            uint8_t* dstRow = bgra.data() + y * w * 4;
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                const float* px = srcRow + x * 4;
+                dstRow[x * 4 + 0] = sRgbEncode(px[2]); // B
+                dstRow[x * 4 + 1] = sRgbEncode(px[1]); // G
+                dstRow[x * 4 + 2] = sRgbEncode(px[0]); // R
+                dstRow[x * 4 + 3] = static_cast<uint8_t>(
+                    px[3] < 0.0f ? 0 : (px[3] > 1.0f ? 255 : static_cast<int>(px[3] * 255.0f + 0.5f)));
+            }
+        }
+
+        winrt::com_ptr<IWICStream> stream;
+        HRESULT hr = wic->CreateStream(stream.put());
+        if (FAILED(hr)) return hr;
+        hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+        if (FAILED(hr)) return hr;
+
+        winrt::com_ptr<IWICBitmapEncoder> encoder;
+        hr = wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.put());
+        if (FAILED(hr)) return hr;
+        hr = encoder->Initialize(stream.get(), WICBitmapEncoderNoCache);
+        if (FAILED(hr)) return hr;
+
+        winrt::com_ptr<IWICBitmapFrameEncode> frame;
+        hr = encoder->CreateNewFrame(frame.put(), nullptr);
+        if (FAILED(hr)) return hr;
+        hr = frame->Initialize(nullptr);
+        if (FAILED(hr)) return hr;
+        hr = frame->SetSize(w, h);
+        if (FAILED(hr)) return hr;
+        WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+        hr = frame->SetPixelFormat(&fmt);
+        if (FAILED(hr)) return hr;
+        hr = frame->WritePixels(h, w * 4, w * h * 4, bgra.data());
+        if (FAILED(hr)) return hr;
+        hr = frame->Commit();
+        if (FAILED(hr)) return hr;
+        return encoder->Commit();
+    }
+}
+
+int wmain(int argc, wchar_t* argv[]);
+
+// Render path extracted into a function so all locals (D2D bitmaps,
+// GraphEvaluator, com_ptrs) destruct cleanly before wmain calls
+// MFShutdown / uninit_apartment. The dangling order otherwise produced
+// hangs on D2D device teardown.
+int RunRender(const Args& args)
+{
+    UINT d3dFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    winrt::com_ptr<ID3D11Device> baseDevice;
+    winrt::com_ptr<ID3D11DeviceContext> baseCtx;
+    HRESULT hr = D3D11CreateDevice(nullptr,
+        args.useWarp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE,
+        nullptr, d3dFlags,
+        featureLevels, ARRAYSIZE(featureLevels),
+        D3D11_SDK_VERSION, baseDevice.put(), nullptr, baseCtx.put());
+    if (FAILED(hr)) {
+        std::wprintf(L"FATAL: D3D11CreateDevice failed 0x%08X\n", static_cast<uint32_t>(hr));
+        return 3;
+    }
+    auto d3dDevice = baseDevice.as<ID3D11Device5>();
+    auto d3dContext = baseCtx.as<ID3D11DeviceContext4>();
+
+    // Match the test runner: enable D3D10 multithread protection so any
+    // background-thread DXVA2 work the engine might spin up doesn't crash.
+    winrt::com_ptr<ID3D10Multithread> mt;
+    d3dDevice.as(mt);
+    if (mt) mt->SetMultithreadProtected(TRUE);
+
+    winrt::com_ptr<ID2D1Factory7> d2dFactory;
+    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        __uuidof(ID2D1Factory7), reinterpret_cast<void**>(d2dFactory.put()));
+
+    winrt::com_ptr<IDXGIDevice> dxgiDev;
+    baseDevice->QueryInterface(dxgiDev.put());
+    winrt::com_ptr<ID2D1Device6> d2dDevice;
+    d2dFactory->CreateDevice(dxgiDev.as<IDXGIDevice>().get(),
+        reinterpret_cast<ID2D1Device**>(d2dDevice.put()));
+    winrt::com_ptr<ID2D1DeviceContext5> dc;
+    d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+        reinterpret_cast<ID2D1DeviceContext**>(dc.put()));
+
+    // Register custom effect classes with the D2D factory (CustomPixelShader,
+    // CustomComputeShader, StatisticsEffect). Without this, custom-effect
+    // nodes in the graph fail to instantiate.
+    winrt::com_ptr<ID2D1Factory1> factory1;
+    d2dFactory->QueryInterface(factory1.put());
+    ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
+
+    // ---- Load the graph ----------------------------------------------------
+    auto graphJson = ReadFileUtf8(args.graphPath);
+    if (graphJson.empty()) {
+        std::wprintf(L"FATAL: could not read graph file '%ls'\n", args.graphPath.c_str());
+        return 4;
+    }
+    // Convert UTF-8 to UTF-16 for FromJson (winrt::hstring).
+    int wcCount = MultiByteToWideChar(CP_UTF8, 0, graphJson.data(),
+        static_cast<int>(graphJson.size()), nullptr, 0);
+    std::wstring graphJsonW(wcCount, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, graphJson.data(),
+        static_cast<int>(graphJson.size()), graphJsonW.data(), wcCount);
+
+    ShaderLab::Graph::EffectGraph graph;
+    try {
+        graph = ShaderLab::Graph::EffectGraph::FromJson(winrt::hstring(graphJsonW));
+    } catch (winrt::hresult_error const& e) {
+        std::wprintf(L"FATAL: graph JSON parse failed (0x%08X): %ls\n",
+            static_cast<uint32_t>(e.code()), e.message().c_str());
+        return 5;
+    }
+
+    if (!graph.FindNode(args.nodeId)) {
+        std::wprintf(L"FATAL: node id %u not found in graph\n", args.nodeId);
+        return 6;
+    }
+
+    // ---- Evaluate the graph (long-lived evaluator!) ------------------------
+    // The evaluator owns the per-node ID2D1Effect cache; each node's
+    // cachedOutput is a non-owning pointer into that cache. Keep it alive
+    // until after readback. (See Phase 7 spike for the lifetime gotcha.)
+    ShaderLab::Effects::SourceNodeFactory sourceFactory;
+    ShaderLab::Rendering::GraphEvaluator evaluator;
+
+    graph.MarkAllDirty();
+    for (auto& node : const_cast<std::vector<ShaderLab::Graph::EffectNode>&>(graph.Nodes()))
+    {
+        if (node.type == ShaderLab::Graph::NodeType::Source)
+        {
+            try {
+                sourceFactory.PrepareSourceNode(node, dc.get(), 0.0,
+                    d3dDevice.get(), d3dContext.get());
+            } catch (...) {
+                // Source prep can fail (missing media, etc); the evaluator
+                // will report cachedOutput=nullptr below if so.
+            }
+        }
+    }
+    // Two-pass evaluate: the second pass picks up any effects that needed
+    // the first pass to instantiate. Mirrors the pattern in the test runner
+    // and in MainWindow::RenderFrame.
+    evaluator.Evaluate(graph, dc.get());
+    evaluator.Evaluate(graph, dc.get());
+
+    auto* node = graph.FindNode(args.nodeId);
+    if (!node->cachedOutput) {
+        std::wprintf(L"FATAL: node %u has no cachedOutput after evaluate (missing inputs or eval error)\n", args.nodeId);
+        if (!node->runtimeError.empty()) {
+            std::wprintf(L"        node.runtimeError = %ls\n", node->runtimeError.c_str());
+        }
+        return 7;
+    }
+
+    // ---- Render to FP32 target + readback ----------------------------------
+    D2D1_BITMAP_PROPERTIES1 targetProps{};
+    targetProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+    targetProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+    targetProps.dpiX = 96.0f;
+    targetProps.dpiY = 96.0f;
+    winrt::com_ptr<ID2D1Bitmap1> target;
+    hr = dc->CreateBitmap(D2D1::SizeU(args.width, args.height),
+        nullptr, 0, targetProps, target.put());
+    if (FAILED(hr)) {
+        std::wprintf(L"FATAL: CreateBitmap (target) failed 0x%08X\n", static_cast<uint32_t>(hr));
+        return 8;
+    }
+
+    D2D1_BITMAP_PROPERTIES1 stagingProps = targetProps;
+    stagingProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+    winrt::com_ptr<ID2D1Bitmap1> staging;
+    hr = dc->CreateBitmap(D2D1::SizeU(args.width, args.height),
+        nullptr, 0, stagingProps, staging.put());
+    if (FAILED(hr)) {
+        std::wprintf(L"FATAL: CreateBitmap (staging) failed 0x%08X\n", static_cast<uint32_t>(hr));
+        return 9;
+    }
+
+    float oldDpiX, oldDpiY;
+    dc->GetDpi(&oldDpiX, &oldDpiY);
+    dc->SetDpi(96.0f, 96.0f);
+    dc->SetTarget(target.get());
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+    dc->DrawImage(node->cachedOutput);
+    hr = dc->EndDraw();
+    dc->SetTarget(nullptr);
+    dc->SetDpi(oldDpiX, oldDpiY);
+    if (FAILED(hr)) {
+        std::wprintf(L"FATAL: D2D EndDraw failed 0x%08X\n", static_cast<uint32_t>(hr));
+        return 10;
+    }
+
+    D2D1_POINT_2U dstPt = { 0, 0 };
+    D2D1_RECT_U srcRect = { 0, 0, args.width, args.height };
+    hr = staging->CopyFromBitmap(&dstPt, target.get(), &srcRect);
+    if (FAILED(hr)) {
+        std::wprintf(L"FATAL: CopyFromBitmap failed 0x%08X\n", static_cast<uint32_t>(hr));
+        return 11;
+    }
+
+    D2D1_MAPPED_RECT mapped{};
+    hr = staging->Map(D2D1_MAP_OPTIONS_READ, &mapped);
+    if (FAILED(hr)) {
+        std::wprintf(L"FATAL: Map staging failed 0x%08X\n", static_cast<uint32_t>(hr));
+        return 12;
+    }
+
+    // ---- Encode PNG via WIC ------------------------------------------------
+    winrt::com_ptr<IWICImagingFactory> wic;
+    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(wic.put()));
+    if (FAILED(hr)) {
+        std::wprintf(L"FATAL: WIC factory failed 0x%08X\n", static_cast<uint32_t>(hr));
+        staging->Unmap();
+        return 13;
+    }
+
+    hr = SaveFp32AsPng(wic.get(),
+        reinterpret_cast<const float*>(mapped.bits),
+        args.width, args.height, mapped.pitch,
+        args.outputPath);
+    staging->Unmap();
+    if (FAILED(hr)) {
+        std::wprintf(L"FATAL: SaveFp32AsPng failed 0x%08X\n", static_cast<uint32_t>(hr));
+        return 14;
+    }
+
+    std::wprintf(L"OK: rendered node %u (%ux%u) -> %ls\n",
+        args.nodeId, args.width, args.height, args.outputPath.c_str());
+
+    // Explicit teardown order: drop the D2D/D3D resources before
+    // ::MFShutdown / uninit_apartment so the destructors don't race
+    // shutdown. Symptom that motivated this: the process hung after the
+    // OK print on first runs.
+    staging = nullptr;
+    target = nullptr;
+    wic = nullptr;
+    dc = nullptr;
+    d2dDevice = nullptr;
+    dxgiDev = nullptr;
+    d2dFactory = nullptr;
+    factory1 = nullptr;
+    d3dContext = nullptr;
+    d3dDevice = nullptr;
+    mt = nullptr;
+    baseCtx = nullptr;
+    baseDevice = nullptr;
+    return 0;
+}
+
+int wmain(int argc, wchar_t* argv[])
+{
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
+    std::wprintf(L"ShaderLabHeadless (engine ABI %u)\n",
+        static_cast<unsigned>(::ShaderLab_GetAbiVersion()));
+
+    Args args;
+    if (!ParseArgs(argc, argv, args)) {
+        if (argc <= 1) PrintUsage(argv[0]);
+        return 1;
+    }
+
+    if (::ShaderLab_GetAbiVersion() != SHADERLAB_ENGINE_ABI_VERSION) {
+        std::wprintf(L"FATAL: engine ABI mismatch (header %u, DLL %u)\n",
+            static_cast<unsigned>(SHADERLAB_ENGINE_ABI_VERSION),
+            static_cast<unsigned>(::ShaderLab_GetAbiVersion()));
+        return 2;
+    }
+
+    winrt::init_apartment();
+    ::MFStartup(MF_VERSION);
+
+    // Run all engine work inside an inner scope so the GraphEvaluator
+    // and other engine objects destruct before MFShutdown / apartment
+    // teardown. (GraphEvaluator owns com_ptrs to D2D effects that need
+    // the factory alive at destruction time.)
+    int rc = RunRender(args);
+
+    ::MFShutdown();
+    winrt::uninit_apartment();
+    return rc;
+}
