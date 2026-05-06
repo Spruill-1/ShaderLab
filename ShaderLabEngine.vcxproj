@@ -118,6 +118,7 @@
     <ClInclude Include="Rendering\MathExpression.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
     <ClInclude Include="Rendering\CaptureNode.h" />
+    <ClInclude Include="Rendering\WorkingSpaceSync.h" />
     <ClInclude Include="Rendering\PixelReadback.h" />
     <ClInclude Include="Effects\CustomComputeShaderEffect.h" />
     <ClInclude Include="Effects\CustomPixelShaderEffect.h" />
@@ -143,6 +144,7 @@
     <ClCompile Include="Rendering\GraphEvaluator.cpp" />
     <ClCompile Include="Rendering\IccProfileParser.cpp" />
     <ClCompile Include="Rendering\CaptureNode.cpp" />
+    <ClCompile Include="Rendering\WorkingSpaceSync.cpp" />
     <ClCompile Include="Rendering\PixelReadback.cpp" />
     <ClCompile Include="Rendering\EffectGraphFile.cpp" />
     <ClCompile Include="Rendering\MathExpression.cpp">

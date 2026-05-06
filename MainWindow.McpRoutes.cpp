@@ -162,6 +162,12 @@ namespace winrt::ShaderLab::implementation
             ctx.d3dContext = window->m_renderEngine.D3DContext();
             ctx.renderFrame = [this]() { window->RenderFrame(); };
             ctx.getPreviewNodeId = [this]() -> uint32_t { return window->m_previewNodeId; };
+            ctx.getLoadedIccProfile = [this]() -> std::optional<::ShaderLab::Rendering::DisplayProfile> {
+                return window->m_loadedIccProfile;
+            };
+            ctx.setLoadedIccProfile = [this](const ::ShaderLab::Rendering::DisplayProfile& p) {
+                window->m_loadedIccProfile = p;
+            };
             return closure(ctx);
         });
     }
@@ -233,6 +239,18 @@ namespace winrt::ShaderLab::implementation
         window->m_nodeGraphController.RebuildLayout();
         window->PopulateAddNodeFlyout();
         window->m_forceRender = true;
+    }
+
+    void MainWindow::GuiEngineCommandSink::OnDisplayProfileChanged()
+    {
+        // MCP-driven profile change. Mirror what ApplyDisplayProfile /
+        // RevertToLiveDisplay do in the GUI's native paths so the
+        // status bar, profile dropdown, and frame state stay in sync.
+        // (Working Space nodes were already refreshed engine-side
+        // inside the route closure before this hook fired.)
+        window->m_graph.MarkAllDirty();
+        window->m_forceRender = true;
+        window->UpdateStatusBar();
     }
 
     void MainWindow::SetupMcpRoutes()
@@ -906,195 +924,12 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // GET /display/profiles  — All built-in presets + the active profile
+        // /display/profiles, /display/profile, /display/profile/clear
+        // -- moved to Engine/Mcp/EngineMcpRoutes.cpp (Phase 7).
+        //    Uses Rendering::UpdateWorkingSpaceNodes engine helper and
+        //    fires OnDisplayProfileChanged so the GUI keeps the status
+        //    bar / profile selector / dirty state in sync.
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/display/profiles", [this](const std::wstring&, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                using namespace ::ShaderLab::Rendering;
-
-                auto serializeProfile = [](const DisplayProfile& p) {
-                    return std::format(
-                        "{{\"name\":\"{}\",\"hdrEnabled\":{},\"bitsPerColor\":{}"
-                        ",\"sdrWhiteNits\":{:.2f},\"peakNits\":{:.2f}"
-                        ",\"minNits\":{:.4f},\"maxFullFrameNits\":{:.2f}"
-                        ",\"gamut\":\"{}\",\"isSimulated\":{}"
-                        ",\"primaryRed\":[{:.4f},{:.4f}]"
-                        ",\"primaryGreen\":[{:.4f},{:.4f}]"
-                        ",\"primaryBlue\":[{:.4f},{:.4f}]"
-                        ",\"whitePoint\":[{:.4f},{:.4f}]}}",
-                        JsonEscape(p.profileName),
-                        p.caps.hdrEnabled ? "true" : "false",
-                        p.caps.bitsPerColor,
-                        p.caps.sdrWhiteLevelNits, p.caps.maxLuminanceNits,
-                        p.caps.minLuminanceNits, p.caps.maxFullFrameLuminanceNits,
-                        JsonEscape(GamutIdToString(p.gamut)),
-                        p.isSimulated ? "true" : "false",
-                        p.primaryRed.x, p.primaryRed.y,
-                        p.primaryGreen.x, p.primaryGreen.y,
-                        p.primaryBlue.x, p.primaryBlue.y,
-                        p.whitePoint.x, p.whitePoint.y);
-                };
-
-                std::string json = "{\"presets\":[";
-                for (size_t i = 0; i < m_displayPresets.size(); ++i)
-                {
-                    if (i) json += ",";
-                    json += "{\"index\":" + std::to_string(i) + ",\"profile\":";
-                    json += serializeProfile(m_displayPresets[i]);
-                    json += "}";
-                }
-                json += "],\"active\":" + serializeProfile(m_displayMonitor.ActiveProfile());
-                json += ",\"live\":" + serializeProfile(m_displayMonitor.LiveProfile());
-                json += ",\"isSimulated\":";
-                json += (m_displayMonitor.IsSimulated() ? "true" : "false");
-                if (m_loadedIccProfile.has_value())
-                {
-                    json += ",\"loadedIcc\":" + serializeProfile(m_loadedIccProfile.value());
-                }
-                json += "}";
-                return { 200, json };
-            });
-        });
-
-        // =====================================================================
-        // POST /display/profile  — Apply a simulated profile
-        // Body: exactly one of:
-        //   {"preset":"PresetP3_1000"}
-        //   {"presetIndex":3}
-        //   {"iccPath":"C:\\path\\to\\file.icc"}
-        //   {"custom":{name?, hdrEnabled?, sdrWhiteNits?, peakNits, minNits?,
-        //              maxFullFrameNits?, primaryRed[2], primaryGreen[2],
-        //              primaryBlue[2], whitePoint[2], gamut?}}
-        // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/display/profile", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                using namespace ::ShaderLab::Rendering;
-                namespace WDJ = winrt::Windows::Data::Json;
-
-                WDJ::JsonObject jo{ nullptr };
-                if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
-                    return { 400, R"({"error":"Invalid JSON body"})" };
-
-                // Mutex check: exactly one source.
-                int count = 0;
-                if (jo.HasKey(L"preset"))      ++count;
-                if (jo.HasKey(L"presetIndex")) ++count;
-                if (jo.HasKey(L"iccPath"))     ++count;
-                if (jo.HasKey(L"custom"))      ++count;
-                if (count != 1)
-                    return { 400, R"({"error":"Specify exactly one of: preset, presetIndex, iccPath, custom"})" };
-
-                std::optional<DisplayProfile> chosen;
-
-                // ---- preset by name (factory function name) ----
-                if (jo.HasKey(L"preset"))
-                {
-                    auto name = std::wstring(jo.GetNamedString(L"preset"));
-                    DisplayProfile p{};
-                    if      (name == L"PresetSrgbSdr"     || name == L"sRGB SDR (80 nits)")              p = PresetSrgbSdr();
-                    else if (name == L"PresetSrgb270"     || name == L"sRGB SDR (270 nits, typical laptop)") p = PresetSrgb270();
-                    else if (name == L"PresetAdobeRGB"    || name == L"Adobe RGB (1998)")                p = PresetAdobeRGB();
-                    else if (name == L"PresetP3_600"      || name == L"DCI-P3 HDR (600 nits, MacBook Pro-class)") p = PresetP3_600();
-                    else if (name == L"PresetP3_1000"     || name == L"DCI-P3 HDR (1000 nits, reference monitor)") p = PresetP3_1000();
-                    else if (name == L"PresetBT2020_1000" || name == L"BT.2020 HDR (1000 nits, HDR TV)")  p = PresetBT2020_1000();
-                    else if (name == L"PresetBT2020_4000" || name == L"BT.2020 HDR (4000 nits, mastering)") p = PresetBT2020_4000();
-                    else
-                        return { 400, std::format(R"({{"error":"Unknown preset: {}"}})", JsonEscape(name)) };
-                    chosen = p;
-                }
-                else if (jo.HasKey(L"presetIndex"))
-                {
-                    auto idx = static_cast<size_t>(jo.GetNamedNumber(L"presetIndex"));
-                    if (idx >= m_displayPresets.size())
-                        return { 400, std::format("{{\"error\":\"presetIndex out of range (0-{})\"}}",
-                            m_displayPresets.size() - 1) };
-                    chosen = m_displayPresets[idx];
-                }
-                else if (jo.HasKey(L"iccPath"))
-                {
-                    auto path = std::wstring(jo.GetNamedString(L"iccPath"));
-                    if (!std::filesystem::exists(path))
-                        return { 400, std::format(R"({{"error":"ICC file not found: {}"}})", JsonEscape(path)) };
-                    auto parsed = IccProfileParser::LoadFromFile(path);
-                    if (!parsed.has_value() || !parsed->valid)
-                        return { 400, std::format(R"({{"error":"Failed to parse ICC profile: {}"}})", JsonEscape(path)) };
-                    chosen = DisplayProfileFromIcc(parsed.value());
-                    m_loadedIccProfile = chosen;
-                }
-                else // custom
-                {
-                    auto co = jo.GetNamedObject(L"custom");
-                    DisplayProfile p{};
-                    p.isSimulated = true;
-
-                    if (co.HasKey(L"name"))
-                        p.profileName = std::wstring(co.GetNamedString(L"name"));
-                    else
-                        p.profileName = L"Custom MCP profile";
-
-                    p.caps.hdrEnabled = co.HasKey(L"hdrEnabled") && co.GetNamedBoolean(L"hdrEnabled");
-                    p.caps.colorSpace = p.caps.hdrEnabled
-                        ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-                        : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-                    p.caps.bitsPerColor = p.caps.hdrEnabled ? 10 : 8;
-                    p.caps.sdrWhiteLevelNits     = co.HasKey(L"sdrWhiteNits")     ? static_cast<float>(co.GetNamedNumber(L"sdrWhiteNits"))     : (p.caps.hdrEnabled ? 203.0f : 80.0f);
-                    if (!co.HasKey(L"peakNits"))
-                        return { 400, R"({"error":"custom profile requires 'peakNits'"})" };
-                    p.caps.maxLuminanceNits      = static_cast<float>(co.GetNamedNumber(L"peakNits"));
-                    p.caps.minLuminanceNits      = co.HasKey(L"minNits")          ? static_cast<float>(co.GetNamedNumber(L"minNits"))          : 0.5f;
-                    p.caps.maxFullFrameLuminanceNits = co.HasKey(L"maxFullFrameNits") ? static_cast<float>(co.GetNamedNumber(L"maxFullFrameNits")) : p.caps.maxLuminanceNits;
-
-                    auto readChroma = [&](const wchar_t* key, ChromaticityXY& dst) -> bool {
-                        if (!co.HasKey(key)) return true; // default already set
-                        auto arr = co.GetNamedArray(key);
-                        if (arr.Size() != 2) return false;
-                        dst.x = static_cast<float>(arr.GetNumberAt(0));
-                        dst.y = static_cast<float>(arr.GetNumberAt(1));
-                        return true;
-                    };
-                    if (!readChroma(L"primaryRed",   p.primaryRed)   ||
-                        !readChroma(L"primaryGreen", p.primaryGreen) ||
-                        !readChroma(L"primaryBlue",  p.primaryBlue)  ||
-                        !readChroma(L"whitePoint",   p.whitePoint))
-                        return { 400, R"({"error":"primaries / whitePoint must be 2-element arrays"})" };
-
-                    p.gamut = GamutId::Custom;
-                    if (co.HasKey(L"gamut"))
-                    {
-                        auto gn = std::wstring(co.GetNamedString(L"gamut"));
-                        if      (gn == L"sRGB")    p.gamut = GamutId::sRGB;
-                        else if (gn == L"DCI-P3"  || gn == L"P3" || gn == L"DCI_P3")   p.gamut = GamutId::DCI_P3;
-                        else if (gn == L"BT.2020" || gn == L"BT2020" || gn == L"Rec2020") p.gamut = GamutId::BT2020;
-                        else                       p.gamut = GamutId::Custom;
-                    }
-                    chosen = p;
-                }
-
-                ApplyDisplayProfile(chosen.value());
-                auto active = m_displayMonitor.ActiveProfile();
-                return { 200, std::format(
-                    R"({{"ok":true,"applied":"{}","hdrEnabled":{},"peakNits":{:.2f}}})",
-                    JsonEscape(active.profileName),
-                    active.caps.hdrEnabled ? "true" : "false",
-                    active.caps.maxLuminanceNits) };
-            });
-        });
-
-        // =====================================================================
-        // POST /display/profile/clear  — Revert to the live OS-reported profile
-        // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/display/profile/clear", [this](const std::wstring&, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                RevertToLiveDisplay();
-                return { 200, R"({"ok":true,"isSimulated":false})" };
-            });
-        });
 
         // =====================================================================
         // POST /render/capture-node -- moved to Engine/Mcp/EngineMcpRoutes.cpp

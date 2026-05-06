@@ -428,6 +428,7 @@ namespace winrt::ShaderLab::implementation
             void OnGraphLoaded() override;
             void OnGraphStructureChanged() override;
             void OnCustomEffectRecompiled(uint32_t nodeId) override;
+            void OnDisplayProfileChanged() override;
         };
         std::unique_ptr<GuiEngineCommandSink> m_engineSink;
 

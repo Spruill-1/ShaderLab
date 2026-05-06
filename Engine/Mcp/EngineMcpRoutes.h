@@ -23,9 +23,11 @@
 
 #include "pch_engine.h"
 #include "../../EngineExport.h"
+#include "../../Rendering/DisplayProfile.h"
 #include "McpHttpServer.h"
 
 #include <functional>
+#include <optional>
 
 namespace ShaderLab::Graph
 {
@@ -68,6 +70,14 @@ namespace ShaderLab::Mcp
         // Optional — if unset, routes that surface previewNodeId default
         // to 0.
         std::function<uint32_t()>     getPreviewNodeId;
+
+        // Optional host-state shim for the most-recently-loaded ICC
+        // profile (so it can appear under "loadedIcc" in the
+        // /display/profiles response and be re-applied through the
+        // profile dropdown without re-parsing the file). The GUI
+        // installs both; headless leaves both null.
+        std::function<std::optional<Rendering::DisplayProfile>()> getLoadedIccProfile;
+        std::function<void(const Rendering::DisplayProfile&)>     setLoadedIccProfile;
     };
 
     // Functional / closure-based command sink (Q4 architecture choice).
@@ -115,6 +125,13 @@ namespace ShaderLab::Mcp
         // have changed), enforces unique effect names, and refreshes
         // the Add Node flyout. Default = no-op (headless).
         virtual void OnCustomEffectRecompiled(uint32_t /*nodeId*/) {}
+
+        // Active display profile changed: simulated / live / ICC. GUI
+        // marks all nodes dirty, refreshes the status bar and profile
+        // selector to match. Headless = no-op. The route already runs
+        // Rendering::UpdateWorkingSpaceNodes inside its closure so
+        // Working Space nodes are sync'd before this fires.
+        virtual void OnDisplayProfileChanged() {}
     };
 
     // Register all engine-pure routes on the given server. Idempotent:
