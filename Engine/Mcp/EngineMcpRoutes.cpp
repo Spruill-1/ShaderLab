@@ -5,6 +5,7 @@
 #include "../../Rendering/GraphEvaluator.h"
 #include "../../Rendering/DisplayMonitor.h"
 #include "../../Rendering/PixelReadback.h"
+#include "../../Rendering/CaptureNode.h"
 #include "../../Effects/EffectRegistry.h"
 #include "../../Effects/ShaderLabEffects.h"
 #include "../../Effects/SourceNodeFactory.h"
@@ -79,6 +80,40 @@ namespace ShaderLab::Mcp
                         out += c;
                     }
                 }
+            }
+            return out;
+        }
+
+        // Base64 (standard alphabet, '=' padding, no line wrapping).
+        // Used for /render/capture-node `inline` PNG payloads.
+        std::string Base64Encode(const uint8_t* data, size_t len)
+        {
+            static constexpr char kAlphabet[] =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string out;
+            if (len == 0) return out;
+            out.reserve(((len + 2) / 3) * 4);
+            size_t i = 0;
+            while (i + 2 < len)
+            {
+                uint32_t v = (uint32_t(data[i]) << 16)
+                           | (uint32_t(data[i + 1]) << 8)
+                           |  uint32_t(data[i + 2]);
+                out.push_back(kAlphabet[(v >> 18) & 0x3F]);
+                out.push_back(kAlphabet[(v >> 12) & 0x3F]);
+                out.push_back(kAlphabet[(v >> 6)  & 0x3F]);
+                out.push_back(kAlphabet[ v        & 0x3F]);
+                i += 3;
+            }
+            if (i < len)
+            {
+                uint32_t v = uint32_t(data[i]) << 16;
+                bool two = (i + 1 < len);
+                if (two) v |= uint32_t(data[i + 1]) << 8;
+                out.push_back(kAlphabet[(v >> 18) & 0x3F]);
+                out.push_back(kAlphabet[(v >> 12) & 0x3F]);
+                out.push_back(two ? kAlphabet[(v >> 6) & 0x3F] : '=');
+                out.push_back('=');
             }
             return out;
         }
@@ -1164,6 +1199,85 @@ namespace ShaderLab::Mcp
                     });
                 });
         }
+        // ---- POST /render/capture-node — render any node to PNG ------------
+        // Body: { nodeId, inline?:bool }. Saves PNG to %TEMP%; returns
+        // path + size. If inline=true, also returns a base64 PNG payload.
+        // Uses Rendering::CaptureNodeAsPng so this route is identical
+        // between GUI and headless hosts.
+        void RegisterCaptureNode(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/render/capture-node",
+                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                        WDJ::JsonObject jo{ nullptr };
+                        if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
+                            return Json(400, R"({"error":"Invalid JSON body"})");
+                        if (!jo.HasKey(L"nodeId"))
+                            return Json(400, R"({"error":"'nodeId' is required"})");
+                        uint32_t nodeId = static_cast<uint32_t>(jo.GetNamedNumber(L"nodeId"));
+                        bool wantInline = jo.HasKey(L"inline")
+                            && jo.GetNamedValue(L"inline").ValueType() == WDJ::JsonValueType::Boolean
+                            && jo.GetNamedBoolean(L"inline");
+
+                        // Force a fresh frame so dirty nodes evaluate before
+                        // capture. Headless host's renderFrame is a no-op.
+                        if (ctx.renderFrame) ctx.renderFrame();
+
+                        auto cap = ::ShaderLab::Rendering::CaptureNodeAsPng(
+                            *ctx.graph, nodeId, ctx.dc);
+                        using S = ::ShaderLab::Rendering::CaptureNodeStatus;
+                        switch (cap.status)
+                        {
+                        case S::NotFound:
+                            return Json(404, std::format(
+                                R"({{"error":"Node {} not found"}})", nodeId));
+                        case S::NotReady:
+                            return Json(409, std::format(
+                                R"({{"error":"Node {} is not yet evaluated","notReady":true}})", nodeId));
+                        case S::EmptyImage:
+                            return Json(500, R"({"error":"Capture failed: empty image"})");
+                        case S::D2DError:
+                            return Json(500, R"({"error":"Capture failed"})");
+                        case S::Success:
+                            break;
+                        }
+
+                        // Persist to %TEMP% with PID + nodeId + monotonic seq
+                        // so concurrent captures don't collide.
+                        static std::atomic<uint32_t> s_seq{ 0 };
+                        uint32_t seq = s_seq.fetch_add(1, std::memory_order_relaxed);
+                        wchar_t tempPath[MAX_PATH]{};
+                        ::GetTempPathW(MAX_PATH, tempPath);
+                        std::wstring filePath = std::format(
+                            L"{}shaderlab_node_{}_{}_{}.png",
+                            tempPath, ::GetCurrentProcessId(), nodeId, seq);
+                        HANDLE hFile = ::CreateFileW(filePath.c_str(),
+                            GENERIC_WRITE, 0, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                        if (hFile == INVALID_HANDLE_VALUE)
+                            return Json(500, R"({"error":"Failed to create temp file"})");
+                        DWORD written = 0;
+                        ::WriteFile(hFile, cap.png.data(),
+                            static_cast<DWORD>(cap.png.size()), &written, nullptr);
+                        ::CloseHandle(hFile);
+
+                        std::string escapedPath = JsonEscape(WideToUtf8(filePath));
+                        if (wantInline)
+                        {
+                            auto b64 = Base64Encode(cap.png.data(), cap.png.size());
+                            return Json(200, std::format(
+                                R"({{"path":"{}","size":{},"nodeId":{},"width":{},"height":{},"mimeType":"image/png","base64":"{}"}})",
+                                escapedPath, cap.png.size(), nodeId,
+                                cap.width, cap.height, b64));
+                        }
+                        return Json(200, std::format(
+                            R"({{"path":"{}","size":{},"nodeId":{},"width":{},"height":{},"mimeType":"image/png"}})",
+                            escapedPath, cap.png.size(), nodeId,
+                            cap.width, cap.height));
+                    });
+                });
+        }
     }
 
     void RegisterEngineRoutes(McpHttpServer& server, IEngineCommandSink& sink)
@@ -1184,5 +1298,6 @@ namespace ShaderLab::Mcp
         RegisterGetGraph(server, sink);
         RegisterCustomEffects(server, sink);
         RegisterAnalysisOutput(server, sink);
+        RegisterCaptureNode(server, sink);
     }
 }

@@ -1175,60 +1175,10 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // POST /render/capture-node  — Capture any node's output as PNG.
-        // Body: { nodeId, inline?:bool }
+        // POST /render/capture-node -- moved to Engine/Mcp/EngineMcpRoutes.cpp
+        // (Phase 7). Uses Rendering::CaptureNodeAsPng so the GUI host and
+        // headless host share the same render-and-encode pipeline.
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/render/capture-node", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                namespace WDJ = winrt::Windows::Data::Json;
-                WDJ::JsonObject jo{ nullptr };
-                if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
-                    return { 400, R"({"error":"Invalid JSON body"})" };
-                if (!jo.HasKey(L"nodeId"))
-                    return { 400, R"({"error":"'nodeId' is required"})" };
-                uint32_t nodeId = static_cast<uint32_t>(jo.GetNamedNumber(L"nodeId"));
-                bool wantInline = jo.HasKey(L"inline")
-                    && jo.GetNamedValue(L"inline").ValueType() == WDJ::JsonValueType::Boolean
-                    && jo.GetNamedBoolean(L"inline");
-
-                bool notFound = false, notReady = false;
-                auto pngData = CaptureNodeAsPng(nodeId, notFound, notReady);
-                if (notFound)
-                    return { 404, std::format(R"({{"error":"Node {} not found"}})", nodeId) };
-                if (notReady)
-                    return { 409, std::format(R"({{"error":"Node {} is not yet evaluated","notReady":true}})", nodeId) };
-                if (pngData.empty())
-                    return { 500, R"({"error":"Capture failed"})" };
-
-                static std::atomic<uint32_t> s_seq{ 0 };
-                uint32_t seq = s_seq.fetch_add(1, std::memory_order_relaxed);
-                wchar_t tempPath[MAX_PATH]{};
-                GetTempPathW(MAX_PATH, tempPath);
-                std::wstring filePath = std::format(L"{}shaderlab_node_{}_{}_{}.png",
-                    tempPath, GetCurrentProcessId(), nodeId, seq);
-                HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_WRITE, 0, nullptr,
-                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (hFile == INVALID_HANDLE_VALUE)
-                    return { 500, R"({"error":"Failed to create temp file"})" };
-                DWORD written = 0;
-                WriteFile(hFile, pngData.data(), static_cast<DWORD>(pngData.size()), &written, nullptr);
-                CloseHandle(hFile);
-
-                std::string escapedPath = JsonEscape(ToUtf8(filePath));
-                if (wantInline)
-                {
-                    auto b64 = Base64Encode(pngData.data(), pngData.size());
-                    return { 200, std::format(
-                        R"({{"path":"{}","size":{},"nodeId":{},"mimeType":"image/png","base64":"{}"}})",
-                        escapedPath, pngData.size(), nodeId, b64) };
-                }
-                return { 200, std::format(
-                    R"({{"path":"{}","size":{},"nodeId":{},"mimeType":"image/png"}})",
-                    escapedPath, pngData.size(), nodeId) };
-            });
-        });
 
         // =====================================================================
         // POST /render/image-stats -- moved to Engine/Mcp/EngineMcpRoutes.cpp
