@@ -18,48 +18,6 @@ static std::string ToUtf8(const std::wstring& ws)
     return s;
 }
 
-// Helper: escape a string for embedding into a JSON string literal.
-// Escapes backslash, quote, and control characters per RFC 8259.
-// Use everywhere we splice user/host strings (HLSL source, paths, error
-// messages, profile names) into a JSON response body.
-static std::string JsonEscape(std::string_view s)
-{
-    std::string out;
-    out.reserve(s.size() + 2);
-    for (char ch : s)
-    {
-        unsigned char uc = static_cast<unsigned char>(ch);
-        switch (ch)
-        {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b";  break;
-            case '\f': out += "\\f";  break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if (uc < 0x20)
-                {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", uc);
-                    out += buf;
-                }
-                else
-                {
-                    out.push_back(ch);
-                }
-                break;
-        }
-    }
-    return out;
-}
-
-static std::string JsonEscape(const std::wstring& ws)
-{
-    return JsonEscape(ToUtf8(ws));
-}
-
 // Base64 (standard alphabet, '=' padding, no line wrapping).
 static std::string Base64Encode(const uint8_t* data, size_t len)
 {
