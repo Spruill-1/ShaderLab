@@ -133,7 +133,6 @@
     <ClInclude Include="Effects\VideoSourceProvider.h" />
     <ClInclude Include="Version.h" />
     <ClInclude Include="Effects\SourceNodeFactory.h" />
-    <ClInclude Include="ShaderLab\McpHttpServer.h" />
     <ClInclude Include="Graph\EffectEdge.h" />
     <ClInclude Include="Graph\EffectGraph.h" />
     <ClInclude Include="Graph\EffectNode.h" />
@@ -173,9 +172,6 @@
     <ClCompile Include="Controls\PixelInspectorController.cpp" />
     <ClCompile Include="Controls\PixelTraceController.cpp" />
     <ClCompile Include="Controls\ShaderEditorController.cpp" />
-    <ClCompile Include="ShaderLab\McpHttpServer.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>

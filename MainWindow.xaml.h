@@ -17,7 +17,8 @@
 #include "Controls/LogWindow.h"
 #include "Controls/NodeLog.h"
 #include "EffectDesignerWindow.xaml.h"
-#include "ShaderLab/McpHttpServer.h"
+#include "Engine/Mcp/McpHttpServer.h"
+#include "Engine/Mcp/EngineMcpRoutes.h"
 
 namespace winrt::ShaderLab::implementation
 {
@@ -400,6 +401,22 @@ namespace winrt::ShaderLab::implementation
         std::wstring m_pendingOpenPath; // file path from Explorer FTA, loaded after init
         void SetupMcpRoutes();
         template<typename F> auto DispatchSync(F&& fn) -> decltype(fn());
+
+        // Phase 7: MainWindow as IEngineCommandSink, hands engine-side
+        // routes a closure that runs on the UI thread (via DispatchSync).
+        // Engine-pure routes that don't need UI thread coordination call
+        // sink.Dispatch with a closure that just reads engine state.
+        // Mutating routes use it to ensure m_graph mutations don't race
+        // with the render tick on the UI thread.
+        struct GuiEngineCommandSink : public ::ShaderLab::Mcp::IEngineCommandSink
+        {
+            MainWindow* window{ nullptr };
+            explicit GuiEngineCommandSink(MainWindow* w) : window(w) {}
+            ::ShaderLab::McpHttpServer::Response Dispatch(
+                std::function<::ShaderLab::McpHttpServer::Response(
+                    ::ShaderLab::Mcp::EngineContext&)> closure) override;
+        };
+        std::unique_ptr<GuiEngineCommandSink> m_engineSink;
 
         // MCP activity indicator state.
         // Updated from the MCP listener thread via the activity callback;

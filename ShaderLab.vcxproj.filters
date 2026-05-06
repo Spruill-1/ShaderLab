@@ -119,7 +119,6 @@
       <Filter>Controls</Filter>
     </ClInclude>
     <ClInclude Include="Version.h" />
-    <ClInclude Include="ShaderLab\McpHttpServer.h" />
   </ItemGroup>
   <!-- Source Files -->
   <ItemGroup>
@@ -148,7 +147,6 @@
     <ClCompile Include="Controls\PixelTraceController.cpp">
       <Filter>Controls</Filter>
     </ClCompile>
-    <ClCompile Include="ShaderLab\McpHttpServer.cpp" />
     <ClCompile Include="MainWindow.McpRoutes.cpp" />
   </ItemGroup>
   <!-- XAML -->

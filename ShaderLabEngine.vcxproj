@@ -99,6 +99,8 @@
     <ClInclude Include="EngineExport.h" />
     <ClInclude Include="Version.h" />
     <ClInclude Include="pch_engine.h" />
+    <ClInclude Include="Engine\Mcp\McpHttpServer.h" />
+    <ClInclude Include="Engine\Mcp\EngineMcpRoutes.h" />
     <ClInclude Include="Graph\EffectEdge.h" />
     <ClInclude Include="Graph\EffectGraph.h" />
     <ClInclude Include="Graph\EffectNode.h" />
@@ -155,6 +157,10 @@
     <ClCompile Include="Effects\SourceNodeFactory.cpp" />
     <ClCompile Include="Effects\StatisticsEffect.cpp" />
     <ClCompile Include="Effects\VideoSourceProvider.cpp" />
+    <ClCompile Include="Engine\Mcp\McpHttpServer.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="Engine\Mcp\EngineMcpRoutes.cpp" />
     <ClCompile Include="third_party\miniz\miniz.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <CompileAs>CompileAsC</CompileAs>

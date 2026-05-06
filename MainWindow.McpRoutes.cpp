@@ -1,6 +1,6 @@
 #include "pch.h"
 #include "MainWindow.xaml.h"
-#include "ShaderLab/McpHttpServer.h"
+#include "Engine/Mcp/McpHttpServer.h"
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
 #include "Effects/ShaderLabEffects.h"
@@ -355,10 +355,34 @@ namespace winrt::ShaderLab::implementation
         return std::move(*state->result);
     }
 
+    ::ShaderLab::McpHttpServer::Response MainWindow::GuiEngineCommandSink::Dispatch(
+        std::function<::ShaderLab::McpHttpServer::Response(
+            ::ShaderLab::Mcp::EngineContext&)> closure)
+    {
+        // Marshal the engine work to the UI thread so the closure
+        // doesn't race with the render tick mutating the same state.
+        // (Headless host's sink runs the closure synchronously on the
+        // listener thread; for that host the McpHttpServer's listener
+        // thread is the only consumer of the engine state.)
+        return window->DispatchSync([this, &closure]() -> ::ShaderLab::McpHttpServer::Response {
+            ::ShaderLab::Mcp::EngineContext ctx{};
+            ctx.graph = &window->m_graph;
+            ctx.evaluator = &window->m_graphEvaluator;
+            ctx.displayMonitor = &window->m_displayMonitor;
+            ctx.dc = window->m_renderEngine.D2DDeviceContext();
+            ctx.d3dDevice = window->m_renderEngine.D3DDevice();
+            ctx.d3dContext = window->m_renderEngine.D3DContext();
+            ctx.renderFrame = [this]() { window->RenderFrame(); };
+            return closure(ctx);
+        });
+    }
+
     void MainWindow::SetupMcpRoutes()
     {
         if (!m_mcpServer)
             m_mcpServer = std::make_unique<::ShaderLab::McpHttpServer>();
+        if (!m_engineSink)
+            m_engineSink = std::make_unique<GuiEngineCommandSink>(this);
 
         // Activity callback: fires on the listener thread once per HTTP request.
         // We update atomic state + a small mutexed string snapshot; the UI render
@@ -387,6 +411,12 @@ namespace winrt::ShaderLab::implementation
                 }
                 m_mcpUiUpdateSeq.fetch_add(1, std::memory_order_release);
             });
+
+        // Register engine-pure routes (Phase 7 migration). Currently
+        // empty; routes are migrated in batches with each commit.
+        // The GUI app then registers UI-coupled routes below
+        // (graph_snapshot, preview/graph view tools, etc).
+        ::ShaderLab::Mcp::RegisterEngineRoutes(*m_mcpServer, *m_engineSink);
 
         // =====================================================================
         // GET /  — Health check / probe (some MCP clients GET / before POST).
@@ -1989,58 +2019,13 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // POST /render/pixel-region  — Read FP32 RGBA pixel grid.
-        // Body: { nodeId, x, y, w, h }   (capped at 32x32 = 1024 pixels)
+        // POST /render/pixel-region — moved to Engine/Mcp/EngineMcpRoutes.cpp
+        // (Phase 7 migration). Uses the existing Rendering::ReadPixelRegion
+        // helper through IEngineCommandSink::Dispatch -- same UI-thread
+        // serialization the MainWindow shim provided, but the route body
+        // now lives engine-side and is registered for the headless host
+        // too.
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/render/pixel-region", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                namespace WDJ = winrt::Windows::Data::Json;
-                WDJ::JsonObject jo{ nullptr };
-                if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
-                    return { 400, R"({"error":"Invalid JSON body"})" };
-                for (auto k : { L"nodeId", L"x", L"y", L"w", L"h" })
-                    if (!jo.HasKey(k))
-                        return { 400, std::format(R"({{"error":"Missing required field: {}"}})",
-                            ToUtf8(std::wstring(k))) };
-
-                uint32_t nodeId = static_cast<uint32_t>(jo.GetNamedNumber(L"nodeId"));
-                int32_t  x      = static_cast<int32_t>(jo.GetNamedNumber(L"x"));
-                int32_t  y      = static_cast<int32_t>(jo.GetNamedNumber(L"y"));
-                uint32_t w      = static_cast<uint32_t>(jo.GetNamedNumber(L"w"));
-                uint32_t h      = static_cast<uint32_t>(jo.GetNamedNumber(L"h"));
-
-                // Cap region area at 32x32 (1024 pixels).  Per-axis cap of 64
-                // lets the agent ask for a thin strip (e.g. 64x4) but never
-                // more than 1024 total samples.
-                if (w == 0 || h == 0)
-                    return { 400, R"({"error":"w and h must be > 0"})" };
-                if (w > 64 || h > 64 || (w * h) > 1024)
-                    return { 400, "{\"error\":\"Region too large (cap: each axis <= 64, total area <= 1024)\"}" };
-
-                std::vector<float> pixels;
-                uint32_t actualW = 0, actualH = 0;
-                bool notFound = false, notReady = false;
-                bool ok = ReadPixelRegion(nodeId, x, y, w, h, pixels,
-                    actualW, actualH, notFound, notReady);
-                if (notFound) return { 404, std::format(R"({{"error":"Node {} not found"}})", nodeId) };
-                if (notReady) return { 409, std::format(R"({{"error":"Node {} is not yet evaluated","notReady":true}})", nodeId) };
-                if (!ok)      return { 404, R"({"error":"Region is empty after clipping to image bounds"})" };
-
-                std::string json = std::format(
-                    R"({{"nodeId":{},"requestedX":{},"requestedY":{},"requestedW":{},"requestedH":{})"
-                    R"(,"actualW":{},"actualH":{},"channelOrder":["r","g","b","a"],"pixels":[)",
-                    nodeId, x, y, w, h, actualW, actualH);
-                for (size_t i = 0; i < pixels.size(); ++i)
-                {
-                    if (i) json += ",";
-                    json += std::format("{:.6f}", pixels[i]);
-                }
-                json += "]}";
-                return { 200, json };
-            });
-        });
 
         // =====================================================================
         // GET /preview/view  — Current preview pan/zoom + image bounds
