@@ -41,6 +41,7 @@
 #include "Effects/EffectRegistry.h"
 #include "Effects/SourceNodeFactory.h"
 #include "Effects/ShaderLabEffects.h"
+#include "Rendering/PixelReadback.h"
 
 #include <wincodec.h>
 #include <cstdio>
@@ -73,6 +74,16 @@ namespace
         // when the graph already produced SDR-range output and we
         // don't want HdrToneMap's mid-tone lift muddying the result.
         bool         skipToneMap{ false };
+        // FP32 RGBA pixel-region readback (alternate output mode).
+        // When set, --output is interpreted as a raw FP32 binary blob
+        // (extension .bin / .raw) or a CSV file (extension .csv). No
+        // PNG / tonemap path is used. Designed for MCP-driven full-
+        // accuracy sampling and quantitative analysis.
+        bool         pixelMode{ false };
+        int32_t      pixelX{ 0 };
+        int32_t      pixelY{ 0 };
+        uint32_t     pixelW{ 1 };
+        uint32_t     pixelH{ 1 };
     };
 
     void PrintUsage(const wchar_t* exeName)
@@ -92,7 +103,16 @@ L"  --adapter X              'warp' or 'default' (default: default)\n"
 L"  --port N                 Reserved for MCP server (default: 47809)\n"
 L"  --input-peak-nits N      D2D HdrToneMap input peak (default: 1000)\n"
 L"  --output-peak-nits N     D2D HdrToneMap output peak (default: 80 = SDR)\n"
-L"  --no-tonemap             Skip HdrToneMap, raw scRGB -> sRGB clamp\n",
+L"  --no-tonemap             Skip HdrToneMap, raw scRGB -> sRGB clamp\n"
+L"\n"
+L"Pixel-region readback mode (raw FP32 RGBA, no tonemap):\n"
+L"  --pixels x,y,w,h         Read a region from the node's output as\n"
+L"                           FP32 RGBA, write to --output. Output\n"
+L"                           extension .bin/.raw -> packed binary\n"
+L"                           (W,H header as two uint32, then floats);\n"
+L"                           .csv -> text 'x,y,r,g,b,a' rows.\n"
+L"                           Designed for MCP-driven full-accuracy\n"
+L"                           sampling. Region is clipped to image bounds.\n",
             exeName);
     }
 
@@ -121,6 +141,38 @@ L"  --no-tonemap             Skip HdrToneMap, raw scRGB -> sRGB clamp\n",
             else if (a == L"--input-peak-nits")  { auto v = needNext(L"--input-peak-nits"); if (!v) return false; out.inputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); }
             else if (a == L"--output-peak-nits") { auto v = needNext(L"--output-peak-nits"); if (!v) return false; out.outputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); }
             else if (a == L"--no-tonemap") { out.skipToneMap = true; }
+            else if (a == L"--pixels")
+            {
+                auto v = needNext(L"--pixels"); if (!v) return false;
+                // Parse "x,y,w,h" into the four fields.
+                wchar_t* p = const_cast<wchar_t*>(v);
+                int32_t  parsed[4] = { 0, 0, 0, 0 };
+                for (int idx = 0; idx < 4; ++idx)
+                {
+                    wchar_t* end = nullptr;
+                    long val = std::wcstol(p, &end, 10);
+                    if (end == p) {
+                        std::wprintf(L"ERROR: --pixels requires 'x,y,w,h' (got '%ls')\n", v);
+                        return false;
+                    }
+                    parsed[idx] = static_cast<int32_t>(val);
+                    p = end;
+                    if (*p == L',') ++p;
+                    else if (idx < 3) {
+                        std::wprintf(L"ERROR: --pixels requires 4 comma-separated values (got '%ls')\n", v);
+                        return false;
+                    }
+                }
+                if (parsed[2] <= 0 || parsed[3] <= 0) {
+                    std::wprintf(L"ERROR: --pixels w and h must be positive (got %d,%d)\n", parsed[2], parsed[3]);
+                    return false;
+                }
+                out.pixelX = parsed[0];
+                out.pixelY = parsed[1];
+                out.pixelW = static_cast<uint32_t>(parsed[2]);
+                out.pixelH = static_cast<uint32_t>(parsed[3]);
+                out.pixelMode = true;
+            }
             else if (a == L"--help" || a == L"-h" || a == L"-?") { PrintUsage(argv[0]); return false; }
             else { std::wprintf(L"ERROR: unknown argument '%ls'\n", argv[i]); return false; }
         }
@@ -328,6 +380,83 @@ int RunRender(const Args& args)
             std::wprintf(L"        node.runtimeError = %ls\n", node->runtimeError.c_str());
         }
         return 7;
+    }
+
+    // ---- Pixel-region readback mode (alternate output path) ----------------
+    // No tonemap, no PNG encode -- raw FP32 RGBA pixels for full-accuracy
+    // analysis (designed to be the engine path the future MCP
+    // read_pixel_region route uses; see p7-mcp-move).
+    if (args.pixelMode)
+    {
+        auto rr = ::ShaderLab::Rendering::ReadPixelRegion(
+            graph, args.nodeId,
+            args.pixelX, args.pixelY, args.pixelW, args.pixelH,
+            dc.get());
+        switch (rr.status)
+        {
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::Success: break;
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::NotFound:
+            std::wprintf(L"FATAL: pixel readback NotFound for node %u\n", args.nodeId);
+            return 7;
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::NotReady:
+            std::wprintf(L"FATAL: pixel readback NotReady for node %u (dirty or missing inputs)\n", args.nodeId);
+            return 7;
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::InvalidRegion:
+            std::wprintf(L"FATAL: pixel readback InvalidRegion (clipped to nothing inside image)\n");
+            return 8;
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::D2DError:
+        default:
+            std::wprintf(L"FATAL: pixel readback D2DError\n");
+            return 10;
+        }
+
+        // Pick output format from extension. .csv -> text rows.
+        // .bin/.raw/anything-else -> packed binary (uint32 W, uint32 H,
+        // then float[W*H*4] RGBA row-major).
+        auto endsWith = [](const std::wstring& s, const wchar_t* suffix) {
+            size_t sl = std::wcslen(suffix);
+            return s.size() >= sl && std::equal(s.end() - sl, s.end(), suffix);
+        };
+        bool csv = endsWith(args.outputPath, L".csv") || endsWith(args.outputPath, L".CSV");
+
+        std::ofstream f(args.outputPath, std::ios::binary);
+        if (!f) {
+            std::wprintf(L"FATAL: could not open output '%ls'\n", args.outputPath.c_str());
+            return 13;
+        }
+        if (csv)
+        {
+            f << "x,y,r,g,b,a\n";
+            char buf[256];
+            for (uint32_t row = 0; row < rr.actualHeight; ++row) {
+                for (uint32_t col = 0; col < rr.actualWidth; ++col) {
+                    const float* px = rr.pixels.data()
+                        + (static_cast<size_t>(row) * rr.actualWidth + col) * 4;
+                    int n = std::snprintf(buf, sizeof(buf),
+                        "%d,%d,%.9g,%.9g,%.9g,%.9g\n",
+                        args.pixelX + static_cast<int32_t>(col),
+                        args.pixelY + static_cast<int32_t>(row),
+                        px[0], px[1], px[2], px[3]);
+                    f.write(buf, n);
+                }
+            }
+        }
+        else
+        {
+            // Binary header so consumers can self-describe (uint32 W,
+            // uint32 H = the *actual* clipped region, in case the
+            // request extended past the image edge).
+            uint32_t hdr[2] = { rr.actualWidth, rr.actualHeight };
+            f.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+            f.write(reinterpret_cast<const char*>(rr.pixels.data()),
+                static_cast<std::streamsize>(rr.pixels.size() * sizeof(float)));
+        }
+        f.close();
+
+        std::wprintf(L"OK: read %ux%u pixel region (%s) from node %u -> %ls\n",
+            rr.actualWidth, rr.actualHeight, csv ? L"csv" : L"binary",
+            args.nodeId, args.outputPath.c_str());
+        return 0;
     }
 
     // ---- Render to FP32 target + readback ----------------------------------

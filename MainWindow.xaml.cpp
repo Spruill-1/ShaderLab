@@ -7,6 +7,7 @@
 #include "Rendering/PipelineFormat.h"
 #include "Rendering/IccProfileParser.h"
 #include "Rendering/EffectGraphFile.h"
+#include "Rendering/PixelReadback.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/StatisticsEffect.h"
 #include "Version.h"
@@ -4789,108 +4790,31 @@ namespace winrt::ShaderLab::implementation
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) return false;
 
+        // Force a fresh frame so dirty nodes evaluate before readback.
+        // The engine helper (Rendering::ReadPixelRegion) is otherwise
+        // pure -- doesn't drive eval -- so the host has to ensure the
+        // graph is up-to-date.
         RenderFrame();
 
-        auto* image = ResolveDisplayImage(nodeId);
-        if (!image)
+        auto result = ::ShaderLab::Rendering::ReadPixelRegion(
+            m_graph, nodeId, x, y, w, h, dc);
+
+        switch (result.status)
         {
-            auto* node = m_graph.FindNode(nodeId);
-            if (!node) outNotFound = true;
-            else       outNotReady = true;
-            return false;
-        }
-
-        // Use 96 DPI so GetImageLocalBounds returns pixel coordinates.
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
-
-        D2D1_RECT_F bounds{};
-        dc->GetImageLocalBounds(image, &bounds);
-        const int32_t imgW = static_cast<int32_t>(bounds.right - bounds.left);
-        const int32_t imgH = static_cast<int32_t>(bounds.bottom - bounds.top);
-        if (imgW <= 0 || imgH <= 0) { dc->SetDpi(oldDpiX, oldDpiY); return false; }
-
-        // Clip the requested region to the image bounds (in image-local pixel
-        // coordinates).  `bounds.left/top` may be non-zero for sources whose
-        // origin isn't at (0,0), so use them as the offset.
-        int32_t x0 = (std::max)(x, 0);
-        int32_t y0 = (std::max)(y, 0);
-        int32_t x1 = (std::min)(static_cast<int32_t>(x + w), imgW);
-        int32_t y1 = (std::min)(static_cast<int32_t>(y + h), imgH);
-        if (x1 <= x0 || y1 <= y0) { dc->SetDpi(oldDpiX, oldDpiY); return false; }
-
-        const uint32_t actW = static_cast<uint32_t>(x1 - x0);
-        const uint32_t actH = static_cast<uint32_t>(y1 - y0);
-
-        try
-        {
-            // FP32 RGBA target so we get the linear scRGB values directly,
-            // matching the convention used by PixelInspectorController.
-            winrt::com_ptr<ID2D1Bitmap1> targetBitmap;
-            D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_TARGET,
-                D2D1::PixelFormat(DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED),
-                96.0f, 96.0f);
-            winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(actW, actH), nullptr, 0, bmpProps, targetBitmap.put()));
-
-            winrt::com_ptr<ID2D1Image> oldTarget;
-            dc->GetTarget(oldTarget.put());
-            dc->SetTarget(targetBitmap.get());
-            dc->BeginDraw();
-            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-            dc->SetTransform(D2D1::Matrix3x2F::Identity());
-
-            // SOURCE_COPY + NEAREST_NEIGHBOR copies raw values without any
-            // alpha blend or filtering, matching the inspector's readback path.
-            // DrawImage(image, targetOffset, imageRect, ...) is always 1:1, so
-            // a srcRect of size (actW, actH) at offset (0,0) in the target lands
-            // exactly the requested region into our bitmap.
-            const float fx0 = static_cast<float>(x0) + bounds.left;
-            const float fy0 = static_cast<float>(y0) + bounds.top;
-            const float fx1 = static_cast<float>(x1) + bounds.left;
-            const float fy1 = static_cast<float>(y1) + bounds.top;
-            D2D1_POINT_2F destOffset = D2D1::Point2F(0.0f, 0.0f);
-            D2D1_RECT_F srcRect = D2D1::RectF(fx0, fy0, fx1, fy1);
-            dc->DrawImage(image, &destOffset, &srcRect,
-                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                D2D1_COMPOSITE_MODE_SOURCE_COPY);
-            dc->EndDraw();
-            dc->SetTarget(oldTarget.get());
-
-            // Copy GPU bitmap to a CPU-readable bitmap and Map it.
-            winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
-            D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                D2D1::PixelFormat(DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED),
-                96.0f, 96.0f);
-            winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(actW, actH), nullptr, 0, cpuProps, cpuBitmap.put()));
-            D2D1_POINT_2U destPt = { 0, 0 };
-            D2D1_RECT_U srcRc = { 0, 0, actW, actH };
-            winrt::check_hresult(cpuBitmap->CopyFromBitmap(&destPt, targetBitmap.get(), &srcRc));
-
-            D2D1_MAPPED_RECT mapped{};
-            winrt::check_hresult(cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped));
-
-            outPixels.resize(static_cast<size_t>(actW) * actH * 4);
-            for (uint32_t row = 0; row < actH; ++row)
-            {
-                const float* srcRow = reinterpret_cast<const float*>(
-                    mapped.bits + static_cast<size_t>(row) * mapped.pitch);
-                std::memcpy(outPixels.data() + static_cast<size_t>(row) * actW * 4,
-                            srcRow,
-                            static_cast<size_t>(actW) * 4 * sizeof(float));
-            }
-            cpuBitmap->Unmap();
-
-            outActualW = actW;
-            outActualH = actH;
-            dc->SetDpi(oldDpiX, oldDpiY);
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::Success:
+            outPixels = std::move(result.pixels);
+            outActualW = result.actualWidth;
+            outActualH = result.actualHeight;
             return true;
-        }
-        catch (...)
-        {
-            dc->SetDpi(oldDpiX, oldDpiY);
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::NotFound:
+            outNotFound = true;
+            return false;
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::NotReady:
+            outNotReady = true;
+            return false;
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::InvalidRegion:
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::D2DError:
+        default:
             return false;
         }
     }
