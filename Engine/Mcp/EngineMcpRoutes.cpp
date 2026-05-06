@@ -112,6 +112,58 @@ namespace ShaderLab::Mcp
                 });
         }
 
+        // ---- POST /graph/connect — wire output pin -> input pin -----------
+        // Note: the GUI app also runs m_nodeGraphController.AutoLayout()
+        // and adds NodeLog entries. Those are UI side effects; the engine
+        // route just does the graph mutation. The GUI's render tick will
+        // pick up the dirty state and refresh the canvas next frame.
+        void RegisterConnect(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/graph/connect",
+                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                        try
+                        {
+                            auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
+                            uint32_t srcId = static_cast<uint32_t>(jobj.GetNamedNumber(L"srcId"));
+                            uint32_t srcPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"srcPin"));
+                            uint32_t dstId = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstId"));
+                            uint32_t dstPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstPin"));
+                            bool ok = ctx.graph->Connect(srcId, srcPin, dstId, dstPin);
+                            ctx.graph->MarkAllDirty();
+                            return Json(200,
+                                std::string("{\"connected\":") + (ok ? "true" : "false") + "}");
+                        }
+                        catch (...) { return Json(400, R"({"error":"Invalid request"})"); }
+                    });
+                });
+        }
+
+        // ---- POST /graph/disconnect — remove a single edge ----------------
+        void RegisterDisconnect(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/graph/disconnect",
+                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                        try
+                        {
+                            auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
+                            uint32_t srcId = static_cast<uint32_t>(jobj.GetNamedNumber(L"srcId"));
+                            uint32_t srcPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"srcPin"));
+                            uint32_t dstId = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstId"));
+                            uint32_t dstPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstPin"));
+                            bool ok = ctx.graph->Disconnect(srcId, srcPin, dstId, dstPin);
+                            ctx.graph->MarkAllDirty();
+                            return Json(200,
+                                std::string("{\"disconnected\":") + (ok ? "true" : "false") + "}");
+                        }
+                        catch (...) { return Json(400, R"({"error":"Invalid request"})"); }
+                    });
+                });
+        }
+
         // ---- POST /graph/set-property — mutates m_graph -------------------
         void RegisterSetProperty(McpHttpServer& server, IEngineCommandSink& sink)
         {
@@ -379,6 +431,8 @@ namespace ShaderLab::Mcp
     void RegisterEngineRoutes(McpHttpServer& server, IEngineCommandSink& sink)
     {
         RegisterRegistry(server);
+        RegisterConnect(server, sink);
+        RegisterDisconnect(server, sink);
         RegisterSetProperty(server, sink);
         RegisterImageStats(server, sink);
         RegisterPixelRegion(server, sink);

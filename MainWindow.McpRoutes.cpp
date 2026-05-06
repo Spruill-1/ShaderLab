@@ -732,64 +732,18 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // POST /graph/connect
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/graph/connect", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            try
-            {
-                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
-                uint32_t srcId = static_cast<uint32_t>(jobj.GetNamedNumber(L"srcId"));
-                uint32_t srcPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"srcPin"));
-                uint32_t dstId = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstId"));
-                uint32_t dstPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstPin"));
-                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                    bool ok = m_graph.Connect(srcId, srcPin, dstId, dstPin);
-                    if (ok)
-                    {
-                        auto* srcNode = m_graph.FindNode(srcId);
-                        auto* dstNode = m_graph.FindNode(dstId);
-                        std::wstring srcName = srcNode ? srcNode->name : std::format(L"Node {}", srcId);
-                        std::wstring dstName = dstNode ? dstNode->name : std::format(L"Node {}", dstId);
-                        m_nodeLogs[dstId].Info(std::format(L"Input {} connected from {} (pin {})", dstPin, srcName, srcPin));
-                        m_nodeLogs[srcId].Info(std::format(L"Output {} connected to {} (pin {})", srcPin, dstName, dstPin));
-                    }
-                    m_graph.MarkAllDirty();
-                    m_nodeGraphController.AutoLayout();
-                    return { 200, std::format("{{\"connected\":{}}}", ok ? "true" : "false") };
-                });
-            }
-            catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
-        });
+        // POST /graph/connect -- moved to Engine/Mcp/EngineMcpRoutes.cpp
+        // (Phase 7 migration). Same notes as /graph/disconnect.
+        // =====================================================================
 
         // =====================================================================
-        // POST /graph/disconnect
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/graph/disconnect", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            try
-            {
-                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
-                uint32_t srcId = static_cast<uint32_t>(jobj.GetNamedNumber(L"srcId"));
-                uint32_t srcPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"srcPin"));
-                uint32_t dstId = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstId"));
-                uint32_t dstPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstPin"));
-                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                    bool ok = m_graph.Disconnect(srcId, srcPin, dstId, dstPin);
-                    if (ok)
-                    {
-                        m_nodeLogs[dstId].Info(std::format(L"Input {} disconnected", dstPin));
-                        m_nodeLogs[srcId].Info(std::format(L"Output {} disconnected", srcPin));
-                    }
-                    m_graph.MarkAllDirty();
-                    m_nodeGraphController.AutoLayout();
-                    return { 200, std::format("{{\"disconnected\":{}}}", ok ? "true" : "false") };
-                });
-            }
-            catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
-        });
+        // POST /graph/disconnect -- moved to Engine/Mcp/EngineMcpRoutes.cpp
+        // (Phase 7 migration). UI side effects (nodeLogs, AutoLayout) drop
+        // out: the GUI render tick picks up dirty state and refreshes the
+        // canvas next frame.
+        // =====================================================================
 
         // =====================================================================
         // =====================================================================
