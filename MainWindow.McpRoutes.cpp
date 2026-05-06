@@ -1656,82 +1656,8 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // GET /effect/hlsl/{nodeId}  — Read HLSL source for a custom-shader
-        // node.  Library effects are also reported with isLibraryEffect=true.
+        // GET /effect/hlsl/{nodeId} -- moved to Engine/Mcp/EngineMcpRoutes.cpp
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/effect/hlsl/", [this](const std::wstring& path, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                // path = "/effect/hlsl/{id}"  (length of prefix = 13)
-                if (path.size() <= 13)
-                    return { 400, R"({"error":"Missing nodeId in URL"})" };
-                uint32_t nodeId = 0;
-                try { nodeId = static_cast<uint32_t>(std::stoul(path.substr(13))); }
-                catch (...) { return { 400, R"({"error":"Invalid nodeId"})" }; }
-
-                auto* node = m_graph.FindNode(nodeId);
-                if (!node) return { 404, std::format(R"({{"error":"Node {} not found"}})", nodeId) };
-
-                std::string runtimeErr = JsonEscape(ToUtf8(node->runtimeError));
-
-                if (!node->customEffect.has_value())
-                {
-                    return { 200, std::format(
-                        R"({{"nodeId":{},"hasCustomEffect":false,"name":"{}","runtimeError":"{}"}})",
-                        nodeId, JsonEscape(ToUtf8(node->name)), runtimeErr) };
-                }
-
-                const auto& def = node->customEffect.value();
-                std::string shaderTypeStr = (def.shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader)
-                    ? "PixelShader" : "ComputeShader";
-
-                std::string inputsJson = "[";
-                for (size_t i = 0; i < def.inputNames.size(); ++i)
-                {
-                    if (i) inputsJson += ",";
-                    inputsJson += "\"" + JsonEscape(ToUtf8(def.inputNames[i])) + "\"";
-                }
-                inputsJson += "]";
-
-                std::string paramsJson = "[";
-                for (size_t i = 0; i < def.parameters.size(); ++i)
-                {
-                    if (i) paramsJson += ",";
-                    paramsJson += "{\"name\":\"" + JsonEscape(ToUtf8(def.parameters[i].name)) + "\"}";
-                }
-                paramsJson += "]";
-
-                bool isLib = !def.shaderLabEffectId.empty();
-                std::string libBlock;
-                if (isLib)
-                {
-                    libBlock = std::format(
-                        R"(,"isLibraryEffect":true,"shaderLabEffectId":"{}","shaderLabEffectVersion":{})",
-                        JsonEscape(ToUtf8(def.shaderLabEffectId)),
-                        def.shaderLabEffectVersion);
-                }
-                else
-                {
-                    libBlock = R"(,"isLibraryEffect":false)";
-                }
-
-                return { 200, std::format(
-                    R"({{"nodeId":{},"hasCustomEffect":true,"name":"{}","shaderType":"{}")"
-                    R"(,"hlslSource":"{}","inputNames":{},"parameters":{},"bytecodeSize":{})"
-                    R"(,"isCompiled":{},"runtimeError":"{}"{}}})",
-                    nodeId,
-                    JsonEscape(ToUtf8(node->name)),
-                    shaderTypeStr,
-                    JsonEscape(ToUtf8(def.hlslSource)),
-                    inputsJson, paramsJson,
-                    def.compiledBytecode.size(),
-                    def.isCompiled() ? "true" : "false",
-                    runtimeErr,
-                    libBlock) };
-            });
-        });
-
         // =====================================================================
         // POST /  — MCP JSON-RPC 2.0 endpoint (Streamable HTTP transport)
         // =====================================================================

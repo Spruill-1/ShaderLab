@@ -48,6 +48,41 @@ namespace ShaderLab::Mcp
             return out;
         }
 
+        // Escape a UTF-8 string for embedding in a JSON string literal.
+        // Mirrors the helper that used to live in MainWindow.McpRoutes.cpp;
+        // covers the required JSON escapes plus the most common control-
+        // char cases. Same output bytes for ASCII-clean inputs.
+        std::string JsonEscape(std::string_view s)
+        {
+            std::string out;
+            out.reserve(s.size() + 8);
+            for (char c : s)
+            {
+                switch (c)
+                {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                case '\b': out += "\\b";  break;
+                case '\f': out += "\\f";  break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20)
+                    {
+                        char buf[8];
+                        std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                        out += buf;
+                    }
+                    else
+                    {
+                        out += c;
+                    }
+                }
+            }
+            return out;
+        }
+
         // ---- Phase 7 incremental migration ---------------------------------
         // Each route here used to live in MainWindow.McpRoutes.cpp.
         // Migration pattern:
@@ -355,6 +390,87 @@ namespace ShaderLab::Mcp
                             return Json(400, R"({"error":"Unknown effect name"})");
                         }
                         catch (...) { return Json(400, R"({"error":"Invalid JSON"})"); }
+                    });
+                });
+        }
+
+        // ---- GET /effect/hlsl/<nodeId> -- read HLSL of a custom effect -----
+        // Read-only; no Dispatch needed. Library effects (ShaderLab built-in)
+        // are reported with isLibraryEffect=true so agents know they're
+        // read-only-shipped and shouldn't try to recompile them.
+        void RegisterEffectHlsl(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"GET", L"/effect/hlsl/",
+                [&sink](const std::wstring& path, const std::string&) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([path](EngineContext& ctx) -> McpHttpServer::Response {
+                        if (path.size() <= 13)
+                            return Json(400, R"({"error":"Missing nodeId in URL"})");
+                        uint32_t nodeId = 0;
+                        try { nodeId = static_cast<uint32_t>(std::stoul(path.substr(13))); }
+                        catch (...) { return Json(400, R"({"error":"Invalid nodeId"})"); }
+
+                        auto* node = ctx.graph->FindNode(nodeId);
+                        if (!node)
+                            return Json(404, "{\"error\":\"Node " + std::to_string(nodeId) + " not found\"}");
+
+                        std::string runtimeErr = JsonEscape(WideToUtf8(node->runtimeError));
+                        std::string nameEsc = JsonEscape(WideToUtf8(node->name));
+
+                        if (!node->customEffect.has_value())
+                        {
+                            std::string j = "{\"nodeId\":" + std::to_string(nodeId)
+                                + ",\"hasCustomEffect\":false,\"name\":\"" + nameEsc
+                                + "\",\"runtimeError\":\"" + runtimeErr + "\"}";
+                            return Json(200, j);
+                        }
+
+                        const auto& def = node->customEffect.value();
+                        const char* shaderTypeStr =
+                            (def.shaderType == Graph::CustomShaderType::PixelShader)
+                                ? "PixelShader" : "ComputeShader";
+
+                        std::string inputsJson = "[";
+                        for (size_t i = 0; i < def.inputNames.size(); ++i)
+                        {
+                            if (i) inputsJson += ",";
+                            inputsJson += "\"" + JsonEscape(WideToUtf8(def.inputNames[i])) + "\"";
+                        }
+                        inputsJson += "]";
+
+                        std::string paramsJson = "[";
+                        for (size_t i = 0; i < def.parameters.size(); ++i)
+                        {
+                            if (i) paramsJson += ",";
+                            paramsJson += "{\"name\":\""
+                                + JsonEscape(WideToUtf8(def.parameters[i].name)) + "\"}";
+                        }
+                        paramsJson += "]";
+
+                        std::string libBlock;
+                        if (!def.shaderLabEffectId.empty())
+                        {
+                            libBlock = std::string(",\"isLibraryEffect\":true,\"shaderLabEffectId\":\"")
+                                + JsonEscape(WideToUtf8(def.shaderLabEffectId))
+                                + "\",\"shaderLabEffectVersion\":"
+                                + std::to_string(def.shaderLabEffectVersion);
+                        }
+                        else
+                        {
+                            libBlock = ",\"isLibraryEffect\":false";
+                        }
+
+                        std::string j = "{\"nodeId\":" + std::to_string(nodeId)
+                            + ",\"hasCustomEffect\":true,\"name\":\"" + nameEsc + "\""
+                            + ",\"shaderType\":\"" + shaderTypeStr + "\""
+                            + ",\"hlslSource\":\"" + JsonEscape(WideToUtf8(def.hlslSource)) + "\""
+                            + ",\"inputNames\":" + inputsJson
+                            + ",\"parameters\":" + paramsJson
+                            + ",\"bytecodeSize\":" + std::to_string(def.compiledBytecode.size())
+                            + ",\"isCompiled\":" + (def.isCompiled() ? "true" : "false")
+                            + ",\"runtimeError\":\"" + runtimeErr + "\""
+                            + libBlock + "}";
+                        return Json(200, j);
                     });
                 });
         }
@@ -698,6 +814,7 @@ namespace ShaderLab::Mcp
     void RegisterEngineRoutes(McpHttpServer& server, IEngineCommandSink& sink)
     {
         RegisterRegistry(server);
+        RegisterEffectHlsl(server, sink);
         RegisterAddNode(server, sink);
         RegisterRemoveNode(server, sink);
         RegisterConnect(server, sink);
