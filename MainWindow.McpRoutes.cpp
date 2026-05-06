@@ -60,13 +60,6 @@ static std::string JsonEscape(const std::wstring& ws)
     return JsonEscape(ToUtf8(ws));
 }
 
-static std::string GuidToString(const GUID& g)
-{
-    wchar_t buf[64]{};
-    StringFromGUID2(g, buf, 64);
-    return ToUtf8(buf);
-}
-
 // Base64 (standard alphabet, '=' padding, no line wrapping).
 static std::string Base64Encode(const uint8_t* data, size_t len)
 {
@@ -98,212 +91,6 @@ static std::string Base64Encode(const uint8_t* data, size_t len)
     return out;
 }
 
-// Helper: serialize a PropertyValue to a JSON fragment string.
-static std::string PropertyValueToJson(const ::ShaderLab::Graph::PropertyValue& pv)
-{
-    return std::visit([](const auto& v) -> std::string
-    {
-        using T = std::decay_t<decltype(v)>;
-        if constexpr (std::is_same_v<T, float>)
-            return std::format("{:.6f}", v);
-        else if constexpr (std::is_same_v<T, int32_t>)
-            return std::format("{}", v);
-        else if constexpr (std::is_same_v<T, uint32_t>)
-            return std::format("{}", v);
-        else if constexpr (std::is_same_v<T, bool>)
-            return v ? "true" : "false";
-        else if constexpr (std::is_same_v<T, std::wstring>)
-        {
-            auto s = ToUtf8(v);
-            // Escape quotes.
-            std::string escaped;
-            for (char c : s) { if (c == '"') escaped += "\\\""; else escaped += c; }
-            return "\"" + escaped + "\"";
-        }
-        else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
-            return std::format("[{:.6f},{:.6f}]", v.x, v.y);
-        else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
-            return std::format("[{:.6f},{:.6f},{:.6f}]", v.x, v.y, v.z);
-        else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
-            return std::format("[{:.6f},{:.6f},{:.6f},{:.6f}]", v.x, v.y, v.z, v.w);
-        else if constexpr (std::is_same_v<T, D2D1_MATRIX_5X4_F>)
-            return "\"<matrix>\"";
-        else if constexpr (std::is_same_v<T, std::vector<float>>)
-            return "\"<curve>\"";
-        else
-            return "null";
-    }, pv);
-}
-
-static std::string McpNodeTypeStr(::ShaderLab::Graph::NodeType t)
-{
-    switch (t)
-    {
-    case ::ShaderLab::Graph::NodeType::Source:        return "Source";
-    case ::ShaderLab::Graph::NodeType::BuiltInEffect: return "BuiltInEffect";
-    case ::ShaderLab::Graph::NodeType::PixelShader:   return "PixelShader";
-    case ::ShaderLab::Graph::NodeType::ComputeShader: return "ComputeShader";
-    case ::ShaderLab::Graph::NodeType::Output:        return "Output";
-    default: return "Unknown";
-    }
-}
-
-static std::string NodeToJson(const ::ShaderLab::Graph::EffectNode& node)
-{
-    std::string json = "{";
-    json += std::format("\"id\":{},\"name\":\"{}\",\"type\":\"{}\"",
-        node.id, ToUtf8(node.name), McpNodeTypeStr(node.type));
-    json += std::format(",\"position\":[{:.1f},{:.1f}]", node.position.x, node.position.y);
-
-    // Properties.
-    json += ",\"properties\":{";
-    bool first = true;
-    for (const auto& [key, val] : node.properties)
-    {
-        if (!first) json += ",";
-        json += "\"" + ToUtf8(key) + "\":" + PropertyValueToJson(val);
-        first = false;
-    }
-    json += "}";
-
-    // Pins.
-    json += ",\"inputPins\":[";
-    for (size_t i = 0; i < node.inputPins.size(); ++i)
-    {
-        if (i > 0) json += ",";
-        json += std::format("{{\"name\":\"{}\",\"index\":{}}}", ToUtf8(node.inputPins[i].name), node.inputPins[i].index);
-    }
-    json += "],\"outputPins\":[";
-    for (size_t i = 0; i < node.outputPins.size(); ++i)
-    {
-        if (i > 0) json += ",";
-        json += std::format("{{\"name\":\"{}\",\"index\":{}}}", ToUtf8(node.outputPins[i].name), node.outputPins[i].index);
-    }
-    json += "]";
-
-    if (node.effectClsid.has_value())
-        json += ",\"effectClsid\":\"" + GuidToString(node.effectClsid.value()) + "\"";
-    if (!node.runtimeError.empty())
-        json += ",\"runtimeError\":\"" + ToUtf8(node.runtimeError) + "\"";
-
-    // Custom effect definition.
-    if (node.customEffect.has_value())
-    {
-        auto& def = node.customEffect.value();
-        json += ",\"customEffect\":{";
-        json += std::format("\"shaderType\":\"{}\",\"compiled\":{},\"bytecodeSize\":{}",
-            def.shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader ? "PixelShader" :
-            def.shaderType == ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader ? "D3D11ComputeShader" :
-            "ComputeShader",
-            def.isCompiled() ? "true" : "false",
-            def.compiledBytecode.size());
-        json += ",\"inputNames\":[";
-        for (size_t i = 0; i < def.inputNames.size(); ++i)
-        {
-            if (i > 0) json += ",";
-            json += "\"" + ToUtf8(def.inputNames[i]) + "\"";
-        }
-        json += "],\"parameters\":[";
-        for (size_t i = 0; i < def.parameters.size(); ++i)
-        {
-            if (i > 0) json += ",";
-            auto& p = def.parameters[i];
-            json += std::format("{{\"name\":\"{}\",\"type\":\"{}\",\"min\":{:.4f},\"max\":{:.4f},\"step\":{:.4f}}}",
-                ToUtf8(p.name), ToUtf8(p.typeName), p.minValue, p.maxValue, p.step);
-        }
-        json += "]";
-
-        // Include HLSL source.
-        std::string hlsl = ToUtf8(def.hlslSource);
-        std::string escapedHlsl;
-        for (char c : hlsl)
-        {
-            if (c == '"') escapedHlsl += "\\\"";
-            else if (c == '\\') escapedHlsl += "\\\\";
-            else if (c == '\n') escapedHlsl += "\\n";
-            else if (c == '\r') escapedHlsl += "\\r";
-            else if (c == '\t') escapedHlsl += "\\t";
-            else escapedHlsl += c;
-        }
-        json += ",\"hlslSource\":\"" + escapedHlsl + "\"";
-
-        // Analysis fields.
-        if (!def.analysisFields.empty())
-        {
-            json += ",\"analysisFields\":[";
-            for (size_t i = 0; i < def.analysisFields.size(); ++i)
-            {
-                if (i > 0) json += ",";
-                const auto& fd = def.analysisFields[i];
-                std::string typeTag;
-                switch (fd.type)
-                {
-                case ::ShaderLab::Graph::AnalysisFieldType::Float:       typeTag = "float"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::Float2:      typeTag = "float2"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::Float3:      typeTag = "float3"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::Float4:      typeTag = "float4"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::FloatArray:   typeTag = "floatarray"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::Float2Array:  typeTag = "float2array"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::Float3Array:  typeTag = "float3array"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::Float4Array:  typeTag = "float4array"; break;
-                }
-                json += "{\"name\":\"" + ToUtf8(fd.name) + "\",\"type\":\"" + typeTag + "\"";
-                if (::ShaderLab::Graph::AnalysisFieldIsArray(fd.type))
-                    json += ",\"length\":" + std::to_string(fd.arrayLength);
-                json += "}";
-            }
-            json += "]";
-        }
-        json += "}";
-    }
-
-    // Analysis output results (runtime data, not serialized in graph JSON).
-    if (node.analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Typed &&
-        !node.analysisOutput.fields.empty())
-    {
-        json += ",\"analysisResults\":[";
-        bool firstField = true;
-        for (const auto& fv : node.analysisOutput.fields)
-        {
-            if (!firstField) json += ",";
-            firstField = false;
-            json += "{\"name\":\"" + ToUtf8(fv.name) + "\"";
-            if (!::ShaderLab::Graph::AnalysisFieldIsArray(fv.type))
-            {
-                uint32_t cc = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
-                json += ",\"value\":[";
-                for (uint32_t c = 0; c < cc; ++c)
-                {
-                    if (c > 0) json += ",";
-                    json += std::format("{:.6f}", fv.components[c]);
-                }
-                json += "]";
-            }
-            else
-            {
-                json += ",\"value\":[";
-                for (size_t i = 0; i < fv.arrayData.size(); ++i)
-                {
-                    if (i > 0) json += ",";
-                    json += std::format("{:.6f}", fv.arrayData[i]);
-                }
-                json += "]";
-            }
-            json += "}";
-            first = false;
-        }
-        json += "]";
-    }
-    else if (node.analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Histogram &&
-             !node.analysisOutput.data.empty())
-    {
-        json += std::format(",\"analysisResults\":{{\"type\":\"histogram\",\"channel\":{},\"bins\":{}}}",
-            node.analysisOutput.channelIndex, node.analysisOutput.data.size());
-    }
-
-    json += "}";
-    return json;
-}
 
 namespace winrt::ShaderLab::implementation
 {
@@ -374,6 +161,7 @@ namespace winrt::ShaderLab::implementation
             ctx.d3dDevice = window->m_renderEngine.D3DDevice();
             ctx.d3dContext = window->m_renderEngine.D3DContext();
             ctx.renderFrame = [this]() { window->RenderFrame(); };
+            ctx.getPreviewNodeId = [this]() -> uint32_t { return window->m_previewNodeId; };
             return closure(ctx);
         });
     }
@@ -548,47 +336,9 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // GET /graph  — Full graph state
+        // GET /graph, GET /graph/save, GET /graph/node/{id}
+        // -- moved to Engine/Mcp/EngineMcpRoutes.cpp (Phase 7).
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/graph", [this](const std::wstring& path, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            // Check for /graph/save or /graph/node/{id}
-            if (path == L"/graph/save")
-            {
-                auto json = m_graph.ToJson();
-                return { 200, ToUtf8(std::wstring(json)) };
-            }
-            if (path.starts_with(L"/graph/node/"))
-            {
-                auto idStr = path.substr(12);
-                uint32_t nodeId = static_cast<uint32_t>(std::stoul(idStr));
-                auto* node = m_graph.FindNode(nodeId);
-                if (!node) return { 404, R"({"error":"Node not found"})" };
-                return { 200, NodeToJson(*node) };
-            }
-
-            // Full graph.
-            std::string json = "{\"nodes\":[";
-            bool first = true;
-            for (const auto& node : m_graph.Nodes())
-            {
-                if (!first) json += ",";
-                json += NodeToJson(node);
-                first = false;
-            }
-            json += "],\"edges\":[";
-            first = true;
-            for (const auto& edge : m_graph.Edges())
-            {
-                if (!first) json += ",";
-                json += std::format("{{\"srcId\":{},\"srcPin\":{},\"dstId\":{},\"dstPin\":{}}}",
-                    edge.sourceNodeId, edge.sourcePin, edge.destNodeId, edge.destPin);
-                first = false;
-            }
-            json += std::format("],\"previewNodeId\":{}}}", m_previewNodeId);
-            return { 200, json };
-        });
 
         // =====================================================================
         // GET /registry -- moved to Engine/Mcp/EngineMcpRoutes.cpp
@@ -596,23 +346,9 @@ namespace winrt::ShaderLab::implementation
         // =====================================================================
 
         // =====================================================================
-        // GET /custom-effects  — Custom effects in graph
+        // GET /custom-effects -- moved to Engine/Mcp/EngineMcpRoutes.cpp
+        // (Phase 7).
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/custom-effects", [this](const std::wstring&, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            std::string json = "[";
-            bool first = true;
-            for (const auto& node : m_graph.Nodes())
-            {
-                if (!node.customEffect.has_value()) continue;
-                if (!first) json += ",";
-                json += NodeToJson(node);
-                first = false;
-            }
-            json += "]";
-            return { 200, json };
-        });
 
         // =====================================================================
         // POST /graph/add-node -- moved to Engine/Mcp/EngineMcpRoutes.cpp
@@ -949,72 +685,8 @@ namespace winrt::ShaderLab::implementation
         // =====================================================================
 
         // =====================================================================
-        // GET /analysis/{id} — Read analysis output fields
+        // GET /analysis/{id} -- moved to Engine/Mcp/EngineMcpRoutes.cpp (Phase 7).
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/analysis/", [this](const std::wstring& path, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            // Parse path: /analysis/{id}
-            auto rest = path.substr(10); // after "/analysis/"
-            uint32_t nodeId = static_cast<uint32_t>(std::stoul(rest));
-            auto* node = m_graph.FindNode(nodeId);
-            if (!node) return { 404, R"({"error":"Node not found"})" };
-
-            if (node->analysisOutput.type != ::ShaderLab::Graph::AnalysisOutputType::Typed ||
-                node->analysisOutput.fields.empty())
-                return { 200, R"({"fields":[]})" };
-
-            std::string json = R"({"fields":[)";
-            bool first = true;
-            for (const auto& fv : node->analysisOutput.fields)
-            {
-                if (!first) json += ",";
-                json += "{\"name\":\"" + ToUtf8(fv.name) + "\"";
-
-                std::string typeTag;
-                switch (fv.type)
-                {
-                case ::ShaderLab::Graph::AnalysisFieldType::Float:       typeTag = "float"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::Float2:      typeTag = "float2"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::Float3:      typeTag = "float3"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::Float4:      typeTag = "float4"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::FloatArray:   typeTag = "floatarray"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::Float2Array:  typeTag = "float2array"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::Float3Array:  typeTag = "float3array"; break;
-                case ::ShaderLab::Graph::AnalysisFieldType::Float4Array:  typeTag = "float4array"; break;
-                }
-                json += ",\"type\":\"" + typeTag + "\"";
-
-                if (!::ShaderLab::Graph::AnalysisFieldIsArray(fv.type))
-                {
-                    uint32_t cc = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
-                    json += ",\"value\":[";
-                    for (uint32_t c = 0; c < cc; ++c)
-                    {
-                        if (c > 0) json += ",";
-                        json += std::format("{:.6f}", fv.components[c]);
-                    }
-                    json += "]";
-                }
-                else
-                {
-                    uint32_t stride = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
-                    uint32_t count = stride > 0 ? static_cast<uint32_t>(fv.arrayData.size()) / stride : 0;
-                    json += ",\"count\":" + std::to_string(count);
-                    json += ",\"value\":[";
-                    for (size_t i = 0; i < fv.arrayData.size(); ++i)
-                    {
-                        if (i > 0) json += ",";
-                        json += std::format("{:.6f}", fv.arrayData[i]);
-                    }
-                    json += "]";
-                }
-                json += "}";
-                first = false;
-            }
-            json += "]}";
-            return { 200, json };
-        });
 
         // =====================================================================
         // POST /render/pixel-trace — Run pixel trace at normalized coordinates

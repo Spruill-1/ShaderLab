@@ -62,6 +62,12 @@ namespace ShaderLab::Mcp
         // nodes are repopulated before readback / capture.
         // Returning void; cannot fail.
         std::function<void()>         renderFrame;
+
+        // Host-specific "preview node" id for `GET /graph` responses.
+        // GUI returns m_previewNodeId; headless returns 0 (no preview pane).
+        // Optional — if unset, routes that surface previewNodeId default
+        // to 0.
+        std::function<uint32_t()>     getPreviewNodeId;
     };
 
     // Functional / closure-based command sink (Q4 architecture choice).

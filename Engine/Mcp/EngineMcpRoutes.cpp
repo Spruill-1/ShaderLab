@@ -83,6 +83,224 @@ namespace ShaderLab::Mcp
             return out;
         }
 
+        // ---- Node serialization helpers ------------------------------------
+        // Used by GET /graph, GET /graph/save, GET /graph/node/{id},
+        // GET /custom-effects. Mirrors the byte-identical output the
+        // MainWindow helpers produced before migration so existing MCP
+        // consumers don't see schema drift.
+
+        std::string GuidToString(const GUID& g)
+        {
+            wchar_t buf[64]{};
+            ::StringFromGUID2(g, buf, 64);
+            return WideToUtf8(buf);
+        }
+
+        std::string PropertyValueToJson(const ::ShaderLab::Graph::PropertyValue& pv)
+        {
+            return std::visit([](const auto& v) -> std::string {
+                using T = std::decay_t<decltype(v)>;
+                if constexpr (std::is_same_v<T, float>)
+                    return std::format("{:.6f}", v);
+                else if constexpr (std::is_same_v<T, int32_t>)
+                    return std::format("{}", v);
+                else if constexpr (std::is_same_v<T, uint32_t>)
+                    return std::format("{}", v);
+                else if constexpr (std::is_same_v<T, bool>)
+                    return v ? "true" : "false";
+                else if constexpr (std::is_same_v<T, std::wstring>)
+                    return "\"" + JsonEscape(WideToUtf8(v)) + "\"";
+                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
+                    return std::format("[{:.6f},{:.6f}]", v.x, v.y);
+                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
+                    return std::format("[{:.6f},{:.6f},{:.6f}]", v.x, v.y, v.z);
+                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
+                    return std::format("[{:.6f},{:.6f},{:.6f},{:.6f}]", v.x, v.y, v.z, v.w);
+                else if constexpr (std::is_same_v<T, D2D1_MATRIX_5X4_F>)
+                    return "\"<matrix>\"";
+                else if constexpr (std::is_same_v<T, std::vector<float>>)
+                    return "\"<curve>\"";
+                else
+                    return "null";
+            }, pv);
+        }
+
+        const char* NodeTypeStr(::ShaderLab::Graph::NodeType t)
+        {
+            using NT = ::ShaderLab::Graph::NodeType;
+            switch (t)
+            {
+            case NT::Source:        return "Source";
+            case NT::BuiltInEffect: return "BuiltInEffect";
+            case NT::PixelShader:   return "PixelShader";
+            case NT::ComputeShader: return "ComputeShader";
+            case NT::Output:        return "Output";
+            }
+            return "Unknown";
+        }
+
+        const char* AnalysisFieldTypeStr(::ShaderLab::Graph::AnalysisFieldType t)
+        {
+            using AFT = ::ShaderLab::Graph::AnalysisFieldType;
+            switch (t)
+            {
+            case AFT::Float:       return "float";
+            case AFT::Float2:      return "float2";
+            case AFT::Float3:      return "float3";
+            case AFT::Float4:      return "float4";
+            case AFT::FloatArray:  return "floatarray";
+            case AFT::Float2Array: return "float2array";
+            case AFT::Float3Array: return "float3array";
+            case AFT::Float4Array: return "float4array";
+            }
+            return "unknown";
+        }
+
+        std::string NodeToJson(const ::ShaderLab::Graph::EffectNode& node)
+        {
+            std::string json = "{";
+            json += std::format("\"id\":{},\"name\":\"{}\",\"type\":\"{}\"",
+                node.id, JsonEscape(WideToUtf8(node.name)), NodeTypeStr(node.type));
+            json += std::format(",\"position\":[{:.1f},{:.1f}]",
+                node.position.x, node.position.y);
+
+            // Properties.
+            json += ",\"properties\":{";
+            bool first = true;
+            for (const auto& [key, val] : node.properties)
+            {
+                if (!first) json += ",";
+                json += "\"" + JsonEscape(WideToUtf8(key)) + "\":" + PropertyValueToJson(val);
+                first = false;
+            }
+            json += "}";
+
+            // Pins.
+            json += ",\"inputPins\":[";
+            for (size_t i = 0; i < node.inputPins.size(); ++i)
+            {
+                if (i > 0) json += ",";
+                json += std::format("{{\"name\":\"{}\",\"index\":{}}}",
+                    JsonEscape(WideToUtf8(node.inputPins[i].name)),
+                    node.inputPins[i].index);
+            }
+            json += "],\"outputPins\":[";
+            for (size_t i = 0; i < node.outputPins.size(); ++i)
+            {
+                if (i > 0) json += ",";
+                json += std::format("{{\"name\":\"{}\",\"index\":{}}}",
+                    JsonEscape(WideToUtf8(node.outputPins[i].name)),
+                    node.outputPins[i].index);
+            }
+            json += "]";
+
+            if (node.effectClsid.has_value())
+                json += ",\"effectClsid\":\"" + GuidToString(node.effectClsid.value()) + "\"";
+            if (!node.runtimeError.empty())
+                json += ",\"runtimeError\":\"" + JsonEscape(WideToUtf8(node.runtimeError)) + "\"";
+
+            // Custom effect definition.
+            if (node.customEffect.has_value())
+            {
+                auto& def = node.customEffect.value();
+                using CST = ::ShaderLab::Graph::CustomShaderType;
+                const char* shaderTypeStr =
+                    def.shaderType == CST::PixelShader ? "PixelShader" :
+                    def.shaderType == CST::D3D11ComputeShader ? "D3D11ComputeShader" :
+                    "ComputeShader";
+                json += ",\"customEffect\":{";
+                json += std::format("\"shaderType\":\"{}\",\"compiled\":{},\"bytecodeSize\":{}",
+                    shaderTypeStr,
+                    def.isCompiled() ? "true" : "false",
+                    def.compiledBytecode.size());
+                json += ",\"inputNames\":[";
+                for (size_t i = 0; i < def.inputNames.size(); ++i)
+                {
+                    if (i > 0) json += ",";
+                    json += "\"" + JsonEscape(WideToUtf8(def.inputNames[i])) + "\"";
+                }
+                json += "],\"parameters\":[";
+                for (size_t i = 0; i < def.parameters.size(); ++i)
+                {
+                    if (i > 0) json += ",";
+                    auto& p = def.parameters[i];
+                    json += std::format(
+                        "{{\"name\":\"{}\",\"type\":\"{}\",\"min\":{:.4f},\"max\":{:.4f},\"step\":{:.4f}}}",
+                        JsonEscape(WideToUtf8(p.name)),
+                        JsonEscape(WideToUtf8(p.typeName)),
+                        p.minValue, p.maxValue, p.step);
+                }
+                json += "]";
+
+                json += ",\"hlslSource\":\"" + JsonEscape(WideToUtf8(def.hlslSource)) + "\"";
+
+                if (!def.analysisFields.empty())
+                {
+                    json += ",\"analysisFields\":[";
+                    for (size_t i = 0; i < def.analysisFields.size(); ++i)
+                    {
+                        if (i > 0) json += ",";
+                        const auto& fd = def.analysisFields[i];
+                        json += "{\"name\":\"" + JsonEscape(WideToUtf8(fd.name))
+                              + "\",\"type\":\"" + AnalysisFieldTypeStr(fd.type) + "\"";
+                        if (::ShaderLab::Graph::AnalysisFieldIsArray(fd.type))
+                            json += ",\"length\":" + std::to_string(fd.arrayLength);
+                        json += "}";
+                    }
+                    json += "]";
+                }
+                json += "}";
+            }
+
+            // Analysis output results (runtime data).
+            using AOT = ::ShaderLab::Graph::AnalysisOutputType;
+            if (node.analysisOutput.type == AOT::Typed && !node.analysisOutput.fields.empty())
+            {
+                json += ",\"analysisResults\":[";
+                bool firstField = true;
+                for (const auto& fv : node.analysisOutput.fields)
+                {
+                    if (!firstField) json += ",";
+                    firstField = false;
+                    json += "{\"name\":\"" + JsonEscape(WideToUtf8(fv.name)) + "\"";
+                    if (!::ShaderLab::Graph::AnalysisFieldIsArray(fv.type))
+                    {
+                        uint32_t cc = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                        json += ",\"value\":[";
+                        for (uint32_t c = 0; c < cc; ++c)
+                        {
+                            if (c > 0) json += ",";
+                            json += std::format("{:.6f}", fv.components[c]);
+                        }
+                        json += "]";
+                    }
+                    else
+                    {
+                        json += ",\"value\":[";
+                        for (size_t i = 0; i < fv.arrayData.size(); ++i)
+                        {
+                            if (i > 0) json += ",";
+                            json += std::format("{:.6f}", fv.arrayData[i]);
+                        }
+                        json += "]";
+                    }
+                    json += "}";
+                }
+                json += "]";
+            }
+            else if (node.analysisOutput.type == AOT::Histogram &&
+                     !node.analysisOutput.data.empty())
+            {
+                json += std::format(
+                    ",\"analysisResults\":{{\"type\":\"histogram\",\"channel\":{},\"bins\":{}}}",
+                    node.analysisOutput.channelIndex,
+                    node.analysisOutput.data.size());
+            }
+
+            json += "}";
+            return json;
+        }
+
         // ---- Phase 7 incremental migration ---------------------------------
         // Each route here used to live in MainWindow.McpRoutes.cpp.
         // Migration pattern:
@@ -809,6 +1027,143 @@ namespace ShaderLab::Mcp
                     });
                 });
         }
+        // ---- GET /graph — full graph state, /graph/save, /graph/node/{id} -
+        // The host that wants /graph to surface a "previewNodeId" provides
+        // ctx.getPreviewNodeId. Headless leaves it null and we emit 0,
+        // which matches "no preview pane" semantics.
+        void RegisterGetGraph(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"GET", L"/graph",
+                [&sink](const std::wstring& path, const std::string&) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&path](EngineContext& ctx) -> McpHttpServer::Response {
+                        // /graph/save -> raw graph JSON via EffectGraph::ToJson.
+                        if (path == L"/graph/save")
+                        {
+                            auto json = ctx.graph->ToJson();
+                            return Json(200, WideToUtf8(std::wstring(json)));
+                        }
+                        // /graph/node/{id} -> single node detail.
+                        if (path.starts_with(L"/graph/node/"))
+                        {
+                            auto idStr = path.substr(12);
+                            uint32_t nodeId = 0;
+                            try { nodeId = static_cast<uint32_t>(std::stoul(idStr)); }
+                            catch (...) { return Json(400, R"({"error":"Invalid node ID"})"); }
+                            auto* node = ctx.graph->FindNode(nodeId);
+                            if (!node) return Json(404, R"({"error":"Node not found"})");
+                            return Json(200, NodeToJson(*node));
+                        }
+
+                        // /graph -> full graph state.
+                        std::string json = "{\"nodes\":[";
+                        bool first = true;
+                        for (const auto& node : ctx.graph->Nodes())
+                        {
+                            if (!first) json += ",";
+                            json += NodeToJson(node);
+                            first = false;
+                        }
+                        json += "],\"edges\":[";
+                        first = true;
+                        for (const auto& edge : ctx.graph->Edges())
+                        {
+                            if (!first) json += ",";
+                            json += std::format(
+                                "{{\"srcId\":{},\"srcPin\":{},\"dstId\":{},\"dstPin\":{}}}",
+                                edge.sourceNodeId, edge.sourcePin,
+                                edge.destNodeId, edge.destPin);
+                            first = false;
+                        }
+                        uint32_t previewId = ctx.getPreviewNodeId ? ctx.getPreviewNodeId() : 0;
+                        json += std::format("],\"previewNodeId\":{}}}", previewId);
+                        return Json(200, json);
+                    });
+                });
+        }
+
+        // ---- GET /custom-effects — all nodes with a customEffect def -----
+        void RegisterCustomEffects(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"GET", L"/custom-effects",
+                [&sink](const std::wstring&, const std::string&) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([](EngineContext& ctx) -> McpHttpServer::Response {
+                        std::string json = "[";
+                        bool first = true;
+                        for (const auto& node : ctx.graph->Nodes())
+                        {
+                            if (!node.customEffect.has_value()) continue;
+                            if (!first) json += ",";
+                            json += NodeToJson(node);
+                            first = false;
+                        }
+                        json += "]";
+                        return Json(200, json);
+                    });
+                });
+        }
+
+        // ---- GET /analysis/{id} — analysis output fields ------------------
+        void RegisterAnalysisOutput(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"GET", L"/analysis/",
+                [&sink](const std::wstring& path, const std::string&) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&path](EngineContext& ctx) -> McpHttpServer::Response {
+                        auto rest = path.substr(10); // after "/analysis/"
+                        uint32_t nodeId = 0;
+                        try { nodeId = static_cast<uint32_t>(std::stoul(rest)); }
+                        catch (...) { return Json(400, R"({"error":"Invalid node ID"})"); }
+                        auto* node = ctx.graph->FindNode(nodeId);
+                        if (!node) return Json(404, R"({"error":"Node not found"})");
+
+                        using AOT = ::ShaderLab::Graph::AnalysisOutputType;
+                        if (node->analysisOutput.type != AOT::Typed ||
+                            node->analysisOutput.fields.empty())
+                            return Json(200, R"({"fields":[]})");
+
+                        std::string json = R"({"fields":[)";
+                        bool first = true;
+                        for (const auto& fv : node->analysisOutput.fields)
+                        {
+                            if (!first) json += ",";
+                            first = false;
+                            json += "{\"name\":\"" + JsonEscape(WideToUtf8(fv.name)) + "\"";
+                            json += ",\"type\":\"" + std::string(AnalysisFieldTypeStr(fv.type)) + "\"";
+                            if (!::ShaderLab::Graph::AnalysisFieldIsArray(fv.type))
+                            {
+                                uint32_t cc = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                                json += ",\"value\":[";
+                                for (uint32_t c = 0; c < cc; ++c)
+                                {
+                                    if (c > 0) json += ",";
+                                    json += std::format("{:.6f}", fv.components[c]);
+                                }
+                                json += "]";
+                            }
+                            else
+                            {
+                                uint32_t stride = ::ShaderLab::Graph::AnalysisFieldComponentCount(fv.type);
+                                uint32_t count = stride > 0
+                                    ? static_cast<uint32_t>(fv.arrayData.size()) / stride
+                                    : 0;
+                                json += ",\"count\":" + std::to_string(count);
+                                json += ",\"value\":[";
+                                for (size_t i = 0; i < fv.arrayData.size(); ++i)
+                                {
+                                    if (i > 0) json += ",";
+                                    json += std::format("{:.6f}", fv.arrayData[i]);
+                                }
+                                json += "]";
+                            }
+                            json += "}";
+                        }
+                        json += "]}";
+                        return Json(200, json);
+                    });
+                });
+        }
     }
 
     void RegisterEngineRoutes(McpHttpServer& server, IEngineCommandSink& sink)
@@ -826,5 +1181,8 @@ namespace ShaderLab::Mcp
         RegisterSetProperty(server, sink);
         RegisterImageStats(server, sink);
         RegisterPixelRegion(server, sink);
+        RegisterGetGraph(server, sink);
+        RegisterCustomEffects(server, sink);
+        RegisterAnalysisOutput(server, sink);
     }
 }
