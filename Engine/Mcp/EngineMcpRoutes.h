@@ -36,6 +36,10 @@ namespace ShaderLab::Rendering
     class GraphEvaluator;
     class DisplayMonitor;
 }
+namespace ShaderLab::Effects
+{
+    class SourceNodeFactory;
+}
 
 namespace ShaderLab::Mcp
 {
@@ -47,6 +51,7 @@ namespace ShaderLab::Mcp
         Graph::EffectGraph*           graph{ nullptr };
         Rendering::GraphEvaluator*    evaluator{ nullptr };
         Rendering::DisplayMonitor*    displayMonitor{ nullptr };
+        Effects::SourceNodeFactory*   sourceFactory{ nullptr };
         ID2D1DeviceContext*           dc{ nullptr };
         ID3D11Device*                 d3dDevice{ nullptr };
         ID3D11DeviceContext*          d3dContext{ nullptr };
@@ -63,6 +68,14 @@ namespace ShaderLab::Mcp
     // The route handler hands a closure to Dispatch; the host runs it
     // on the right thread and returns the McpHttpServer::Response back
     // to the listener thread that the route returns on.
+    //
+    // Engine state mutations also fire **events** (the OnXxx virtuals
+    // below). Hosts override them to keep their own UI / output windows
+    // / preview selector in sync — mirroring the path the user's own
+    // UI interactions take. Events fire **inside** Dispatch (i.e., on
+    // the dispatch thread) immediately after the closure mutates engine
+    // state, so the GUI sees changes synchronously and the engine route
+    // returns to the listener with the UI already up-to-date.
     class SHADERLAB_API IEngineCommandSink
     {
     public:
@@ -74,6 +87,22 @@ namespace ShaderLab::Mcp
         // completes. Closure exceptions propagate.
         virtual McpHttpServer::Response Dispatch(
             std::function<McpHttpServer::Response(EngineContext&)> closure) = 0;
+
+        // ---- Engine state-change events (UI hooks) -----------------------
+        //
+        // Routes call these AFTER successful engine mutation, from
+        // inside the Dispatch closure. Default impls are no-ops; the
+        // headless host doesn't override them. The GUI host wires them
+        // to the same methods that handle native user UI interactions
+        // (e.g. OnNodeAdded -> PopulatePreviewNodeSelector + AutoLayout,
+        // matching what happens when the user adds a node via the
+        // toolbar).
+        virtual void OnNodeAdded(uint32_t /*nodeId*/) {}
+        virtual void OnNodeRemoved(uint32_t /*nodeId*/) {}
+        virtual void OnNodeChanged(uint32_t /*nodeId*/) {}
+        virtual void OnGraphCleared() {}
+        virtual void OnGraphLoaded() {}
+        virtual void OnGraphStructureChanged() {}  // edges added/removed
     };
 
     // Register all engine-pure routes on the given server. Idempotent:

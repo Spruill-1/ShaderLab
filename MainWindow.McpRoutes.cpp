@@ -369,12 +369,71 @@ namespace winrt::ShaderLab::implementation
             ctx.graph = &window->m_graph;
             ctx.evaluator = &window->m_graphEvaluator;
             ctx.displayMonitor = &window->m_displayMonitor;
+            ctx.sourceFactory = &window->m_sourceFactory;
             ctx.dc = window->m_renderEngine.D2DDeviceContext();
             ctx.d3dDevice = window->m_renderEngine.D3DDevice();
             ctx.d3dContext = window->m_renderEngine.D3DContext();
             ctx.renderFrame = [this]() { window->RenderFrame(); };
             return closure(ctx);
         });
+    }
+
+    // Event hooks. All of these run on the UI thread (the engine route's
+    // Dispatch closure already marshaled there). The implementations call
+    // the same UI methods MainWindow uses on native user interactions, so
+    // MCP-driven mutations take the same UI code path the user does.
+
+    void MainWindow::GuiEngineCommandSink::OnNodeAdded(uint32_t /*nodeId*/)
+    {
+        window->m_graph.MarkAllDirty();
+        window->m_nodeGraphController.AutoLayout();
+        window->PopulatePreviewNodeSelector();
+        window->m_forceRender = true;
+    }
+
+    void MainWindow::GuiEngineCommandSink::OnNodeRemoved(uint32_t nodeId)
+    {
+        window->m_graphEvaluator.InvalidateNode(nodeId);
+        window->CloseOutputWindow(nodeId);
+        window->m_graph.MarkAllDirty();
+        window->m_nodeGraphController.AutoLayout();
+        window->PopulatePreviewNodeSelector();
+        window->m_forceRender = true;
+    }
+
+    void MainWindow::GuiEngineCommandSink::OnNodeChanged(uint32_t /*nodeId*/)
+    {
+        window->m_forceRender = true;
+    }
+
+    void MainWindow::GuiEngineCommandSink::OnGraphCleared()
+    {
+        window->m_graphEvaluator.ReleaseCache();
+        window->m_outputWindows.clear();
+        window->m_previewNodeId = 0;
+        window->m_graph.MarkAllDirty();
+        window->m_nodeGraphController.AutoLayout();
+        window->PopulatePreviewNodeSelector();
+        window->m_forceRender = true;
+    }
+
+    void MainWindow::GuiEngineCommandSink::OnGraphLoaded()
+    {
+        // ResetAfterGraphLoad rebuilds the per-load UI state (heartbeats,
+        // output windows, preview selector). Same path the file-open dialog
+        // takes.
+        window->ResetAfterGraphLoad(/*reopenOutputWindows=*/true);
+        window->m_nodeGraphController.AutoLayout();
+        window->m_forceRender = true;
+    }
+
+    void MainWindow::GuiEngineCommandSink::OnGraphStructureChanged()
+    {
+        // Edges or property bindings changed -- rebuild the canvas layout
+        // so any new connections render correctly. AutoLayout is the same
+        // call user-driven connect/disconnect uses.
+        window->m_nodeGraphController.AutoLayout();
+        window->m_forceRender = true;
     }
 
     void MainWindow::SetupMcpRoutes()
@@ -556,180 +615,13 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // POST /graph/add-node
+        // POST /graph/add-node -- moved to Engine/Mcp/EngineMcpRoutes.cpp
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/graph/add-node", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            try
-            {
-                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
-                if (jobj.HasKey(L"effectName"))
-                {
-                    auto name = jobj.GetNamedString(L"effectName");
-
-                    // Support creating custom compute/pixel shader nodes directly.
-                    if (name == L"Custom Compute Shader" || name == L"Custom Pixel Shader" ||
-                        name == L"Custom D3D11 Compute Shader")
-                    {
-                        ::ShaderLab::Graph::EffectNode node;
-                        bool isCompute = (name == L"Custom Compute Shader");
-                        bool isD3D11 = (name == L"Custom D3D11 Compute Shader");
-                        node.type = (isCompute || isD3D11)
-                            ? ::ShaderLab::Graph::NodeType::ComputeShader
-                            : ::ShaderLab::Graph::NodeType::PixelShader;
-                        node.name = std::wstring(name);
-
-                        if (isD3D11)
-                        {
-                            // D3D11 compute: no D2D effect, no output pin (data-only).
-                            // No effectClsid needed.
-                        }
-                        else
-                        {
-                            node.effectClsid = isCompute
-                                ? ::ShaderLab::Effects::CustomComputeShaderEffect::CLSID_CustomComputeShader
-                                : ::ShaderLab::Effects::CustomPixelShaderEffect::CLSID_CustomPixelShader;
-                            node.outputPins.push_back({ L"Output", 0 });
-                        }
-
-                        // Create a default custom effect definition.
-                        ::ShaderLab::Graph::CustomEffectDefinition def;
-                        def.shaderType = isD3D11
-                            ? ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader
-                            : isCompute
-                                ? ::ShaderLab::Graph::CustomShaderType::ComputeShader
-                                : ::ShaderLab::Graph::CustomShaderType::PixelShader;
-                        CoCreateGuid(&def.shaderGuid);
-
-                        // Default: 1 input named "Source".
-                        def.inputNames.push_back(L"Source");
-                        node.inputPins.push_back({ L"I0", 0 });
-
-                        if (isCompute) { def.threadGroupX = 8; def.threadGroupY = 8; def.threadGroupZ = 1; }
-
-                        if (isD3D11)
-                        {
-                            // Default analysis field so the node has output.
-                            def.analysisOutputType = ::ShaderLab::Graph::AnalysisOutputType::Typed;
-                            def.analysisFields.push_back(
-                                { L"Result", ::ShaderLab::Graph::AnalysisFieldType::Float4 });
-                        }
-
-                        node.customEffect = std::move(def);
-
-                        return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                            auto id = m_graph.AddNode(std::move(node));
-                            m_graph.MarkAllDirty();
-                            m_nodeGraphController.AutoLayout();
-                            PopulatePreviewNodeSelector();
-                            return { 200, std::format("{{\"nodeId\":{}}}", id) };
-                        });
-                    }
-
-                    // Check ShaderLab effects registry.
-                    auto* slDesc = ::ShaderLab::Effects::ShaderLabEffects::Instance().FindByName(name);
-                    if (slDesc)
-                    {
-                        auto node = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*slDesc);
-                        return DispatchSync([&, wname = std::wstring(name)]() -> ::ShaderLab::McpHttpServer::Response {
-                            auto id = m_graph.AddNode(std::move(node));
-                            m_nodeLogs[id].Info(std::format(L"Node created: {}", wname));
-                            m_graph.MarkAllDirty();
-                            m_nodeGraphController.AutoLayout();
-                            PopulatePreviewNodeSelector();
-                            return { 200, std::format("{{\"nodeId\":{}}}", id) };
-                        });
-                    }
-
-                    auto* desc = ::ShaderLab::Effects::EffectRegistry::Instance().FindByName(name);
-                    if (!desc)
-                    {
-                        // Check for special source types.
-                        std::wstring wname(name.begin(), name.end());
-                        std::wstring filePath;
-                        if (jobj.HasKey(L"filePath"))
-                            filePath = std::wstring(jobj.GetNamedString(L"filePath"));
-
-                        if (wname == L"Video Source" || wname == L"Video")
-                        {
-                            auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(filePath,
-                                filePath.empty() ? L"Video Source" : filePath.substr(filePath.find_last_of(L"\\/") + 1));
-                            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                                auto id = m_graph.AddNode(std::move(node));
-                                if (!filePath.empty())
-                                {
-                                    auto* graphNode = m_graph.FindNode(id);
-                                    auto* dc = m_renderEngine.D2DDeviceContext();
-                                    if (graphNode && dc)
-                                        m_sourceFactory.PrepareSourceNode(*graphNode, dc, 0.0,
-                                            m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-                                }
-                                m_graph.MarkAllDirty();
-                                m_nodeGraphController.AutoLayout();
-                                PopulatePreviewNodeSelector();
-                                return { 200, std::format("{{\"nodeId\":{}}}", id) };
-                            });
-                        }
-                        if (wname == L"Image Source" || wname == L"Image")
-                        {
-                            auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateImageSourceNode(filePath,
-                                filePath.empty() ? L"Image Source" : filePath.substr(filePath.find_last_of(L"\\/") + 1));
-                            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                                auto id = m_graph.AddNode(std::move(node));
-                                if (!filePath.empty())
-                                {
-                                    auto* graphNode = m_graph.FindNode(id);
-                                    auto* dc = m_renderEngine.D2DDeviceContext();
-                                    if (graphNode && dc)
-                                        m_sourceFactory.PrepareSourceNode(*graphNode, dc, 0.0,
-                                            m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-                                }
-                                m_graph.MarkAllDirty();
-                                m_nodeGraphController.AutoLayout();
-                                PopulatePreviewNodeSelector();
-                                return { 200, std::format("{{\"nodeId\":{}}}", id) };
-                            });
-                        }
-                        return { 400, R"({"error":"Unknown effect name"})" };
-                    }
-                    auto node = ::ShaderLab::Effects::EffectRegistry::CreateNode(*desc);
-                    return DispatchSync([&, wname = std::wstring(name)]() -> ::ShaderLab::McpHttpServer::Response {
-                        auto id = m_graph.AddNode(std::move(node));
-                        m_nodeLogs[id].Info(std::format(L"Node created: {}", wname));
-                        m_graph.MarkAllDirty();
-                        m_nodeGraphController.AutoLayout();
-                        PopulatePreviewNodeSelector();
-                        return { 200, std::format("{{\"nodeId\":{}}}", id) };
-                    });
-                }
-                return { 400, R"({"error":"Provide effectName"})" };
-            }
-            catch (...) { return { 400, R"({"error":"Invalid JSON"})" }; }
-        });
 
         // =====================================================================
-        // POST /graph/remove-node
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/graph/remove-node", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            try
-            {
-                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
-                uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
-                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                    m_graph.RemoveNode(nodeId);
-                    m_graphEvaluator.InvalidateNode(nodeId);
-                    CloseOutputWindow(nodeId);
-                    m_graph.MarkAllDirty();
-                    m_nodeGraphController.AutoLayout();
-                    PopulatePreviewNodeSelector();
-                    return { 200, R"({"ok":true})" };
-                });
-            }
-            catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
-        });
+        // POST /graph/remove-node -- moved to Engine/Mcp/EngineMcpRoutes.cpp
+        // =====================================================================
 
         // =====================================================================
         // =====================================================================
@@ -752,45 +644,14 @@ namespace winrt::ShaderLab::implementation
         // =====================================================================
 
         // =====================================================================
-        // POST /graph/load
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/graph/load", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            try
-            {
-                auto loaded = ::ShaderLab::Graph::EffectGraph::FromJson(winrt::to_hstring(body));
-                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                    m_graphEvaluator.ReleaseCache();
-                    m_graph = std::move(loaded);
-                    ResetAfterGraphLoad();
-                    m_nodeGraphController.AutoLayout();
-                    return { 200, R"({"ok":true})" };
-                });
-            }
-            catch (const std::exception& ex)
-            {
-                return { 400, std::string(R"({"error":")") + ex.what() + R"("})" };
-            }
-        });
+        // POST /graph/load -- moved to Engine/Mcp/EngineMcpRoutes.cpp
+        // =====================================================================
 
         // =====================================================================
-        // POST /graph/clear
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/graph/clear", [this](const std::wstring&, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                m_graphEvaluator.ReleaseCache();
-                m_graph.Clear();
-                m_outputWindows.clear();
-                m_previewNodeId = 0;
-                m_graph.MarkAllDirty();
-                m_nodeGraphController.AutoLayout();
-                PopulatePreviewNodeSelector();
-                return { 200, R"({"ok":true})" };
-            });
-        });
+        // POST /graph/clear -- moved to Engine/Mcp/EngineMcpRoutes.cpp
+        // =====================================================================
 
         // =====================================================================
         // POST /render/preview-node

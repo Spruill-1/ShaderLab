@@ -415,6 +415,18 @@ namespace winrt::ShaderLab::implementation
             ::ShaderLab::McpHttpServer::Response Dispatch(
                 std::function<::ShaderLab::McpHttpServer::Response(
                     ::ShaderLab::Mcp::EngineContext&)> closure) override;
+
+            // ---- Event hooks ---------------------------------------------
+            // Wired to the same UI methods that fire on native user
+            // interactions (toolbar add-node, drag-edge, etc) so MCP-driven
+            // mutations and user-driven mutations take the same code path
+            // through the GUI.
+            void OnNodeAdded(uint32_t /*nodeId*/) override;
+            void OnNodeRemoved(uint32_t nodeId) override;
+            void OnNodeChanged(uint32_t /*nodeId*/) override;
+            void OnGraphCleared() override;
+            void OnGraphLoaded() override;
+            void OnGraphStructureChanged() override;
         };
         std::unique_ptr<GuiEngineCommandSink> m_engineSink;
 

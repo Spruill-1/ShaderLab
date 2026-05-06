@@ -7,6 +7,9 @@
 #include "../../Rendering/PixelReadback.h"
 #include "../../Effects/EffectRegistry.h"
 #include "../../Effects/ShaderLabEffects.h"
+#include "../../Effects/SourceNodeFactory.h"
+#include "../../Effects/CustomComputeShaderEffect.h"
+#include "../../Effects/CustomPixelShaderEffect.h"
 #include "../../Version.h"
 
 #include <winrt/Windows.Data.Json.h>
@@ -122,7 +125,7 @@ namespace ShaderLab::Mcp
             server.AddRoute(L"POST", L"/graph/connect",
                 [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
                 {
-                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -132,6 +135,7 @@ namespace ShaderLab::Mcp
                             uint32_t dstPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstPin"));
                             bool ok = ctx.graph->Connect(srcId, srcPin, dstId, dstPin);
                             ctx.graph->MarkAllDirty();
+                            if (ok) sink.OnGraphStructureChanged();
                             return Json(200,
                                 std::string("{\"connected\":") + (ok ? "true" : "false") + "}");
                         }
@@ -146,7 +150,7 @@ namespace ShaderLab::Mcp
             server.AddRoute(L"POST", L"/graph/disconnect",
                 [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
                 {
-                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -156,6 +160,7 @@ namespace ShaderLab::Mcp
                             uint32_t dstPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstPin"));
                             bool ok = ctx.graph->Disconnect(srcId, srcPin, dstId, dstPin);
                             ctx.graph->MarkAllDirty();
+                            if (ok) sink.OnGraphStructureChanged();
                             return Json(200,
                                 std::string("{\"disconnected\":") + (ok ? "true" : "false") + "}");
                         }
@@ -173,7 +178,7 @@ namespace ShaderLab::Mcp
             server.AddRoute(L"POST", L"/graph/bind-property",
                 [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
                 {
-                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -187,6 +192,7 @@ namespace ShaderLab::Mcp
                             auto err = ctx.graph->BindProperty(nodeId, propName, srcNodeId, srcFieldName, srcComponent);
                             if (!err.empty())
                                 return Json(400, "{\"error\":\"" + WideToUtf8(err) + "\"}");
+                            sink.OnGraphStructureChanged();
                             return Json(200, R"({"ok":true})");
                         }
                         catch (...) { return Json(400, R"({"error":"Invalid request"})"); }
@@ -200,7 +206,7 @@ namespace ShaderLab::Mcp
             server.AddRoute(L"POST", L"/graph/unbind-property",
                 [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
                 {
-                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -208,6 +214,215 @@ namespace ShaderLab::Mcp
                             auto propName = std::wstring(jobj.GetNamedString(L"propertyName"));
                             if (!ctx.graph->UnbindProperty(nodeId, propName))
                                 return Json(404, R"({"error":"No binding for that property"})");
+                            sink.OnGraphStructureChanged();
+                            return Json(200, R"({"ok":true})");
+                        }
+                        catch (...) { return Json(400, R"({"error":"Invalid request"})"); }
+                    });
+                });
+        }
+
+        // ---- POST /graph/add-node ------------------------------------------
+        // Big route with multiple node-type branches:
+        //   * "Custom Compute Shader" / "Custom Pixel Shader" / "Custom D3D11
+        //     Compute Shader" -- create a fresh user-authored shader node.
+        //   * Any ShaderLab effect name -- look up in ShaderLabEffects registry.
+        //   * "Video Source" / "Image Source" -- create + PrepareSourceNode.
+        //   * Any built-in D2D effect name -- look up in EffectRegistry.
+        //
+        // After AddNode the OnNodeAdded event fires so the host (if any)
+        // can run AutoLayout + PopulatePreviewNodeSelector + log entry.
+        // Same UI path the toolbar AddNode flyout takes.
+        void RegisterAddNode(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/graph/add-node",
+                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                        try
+                        {
+                            auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
+                            if (!jobj.HasKey(L"effectName"))
+                                return Json(400, R"({"error":"Provide effectName"})");
+                            auto name = jobj.GetNamedString(L"effectName");
+
+                            auto addAndReply = [&](Graph::EffectNode&& node) -> McpHttpServer::Response {
+                                auto id = ctx.graph->AddNode(std::move(node));
+                                ctx.graph->MarkAllDirty();
+                                sink.OnNodeAdded(id);
+                                return Json(200, "{\"nodeId\":" + std::to_string(id) + "}");
+                            };
+
+                            // Custom shader node creation.
+                            if (name == L"Custom Compute Shader" || name == L"Custom Pixel Shader" ||
+                                name == L"Custom D3D11 Compute Shader")
+                            {
+                                Graph::EffectNode node;
+                                bool isCompute = (name == L"Custom Compute Shader");
+                                bool isD3D11 = (name == L"Custom D3D11 Compute Shader");
+                                node.type = (isCompute || isD3D11)
+                                    ? Graph::NodeType::ComputeShader
+                                    : Graph::NodeType::PixelShader;
+                                node.name = std::wstring(name);
+
+                                if (!isD3D11)
+                                {
+                                    node.effectClsid = isCompute
+                                        ? ::ShaderLab::Effects::CustomComputeShaderEffect::CLSID_CustomComputeShader
+                                        : ::ShaderLab::Effects::CustomPixelShaderEffect::CLSID_CustomPixelShader;
+                                    node.outputPins.push_back({ L"Output", 0 });
+                                }
+
+                                Graph::CustomEffectDefinition def;
+                                def.shaderType = isD3D11
+                                    ? Graph::CustomShaderType::D3D11ComputeShader
+                                    : isCompute
+                                        ? Graph::CustomShaderType::ComputeShader
+                                        : Graph::CustomShaderType::PixelShader;
+                                CoCreateGuid(&def.shaderGuid);
+                                def.inputNames.push_back(L"Source");
+                                node.inputPins.push_back({ L"I0", 0 });
+                                if (isCompute) { def.threadGroupX = 8; def.threadGroupY = 8; def.threadGroupZ = 1; }
+                                if (isD3D11)
+                                {
+                                    def.analysisOutputType = Graph::AnalysisOutputType::Typed;
+                                    def.analysisFields.push_back(
+                                        { L"Result", Graph::AnalysisFieldType::Float4 });
+                                }
+                                node.customEffect = std::move(def);
+                                return addAndReply(std::move(node));
+                            }
+
+                            // ShaderLab effects registry lookup.
+                            if (auto* slDesc = ::ShaderLab::Effects::ShaderLabEffects::Instance().FindByName(name))
+                            {
+                                auto node = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*slDesc);
+                                return addAndReply(std::move(node));
+                            }
+
+                            // Built-in D2D effects registry lookup.
+                            if (auto* desc = ::ShaderLab::Effects::EffectRegistry::Instance().FindByName(name))
+                            {
+                                auto node = ::ShaderLab::Effects::EffectRegistry::CreateNode(*desc);
+                                return addAndReply(std::move(node));
+                            }
+
+                            // Special source types: Video / Image. Optional
+                            // filePath; if present, PrepareSourceNode kicks in.
+                            std::wstring wname(name.begin(), name.end());
+                            std::wstring filePath;
+                            if (jobj.HasKey(L"filePath"))
+                                filePath = std::wstring(jobj.GetNamedString(L"filePath"));
+
+                            auto displayName = [&](const wchar_t* fallback) {
+                                return filePath.empty() ? std::wstring(fallback)
+                                    : filePath.substr(filePath.find_last_of(L"\\/") + 1);
+                            };
+
+                            if (wname == L"Video Source" || wname == L"Video")
+                            {
+                                auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(
+                                    filePath, displayName(L"Video Source"));
+                                auto id = ctx.graph->AddNode(std::move(node));
+                                if (!filePath.empty() && ctx.sourceFactory && ctx.dc)
+                                {
+                                    if (auto* graphNode = ctx.graph->FindNode(id))
+                                        ctx.sourceFactory->PrepareSourceNode(*graphNode,
+                                            static_cast<ID2D1DeviceContext5*>(ctx.dc), 0.0,
+                                            ctx.d3dDevice, ctx.d3dContext);
+                                }
+                                ctx.graph->MarkAllDirty();
+                                sink.OnNodeAdded(id);
+                                return Json(200, "{\"nodeId\":" + std::to_string(id) + "}");
+                            }
+                            if (wname == L"Image Source" || wname == L"Image")
+                            {
+                                auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateImageSourceNode(
+                                    filePath, displayName(L"Image Source"));
+                                auto id = ctx.graph->AddNode(std::move(node));
+                                if (!filePath.empty() && ctx.sourceFactory && ctx.dc)
+                                {
+                                    if (auto* graphNode = ctx.graph->FindNode(id))
+                                        ctx.sourceFactory->PrepareSourceNode(*graphNode,
+                                            static_cast<ID2D1DeviceContext5*>(ctx.dc), 0.0,
+                                            ctx.d3dDevice, ctx.d3dContext);
+                                }
+                                ctx.graph->MarkAllDirty();
+                                sink.OnNodeAdded(id);
+                                return Json(200, "{\"nodeId\":" + std::to_string(id) + "}");
+                            }
+
+                            return Json(400, R"({"error":"Unknown effect name"})");
+                        }
+                        catch (...) { return Json(400, R"({"error":"Invalid JSON"})"); }
+                    });
+                });
+        }
+
+        // ---- POST /graph/clear ---------------------------------------------
+        // Engine drops graph state and the evaluator cache. The OnGraphCleared
+        // event runs the host's UI cleanup (output windows, preview selector
+        // reset). Same path /graph/clear via UI button takes.
+        void RegisterClear(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/graph/clear",
+                [&sink](const std::wstring&, const std::string&) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&sink](EngineContext& ctx) -> McpHttpServer::Response {
+                        ctx.evaluator->ReleaseCache();
+                        ctx.graph->Clear();
+                        ctx.graph->MarkAllDirty();
+                        sink.OnGraphCleared();
+                        return Json(200, R"({"ok":true})");
+                    });
+                });
+        }
+
+        // ---- POST /graph/load ----------------------------------------------
+        // Body is the full graph JSON. Engine deserializes + assigns; the
+        // OnGraphLoaded event runs the host's per-load setup (heartbeats,
+        // re-opens output windows for nodes that had them, preview selector
+        // refresh). Same path the file-open dialog takes.
+        void RegisterLoad(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/graph/load",
+                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                {
+                    // Parse on the listener thread; assignment requires the
+                    // dispatch thread (it owns m_graph).
+                    Graph::EffectGraph loaded;
+                    try
+                    {
+                        loaded = Graph::EffectGraph::FromJson(winrt::to_hstring(body));
+                    }
+                    catch (const std::exception& ex)
+                    {
+                        return Json(400, std::string(R"({"error":")") + ex.what() + R"("})");
+                    }
+                    return sink.Dispatch([&loaded, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                        ctx.evaluator->ReleaseCache();
+                        *ctx.graph = std::move(loaded);
+                        ctx.graph->MarkAllDirty();
+                        sink.OnGraphLoaded();
+                        return Json(200, R"({"ok":true})");
+                    });
+                });
+        }
+
+        // ---- POST /graph/remove-node ---------------------------------------
+        void RegisterRemoveNode(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/graph/remove-node",
+                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                        try
+                        {
+                            auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
+                            uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
+                            ctx.graph->RemoveNode(nodeId);
+                            ctx.graph->MarkAllDirty();
+                            sink.OnNodeRemoved(nodeId);
                             return Json(200, R"({"ok":true})");
                         }
                         catch (...) { return Json(400, R"({"error":"Invalid request"})"); }
@@ -221,7 +436,7 @@ namespace ShaderLab::Mcp
             server.AddRoute(L"POST", L"/graph/set-property",
                 [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
                 {
-                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -300,6 +515,7 @@ namespace ShaderLab::Mcp
                                     node->shaderPath = *sv;
                             }
 
+                            sink.OnNodeChanged(nodeId);
                             return Json(200, R"({"ok":true})");
                         }
                         catch (...) { return Json(400, R"({"error":"Invalid request"})"); }
@@ -313,7 +529,7 @@ namespace ShaderLab::Mcp
             server.AddRoute(L"POST", L"/render/image-stats",
                 [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
                 {
-                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
                         WDJ::JsonObject jo{ nullptr };
                         if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
                             return Json(400, R"({"error":"Invalid JSON body"})");
@@ -408,7 +624,7 @@ namespace ShaderLab::Mcp
             server.AddRoute(L"POST", L"/render/pixel-region",
                 [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
                 {
-                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
                         WDJ::JsonObject jo{ nullptr };
                         if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
                             return Json(400, R"({"error":"Invalid JSON body"})");
@@ -482,10 +698,14 @@ namespace ShaderLab::Mcp
     void RegisterEngineRoutes(McpHttpServer& server, IEngineCommandSink& sink)
     {
         RegisterRegistry(server);
+        RegisterAddNode(server, sink);
+        RegisterRemoveNode(server, sink);
         RegisterConnect(server, sink);
         RegisterDisconnect(server, sink);
         RegisterBindProperty(server, sink);
         RegisterUnbindProperty(server, sink);
+        RegisterClear(server, sink);
+        RegisterLoad(server, sink);
         RegisterSetProperty(server, sink);
         RegisterImageStats(server, sink);
         RegisterPixelRegion(server, sink);
