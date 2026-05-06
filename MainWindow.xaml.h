@@ -191,6 +191,7 @@ namespace winrt::ShaderLab::implementation
         void OnAddFloodSourceClicked(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        winrt::fire_and_forget AddWindowsGraphicsCaptureSourceAsync();
         void OnNodeAdded(uint32_t nodeId);
         void OnPreviewPointerDragged(
             winrt::Windows::Foundation::IInspectable const& sender,

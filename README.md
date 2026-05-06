@@ -417,6 +417,7 @@ GitHub Actions workflow `.github/workflows/release.yml` runs as a matrix (`x64`,
 | `windowscodecs.lib` | WIC image loading |
 | `mfplat.lib`, `mfreadwrite.lib`, `mfuuid.lib` | Media Foundation video source decoding |
 | `mscms.lib` | ICC profile reading (Image Color Management) |
+| `windowsapp.lib` | Windows Graphics Capture interop (CreateDirect3D11DeviceFromDXGIDevice) |
 
 ---
 

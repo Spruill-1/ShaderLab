@@ -9,6 +9,7 @@
 #include "Rendering/EffectGraphFile.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/StatisticsEffect.h"
+#include "Effects/DxgiDuplicationSourceProvider.h"
 #include "Version.h"
 #include <microsoft.ui.xaml.media.dxinterop.h>
 
@@ -2298,6 +2299,44 @@ namespace winrt::ShaderLab::implementation
                         BrowseVideoForSourceNode();
                     });
                     subItem.Items().Append(videoSourceItem);
+
+                    auto dxgiCaptureGroup = MUX::MenuFlyoutSubItem();
+                    dxgiCaptureGroup.Text(L"DXGI DuplicateOutput");
+                    auto outputs = ::ShaderLab::Effects::DxgiDuplicationSourceProvider::EnumerateOutputs();
+                    for (const auto& output : outputs)
+                    {
+                        auto item = MUX::MenuFlyoutItem();
+                        std::wstring text = output.deviceName.empty()
+                            ? std::format(L"Adapter {} Output {}", output.adapterIndex, output.outputIndex)
+                            : std::format(L"{} ({},{})", output.deviceName, output.adapterIndex, output.outputIndex);
+                        item.Text(winrt::hstring(text));
+                        item.Click([this, output, text](auto&&, auto&&)
+                        {
+                            auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateDxgiDuplicateOutputSourceNode(
+                                output.adapterIndex,
+                                output.outputIndex,
+                                L"DXGI " + text);
+                            auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
+                            OnNodeAdded(nodeId);
+                        });
+                        dxgiCaptureGroup.Items().Append(item);
+                    }
+                    if (dxgiCaptureGroup.Items().Size() == 0)
+                    {
+                        auto unavailable = MUX::MenuFlyoutItem();
+                        unavailable.Text(L"No outputs available");
+                        unavailable.IsEnabled(false);
+                        dxgiCaptureGroup.Items().Append(unavailable);
+                    }
+                    subItem.Items().Append(dxgiCaptureGroup);
+
+                    auto wgcSourceItem = MUX::MenuFlyoutItem();
+                    wgcSourceItem.Text(L"Windows Graphics Capture...");
+                    wgcSourceItem.Click([this](auto&&, auto&&)
+                    {
+                        AddWindowsGraphicsCaptureSourceAsync();
+                    });
+                    subItem.Items().Append(wgcSourceItem);
                 }
             }
 
@@ -2465,6 +2504,31 @@ namespace winrt::ShaderLab::implementation
 
         auto* graphNode = m_graph.FindNode(nodeId);
         if (graphNode && m_renderEngine.D2DDeviceContext())
+        {
+            m_sourceFactory.PrepareSourceNode(*graphNode, m_renderEngine.D2DDeviceContext(), 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+        }
+
+        OnNodeAdded(nodeId);
+    }
+
+    winrt::fire_and_forget MainWindow::AddWindowsGraphicsCaptureSourceAsync()
+    {
+        auto strong = get_strong();
+
+        winrt::Windows::Graphics::Capture::GraphicsCapturePicker picker;
+        picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
+
+        auto item = co_await picker.PickSingleItemAsync();
+        if (!item) co_return;
+
+        std::wstring name = item.DisplayName().empty()
+            ? L"Windows Graphics Capture"
+            : std::wstring(item.DisplayName().c_str());
+        auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateWindowsGraphicsCaptureSourceNode(name);
+        auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
+        m_sourceFactory.RegisterGraphicsCaptureItem(nodeId, item);
+
+        if (auto* graphNode = m_graph.FindNode(nodeId); graphNode && m_renderEngine.D2DDeviceContext())
         {
             m_sourceFactory.PrepareSourceNode(*graphNode, m_renderEngine.D2DDeviceContext(), 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
         }
@@ -6410,9 +6474,9 @@ namespace winrt::ShaderLab::implementation
         if (dc)
         {
             try {
-                m_sourceFactory.TickAndUploadVideos(
-                    const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()),
-                    dc, deltaSec);
+                auto& nodes = const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes());
+                m_sourceFactory.TickAndUploadVideos(nodes, dc, deltaSec);
+                m_sourceFactory.TickAndUploadLiveCaptures(nodes, dc);
             } catch (...) {}
         }
 
