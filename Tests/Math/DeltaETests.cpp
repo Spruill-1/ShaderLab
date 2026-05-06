@@ -47,8 +47,8 @@ float DeltaE2000(float3 lab1, float3 lab2) {
     float a2p = a2 * (1.0 + G);
     float C1p = sqrt(a1p*a1p + b1*b1);
     float C2p = sqrt(a2p*a2p + b2*b2);
-    float h1p = atan2(b1, a1p); if (h1p < 0.0) h1p += 6.28318530718;
-    float h2p = atan2(b2, a2p); if (h2p < 0.0) h2p += 6.28318530718;
+    float h1p = (C1p < 1e-10) ? 0.0 : atan2(b1, a1p); if (h1p < 0.0) h1p += 6.28318530718;
+    float h2p = (C2p < 1e-10) ? 0.0 : atan2(b2, a2p); if (h2p < 0.0) h2p += 6.28318530718;
     float dLp = L2 - L1;
     float dCp = C2p - C1p;
     float dhp;
@@ -141,22 +141,14 @@ float DeltaE2000(float3 lab1, float3 lab2) {
         // every branch of the formula (G correction, hue wrap, T term,
         // RT rotation in the blue region).
         //
-        // **Skipped: Sharma pair 6 (50, -1, 2) vs (50, 0, 0).** The
-        // current shipping DeltaE2000 HLSL produces NaN on this pair
-        // because atan2(0, 0) on the (a2, b2) = (0, 0) input is
-        // implementation-defined and propagates NaN through hp_avg.
-        // Tracked as a known bug to fix in a follow-up; covered by the
-        // separate "C2 == 0 NaN regression flag" test below so a future
-        // fix is detected automatically.
-        // **Known bug, not a test:** Sharma pair 6 (50, -1, 2) vs (50, 0, 0)
-        // produces NaN through DeltaE2000 because atan2(0, 0) is
-        // implementation-defined and propagates through hp_avg. Tracked
-        // separately; once the implementation guards C1p*C2p == 0 in the
-        // hp_avg branch, add this pair back to the Sharma loop above:
-        //   { 50.0000f, -1.0000f, 2.0000f, 50.0000f, 0.0000f, 0.0000f, 2.3669f }
+        // Pair 6 (50,-1,2) vs (50,0,0) was previously broken: atan2(0,0)
+        // on (a2=0,b2=0) produced NaN that propagated through hp_avg.
+        // Fixed by guarding h2p with C2p<1e-10 (Phase 5 companion fix to
+        // bug `p2-bug-de2000-nan`). Effect version bumped 3 -> 4.
         struct Pair { float l1, a1, b1, l2, a2, b2, expected; };
         const Pair pairs[] = {
             { 50.0000f,  2.6772f, -79.7751f, 50.0000f, 0.0000f, -82.7485f, 2.0425f },
+            { 50.0000f, -1.0000f,   2.0000f, 50.0000f, 0.0000f,   0.0000f, 2.3669f },
             { 50.0000f,  2.5000f,   0.0000f, 50.0000f, 0.0000f,  -2.5000f, 4.3065f },
             { 60.2574f, -34.0099f, 36.2677f, 60.4626f, -34.1751f, 39.4387f, 1.2644f },
             { 22.7233f,  20.0904f, -46.6940f, 23.0331f, 14.9730f, -42.5619f, 2.0373f },

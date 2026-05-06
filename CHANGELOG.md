@@ -5,7 +5,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- **`DeltaE2000` NaN when one input has C == 0 (a == b == 0).** Found by the Phase 2 test bench against Sharma reference pair 6 (50,-1,2) vs (50,0,0). `atan2(0, 0)` is implementation-defined and was propagating NaN through `hp_avg = h1p + h2p`. Guarded both `h1p` and `h2p` with a `Cnp < 1e-10 ? 0.0 : atan2(...)` check; downstream `hp_avg` already short-circuits when `C1p * C2p < 1e-10`, so the achromatic-point hue values never feed back into the result. Sharma pair 6 now passes within the 5e-3 tolerance the other Sharma pairs use. Effect version `Delta E Comparator` 3 → 4. Tracked from `p2-bug-de2000-nan`.
+
 ### Changed
+- **Phase 5 (partial): extract HLSL color-math library into its own TU.** `Effects/ColorMath.cpp` now owns the embedded `s_colorMathHLSL` string and `GetColorMathHLSL()`. `Effects/ShaderLabEffects.cpp` shrank from **3169 → 2839 lines (-10%)**. Per-effect file split (decision: 30+ effects each registering via static initializer) is deferred — the static-init-order-across-TUs risk is real and the existing one-file-per-30-effects layout works. Phase 2 test bench would not catch a regression in effect registration order.
 - **Phase 4 (partial): MainWindow.xaml.cpp split into sibling partial TUs.** Three of the five planned extractions: `MainWindow.WorkingSpace.cpp` (~270 LoC: display-profile selection, ICC loader, `UpdateWorkingSpaceNodes`), `MainWindow.GraphFileIo.cpp` (~770 LoC: save/load + miniz embedded-media archive + heartbeat / stale-temp-dir reaper), `MainWindow.RenderTick.cpp` (~500 LoC: `OnRenderTick`, `RenderFrame`, dirty-propagation pre-pass, video tick, output-window present). All three new TUs share the `winrt::ShaderLab::implementation::MainWindow` class via `MainWindow.xaml.h`; method bodies were moved verbatim with no behavior change. `MainWindow.xaml.cpp` shrank from **6088 → 4730 lines (-22%)**. PropertiesPanel and Dialogs extractions are deferred — the Properties-panel rebuild logic is interleaved with NodeGraphController canvas rendering inside one 2400-line section, and Dialogs are spread across the file; both need a closer look at method-boundary coupling before extraction.
 
 ### Added
