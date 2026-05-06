@@ -61,6 +61,18 @@ namespace
         uint32_t     height{ 1024 };
         bool         useWarp{ false };
         uint16_t     mcpPort{ 47809 };  // q-p7-mcp-port-conflict default
+        // D2D HdrToneMap parameters: InputMaxLuminance is the peak nit
+        // value of the source content; OutputMaxLuminance is the peak
+        // nit value the SDR PNG can represent (80 == scRGB 1.0). The
+        // tone mapper saturates inputs above 1000 nits to 80 nits SDR
+        // by default, which is what we want for visual inspection of
+        // HDR test patterns rendered through the engine.
+        float        inputPeakNits{ 1000.0f };
+        float        outputPeakNits{ 80.0f };
+        // Skip the tone map entirely (raw scRGB -> sRGB clamp). Useful
+        // when the graph already produced SDR-range output and we
+        // don't want HdrToneMap's mid-tone lift muddying the result.
+        bool         skipToneMap{ false };
     };
 
     void PrintUsage(const wchar_t* exeName)
@@ -74,10 +86,13 @@ L"  --node ID       Numeric node id to render\n"
 L"  --output PATH   PNG output path\n"
 L"\n"
 L"Options:\n"
-L"  --width N       Output width (default: 1024)\n"
-L"  --height N      Output height (default: 1024)\n"
-L"  --adapter X     'warp' or 'default' (default: default)\n"
-L"  --port N        Reserved for MCP server (default: 47809)\n",
+L"  --width N                Output width (default: 1024)\n"
+L"  --height N               Output height (default: 1024)\n"
+L"  --adapter X              'warp' or 'default' (default: default)\n"
+L"  --port N                 Reserved for MCP server (default: 47809)\n"
+L"  --input-peak-nits N      D2D HdrToneMap input peak (default: 1000)\n"
+L"  --output-peak-nits N     D2D HdrToneMap output peak (default: 80 = SDR)\n"
+L"  --no-tonemap             Skip HdrToneMap, raw scRGB -> sRGB clamp\n",
             exeName);
     }
 
@@ -103,6 +118,9 @@ L"  --port N        Reserved for MCP server (default: 47809)\n",
             else if (a == L"--height")  { auto v = needNext(L"--height"); if (!v) return false; out.height = static_cast<uint32_t>(std::wcstoul(v, nullptr, 10)); }
             else if (a == L"--adapter") { auto v = needNext(L"--adapter"); if (!v) return false; out.useWarp = (std::wstring_view{v} == L"warp"); }
             else if (a == L"--port")    { auto v = needNext(L"--port"); if (!v) return false; out.mcpPort = static_cast<uint16_t>(std::wcstoul(v, nullptr, 10)); }
+            else if (a == L"--input-peak-nits")  { auto v = needNext(L"--input-peak-nits"); if (!v) return false; out.inputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); }
+            else if (a == L"--output-peak-nits") { auto v = needNext(L"--output-peak-nits"); if (!v) return false; out.outputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); }
+            else if (a == L"--no-tonemap") { out.skipToneMap = true; }
             else if (a == L"--help" || a == L"-h" || a == L"-?") { PrintUsage(argv[0]); return false; }
             else { std::wprintf(L"ERROR: unknown argument '%ls'\n", argv[i]); return false; }
         }
@@ -336,13 +354,42 @@ int RunRender(const Args& args)
         return 9;
     }
 
+    // Build the input image for the render pass: either the cached
+    // output directly (--no-tonemap) or the same image piped through
+    // a CLSID_D2D1HdrToneMap effect (default). The HdrToneMap effect's
+    // documented behavior is "fixed BT.2408-style mid-tone lift" -- see
+    // README decision log #52 for the empirical analysis. For PNG
+    // visual-inspection output we want the lift; for raw scRGB pixel
+    // sampling use --no-tonemap (or, future work, the FP16 readback
+    // path tracked as p7-headless-fp16-pixel-readback).
+    winrt::com_ptr<ID2D1Effect> toneMap;
+    winrt::com_ptr<ID2D1Image> toneMappedOut;
+    ID2D1Image* renderInput = node->cachedOutput;
+    if (!args.skipToneMap)
+    {
+        hr = dc->CreateEffect(CLSID_D2D1HdrToneMap, toneMap.put());
+        if (FAILED(hr)) {
+            std::wprintf(L"FATAL: CreateEffect(HdrToneMap) failed 0x%08X\n", static_cast<uint32_t>(hr));
+            return 10;
+        }
+        toneMap->SetInput(0, node->cachedOutput);
+        toneMap->SetValue(D2D1_HDRTONEMAP_PROP_INPUT_MAX_LUMINANCE,  args.inputPeakNits);
+        toneMap->SetValue(D2D1_HDRTONEMAP_PROP_OUTPUT_MAX_LUMINANCE, args.outputPeakNits);
+        toneMap->SetValue(D2D1_HDRTONEMAP_PROP_DISPLAY_MODE,
+            (args.outputPeakNits <= 80.0f)
+                ? D2D1_HDRTONEMAP_DISPLAY_MODE_SDR
+                : D2D1_HDRTONEMAP_DISPLAY_MODE_HDR);
+        toneMap->GetOutput(toneMappedOut.put());
+        renderInput = toneMappedOut.get();
+    }
+
     float oldDpiX, oldDpiY;
     dc->GetDpi(&oldDpiX, &oldDpiY);
     dc->SetDpi(96.0f, 96.0f);
     dc->SetTarget(target.get());
     dc->BeginDraw();
     dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-    dc->DrawImage(node->cachedOutput);
+    dc->DrawImage(renderInput);
     hr = dc->EndDraw();
     dc->SetTarget(nullptr);
     dc->SetDpi(oldDpiX, oldDpiY);
