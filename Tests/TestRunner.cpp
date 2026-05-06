@@ -47,6 +47,14 @@ namespace
     winrt::com_ptr<ID2D1Factory7> g_d2dFactory;
     winrt::com_ptr<ID2D1DeviceContext5> g_dc;
 
+    // Phase 7 spike discovered: cachedOutput is only valid while the
+    // GraphEvaluator that produced it is alive. The evaluator owns the
+    // ID2D1Effect cache; effects own their output ID2D1Image; node
+    // pointers are non-owning. Keep this evaluator alive for the
+    // lifetime of any test that wants to use cachedOutput downstream
+    // (DrawImage, pixel readback, etc).
+    ShaderLab::Rendering::GraphEvaluator g_evaluator;
+
     void Evaluate(ShaderLab::Graph::EffectGraph& graph, ShaderLab::Effects::SourceNodeFactory& sf)
     {
         graph.MarkAllDirty();
@@ -58,9 +66,8 @@ namespace
                 catch (...) {}
             }
         }
-        ShaderLab::Rendering::GraphEvaluator evaluator;
-        evaluator.Evaluate(graph, g_dc.get());
-        evaluator.Evaluate(graph, g_dc.get()); // second pass for new effects
+        g_evaluator.Evaluate(graph, g_dc.get());
+        g_evaluator.Evaluate(graph, g_dc.get()); // second pass for new effects
     }
 
     bool HasOutput(const ShaderLab::Graph::EffectNode& node)
@@ -509,6 +516,116 @@ void main(uint3 id : SV_DispatchThreadID) { output[id.xy] = float4(1,0,0,1); }
         auto* inv = g.FindNode(invertId);
         TEST("ThreeNodeChain", inv && HasOutput(*inv));
     }
+
+    // ----- Phase 7 spike: headless pixel readback ----------------------------
+    //
+    // The Phase 7 plan to move the MCP server engine-side and add a
+    // ShaderLabHeadless.exe console host depends on being able to render
+    // the graph and read pixels back without any DXGI swap chain. The
+    // existing TestEffectChain already proves the *evaluate* half works
+    // off-screen (the test runner has no swap chain). This test proves
+    // the *read pixels back* half works too -- the missing capability
+    // for graph_snapshot / render_capture_node / image_stats MCP routes
+    // when running in a no-UI host.
+    void TestHeadlessReadback()
+    {
+        printf("\n=== Phase 7 Spike: Headless Readback ===\n");
+
+        // Build the smallest finite-extent graph we can. Gamut Source is
+        // a ShaderLab effect with a fixed output size (scRGB FP16) and
+        // produces a deterministic CIE xy chromaticity diagram. Any
+        // bounded source works; we just need "evaluate -> finite cached
+        // output -> can read a pixel".
+        auto& reg = ShaderLab::Effects::ShaderLabEffects::Instance();
+
+        ShaderLab::Graph::EffectGraph g;
+        ShaderLab::Effects::SourceNodeFactory sf;
+
+        auto srcNode = ShaderLab::Effects::ShaderLabEffects::CreateNode(
+            *reg.FindByName(L"Gamut Source"));
+        auto srcId = g.AddNode(std::move(srcNode));
+
+        Evaluate(g, sf);
+        auto* node = g.FindNode(srcId);
+        if (!node || !node->cachedOutput) {
+            TEST("Gamut Source produces cachedOutput", false);
+            return;
+        }
+        TEST("Gamut Source produces cachedOutput", true);
+
+        // Sample the source onto a small but non-trivial target. A 32x32
+        // target with no srcRect lets D2D figure out its own tiling.
+        // Map and read pixel (16, 16) for the test.
+        const UINT kSize = 32;
+        winrt::com_ptr<ID2D1Bitmap1> targetBmp;
+        D2D1_BITMAP_PROPERTIES1 targetProps{};
+        targetProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+        targetProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+        targetProps.dpiX = 96.0f;
+        targetProps.dpiY = 96.0f;
+        HRESULT hr = g_dc->CreateBitmap(D2D1::SizeU(kSize, kSize), nullptr, 0, targetProps, targetBmp.put());
+        if (FAILED(hr)) { TEST("CreateBitmap (target)", false); return; }
+
+        winrt::com_ptr<ID2D1Bitmap1> stagingBmp;
+        D2D1_BITMAP_PROPERTIES1 stagingProps{};
+        stagingProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+        stagingProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+        stagingProps.dpiX = 96.0f;
+        stagingProps.dpiY = 96.0f;
+        hr = g_dc->CreateBitmap(D2D1::SizeU(kSize, kSize), nullptr, 0, stagingProps, stagingBmp.put());
+        if (FAILED(hr)) { TEST("CreateBitmap (staging)", false); return; }
+
+        float oldDpiX, oldDpiY;
+        g_dc->GetDpi(&oldDpiX, &oldDpiY);
+        g_dc->SetDpi(96.0f, 96.0f);
+
+        g_dc->SetTarget(targetBmp.get());
+        g_dc->BeginDraw();
+        g_dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        // No srcRect, no offset: render whatever's there. D2D figures out
+        // its own bounds; for the Gamut Source's fixed-size output this
+        // is well-defined.
+        g_dc->DrawImage(node->cachedOutput);
+        hr = g_dc->EndDraw();
+        g_dc->SetTarget(nullptr);
+        g_dc->SetDpi(oldDpiX, oldDpiY);
+        if (FAILED(hr)) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                "EndDraw target (hr=0x%08X)", static_cast<uint32_t>(hr));
+            TEST(buf, false);
+            return;
+        }
+
+        D2D1_POINT_2U dstPt = { 0, 0 };
+        D2D1_RECT_U srcRectU = { 0, 0, kSize, kSize };
+        hr = stagingBmp->CopyFromBitmap(&dstPt, targetBmp.get(), &srcRectU);
+        if (FAILED(hr)) { TEST("CopyFromBitmap (staging)", false); return; }
+
+        D2D1_MAPPED_RECT mapped{};
+        hr = stagingBmp->Map(D2D1_MAP_OPTIONS_READ, &mapped);
+        if (FAILED(hr)) { TEST("Map staging bitmap", false); return; }
+
+        // Read pixel (16, 16) from the mapped buffer.
+        const uint8_t* row = mapped.bits + 16 * mapped.pitch;
+        const float* px = reinterpret_cast<const float*>(row) + 16 * 4;
+        const float r = px[0], green = px[1], b = px[2], a = px[3];
+        stagingBmp->Unmap();
+
+        // The exact value depends on Gamut Source's content at (128,128),
+        // which we don't try to predict here. The Phase 7 spike only
+        // needs to confirm: (a) the readback path runs without hanging
+        // or failing, and (b) the bytes that came back are finite,
+        // non-NaN floats. That's the headless-host capability we need
+        // for graph_snapshot / render_capture_node / image_stats MCP
+        // routes.
+        bool finite = std::isfinite(r) && std::isfinite(green)
+            && std::isfinite(b) && std::isfinite(a);
+        TEST("Headless pixel readback completes without hang", true);
+        TEST("Headless pixel readback returns finite floats", finite);
+
+        std::printf("    pixel = (%.4f, %.4f, %.4f, %.4f)\n", r, green, b, a);
+    }
 }
 
 int main(int argc, char* argv[])
@@ -579,6 +696,7 @@ int main(int argc, char* argv[])
     TestClockNode();
     TestShaderCompilation();
     TestEffectChain();
+    TestHeadlessReadback();
 
     // ---- Math test bench (Phase 2) -----------------------------------------
     {
