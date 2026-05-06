@@ -327,7 +327,7 @@ float ReinhardExpandI(float I, float peakIn_I, float peakOut_I) {
 }
 )HLSL";
 
-    const std::string& GetColorMathHLSL()
+    SHADERLAB_API const std::string& GetColorMathHLSL()
     {
         return s_colorMathHLSL;
     }

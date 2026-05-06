@@ -88,5 +88,5 @@ namespace ShaderLab::Effects
     SHADERLAB_API void RegisterEngineD2DEffects(ID2D1Factory1* factory);
 
     // Shared HLSL color math functions (prepended to all ShaderLab shaders).
-    const std::string& GetColorMathHLSL();
+    SHADERLAB_API const std::string& GetColorMathHLSL();
 }

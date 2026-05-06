@@ -1,4 +1,6 @@
 #include "pch_engine.h"
+#include "TestCommon.h"
+#include "ShaderTestBench.h"
 #include "Graph/EffectGraph.h"
 #include "Rendering/GraphEvaluator.h"
 #include "Effects/SourceNodeFactory.h"
@@ -19,23 +21,25 @@
 // Exit code = number of failures (0 = all passed).
 // ============================================================================
 
+// Forward decl from Tests/Math/*.cpp.
+namespace ShaderLab::Tests
+{
+    void TestTransferFunctions(ShaderTestBench& bench);
+    void TestColorMatrices(ShaderTestBench& bench);
+    void TestMobiusReinhard(ShaderTestBench& bench);
+    void TestDeltaE(ShaderTestBench& bench);
+    void TestGamut(ShaderTestBench& bench);
+}
+
 namespace
 {
-    int g_passed = 0;
-    int g_failed = 0;
-
-    void TEST(const char* name, bool result)
-    {
-        if (result) {
-            printf("  [PASS] %s\n", name);
-            g_passed++;
-        }
-        else {
-            printf("  [FAIL] %s\n", name);
-            g_failed++;
-        }
-        fflush(stdout);
-    }
+    // TEST() and g_passed/g_failed live in TestCommon.h so multiple TUs
+    // (Tests/Math/*.cpp) can share the same summary counters. Pull them
+    // into the local anonymous namespace via using-declarations so the
+    // existing test bodies in this file stay unchanged.
+    using ShaderLab::Tests::TEST;
+    using ShaderLab::Tests::g_passed;
+    using ShaderLab::Tests::g_failed;
 
     // Shared device resources.
     winrt::com_ptr<ID3D11Device5> g_d3dDevice;
@@ -575,6 +579,18 @@ int main(int argc, char* argv[])
     TestClockNode();
     TestShaderCompilation();
     TestEffectChain();
+
+    // ---- Math test bench (Phase 2) -----------------------------------------
+    {
+        ShaderLab::Tests::ShaderTestBench bench;
+        bench.Initialize(g_d3dDevice.get(), g_d3dContext.get());
+        ShaderLab::Tests::TestTransferFunctions(bench);
+        ShaderLab::Tests::TestColorMatrices(bench);
+        ShaderLab::Tests::TestMobiusReinhard(bench);
+        ShaderLab::Tests::TestDeltaE(bench);
+        ShaderLab::Tests::TestGamut(bench);
+        bench.Shutdown();
+    }
 
     // Summary.
     printf("\n========================================\n");
