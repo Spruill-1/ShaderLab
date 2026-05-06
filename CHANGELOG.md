@@ -3,7 +3,7 @@
 All notable changes to ShaderLab will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.4.1] - 2026-05-05
 
 ### Added
 - **`OutputMode` parameter on the `Delta E Comparator` effect** (effectVersion 2 → 3). Two modes: `0 = Heatmap` (default — Turbo colormap, prior behavior) and `1 = Grayscale dE`. Grayscale mode writes `saturate(dE / MaxDeltaE)` to all three RGB channels, which makes a downstream `Luminance Statistics` node read true mean/p95/max color-difference values directly off the GPU — no CPU pixel readback required. Enables live in-graph dE telemetry while sweeping a tone-mapper's parameters: bind / drive any input, watch the mean dE field update in the Properties panel each frame.
