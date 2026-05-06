@@ -80,6 +80,16 @@ namespace winrt::ShaderLab::implementation
         D2D1_SIZE_F PreviewViewportDips() const;
         void ApplyDisplayProfile(const ::ShaderLab::Rendering::DisplayProfile& profile);
         void RevertToLiveDisplay();
+
+        // Mirror the active display profile (live or simulated) into the
+        // properties of every "Working Space" parameter node in the graph.
+        // Called from the few hot paths where the profile changes
+        // (ApplyDisplayProfile, RevertToLiveDisplay, display-change
+        // callback) and once per render tick so newly-added Working Space
+        // nodes pick up live values immediately. Cheap no-op when the graph
+        // contains no Working Space nodes.
+        void UpdateWorkingSpaceNodes();
+
         void ResetAfterGraphLoad(bool reopenOutputWindows = true);
 
         // Pixel trace helpers.
@@ -330,6 +340,47 @@ namespace winrt::ShaderLab::implementation
         // Capture the current preview as a PNG byte buffer.
         // Returns empty vector on failure.
         std::vector<uint8_t> CapturePreviewAsPng();
+
+        // Encode a D2D image as a PNG byte buffer (BGRA8 via WIC).  Used by
+        // CapturePreviewAsPng and CaptureNodeAsPng to share the encoder path.
+        // Caps each axis at maxDim pixels to keep responses bounded.
+        std::vector<uint8_t> CaptureImageAsPng(ID2D1Image* image, uint32_t maxDim = 2048);
+
+        // Capture an arbitrary node's resolved output as a PNG byte buffer.
+        // Forces a render frame first so dirty downstream nodes evaluate.
+        // Returns:
+        //   - empty + outNotFound=true  when the node ID doesn't exist.
+        //   - empty + outNotReady=true  when the node exists but isn't yet ready.
+        //   - empty + neither flag set  on encode failure.
+        std::vector<uint8_t> CaptureNodeAsPng(uint32_t nodeId,
+                                              bool& outNotFound,
+                                              bool& outNotReady);
+
+        // Read a w x h pixel region from a node's resolved output as scRGB
+        // FP32 RGBA values (one float4 per pixel, row-major from top-left).
+        // Forces a render frame first.  Region is clipped to image bounds.
+        // Returns true on success and populates `outPixels` with w*h*4 floats.
+        // outActualW/H reflect the (clipped) region actually read.
+        bool ReadPixelRegion(uint32_t nodeId,
+                             int32_t x, int32_t y, uint32_t w, uint32_t h,
+                             std::vector<float>& outPixels,
+                             uint32_t& outActualW, uint32_t& outActualH,
+                             bool& outNotFound, bool& outNotReady);
+
+        // Capture the live node-graph view (current pan/zoom, sized to the
+        // graph swap-chain panel) as a PNG byte buffer.  Renders into an
+        // off-screen bitmap so it doesn't disturb the live render tick.
+        // Returns empty vector on failure.
+        std::vector<uint8_t> CaptureGraphAsPng();
+
+        // Pan/zoom the node-graph view to fit all nodes on screen, with the
+        // given viewport-space padding (DIPs).  No-op when the graph is empty.
+        void FitGraphView(float padding = 40.0f);
+
+        // Shared draw routine for the node-graph scene (clear + dot grid +
+        // controller render).  Used by both the live render tick and the
+        // off-screen snapshot capture so the two never drift.
+        void RenderGraphScene(ID2D1DeviceContext5* dc, D2D1_SIZE_F viewSize);
         void OpenEffectDesigner();
         void EnforceCustomEffectNameUniqueness(uint32_t modifiedNodeId);
 
@@ -349,6 +400,22 @@ namespace winrt::ShaderLab::implementation
         std::wstring m_pendingOpenPath; // file path from Explorer FTA, loaded after init
         void SetupMcpRoutes();
         template<typename F> auto DispatchSync(F&& fn) -> decltype(fn());
+
+        // MCP activity indicator state.
+        // Updated from the MCP listener thread via the activity callback;
+        // polled from the UI render tick to drive the dot color + tooltip.
+        std::atomic<int64_t>  m_mcpLastActivityMs{ 0 };
+        std::atomic<uint64_t> m_mcpRequestCount{ 0 };
+        std::atomic<uint64_t> m_mcpUiUpdateSeq{ 0 };  // bumped every callback; UI compares
+        uint64_t              m_mcpLastUiUpdateSeq{ 0 };
+        std::mutex            m_mcpLastReqMutex;
+        std::string           m_mcpLastReqMethod;
+        std::string           m_mcpLastReqPath;
+        std::string           m_mcpLastReqPeer;
+        uint16_t              m_mcpLastReqStatus{ 0 };
+        std::set<std::string> m_mcpKnownPeers;  // distinct peer addresses seen since server start
+        void UpdateMcpActivityIndicator();
+        void ResetMcpActivityState();
 
         // Column splitter drag state.
         bool m_isDraggingSplitter{ false };

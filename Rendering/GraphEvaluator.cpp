@@ -327,7 +327,12 @@ namespace ShaderLab::Rendering
                     }
                     else
                     {
-                        // Regular parameter nodes: copy property values.
+                        // Regular parameter nodes: copy property values into
+                        // the analysis output fields. Supports the full
+                        // PropertyValue variant — host-managed nodes (e.g.
+                        // Working Space) write float2/float3/float4 plus
+                        // bool / int / uint into properties keyed by field
+                        // name and the evaluator unpacks them here.
                         for (const auto& fd : node->customEffect->analysisFields)
                         {
                             AnalysisFieldValue fv;
@@ -336,8 +341,41 @@ namespace ShaderLab::Rendering
                             auto propIt = node->properties.find(fd.name);
                             if (propIt != node->properties.end())
                             {
-                                if (auto* f = std::get_if<float>(&propIt->second))
+                                const auto& pv = propIt->second;
+                                if (auto* f = std::get_if<float>(&pv))
+                                {
                                     fv.components[0] = *f;
+                                }
+                                else if (auto* b = std::get_if<bool>(&pv))
+                                {
+                                    fv.components[0] = *b ? 1.0f : 0.0f;
+                                }
+                                else if (auto* i = std::get_if<int32_t>(&pv))
+                                {
+                                    fv.components[0] = static_cast<float>(*i);
+                                }
+                                else if (auto* u = std::get_if<uint32_t>(&pv))
+                                {
+                                    fv.components[0] = static_cast<float>(*u);
+                                }
+                                else if (auto* v2 = std::get_if<winrt::Windows::Foundation::Numerics::float2>(&pv))
+                                {
+                                    fv.components[0] = v2->x;
+                                    fv.components[1] = v2->y;
+                                }
+                                else if (auto* v3 = std::get_if<winrt::Windows::Foundation::Numerics::float3>(&pv))
+                                {
+                                    fv.components[0] = v3->x;
+                                    fv.components[1] = v3->y;
+                                    fv.components[2] = v3->z;
+                                }
+                                else if (auto* v4 = std::get_if<winrt::Windows::Foundation::Numerics::float4>(&pv))
+                                {
+                                    fv.components[0] = v4->x;
+                                    fv.components[1] = v4->y;
+                                    fv.components[2] = v4->z;
+                                    fv.components[3] = v4->w;
+                                }
                             }
                             node->analysisOutput.fields.push_back(std::move(fv));
                         }
@@ -2147,6 +2185,50 @@ namespace ShaderLab::Rendering
         addField(L"P95", stats.p95);
         addField(L"Samples", static_cast<float>(stats.samples));
         addField(L"Nonzero%", vNonzero);
+    }
+
+    // -----------------------------------------------------------------------
+    // Standalone (graph-mutation-free) image statistics for MCP queries.
+    // -----------------------------------------------------------------------
+    std::vector<ImageStats> GraphEvaluator::ComputeStandaloneStats(
+        ID2D1DeviceContext5* dc,
+        ID2D1Image* inputImage,
+        const std::vector<uint32_t>& channels,
+        bool nonzeroOnly)
+    {
+        std::vector<ImageStats> result;
+        if (!dc || !inputImage || channels.empty()) return result;
+
+        // Re-render the upstream chain to a fresh FP32 GPU bitmap.  EndDraw
+        // inside PreRenderInputBitmap flushes the D2D batch, so the surface
+        // is populated before the D3D11 compute pass below.
+        auto fp32 = PreRenderInputBitmap(dc, inputImage);
+        if (!fp32) return result;
+
+        // Pull the underlying D3D11 texture out of the D2D bitmap so we can
+        // hand it to GpuReduction (which speaks raw D3D11).
+        winrt::com_ptr<IDXGISurface> surface;
+        if (FAILED(fp32->GetSurface(surface.put()))) return result;
+        winrt::com_ptr<ID3D11Texture2D> tex;
+        if (FAILED(surface->QueryInterface(tex.put()))) return result;
+
+        winrt::com_ptr<ID3D11Device> device;
+        tex->GetDevice(device.put());
+        winrt::com_ptr<ID3D11DeviceContext> d3dCtx;
+        device->GetImmediateContext(d3dCtx.put());
+
+        if (!m_gpuReduction.IsInitialized())
+            m_gpuReduction.Initialize(device.get());
+
+        result.reserve(channels.size());
+        for (uint32_t ch : channels)
+        {
+            // Defensive: GpuReduction channel codes are 0=Y,1=R,2=G,3=B,4=A.
+            // Anything outside that range falls back to luminance.
+            uint32_t safe = (ch <= 4) ? ch : 0;
+            result.push_back(m_gpuReduction.Reduce(d3dCtx.get(), tex.get(), safe, nonzeroOnly));
+        }
+        return result;
     }
 }
 

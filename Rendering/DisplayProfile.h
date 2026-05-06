@@ -54,6 +54,19 @@ namespace ShaderLab::Rendering
     // Preset factory functions
     // -----------------------------------------------------------------------
 
+    // Preset helper: stamp coherent ACM/WCG/activeColorMode flags into a
+    // `caps` block based on hdrEnabled. Used by every Preset*() factory so
+    // simulated profiles report a self-consistent display mode through the
+    // Working Space node and other consumers.
+    inline void StampSimulatedColorMode(DisplayCapabilities& caps)
+    {
+        caps.activeColorMode = caps.hdrEnabled ? 2u : 0u; // 2=HDR, 0=SDR
+        caps.hdrSupported    = caps.hdrEnabled;
+        caps.hdrUserEnabled  = caps.hdrEnabled;
+        caps.wcgSupported    = caps.hdrEnabled; // SDR presets don't simulate ACM/WCG
+        caps.wcgUserEnabled  = false;
+    }
+
     inline DisplayProfile PresetSrgbSdr()
     {
         DisplayProfile p{};
@@ -64,6 +77,7 @@ namespace ShaderLab::Rendering
         p.caps.maxLuminanceNits = 80.0f;
         p.caps.minLuminanceNits = 0.5f;
         p.caps.maxFullFrameLuminanceNits = 80.0f;
+        StampSimulatedColorMode(p.caps);
         p.gamut = GamutId::sRGB;
         p.profileName = L"sRGB SDR (80 nits)";
         p.isSimulated = true;
@@ -80,6 +94,7 @@ namespace ShaderLab::Rendering
         p.caps.maxLuminanceNits = 270.0f;
         p.caps.minLuminanceNits = 0.5f;
         p.caps.maxFullFrameLuminanceNits = 270.0f;
+        StampSimulatedColorMode(p.caps);
         p.gamut = GamutId::sRGB;
         p.profileName = L"sRGB SDR (270 nits, typical laptop)";
         p.isSimulated = true;
@@ -96,6 +111,7 @@ namespace ShaderLab::Rendering
         p.caps.maxLuminanceNits = 600.0f;
         p.caps.minLuminanceNits = 0.05f;
         p.caps.maxFullFrameLuminanceNits = 500.0f;
+        StampSimulatedColorMode(p.caps);
         // DCI-P3 primaries
         p.primaryRed   = { 0.680f, 0.320f };
         p.primaryGreen = { 0.265f, 0.690f };
@@ -117,6 +133,7 @@ namespace ShaderLab::Rendering
         p.caps.maxLuminanceNits = 1000.0f;
         p.caps.minLuminanceNits = 0.05f;
         p.caps.maxFullFrameLuminanceNits = 600.0f;
+        StampSimulatedColorMode(p.caps);
         // DCI-P3 primaries
         p.primaryRed   = { 0.680f, 0.320f };
         p.primaryGreen = { 0.265f, 0.690f };
@@ -138,6 +155,7 @@ namespace ShaderLab::Rendering
         p.caps.maxLuminanceNits = 1000.0f;
         p.caps.minLuminanceNits = 0.005f;
         p.caps.maxFullFrameLuminanceNits = 600.0f;
+        StampSimulatedColorMode(p.caps);
         // BT.2020 primaries
         p.primaryRed   = { 0.708f, 0.292f };
         p.primaryGreen = { 0.170f, 0.797f };
@@ -159,6 +177,7 @@ namespace ShaderLab::Rendering
         p.caps.maxLuminanceNits = 4000.0f;
         p.caps.minLuminanceNits = 0.005f;
         p.caps.maxFullFrameLuminanceNits = 1000.0f;
+        StampSimulatedColorMode(p.caps);
         // BT.2020 primaries
         p.primaryRed   = { 0.708f, 0.292f };
         p.primaryGreen = { 0.170f, 0.797f };
@@ -180,6 +199,7 @@ namespace ShaderLab::Rendering
         p.caps.maxLuminanceNits = 160.0f;
         p.caps.minLuminanceNits = 0.5f;
         p.caps.maxFullFrameLuminanceNits = 160.0f;
+        StampSimulatedColorMode(p.caps);
         // Adobe RGB (1998) primaries
         p.primaryRed   = { 0.6400f, 0.3300f };
         p.primaryGreen = { 0.2100f, 0.7100f };

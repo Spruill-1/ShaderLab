@@ -103,6 +103,12 @@ namespace ShaderLab::Rendering
             // Fallback to 80 nits when the call isn't available (older
             // Windows builds, non-DXGI outputs, virtual displays).
             caps.sdrWhiteLevelNits = QuerySdrWhiteLevelForOutput(output.get());
+
+            // Pull ACM / advanced-color state (HDR/WCG support, user-enabled
+            // toggles, activeColorMode SDR/WCG/HDR) from DisplayConfig.
+            // Falls back to a hdrEnabled-derived activeColorMode internally
+            // when the type-15 query is unavailable.
+            QueryAdvancedColorInfo2(output.get(), caps);
         }
 
         return caps;
@@ -213,6 +219,94 @@ namespace ShaderLab::Rendering
         }
 
         return kDefaultNits;
+    }
+
+    // -----------------------------------------------------------------------
+    // Advanced color info (ACM / WCG / HDR mode)
+    // -----------------------------------------------------------------------
+
+    void DisplayMonitor::QueryAdvancedColorInfo2(IDXGIOutput6* output,
+                                                 DisplayCapabilities& caps)
+    {
+        // Default fallback: derive from already-populated caps.hdrEnabled
+        // (legacy DXGI_OUTPUT_DESC1 path). 0=SDR, 2=HDR. WCG isn't
+        // distinguishable without the type-15 query so we never report
+        // 1=WCG from the fallback.
+        caps.activeColorMode = caps.hdrEnabled ? 2u : 0u;
+        caps.hdrSupported    = caps.hdrEnabled;
+        caps.hdrUserEnabled  = caps.hdrEnabled;
+        caps.wcgSupported    = false;
+        caps.wcgUserEnabled  = false;
+
+        if (!output) return;
+
+        DXGI_OUTPUT_DESC desc{};
+        if (FAILED(output->GetDesc(&desc)) || desc.Monitor == nullptr)
+            return;
+
+        // Resolve HMONITOR -> GDI device name -> source path -> target ID.
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (!::GetMonitorInfoW(desc.Monitor, &mi))
+            return;
+
+        UINT32 pathCount = 0;
+        UINT32 modeCount = 0;
+        if (::GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
+            return;
+
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+        if (::QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                                 &pathCount, paths.data(),
+                                 &modeCount, modes.data(),
+                                 nullptr) != ERROR_SUCCESS)
+            return;
+        paths.resize(pathCount);
+        modes.resize(modeCount);
+
+        for (const auto& path : paths)
+        {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName{};
+            srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            srcName.header.size = sizeof(srcName);
+            srcName.header.adapterId = path.sourceInfo.adapterId;
+            srcName.header.id = path.sourceInfo.id;
+            if (::DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
+                continue;
+            if (wcscmp(srcName.viewGdiDeviceName, mi.szDevice) != 0)
+                continue;
+
+            DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 info{};
+            info.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2;
+            info.header.size = sizeof(info);
+            info.header.adapterId = path.targetInfo.adapterId;
+            info.header.id = path.targetInfo.id;
+            if (::DisplayConfigGetDeviceInfo(&info.header) != ERROR_SUCCESS)
+                return; // keep the hdrEnabled-derived fallback
+
+            caps.hdrSupported   = info.highDynamicRangeSupported  != 0;
+            caps.hdrUserEnabled = info.highDynamicRangeUserEnabled != 0;
+            caps.wcgSupported   = info.wideColorSupported          != 0;
+            caps.wcgUserEnabled = info.wideColorUserEnabled        != 0;
+
+            // Map DISPLAYCONFIG_ADVANCED_COLOR_MODE -> 0/1/2.
+            switch (info.activeColorMode)
+            {
+            case DISPLAYCONFIG_ADVANCED_COLOR_MODE_SDR: caps.activeColorMode = 0; break;
+            case DISPLAYCONFIG_ADVANCED_COLOR_MODE_WCG: caps.activeColorMode = 1; break;
+            case DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR: caps.activeColorMode = 2; break;
+            default:                                    caps.activeColorMode = caps.hdrEnabled ? 2u : 0u; break;
+            }
+
+            // Trust DisplayConfig over the legacy color-space heuristic for
+            // bitsPerColor too — DXGI_OUTPUT_DESC1 reports 8 in many WCG
+            // configurations even though the actual scanout is 10-bit.
+            if (info.bitsPerColorChannel != 0)
+                caps.bitsPerColor = info.bitsPerColorChannel;
+
+            return;
+        }
     }
 
     // -----------------------------------------------------------------------

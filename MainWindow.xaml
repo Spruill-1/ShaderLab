@@ -90,7 +90,20 @@
                               ToolTipService.ToolTip="Start/stop MCP server for AI assistant integration">
                     <StackPanel Orientation="Horizontal" Spacing="6">
                         <FontIcon Glyph="&#xEC05;" FontSize="14" />
-                        <TextBlock Text="MCP Server" />
+                        <TextBlock x:Name="McpServerLabel" Text="MCP Server" />
+                        <Ellipse x:Name="McpActivityDot"
+                                 Width="10" Height="10"
+                                 VerticalAlignment="Center"
+                                 StrokeThickness="1"
+                                 Visibility="Collapsed"
+                                 ToolTipService.ToolTip="MCP activity indicator">
+                            <Ellipse.Fill>
+                                <SolidColorBrush x:Name="McpActivityDotBrush" Color="#FF303030" />
+                            </Ellipse.Fill>
+                            <Ellipse.Stroke>
+                                <SolidColorBrush Color="#80000000" />
+                            </Ellipse.Stroke>
+                        </Ellipse>
                     </StackPanel>
                 </ToggleButton>
                 <Button x:Name="McpExportConfigButton" Visibility="Collapsed"

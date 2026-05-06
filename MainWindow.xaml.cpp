@@ -320,16 +320,19 @@ namespace winrt::ShaderLab::implementation
                 // Wait briefly for the listener thread to bind and set the port.
                 Sleep(100);
                 uint16_t actualPort = m_mcpServer ? m_mcpServer->Port() : 47808;
-                McpServerToggle().Content(winrt::box_value(
-                    std::format(L"MCP Server :{}", actualPort)));
+                McpServerLabel().Text(std::format(L"MCP Server :{}", actualPort));
                 McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
+                ResetMcpActivityState();
+                UpdateMcpActivityIndicator();
             }
             else
             {
                 if (m_mcpServer)
                     m_mcpServer->Stop();
-                McpServerToggle().Content(winrt::box_value(L"MCP Server"));
+                McpServerLabel().Text(L"MCP Server");
                 McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
+                ResetMcpActivityState();
+                UpdateMcpActivityIndicator();
             }
         });
 
@@ -417,6 +420,9 @@ namespace winrt::ShaderLab::implementation
                 // Pick up new refresh rate (e.g. user changed displays
                 // or switched modes from 60 Hz to 144 Hz).
                 UpdateRenderTimerInterval();
+                // Push the new capabilities into any Working Space nodes
+                // so downstream binders see the live values immediately.
+                UpdateWorkingSpaceNodes();
                 UpdateStatusBar();
             });
         });
@@ -456,9 +462,10 @@ namespace winrt::ShaderLab::implementation
             DispatcherQueue().TryEnqueue([this]()
             {
                 uint16_t actualPort = m_mcpServer ? m_mcpServer->Port() : 47808;
-                McpServerToggle().Content(winrt::box_value(
-                    std::format(L"MCP Server :{}", actualPort)));
+                McpServerLabel().Text(std::format(L"MCP Server :{}", actualPort));
                 McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
+                ResetMcpActivityState();
+                UpdateMcpActivityIndicator();
             });
         }
 
@@ -551,6 +558,126 @@ namespace winrt::ShaderLab::implementation
             else
                 GpuInfoText().Text(L"GPU: " + m_renderEngine.AdapterName());
         }
+    }
+
+    void MainWindow::ResetMcpActivityState()
+    {
+        m_mcpLastActivityMs.store(0, std::memory_order_relaxed);
+        m_mcpRequestCount.store(0, std::memory_order_relaxed);
+        m_mcpUiUpdateSeq.store(0, std::memory_order_relaxed);
+        m_mcpLastUiUpdateSeq = 0;
+        std::lock_guard lock(m_mcpLastReqMutex);
+        m_mcpLastReqMethod.clear();
+        m_mcpLastReqPath.clear();
+        m_mcpLastReqPeer.clear();
+        m_mcpLastReqStatus = 0;
+        m_mcpKnownPeers.clear();
+    }
+
+    void MainWindow::UpdateMcpActivityIndicator()
+    {
+        // Hide the dot entirely when the server is off.
+        if (!m_mcpServer || !m_mcpServer->IsRunning())
+        {
+            McpActivityDot().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
+            Controls::ToolTipService::SetToolTip(McpServerToggle(),
+                winrt::box_value(winrt::hstring(L"Start/stop MCP server for AI assistant integration")));
+            return;
+        }
+
+        McpActivityDot().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
+
+        const int64_t lastMs = m_mcpLastActivityMs.load(std::memory_order_relaxed);
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const int64_t ageMs = (lastMs == 0) ? -1 : (nowMs - lastMs);
+        const uint64_t totalCount = m_mcpRequestCount.load(std::memory_order_relaxed);
+
+        // Color ramp (chosen for high contrast against the accent-blue
+        // checked-toggle background AND the neutral unchecked background):
+        //   no activity yet  -> dark slate (#FF303030)
+        //   <250ms           -> amber (#FFFFC107) -- "live" pulse
+        //   250-1500ms       -> linear fade amber -> dark slate
+        //   >=1500ms         -> dark slate (#FF303030)
+        winrt::Windows::UI::Color color{};
+        color.A = 0xFF;
+        if (ageMs < 0)
+        {
+            color.R = 0x30; color.G = 0x30; color.B = 0x30;
+        }
+        else if (ageMs < 250)
+        {
+            color.R = 0xFF; color.G = 0xC1; color.B = 0x07;
+        }
+        else if (ageMs < 1500)
+        {
+            const float t = static_cast<float>(ageMs - 250) / 1250.0f;
+            const float inv = 1.0f - t;
+            const float r = 0xFF * inv + 0x30 * t;
+            const float g = 0xC1 * inv + 0x30 * t;
+            const float b = 0x07 * inv + 0x30 * t;
+            color.R = static_cast<uint8_t>(r);
+            color.G = static_cast<uint8_t>(g);
+            color.B = static_cast<uint8_t>(b);
+        }
+        else
+        {
+            color.R = 0x30; color.G = 0x30; color.B = 0x30;
+        }
+        McpActivityDotBrush().Color(color);
+
+        // Tooltip: only rebuild on a callback-driven change OR while we're
+        // still in the active fade window (so "Xs ago" stays current).
+        const uint64_t seq = m_mcpUiUpdateSeq.load(std::memory_order_acquire);
+        const bool inFade = (ageMs >= 0 && ageMs < 1500);
+        if (seq == m_mcpLastUiUpdateSeq && !inFade)
+            return;
+        m_mcpLastUiUpdateSeq = seq;
+        std::wstring tooltip;
+        uint16_t port = m_mcpServer->Port();
+        if (totalCount == 0)
+        {
+            tooltip = std::format(L"MCP Server :{} \u2014 listening (no requests yet)", port);
+        }
+        else
+        {
+            std::string method, path, peer;
+            uint16_t status = 0;
+            size_t peerCount = 0;
+            {
+                std::lock_guard lock(m_mcpLastReqMutex);
+                method = m_mcpLastReqMethod;
+                path   = m_mcpLastReqPath;
+                peer   = m_mcpLastReqPeer;
+                status = m_mcpLastReqStatus;
+                peerCount = m_mcpKnownPeers.size();
+            }
+            std::wstring methodW(method.begin(), method.end());
+            int needed = MultiByteToWideChar(CP_UTF8, 0, path.c_str(),
+                static_cast<int>(path.size()), nullptr, 0);
+            std::wstring pathW(static_cast<size_t>(needed), L'\0');
+            if (needed > 0)
+            {
+                MultiByteToWideChar(CP_UTF8, 0, path.c_str(),
+                    static_cast<int>(path.size()), pathW.data(), needed);
+            }
+            std::wstring peerW(peer.begin(), peer.end());
+            std::wstring ageStr;
+            if (ageMs < 1000)        ageStr = L"just now";
+            else if (ageMs < 60000)  ageStr = std::format(L"{}s ago", ageMs / 1000);
+            else                     ageStr = std::format(L"{}m ago", ageMs / 60000);
+
+            tooltip = std::format(
+                L"MCP Server :{} \u2014 {} request{}\n"
+                L"Last: {} {} \u2192 {} ({})\n"
+                L"From: {}{}",
+                port, totalCount, (totalCount == 1 ? L"" : L"s"),
+                methodW, pathW, status, ageStr,
+                peerW.empty() ? L"(unknown)" : peerW.c_str(),
+                peerCount > 1 ? std::format(L"  (\u00d7{} distinct clients)", peerCount).c_str() : L"");
+        }
+        Controls::ToolTipService::SetToolTip(McpServerToggle(),
+            winrt::box_value(winrt::hstring(tooltip)));
     }
 
     uint32_t MainWindow::QueryDisplayRefreshHz() const noexcept
@@ -1014,6 +1141,7 @@ namespace winrt::ShaderLab::implementation
         m_displayMonitor.SetSimulatedProfile(profile);
         m_graph.MarkAllDirty();
         m_forceRender = true;
+        UpdateWorkingSpaceNodes();
         UpdateStatusBar();
     }
 
@@ -1022,7 +1150,112 @@ namespace winrt::ShaderLab::implementation
         m_displayMonitor.ClearSimulatedProfile();
         m_graph.MarkAllDirty();
         m_forceRender = true;
+        UpdateWorkingSpaceNodes();
         UpdateStatusBar();
+    }
+
+    void MainWindow::UpdateWorkingSpaceNodes()
+    {
+        // Walk every node in the graph and, for each "Working Space"
+        // parameter node, write the 14 fields of the active profile into
+        // the node's properties keyed by analysis-field name. Marks the
+        // node dirty only when at least one field actually changed so the
+        // render loop doesn't re-evaluate every tick when the profile is
+        // stable.
+        using namespace ::ShaderLab::Graph;
+        using winrt::Windows::Foundation::Numerics::float2;
+
+        auto profile = m_displayMonitor.ActiveProfile();
+        const auto& caps = profile.caps;
+        const bool isSim = m_displayMonitor.IsSimulated();
+
+        struct ScalarField { const wchar_t* name; float value; };
+        const ScalarField scalars[] = {
+            { L"ActiveColorMode",  static_cast<float>(caps.activeColorMode) },
+            { L"HdrSupported",     caps.hdrSupported    ? 1.0f : 0.0f },
+            { L"HdrUserEnabled",   caps.hdrUserEnabled  ? 1.0f : 0.0f },
+            { L"WcgSupported",     caps.wcgSupported    ? 1.0f : 0.0f },
+            { L"WcgUserEnabled",   caps.wcgUserEnabled  ? 1.0f : 0.0f },
+            { L"IsSimulated",      isSim ? 1.0f : 0.0f },
+            { L"SdrWhiteNits",     caps.sdrWhiteLevelNits },
+            { L"PeakNits",         caps.maxLuminanceNits },
+            { L"MinNits",          caps.minLuminanceNits },
+            { L"MaxFullFrameNits", caps.maxFullFrameLuminanceNits },
+        };
+
+        struct VectorField { const wchar_t* name; float2 value; };
+        const VectorField vectors[] = {
+            { L"RedPrimary",   float2{ profile.primaryRed.x,   profile.primaryRed.y   } },
+            { L"GreenPrimary", float2{ profile.primaryGreen.x, profile.primaryGreen.y } },
+            { L"BluePrimary",  float2{ profile.primaryBlue.x,  profile.primaryBlue.y  } },
+            { L"WhitePoint",   float2{ profile.whitePoint.x,   profile.whitePoint.y   } },
+        };
+
+        bool anyChanged = false;
+        for (auto& node : const_cast<std::vector<EffectNode>&>(m_graph.Nodes()))
+        {
+            if (!node.customEffect.has_value()) continue;
+            if (node.customEffect->shaderLabEffectId != L"Working Space") continue;
+
+            bool nodeChanged = false;
+
+            for (const auto& f : scalars)
+            {
+                auto it = node.properties.find(f.name);
+                if (it == node.properties.end())
+                {
+                    node.properties[f.name] = PropertyValue{ f.value };
+                    nodeChanged = true;
+                    continue;
+                }
+                if (auto* cur = std::get_if<float>(&it->second))
+                {
+                    if (*cur != f.value)
+                    {
+                        *cur = f.value;
+                        nodeChanged = true;
+                    }
+                }
+                else
+                {
+                    it->second = PropertyValue{ f.value };
+                    nodeChanged = true;
+                }
+            }
+
+            for (const auto& f : vectors)
+            {
+                auto it = node.properties.find(f.name);
+                if (it == node.properties.end())
+                {
+                    node.properties[f.name] = PropertyValue{ f.value };
+                    nodeChanged = true;
+                    continue;
+                }
+                if (auto* cur = std::get_if<float2>(&it->second))
+                {
+                    if (cur->x != f.value.x || cur->y != f.value.y)
+                    {
+                        *cur = f.value;
+                        nodeChanged = true;
+                    }
+                }
+                else
+                {
+                    it->second = PropertyValue{ f.value };
+                    nodeChanged = true;
+                }
+            }
+
+            if (nodeChanged)
+            {
+                node.dirty = true;
+                anyChanged = true;
+            }
+        }
+
+        if (anyChanged)
+            m_forceRender = true;
     }
 
     void MainWindow::OnDisplayProfileSelectionChanged(
@@ -2958,6 +3191,37 @@ namespace winrt::ShaderLab::implementation
         m_traceSwapChain->Present(0, 0);
     }
 
+    void MainWindow::RenderGraphScene(ID2D1DeviceContext5* dc, D2D1_SIZE_F viewSize)
+    {
+        if (!dc) return;
+
+        dc->Clear(D2D1::ColorF(0x1A1A1E));
+
+        // Draw subtle dot grid for spatial reference.
+        {
+            auto pan = m_nodeGraphController.PanOffset();
+            float zoom = m_nodeGraphController.Zoom();
+            float gridSpacing = 24.0f * zoom;
+            if (gridSpacing > 8.0f)
+            {
+                if (!m_graphGridBrush)
+                    dc->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF, 0.06f), m_graphGridBrush.put());
+                if (m_graphGridBrush)
+                {
+                    float startX = fmodf(pan.x, gridSpacing);
+                    float startY = fmodf(pan.y, gridSpacing);
+                    if (startX < 0) startX += gridSpacing;
+                    if (startY < 0) startY += gridSpacing;
+                    for (float y = startY; y < viewSize.height; y += gridSpacing)
+                        for (float x = startX; x < viewSize.width; x += gridSpacing)
+                            dc->FillEllipse({ { x, y }, 1.0f, 1.0f }, m_graphGridBrush.get());
+                }
+            }
+        }
+
+        m_nodeGraphController.Render(dc, viewSize);
+    }
+
     void MainWindow::RenderNodeGraph()
     {
         if (!m_graphSwapChain || !m_graphRenderTarget)
@@ -2982,35 +3246,10 @@ namespace winrt::ShaderLab::implementation
 
         dc->SetTarget(m_graphRenderTarget.get());
         dc->BeginDraw();
-        dc->Clear(D2D1::ColorF(0x1A1A1E));
-
-        // Draw subtle dot grid for spatial reference.
-        {
-            auto pan = m_nodeGraphController.PanOffset();
-            float zoom = m_nodeGraphController.Zoom();
-            float gridSpacing = 24.0f * zoom;
-            if (gridSpacing > 8.0f)
-            {
-                if (!m_graphGridBrush)
-                    dc->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF, 0.06f), m_graphGridBrush.put());
-                if (m_graphGridBrush)
-                {
-                    float startX = fmodf(pan.x, gridSpacing);
-                    float startY = fmodf(pan.y, gridSpacing);
-                    if (startX < 0) startX += gridSpacing;
-                    if (startY < 0) startY += gridSpacing;
-                    float w = static_cast<float>(m_graphPanelWidth);
-                    float h = static_cast<float>(m_graphPanelHeight);
-                    for (float y = startY; y < h; y += gridSpacing)
-                        for (float x = startX; x < w; x += gridSpacing)
-                            dc->FillEllipse({ { x, y }, 1.0f, 1.0f }, m_graphGridBrush.get());
-                }
-            }
-        }
 
         D2D1_SIZE_F viewSize = { static_cast<float>(m_graphPanelWidth),
                                  static_cast<float>(m_graphPanelHeight) };
-        m_nodeGraphController.Render(dc, viewSize);
+        RenderGraphScene(dc, viewSize);
 
         dc->EndDraw();
         dc->SetTarget(oldTarget.get());
@@ -3642,6 +3881,21 @@ namespace winrt::ShaderLab::implementation
                 // Skip hidden properties (convention: name ends with _hidden).
                 if (key.size() > 7 && key.ends_with(L"_hidden"))
                     continue;
+                // For nodes with a customEffect, only render properties that
+                // correspond to a declared parameter. Properties that exist
+                // solely as host-driven bootstrap values (e.g. Working Space,
+                // fed by hiddenDefaults + UpdateWorkingSpaceNodes) must NOT
+                // appear in the Properties panel — they are sink-only
+                // analysis backing storage.
+                if (node->customEffect.has_value())
+                {
+                    bool isDeclaredParam = false;
+                    for (const auto& p : node->customEffect->parameters)
+                    {
+                        if (p.name == key) { isDeclaredParam = true; break; }
+                    }
+                    if (!isDeclaredParam) continue;
+                }
                 // Skip parameters hidden by conditional visibility.
                 if (node->customEffect.has_value())
                 {
@@ -5416,18 +5670,22 @@ namespace winrt::ShaderLab::implementation
 
     std::vector<uint8_t> MainWindow::CapturePreviewAsPng()
     {
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) return {};
-
         auto* image = ResolveDisplayImage(m_previewNodeId);
         if (!image) return {};
+        return CaptureImageAsPng(image);
+    }
 
+    std::vector<uint8_t> MainWindow::CaptureImageAsPng(ID2D1Image* image, uint32_t maxDim)
+    {
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (!dc || !image) return {};
+
+        // Use 96 DPI so GetImageLocalBounds returns pixel coordinates.
         float oldDpiX, oldDpiY;
         dc->GetDpi(&oldDpiX, &oldDpiY);
         dc->SetDpi(96.0f, 96.0f);
         dc->SetTransform(D2D1::Matrix3x2F::Identity());
 
-        // Use the raw image bounds (not swap chain dimensions).
         D2D1_RECT_F bounds{};
         dc->GetImageLocalBounds(image, &bounds);
         uint32_t w = static_cast<uint32_t>(bounds.right - bounds.left);
@@ -5436,8 +5694,8 @@ namespace winrt::ShaderLab::implementation
         dc->SetDpi(oldDpiX, oldDpiY);
 
         if (w == 0 || h == 0) return {};
-        w = (std::min)(w, 2048u);
-        h = (std::min)(h, 2048u);
+        w = (std::min)(w, maxDim);
+        h = (std::min)(h, maxDim);
 
         try
         {
@@ -5502,6 +5760,301 @@ namespace winrt::ShaderLab::implementation
             return result;
         }
         catch (...) { return {}; }
+    }
+
+    std::vector<uint8_t> MainWindow::CaptureNodeAsPng(uint32_t nodeId,
+                                                     bool& outNotFound,
+                                                     bool& outNotReady)
+    {
+        outNotFound = false;
+        outNotReady = false;
+
+        // Force a render frame so dirty downstream nodes evaluate before we
+        // try to resolve the output.  Same convention as /render/capture.
+        RenderFrame();
+
+        auto* image = ResolveDisplayImage(nodeId);
+        if (!image)
+        {
+            // Disambiguate "no such node" vs "node exists but isn't ready".
+            auto* node = m_graph.FindNode(nodeId);
+            if (!node) { outNotFound = true; return {}; }
+            outNotReady = true;
+            return {};
+        }
+        return CaptureImageAsPng(image);
+    }
+
+    bool MainWindow::ReadPixelRegion(uint32_t nodeId,
+                                     int32_t x, int32_t y, uint32_t w, uint32_t h,
+                                     std::vector<float>& outPixels,
+                                     uint32_t& outActualW, uint32_t& outActualH,
+                                     bool& outNotFound, bool& outNotReady)
+    {
+        outPixels.clear();
+        outActualW = 0;
+        outActualH = 0;
+        outNotFound = false;
+        outNotReady = false;
+
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (!dc) return false;
+
+        RenderFrame();
+
+        auto* image = ResolveDisplayImage(nodeId);
+        if (!image)
+        {
+            auto* node = m_graph.FindNode(nodeId);
+            if (!node) outNotFound = true;
+            else       outNotReady = true;
+            return false;
+        }
+
+        // Use 96 DPI so GetImageLocalBounds returns pixel coordinates.
+        float oldDpiX, oldDpiY;
+        dc->GetDpi(&oldDpiX, &oldDpiY);
+        dc->SetDpi(96.0f, 96.0f);
+
+        D2D1_RECT_F bounds{};
+        dc->GetImageLocalBounds(image, &bounds);
+        const int32_t imgW = static_cast<int32_t>(bounds.right - bounds.left);
+        const int32_t imgH = static_cast<int32_t>(bounds.bottom - bounds.top);
+        if (imgW <= 0 || imgH <= 0) { dc->SetDpi(oldDpiX, oldDpiY); return false; }
+
+        // Clip the requested region to the image bounds (in image-local pixel
+        // coordinates).  `bounds.left/top` may be non-zero for sources whose
+        // origin isn't at (0,0), so use them as the offset.
+        int32_t x0 = (std::max)(x, 0);
+        int32_t y0 = (std::max)(y, 0);
+        int32_t x1 = (std::min)(static_cast<int32_t>(x + w), imgW);
+        int32_t y1 = (std::min)(static_cast<int32_t>(y + h), imgH);
+        if (x1 <= x0 || y1 <= y0) { dc->SetDpi(oldDpiX, oldDpiY); return false; }
+
+        const uint32_t actW = static_cast<uint32_t>(x1 - x0);
+        const uint32_t actH = static_cast<uint32_t>(y1 - y0);
+
+        try
+        {
+            // FP32 RGBA target so we get the linear scRGB values directly,
+            // matching the convention used by PixelInspectorController.
+            winrt::com_ptr<ID2D1Bitmap1> targetBitmap;
+            D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET,
+                D2D1::PixelFormat(DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                96.0f, 96.0f);
+            winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(actW, actH), nullptr, 0, bmpProps, targetBitmap.put()));
+
+            winrt::com_ptr<ID2D1Image> oldTarget;
+            dc->GetTarget(oldTarget.put());
+            dc->SetTarget(targetBitmap.get());
+            dc->BeginDraw();
+            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+            dc->SetTransform(D2D1::Matrix3x2F::Identity());
+
+            // SOURCE_COPY + NEAREST_NEIGHBOR copies raw values without any
+            // alpha blend or filtering, matching the inspector's readback path.
+            // DrawImage(image, targetOffset, imageRect, ...) is always 1:1, so
+            // a srcRect of size (actW, actH) at offset (0,0) in the target lands
+            // exactly the requested region into our bitmap.
+            const float fx0 = static_cast<float>(x0) + bounds.left;
+            const float fy0 = static_cast<float>(y0) + bounds.top;
+            const float fx1 = static_cast<float>(x1) + bounds.left;
+            const float fy1 = static_cast<float>(y1) + bounds.top;
+            D2D1_POINT_2F destOffset = D2D1::Point2F(0.0f, 0.0f);
+            D2D1_RECT_F srcRect = D2D1::RectF(fx0, fy0, fx1, fy1);
+            dc->DrawImage(image, &destOffset, &srcRect,
+                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                D2D1_COMPOSITE_MODE_SOURCE_COPY);
+            dc->EndDraw();
+            dc->SetTarget(oldTarget.get());
+
+            // Copy GPU bitmap to a CPU-readable bitmap and Map it.
+            winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
+            D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                96.0f, 96.0f);
+            winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(actW, actH), nullptr, 0, cpuProps, cpuBitmap.put()));
+            D2D1_POINT_2U destPt = { 0, 0 };
+            D2D1_RECT_U srcRc = { 0, 0, actW, actH };
+            winrt::check_hresult(cpuBitmap->CopyFromBitmap(&destPt, targetBitmap.get(), &srcRc));
+
+            D2D1_MAPPED_RECT mapped{};
+            winrt::check_hresult(cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped));
+
+            outPixels.resize(static_cast<size_t>(actW) * actH * 4);
+            for (uint32_t row = 0; row < actH; ++row)
+            {
+                const float* srcRow = reinterpret_cast<const float*>(
+                    mapped.bits + static_cast<size_t>(row) * mapped.pitch);
+                std::memcpy(outPixels.data() + static_cast<size_t>(row) * actW * 4,
+                            srcRow,
+                            static_cast<size_t>(actW) * 4 * sizeof(float));
+            }
+            cpuBitmap->Unmap();
+
+            outActualW = actW;
+            outActualH = actH;
+            dc->SetDpi(oldDpiX, oldDpiY);
+            return true;
+        }
+        catch (...)
+        {
+            dc->SetDpi(oldDpiX, oldDpiY);
+            return false;
+        }
+    }
+
+    std::vector<uint8_t> MainWindow::CaptureGraphAsPng()
+    {
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (!dc) return {};
+
+        // Layout may be stale (e.g., after MCP set-property) — rebuild before
+        // measuring or drawing.
+        m_nodeGraphController.RebuildLayout();
+
+        const uint32_t w = (std::max)(uint32_t{ 1 }, m_graphPanelWidth);
+        const uint32_t h = (std::max)(uint32_t{ 1 }, m_graphPanelHeight);
+
+        // Save & restore the controller's dirty flag.  RenderGraphScene calls
+        // controller.Render, which clears the flag on completion — that would
+        // suppress the next live render tick.  Capturing is a *side query* and
+        // must not change live render scheduling.
+        const bool wasDirty = m_nodeGraphController.NeedsRedraw();
+
+        // Save full DC state.
+        winrt::com_ptr<ID2D1Image> oldTarget;
+        dc->GetTarget(oldTarget.put());
+        float oldDpiX = 96.0f, oldDpiY = 96.0f;
+        dc->GetDpi(&oldDpiX, &oldDpiY);
+        D2D1_MATRIX_3X2_F oldTransform = D2D1::Matrix3x2F::Identity();
+        dc->GetTransform(&oldTransform);
+
+        winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
+        winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
+        D2D1_MAPPED_RECT mapped{};
+        bool isMapped = false;
+
+        // RAII restore for the DC state and CPU map. Runs in reverse order.
+        struct ScopeGuard {
+            std::function<void()> fn;
+            ~ScopeGuard() { if (fn) fn(); }
+        };
+        ScopeGuard restoreState{ [&]
+        {
+            if (isMapped && cpuBitmap) { cpuBitmap->Unmap(); }
+            dc->SetTransform(oldTransform);
+            dc->SetDpi(oldDpiX, oldDpiY);
+            dc->SetTarget(oldTarget.get());
+            if (wasDirty) m_nodeGraphController.SetNeedsRedraw();
+        } };
+
+        try
+        {
+            D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                96.0f, 96.0f);
+            winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0,
+                bmpProps, renderBitmap.put()));
+
+            dc->SetDpi(96.0f, 96.0f);
+            dc->SetTarget(renderBitmap.get());
+            dc->SetTransform(D2D1::Matrix3x2F::Identity());
+            dc->BeginDraw();
+
+            D2D1_SIZE_F viewSize = { static_cast<float>(w), static_cast<float>(h) };
+            RenderGraphScene(dc, viewSize);
+
+            HRESULT hrEnd = dc->EndDraw();
+            if (FAILED(hrEnd)) return {};
+
+            D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                96.0f, 96.0f);
+            winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0,
+                cpuProps, cpuBitmap.put()));
+            D2D1_POINT_2U destPt = { 0, 0 };
+            D2D1_RECT_U srcRc = { 0, 0, w, h };
+            winrt::check_hresult(cpuBitmap->CopyFromBitmap(&destPt, renderBitmap.get(), &srcRc));
+
+            winrt::check_hresult(cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped));
+            isMapped = true;
+
+            winrt::com_ptr<IWICImagingFactory> wicFactory;
+            winrt::check_hresult(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(wicFactory.put())));
+
+            winrt::com_ptr<IStream> memStream;
+            winrt::check_hresult(CreateStreamOnHGlobal(nullptr, TRUE, memStream.put()));
+
+            winrt::com_ptr<IWICBitmapEncoder> encoder;
+            winrt::check_hresult(wicFactory->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.put()));
+            winrt::check_hresult(encoder->Initialize(memStream.get(), WICBitmapEncoderNoCache));
+
+            winrt::com_ptr<IWICBitmapFrameEncode> frame;
+            winrt::check_hresult(encoder->CreateNewFrame(frame.put(), nullptr));
+            winrt::check_hresult(frame->Initialize(nullptr));
+            winrt::check_hresult(frame->SetSize(w, h));
+            WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+            winrt::check_hresult(frame->SetPixelFormat(&fmt));
+            winrt::check_hresult(frame->WritePixels(h, mapped.pitch, mapped.pitch * h, mapped.bits));
+            winrt::check_hresult(frame->Commit());
+            winrt::check_hresult(encoder->Commit());
+
+            STATSTG stat{};
+            memStream->Stat(&stat, STATFLAG_NONAME);
+            ULONG pngSize = static_cast<ULONG>(stat.cbSize.QuadPart);
+            std::vector<uint8_t> result(pngSize);
+            LARGE_INTEGER zero{};
+            memStream->Seek(zero, STREAM_SEEK_SET, nullptr);
+            memStream->Read(result.data(), pngSize, nullptr);
+            return result;
+        }
+        catch (...) { return {}; }
+    }
+
+    void MainWindow::FitGraphView(float padding)
+    {
+        // Layout may be stale (e.g., after MCP set-property) — rebuild before
+        // measuring bounds.
+        m_nodeGraphController.RebuildLayout();
+
+        D2D1_RECT_F b = m_nodeGraphController.ContentBounds();
+        float contentW = b.right - b.left;
+        float contentH = b.bottom - b.top;
+        if (contentW <= 0.0f || contentH <= 0.0f) return; // Empty graph.
+
+        float vpW = static_cast<float>(m_graphPanelWidth);
+        float vpH = static_cast<float>(m_graphPanelHeight);
+        if (vpW <= 1.0f || vpH <= 1.0f) return;
+
+        // Padding is in viewport (screen) space.  Guard against viewport too
+        // small for the requested padding.
+        padding = (std::max)(0.0f, padding);
+        if (padding * 2.0f > vpW * 0.5f) padding = vpW * 0.25f;
+        if (padding * 2.0f > vpH * 0.5f) padding = (std::min)(padding, vpH * 0.25f);
+
+        float availW = (std::max)(1.0f, vpW - 2.0f * padding);
+        float availH = (std::max)(1.0f, vpH - 2.0f * padding);
+
+        float zoom = (std::min)(availW / contentW, availH / contentH);
+        // Controller will clamp to [0.1, 5.0] internally; mirror so pan is
+        // computed against the actual zoom that will take effect.
+        zoom = (std::max)(0.1f, (std::min)(5.0f, zoom));
+
+        float contentCx = (b.left + b.right) * 0.5f;
+        float contentCy = (b.top + b.bottom) * 0.5f;
+
+        // screen = zoom * canvas + pan, so pan = screenCenter - zoom * canvasCenter.
+        float panX = vpW * 0.5f - zoom * contentCx;
+        float panY = vpH * 0.5f - zoom * contentCy;
+
+        m_nodeGraphController.SetZoom(zoom);
+        m_nodeGraphController.SetPanOffset(panX, panY);
     }
 
     winrt::fire_and_forget MainWindow::SaveImageAsync()
@@ -5719,6 +6272,13 @@ namespace winrt::ShaderLab::implementation
         // Clamp to avoid huge jumps (e.g., after breakpoint or sleep).
         if (deltaSec > 0.1) deltaSec = 0.016;
 
+        // Mirror the active display profile into Working Space parameter
+        // nodes. This is a cheap node-list walk that no-ops when no
+        // Working Space nodes are present and only marks dirty when at
+        // least one field actually changed, so freshly-added nodes pick
+        // up live values immediately without hooking every AddNode site.
+        UpdateWorkingSpaceNodes();
+
         // Tick clock nodes: advance time.
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
         {
@@ -5890,6 +6450,9 @@ namespace winrt::ShaderLab::implementation
                 if (selNode && !selNode->propertyBindings.empty())
                     UpdatePropertiesPanel();
             }
+            // Refresh MCP activity indicator (dot color fade + tooltip "Xs ago"
+            // counter).  Cheap when no activity has occurred.
+            UpdateMcpActivityIndicator();
         }
         if (elapsed >= 1000)
         {
@@ -5956,156 +6519,6 @@ namespace winrt::ShaderLab::implementation
                 } catch (...) {
                     node.runtimeError = L"Source preparation failed";
                     node.dirty = false;
-                }
-            }
-        }
-
-        // Inject display primaries into Gamut Highlight and CIE Chromaticity Plot nodes.
-        // Only update when primaries actually change to avoid infinite dirty loops.
-        {
-            auto liveProfile = m_displayMonitor.LiveProfile();
-            auto activeProfile = m_displayMonitor.ActiveProfile();
-            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-            {
-                if (node.name == L"Gamut Highlight")
-                {
-                    auto gamutIt = node.properties.find(L"TargetGamut");
-                    if (gamutIt == node.properties.end()) continue;
-                    float gamutVal = 0;
-                    if (auto* f = std::get_if<float>(&gamutIt->second)) gamutVal = *f;
-
-                    const ::ShaderLab::Rendering::DisplayProfile* src = nullptr;
-                    if (gamutVal < 0.5f)        src = &liveProfile;   // Current Monitor
-                    else if (gamutVal > 3.5f)   src = &activeProfile;  // Working Space
-
-                    if (src)
-                    {
-                        auto getF = [&](const std::wstring& k) -> float {
-                            auto it = node.properties.find(k);
-                            if (it != node.properties.end())
-                                if (auto* f = std::get_if<float>(&it->second)) return *f;
-                            return 0.0f;
-                        };
-                        bool changed = std::abs(getF(L"PrimRedX_hidden") - src->primaryRed.x) > 0.0001f
-                            || std::abs(getF(L"PrimGreenX_hidden") - src->primaryGreen.x) > 0.0001f
-                            || std::abs(getF(L"PrimBlueX_hidden") - src->primaryBlue.x) > 0.0001f;
-
-                        node.properties[L"PrimRedX_hidden"]   = src->primaryRed.x;
-                        node.properties[L"PrimRedY_hidden"]   = src->primaryRed.y;
-                        node.properties[L"PrimGreenX_hidden"] = src->primaryGreen.x;
-                        node.properties[L"PrimGreenY_hidden"] = src->primaryGreen.y;
-                        node.properties[L"PrimBlueX_hidden"]  = src->primaryBlue.x;
-                        node.properties[L"PrimBlueY_hidden"]  = src->primaryBlue.y;
-                        if (changed) node.dirty = true;
-                    }
-                }
-                else if (node.name == L"CIE Chromaticity Plot")
-                {
-                    const auto& src = liveProfile;
-                    auto getF = [&](const std::wstring& k) -> float {
-                        auto it = node.properties.find(k);
-                        if (it != node.properties.end())
-                            if (auto* f = std::get_if<float>(&it->second)) return *f;
-                        return 0.0f;
-                    };
-                    bool changed = std::abs(getF(L"MonRedX_hidden") - src.primaryRed.x) > 0.0001f
-                        || std::abs(getF(L"MonGreenX_hidden") - src.primaryGreen.x) > 0.0001f
-                        || std::abs(getF(L"MonBlueX_hidden") - src.primaryBlue.x) > 0.0001f;
-
-                    node.properties[L"MonRedX_hidden"]   = src.primaryRed.x;
-                    node.properties[L"MonRedY_hidden"]   = src.primaryRed.y;
-                    node.properties[L"MonGreenX_hidden"] = src.primaryGreen.x;
-                    node.properties[L"MonGreenY_hidden"] = src.primaryGreen.y;
-                    node.properties[L"MonBlueX_hidden"]  = src.primaryBlue.x;
-                    node.properties[L"MonBlueY_hidden"]  = src.primaryBlue.y;
-                    if (changed) node.dirty = true;
-                }
-
-                // Inject working space primaries into any node that uses them.
-                if (node.properties.count(L"WsRedX_hidden"))
-                {
-                    const auto& ws = activeProfile;
-                    auto getF = [&](const std::wstring& k) -> float {
-                        auto it = node.properties.find(k);
-                        if (it != node.properties.end())
-                            if (auto* f = std::get_if<float>(&it->second)) return *f;
-                        return 0.0f;
-                    };
-                    bool changed = std::abs(getF(L"WsRedX_hidden") - ws.primaryRed.x) > 0.0001f
-                        || std::abs(getF(L"WsGreenX_hidden") - ws.primaryGreen.x) > 0.0001f
-                        || std::abs(getF(L"WsBlueX_hidden") - ws.primaryBlue.x) > 0.0001f;
-
-                    node.properties[L"WsRedX_hidden"]   = ws.primaryRed.x;
-                    node.properties[L"WsRedY_hidden"]   = ws.primaryRed.y;
-                    node.properties[L"WsGreenX_hidden"] = ws.primaryGreen.x;
-                    node.properties[L"WsGreenY_hidden"] = ws.primaryGreen.y;
-                    node.properties[L"WsBlueX_hidden"]  = ws.primaryBlue.x;
-                    node.properties[L"WsBlueY_hidden"]  = ws.primaryBlue.y;
-                    if (changed) node.dirty = true;
-                }
-
-                // Inject SDR white level (nits) into any node that asks
-                // for it. The current monitor's value comes from the live
-                // OS-reported white level (Windows "SDR content brightness"
-                // slider when HDR is on, 80 nits otherwise); a simulated
-                // profile substitutes its preset value. Effects pick the
-                // canonical key `SdrWhiteNits_hidden`.
-                if (node.properties.count(L"SdrWhiteNits_hidden") ||
-                    node.properties.count(L"WsSdrWhiteNits_hidden"))
-                {
-                    auto getF = [&](const std::wstring& k) -> float {
-                        auto it = node.properties.find(k);
-                        if (it != node.properties.end())
-                            if (auto* f = std::get_if<float>(&it->second)) return *f;
-                        return 0.0f;
-                    };
-                    float liveSdr = liveProfile.caps.sdrWhiteLevelNits;
-                    float wsSdr   = activeProfile.caps.sdrWhiteLevelNits;
-                    bool changed =
-                        (node.properties.count(L"SdrWhiteNits_hidden") &&
-                         std::abs(getF(L"SdrWhiteNits_hidden") - liveSdr) > 0.001f) ||
-                        (node.properties.count(L"WsSdrWhiteNits_hidden") &&
-                         std::abs(getF(L"WsSdrWhiteNits_hidden") - wsSdr) > 0.001f);
-                    if (node.properties.count(L"SdrWhiteNits_hidden"))
-                        node.properties[L"SdrWhiteNits_hidden"] = liveSdr;
-                    if (node.properties.count(L"WsSdrWhiteNits_hidden"))
-                        node.properties[L"WsSdrWhiteNits_hidden"] = wsSdr;
-                    if (changed) node.dirty = true;
-                }
-
-                // Inject monitor luminance range into Luminance Highlight.
-                // Mode 0 (Current Monitor) uses the live display; mode 7
-                // (Working Space) uses the active simulated profile. Other
-                // modes ignore these values, but we still keep them fresh
-                // so a mode change picks up the latest range immediately.
-                if (node.name == L"Luminance Highlight")
-                {
-                    auto rangeIt = node.properties.find(L"TargetRange");
-                    float rangeVal = 0.0f;
-                    if (rangeIt != node.properties.end())
-                        if (auto* f = std::get_if<float>(&rangeIt->second)) rangeVal = *f;
-
-                    const ::ShaderLab::Rendering::DisplayProfile* src = nullptr;
-                    if (rangeVal < 0.5f)        src = &liveProfile;    // Current Monitor
-                    else if (rangeVal > 6.5f)   src = &activeProfile;  // Working Space
-
-                    if (src)
-                    {
-                        auto getF = [&](const std::wstring& k) -> float {
-                            auto it = node.properties.find(k);
-                            if (it != node.properties.end())
-                                if (auto* f = std::get_if<float>(&it->second)) return *f;
-                            return 0.0f;
-                        };
-                        float newMin = src->caps.minLuminanceNits;
-                        float newMax = src->caps.maxLuminanceNits;
-                        bool changed = std::abs(getF(L"MonMinNits_hidden") - newMin) > 0.001f
-                            || std::abs(getF(L"MonMaxNits_hidden") - newMax) > 0.001f;
-
-                        node.properties[L"MonMinNits_hidden"] = newMin;
-                        node.properties[L"MonMaxNits_hidden"] = newMax;
-                        if (changed) node.dirty = true;
-                    }
                 }
             }
         }

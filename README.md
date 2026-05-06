@@ -181,7 +181,9 @@ sequenceDiagram
 
 ### SDR white level
 
-`DisplayCapabilities::sdrWhiteLevelNits` is queried from the OS via `DisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL)`, decoded as `nits = SDRWhiteLevel / 1000 * 80`. This value tracks the user's **Settings → Display → HDR → "SDR content brightness"** slider when HDR is on; when HDR is off it falls back to 80 nits. Effects that need to know the nit value of scRGB 1.0 (the entire ICtCp suite, plus the built-in tone mapper) opt in by declaring `SdrWhiteNits_hidden` (current monitor) or `WsSdrWhiteNits_hidden` (active simulated / working-space profile) in their `hiddenDefaults` — the host writes the live value every frame using the same change-detected pattern as `MonMaxNits_hidden` and `WsRedX_hidden`. Selecting a simulated `DisplayProfile` preset overrides the value via the existing profile path.
+`DisplayCapabilities::sdrWhiteLevelNits` is queried from the OS via `DisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL)`, decoded as `nits = SDRWhiteLevel / 1000 * 80`. This value tracks the user's **Settings → Display → HDR → "SDR content brightness"** slider when HDR is on; when HDR is off it falls back to 80 nits.
+
+The value is exposed to graphs through the **`Working Space` parameter node** (see [Working Space Integration](#working-space-integration)) on its `SdrWhiteNits` analysis output. Effects that need to know the nit value of scRGB 1.0 (the entire ICtCp suite) consume it via property bindings — wire `working_space.SdrWhiteNits` into the effect's nit-target parameter and it tracks both the OS slider and any simulated `DisplayProfile` preset automatically. There is no longer any per-effect "follow the live monitor" or "follow the working space" host-side plumbing; the Working Space node is the single explicit path.
 
 ## Display Profile Mocking
 
@@ -354,7 +356,7 @@ The evaluator runs at the **monitor's refresh rate** (clamped to 60–240 Hz) vi
 | 32 | Remove built-in tone mapper | Pipeline passes raw scRGB through. Users build tone mappers as graph effects. Full accuracy by default. | Day 6 |
 | 33 | Multi-output windows via OutputWindow | Each Output node gets its own SwapChainPanel window. Shares D2D device context. Bidirectional sync: close window ↔ delete node. | Day 6 |
 | 34 | Effect versioning with effectId/effectVersion | Stable IDs survive renames. Per-node and batch upgrade buttons. Preserves user property values on upgrade. | Day 6 |
-| 35 | _hidden suffix convention | Properties ending in `_hidden` excluded from UI. Replaces prefix-based filtering. Used for working space injection. | Day 6 |
+| 35 | _hidden suffix convention | Properties ending in `_hidden` excluded from UI. Replaces prefix-based filtering. **Originally** used for per-effect working-space and OS-driven cbuffer injection; **superseded by decision #51** (Working Space node + bindings) but the filter is retained because legacy saved graphs may still carry stale `_hidden` keys that need to remain inert in the Properties panel and pin list. | Day 6 |
 | 36 | D3D11 compute via evaluator dispatch | Bypass D2D tiling for reduction operations. GpuReduction uses 32×32 thread group with groupshared memory. Only 32 bytes read back to CPU. | Day 6 |
 | 37 | ID2D1StatisticsEffect COM interface | D2D-compatible effect wrapper with custom interface for analysis results. Pass-through pixel shader + D3D11 compute dispatch. | Day 6 |
 | 38 | Parameter nodes as data-only graph elements | No shader, evaluator handles directly. Teal color, inline slider, don't switch preview. Four types: Float, Integer, Toggle, Gamut. | Day 6 |
@@ -370,6 +372,8 @@ The evaluator runs at the **monitor's refresh rate** (clamped to 60–240 Hz) vi
 | 48 | ExprTk feature-disable macros for Release safety | The MSVC Release optimizer crashed in ExprTk's regex / IO paths on first evaluation. Defining `exprtk_disable_string_capabilities`, `exprtk_disable_rtl_io`, `exprtk_disable_rtl_io_file`, `exprtk_disable_rtl_vecops`, `exprtk_disable_enhanced_features`, and `exprtk_disable_caseinsensitivity` before `#include`-ing `exprtk.hpp` (with PCH disabled on `MathExpression.cpp`) keeps the math-only core and eliminates the crash. | Day 9 |
 | 49 | Switch ICC reader to mscms.dll | Removed the in-house ICC binary parser in favor of `OpenColorProfileW` + `GetColorProfileElement` (mscms.dll). We still interpret the small XYZType / textDescriptionType / multiLocalizedUnicodeType tag bodies, but mscms owns container layout, tag addressing, and v2/v4 version handling. Public `IccProfileParser::LoadFromFile` API and `IccProfileData` struct are unchanged. Engine link list gains `mscms.lib`. | Day 10 |
 | 50 | Refresh-rate-driven render loop (60\u2013240 Hz) | Render `DispatcherQueueTimer` interval is now derived from the active monitor's `dmDisplayFrequency` (via `MonitorFromWindow` \u2192 `GetMonitorInfoW` \u2192 `EnumDisplaySettingsW`), clamped to [60, 240] Hz, refreshed on every display change. 120 / 144 / 165 / 240 Hz panels and high-FPS video sources run at native cadence. Interval is set in microseconds so non-integer-ms periods stay accurate. | Day 10 |
+| 51 | Working Space node is the single path for display tracking | Removed every per-effect "follow the live monitor" / "follow the working space" enum mode (`Current Monitor`, `Working Space` entries on `TargetGamut` / `SourceGamut` / `TargetRange`, plus `SdrWhiteSource` / `ClipSource` switches) and dropped all 5 host-side per-frame writer blocks (`PrimRed/Green/BlueX/Y_hidden`, `MonRed/Green/BlueX/Y_hidden`, `WsRed/Green/BlueX/Y_hidden`, `MonMin/MaxNits_hidden`, `(Ws)SdrWhiteNits_hidden`) from `MainWindow.xaml.cpp`. 12 ShaderLab effects now expose a `Custom` enum entry plus first-class `RedPrimary` / `GreenPrimary` / `BluePrimary` `Float2` parameters (gated by `visibleWhen`), and the SDR-white-consuming ICtCp effects use their existing numeric peak-nit parameters as the sole source. CIE Chromaticity Plot exposes its primaries unconditionally. To follow the active profile, the user wires the `Working Space` parameter node's analysis outputs into the relevant effect properties via the existing binding system. **Breaks saved graphs that used the old enum entries** — accepted because graph-format-version 2 doesn't compatibility-gate this and the stale `_hidden` properties on loaded nodes are inert (the shader cbuffer no longer references them and the `_hidden` filter hides them from the UI). | Day 11 |
+| 52 | ICtCp Tone Map gains a configurable `ToneLift` knob; the D2D `HdrToneMap` mid-tone lift is fixed and not adaptive | A/B testing on the *Colors of Journey* HDR clip (3442 → 1015 nits) showed `D2D HdrToneMap` *brightening* mid-tones by 38–350 % of source while ICtCp Tone Map slightly *darkened* them (−9 % to −24 %). Setting `D2D InputMaxLuminance` to 10000 vs the actual 3442 nits left the boost **unchanged** at 140 / 270 / 364 % — confirming D2D applies a fixed BT.2408-style "make HDR readable on SDR" dark-end lift unrelated to the source peak. ICtCp's anchored Möbius/Reinhard `f(I) = I / (1 + k·I)` (with `k = 1/peakOut − 1/peakIn`) is mathematically correct: `f(0) = 0`, `f(peakIn) = peakOut`, `f'(0) = 1`. The two effects encode different *philosophies* — neutral peak compression vs. opinionated readability lift — not different correctness. To let users opt in to the D2D look without losing the option of pure compression, ICtCp Tone Map gained a `ToneLift` parameter (default `0.0` = identity, range `[0..1]`) implementing an anchored polynomial mid-bump `f(x) = x + a·x·(1−x)` evaluated in normalized `[0, peakOut]` I-space. Polynomial form was chosen over `pow(I/peak, exp)` after rubber-duck critique: gamma has *infinite* slope at the toe (`f'(0) = ∞`), which would lift sensor noise and shadow detail aggressively; the polynomial has finite controlled slope `1 + a` at the toe. Hand-trace + measurement at `ToneLift = 0.6`: dark/mid nit counts match D2D within ~10 %; at `ToneLift = 0` the effect reverts to pure peak compression, matching the prior shipped behavior exactly. Bright-end overshoots D2D by ~80 % at `ToneLift = 0.6` — a single-knob limitation accepted for now; a future 2-knob `ToeLift / ShoulderLift` curve could match across the full range. Effect version bumped 9 → 10. Also added a defensive `pqLms = saturate(pqLms);` in `ICtCpToScRGB`: out-of-domain LMS components (e.g. when ICtCp I is modified upstream and pushes an LMS row above 1) would otherwise hit `PQ_EOTF`'s denominator-zero region around `V ≈ 1.16` and emit NaN. Benefits all 8 ICtCp-using effects without changing in-domain behavior. | Day 11 |
 
 ---
 
@@ -608,7 +612,7 @@ A growing set of HDR↔SDR operators built around BT.2100 ICtCp. The key propert
 | ICtCp Tone Map (HDR → SDR) | Pixel Shader | I-channel Reinhard compression. Source / target peaks specified in nits; Ct/Cp pass through unchanged. |
 | ICtCp Inverse Tone Map (SDR → HDR) | Pixel Shader | Mirror of the above; inverse Reinhard expands SDR-anchored content into the HDR peak. |
 
-Each tone-mapping effect declares `SdrWhiteNits_hidden` so the host writes the live OS-reported SDR white level (the *Settings → Display → HDR → "SDR content brightness"* slider value) into the cbuffer every frame. Future variants (BT.2390, hue-preserving ACES, adaptive) will live in this same subcategory.
+Each tone-mapping effect exposes its nit-target as a regular numeric parameter (`TargetPeakNits`, `SourcePeakNits`, etc.) — wire it from `working_space.SdrWhiteNits` / `PeakNits` to track the OS slider or simulated profile automatically. Future variants (BT.2390, hue-preserving ACES, adaptive) will live in this same subcategory and follow the same convention.
 
 ### Source / Generator Effects
 
@@ -632,6 +636,7 @@ Each tone-mapping effect declares `SdrWhiteNits_hidden` so the host writes the l
 | Clock | Time source: outputs `Time` (seconds) and `Progress` (0–1 over a configurable duration). Drives the animation system. |
 | Numeric Expression | Single configurable math node powered by ExprTk; user-supplied formula evaluated against dynamic float inputs `A..Z`. Replaces the older Add / Subtract / Multiply / Divide / Min / Max nodes. See [below](#numeric-expression-node-exprtk). |
 | Random | Takes a single `Seed` float input and outputs a deterministic, well-mixed `Result` in `[0, 1)`. The output is a pure function of the seed (SplitMix64-style integer mixer on the float's bit pattern), so identical seeds always reproduce identical values and any change — e.g. a tick from an upstream Clock or Numeric Expression — yields a fresh random number. |
+| Working Space | Strict sink (no input pins, no output image pin) that mirrors the active display profile from the top-bar profile selector — live OS-reported caps or whatever simulated preset / ICC the user has applied. Exposes 14 typed analysis output fields: `ActiveColorMode` (0=SDR, 1=WCG/ACM, 2=HDR), `HdrSupported`, `HdrUserEnabled`, `WcgSupported`, `WcgUserEnabled`, `IsSimulated`, `SdrWhiteNits`, `PeakNits`, `MinNits`, `MaxFullFrameNits`, plus the four CIE-xy primaries `RedPrimary` / `GreenPrimary` / `BluePrimary` / `WhitePoint` (each Float2). Bind any downstream property to these fields via the property-binding system to drive an effect from the live working space — e.g. wire a tone-mapper's peak-nits to `working_space.PeakNits` and it will track Display Settings or simulated profile changes automatically without touching the graph. |
 
 ## Numeric Expression Node (ExprTk)
 
@@ -1138,11 +1143,12 @@ ShaderLab does not currently support importing a fully compiled effect from an e
 
 ## Working Space Integration
 
-ShaderLab effects that operate in a specific color space receive **working space primaries** from the active display profile at render time.
+The active display profile (live OS-reported caps or any simulated preset / ICC the user has applied) is exposed to graphs through a single first-class node: **`Working Space`** (Parameter category). Effects that operate in a specific color space pull from it via the property-binding system.
 
-- **Hidden properties**: Working space chromaticities are stored as properties with the `_hidden` suffix (e.g., `WsRedX_hidden`, `WsRedY_hidden`, `WsGreenX_hidden`, etc.).
-- **Injected at render time**: The evaluator injects these values from `DisplayMonitor::ActiveProfile()` before each evaluation.
-- **UI exclusion**: Properties ending in `_hidden` are excluded from the Properties panel and data pins.
+- **Single source of truth**: The Working Space node's 14 typed analysis output fields mirror the active profile — `ActiveColorMode` (0=SDR, 1=WCG/ACM, 2=HDR), `HdrSupported`, `HdrUserEnabled`, `WcgSupported`, `WcgUserEnabled`, `IsSimulated`, `SdrWhiteNits`, `PeakNits`, `MinNits`, `MaxFullFrameNits`, plus the four CIE-xy primaries `RedPrimary` / `GreenPrimary` / `BluePrimary` / `WhitePoint` (each Float2).
+- **Updated by `MainWindow::UpdateWorkingSpaceNodes()`**, which runs on `ApplyDisplayProfile`, `RevertToLiveDisplay`, the display-change callback, and once per render tick. Only marks the node dirty when at least one field actually changed, so binding consumers re-evaluate on profile changes only.
+- **Bind, don't hide**: Effects that need to know the working-space primaries or peak nits expose them as bindable `Float2` / `Float` parameters (typically a `Custom` enum mode that gates them via `visibleWhen`, plus a few static convenience modes like `sRGB` / `BT.2020`). Wire those parameters from the Working Space node to follow the live profile, or set them by hand for strict static analysis. There is no "follow the working space" toggle anymore — wiring the binding **is** the toggle.
+- **Legacy `_hidden` properties** (e.g. `WsRedX_hidden`, `MonMaxNits_hidden`, `SdrWhiteNits_hidden`) are no longer written by the host and are not declared on any current effect. The `_hidden` suffix filter is retained so older saved graphs that still carry these keys load cleanly with the stale entries inert and invisible.
 
 ## Image Statistics Effect
 
@@ -1167,7 +1173,7 @@ ShaderLab includes an embedded HTTP server implementing the **Model Context Prot
 - Transport: Streamable HTTP (`POST /` for JSON-RPC)
 - Enable: MCP toggle in toolbar, `--mcp` flag, or `config.json`
 
-### Tools (23 total)
+### Tools (27 total)
 
 | Tool | Description |
 |------|-------------|
@@ -1194,6 +1200,10 @@ ShaderLab includes an embedded HTTP server implementing the **Model Context Prot
 | `get_display_info` | Display caps, active profile, pipeline, app version. |
 | `node_logs` | Per-node timestamped info / warning / error log entries. |
 | `perf_timings` | Per-node evaluation timings from the most recent frame. |
+| `graph_snapshot` | PNG snapshot of the live node-graph editor view. With `inline=true` returns image bytes as MCP image content; otherwise returns the temp file path. |
+| `graph_get_view` | Read the editor's current zoom, pan, viewport size, and content bounds. |
+| `graph_set_view` | Apply `{zoom?, panX?, panY?}` to the live editor — same effect as user pan/zoom input. |
+| `graph_fit_view` | Fit the editor view to all nodes with a viewport-space `padding` (DIPs, default 40). |
 
 ### Known Limitations
 

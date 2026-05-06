@@ -95,6 +95,12 @@ namespace ShaderLab::Controls
         // Used to place auto-positioned new nodes in the user's current view.
         void SetViewportSize(float w, float h) { m_viewportW = w; m_viewportH = h; }
 
+        // Returns the axis-aligned bounding box of all node visuals in canvas
+        // (pre-pan/zoom) space. Returns {0,0,0,0} when no nodes are laid out.
+        // Caller is responsible for calling RebuildLayout() first if the graph
+        // may have changed since the last layout.
+        D2D1_RECT_F ContentBounds() const;
+
         // ---- Interaction ----
 
         // Hit-test a canvas point. Returns the node ID under the point, or 0.

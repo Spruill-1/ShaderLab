@@ -246,6 +246,10 @@ namespace ShaderLab::Rendering
 		p.caps.minLuminanceNits = p.caps.hdrEnabled ? 0.05f : 0.5f;
 		p.caps.maxFullFrameLuminanceNits = (std::min)(lum, lum * 0.8f + 100.0f);
 
+		// Reuse the preset helper to stamp coherent ACM/WCG/activeColorMode
+		// flags into the simulated caps, derived from hdrEnabled.
+		StampSimulatedColorMode(p.caps);
+
 		p.primaryRed   = icc.primaryRed;
 		p.primaryGreen = icc.primaryGreen;
 		p.primaryBlue  = icc.primaryBlue;

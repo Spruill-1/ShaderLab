@@ -186,6 +186,35 @@ namespace ShaderLab::Controls
         m_needsRedraw = true;
     }
 
+    D2D1_RECT_F NodeGraphController::ContentBounds() const
+    {
+        if (m_visuals.empty())
+            return D2D1::RectF(0.0f, 0.0f, 0.0f, 0.0f);
+
+        bool first = true;
+        D2D1_RECT_F acc{};
+        for (const auto& [id, v] : m_visuals)
+        {
+            const auto& b = v.bounds;
+            if (b.right <= b.left || b.bottom <= b.top) continue;
+            if (first)
+            {
+                acc = b;
+                first = false;
+            }
+            else
+            {
+                acc.left   = (std::min)(acc.left,   b.left);
+                acc.top    = (std::min)(acc.top,    b.top);
+                acc.right  = (std::max)(acc.right,  b.right);
+                acc.bottom = (std::max)(acc.bottom, b.bottom);
+            }
+        }
+        if (first)
+            return D2D1::RectF(0.0f, 0.0f, 0.0f, 0.0f);
+        return acc;
+    }
+
     // -----------------------------------------------------------------------
     // Hit testing
     // -----------------------------------------------------------------------
@@ -622,6 +651,20 @@ namespace ShaderLab::Controls
             // Skip hidden properties (internal cbuffer plumbing).
             if (key.size() > 7 && key.ends_with(L"_hidden"))
                 continue;
+            // For nodes with a customEffect, only show input pins for properties
+            // that correspond to a declared parameter. Properties that exist
+            // solely as host-driven bootstrap values (e.g. Working Space, fed
+            // by hiddenDefaults + UpdateWorkingSpaceNodes) must NOT appear as
+            // input pins — they are sink-only analysis backing storage.
+            if (node.customEffect.has_value())
+            {
+                bool isDeclaredParam = false;
+                for (const auto& p : node.customEffect->parameters)
+                {
+                    if (p.name == key) { isDeclaredParam = true; break; }
+                }
+                if (!isDeclaredParam) continue;
+            }
             // Skip conditionally hidden parameters.
             if (node.customEffect.has_value())
             {

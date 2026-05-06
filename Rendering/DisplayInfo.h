@@ -5,7 +5,8 @@
 namespace ShaderLab::Rendering
 {
     // Snapshot of the display's HDR / color capabilities,
-    // queried from DXGI_OUTPUT_DESC1 via IDXGIOutput6::GetDesc1.
+    // queried from DXGI_OUTPUT_DESC1 via IDXGIOutput6::GetDesc1, augmented
+    // with Windows DisplayConfig advanced-color info (HDR/WCG/ACM state).
     struct DisplayCapabilities
     {
         // True when the OS reports Advanced Color (HDR) is active on this output.
@@ -39,6 +40,23 @@ namespace ShaderLab::Rendering
         float bluePrimaryY{ 0.06f };
         float whitePointX{ 0.3127f };
         float whitePointY{ 0.3290f };
+
+        // Active color mode reported by Windows DisplayConfig
+        // (DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2.activeColorMode).
+        // 0 = SDR, 1 = WCG/ACM (FP16 scRGB composition, display-referred
+        // luminance), 2 = HDR (FP16 scRGB composition, scene-referred
+        // luminance). Falls back to {0,2} derived from hdrEnabled when
+        // the type-15 query is unavailable.
+        uint32_t activeColorMode{ 0 };
+
+        // Capability + user-toggle flags from
+        // DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2. These reflect what the
+        // display HW reports vs. what the user has enabled in Settings.
+        // ACTIVE state is in `activeColorMode` / `hdrEnabled`.
+        bool hdrSupported{ false };
+        bool hdrUserEnabled{ false };
+        bool wcgSupported{ false };
+        bool wcgUserEnabled{ false };
 
         // Human-readable summary for the status bar.
         std::wstring ModeString() const

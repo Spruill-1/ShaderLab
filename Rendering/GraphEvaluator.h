@@ -58,6 +58,24 @@ namespace ShaderLab::Rendering
         // If the effect isn't cached yet, does nothing (next Evaluate will create it).
         void UpdateNodeShader(uint32_t nodeId, const Graph::EffectNode& node);
 
+        // Compute statistics for an arbitrary D2D image without mutating any
+        // graph node.  Pre-renders the image to a fresh FP32 GPU bitmap (reusing
+        // PreRenderInputBitmap) and runs a separate GpuReduction pass per
+        // requested channel.
+        //
+        // channels: list of GpuReduction channel codes
+        //   0 = luminance (Rec.709), 1 = R, 2 = G, 3 = B, 4 = A.
+        // nonzeroOnly: if true, samples with all-zero RGB are excluded (matches
+        //              the per-node analysis behaviour).
+        //
+        // Returns one ImageStats per channel in the order requested.  Returns an
+        // empty vector if pre-render fails or any channel reduction fails.
+        std::vector<ImageStats> ComputeStandaloneStats(
+            ID2D1DeviceContext5* dc,
+            ID2D1Image* inputImage,
+            const std::vector<uint32_t>& channels,
+            bool nonzeroOnly);
+
     private:
         // Create or retrieve the cached D2D effect for a built-in effect node.
         ID2D1Effect* GetOrCreateEffect(

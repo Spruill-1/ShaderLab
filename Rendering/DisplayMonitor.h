@@ -87,6 +87,14 @@ namespace ShaderLab::Rendering
         // slider via DisplayConfigGetDeviceInfo. Returns 80.0f on failure.
         static float QuerySdrWhiteLevelForOutput(IDXGIOutput6* output);
 
+        // Query DisplayConfig for ACM / advanced-color state on the display
+        // that hosts the given output. Populates the activeColorMode +
+        // *Supported / *UserEnabled fields on `caps`. Falls back to deriving
+        // activeColorMode from the existing `caps.hdrEnabled` when the
+        // type-15 (ADVANCED_COLOR_INFO_2) query is unavailable.
+        static void QueryAdvancedColorInfo2(IDXGIOutput6* output,
+                                            DisplayCapabilities& caps);
+
         HWND                            m_appHwnd{ nullptr };
         HWND                            m_msgHwnd{ nullptr };
         ATOM                            m_wndClass{ 0 };

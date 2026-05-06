@@ -251,6 +251,10 @@ float3 ScRGBToICtCp(float3 rgb) {
 // ICtCp -> scRGB
 float3 ICtCpToScRGB(float3 ictcp) {
     float3 pqLms = mul(ICTCP_TO_PQLMS, ictcp);
+    // Defensive clamp: PQ_EOTF is only defined for V in [0, 1]. Out-of-range
+    // pqLms (which can happen when callers modify I-channel without rescaling
+    // Ct/Cp, or with out-of-gamut chroma) produce NaN/Inf via the EOTF.
+    pqLms = saturate(pqLms);
     // PQ decode to nits
     float3 lms = float3(
         PQ_EOTF(pqLms.x),
@@ -359,11 +363,13 @@ float4 main(
     static const std::string s_outOfGamutHLSL = R"HLSL(
 // Gamut Highlight
 // TargetGamut modes:
-//   0 = Current Monitor (primaries injected by host from live display)
-//   1 = Rec.709
-//   2 = DCI-P3
-//   3 = Rec.2020
-//   4 = Working Space (primaries follow active/simulated Display profile)
+//   0 = Rec.709    (matrix conversion)
+//   1 = DCI-P3     (matrix conversion)
+//   2 = Rec.2020   (matrix conversion)
+//   3 = Custom     (CIE xy chromaticity triangle test using
+//                   RedPrimary/GreenPrimary/BluePrimary; bind these to
+//                   `Working Space.RedPrimary` etc. for monitor-matched
+//                   analysis, or set them manually.)
 Texture2D Source : register(t0);
 
 cbuffer constants : register(b0) {
@@ -373,13 +379,9 @@ cbuffer constants : register(b0) {
     float OverlayB;
     float OverlayStrength;
     float Mode;
-    // Primaries for modes 0 and 4 (auto-injected, not user-visible)
-    float PrimRedX_hidden;
-    float PrimRedY_hidden;
-    float PrimGreenX_hidden;
-    float PrimGreenY_hidden;
-    float PrimBlueX_hidden;
-    float PrimBlueY_hidden;
+    float2 RedPrimary;
+    float2 GreenPrimary;
+    float2 BluePrimary;
 };
 
 float4 main(
@@ -393,26 +395,25 @@ float4 main(
     float lum = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
     if (lum < 0.001) return color;
 
-    // All modes use the same primaries-based approach.
-    // For Rec.709/P3/2020, the evaluator could inject known primaries,
-    // but we use matrix conversion for those (more accurate).
-    // The Prim* variables are always referenced to prevent HLSL optimization.
+    // Read all cbuffer vars at top so DXC keeps them resident even on
+    // branches that don't directly reference every primary.
+    float gamut = TargetGamut;
+    float2 mr = RedPrimary;
+    float2 mg = GreenPrimary;
+    float2 mb = BluePrimary;
+
     float3 xyz = ScRGBToXYZ(color.rgb);
     float3 targetRGB = color.rgb;
 
-    // Force the compiler to keep Prim* in the cbuffer by always reading them.
-    float2 mr = float2(PrimRedX_hidden, PrimRedY_hidden);
-    float2 mg = float2(PrimGreenX_hidden, PrimGreenY_hidden);
-    float2 mb = float2(PrimBlueX_hidden, PrimBlueY_hidden);
-
-    if (TargetGamut > 0.5 && TargetGamut < 1.5) {
-        targetRGB = color.rgb; // Rec.709
-    } else if (TargetGamut > 1.5 && TargetGamut < 2.5) {
+    if (gamut < 0.5) {
+        // Rec.709 (identity for our scRGB pipeline).
+        targetRGB = color.rgb;
+    } else if (gamut < 1.5) {
         targetRGB = mul(XYZ_TO_P3D65, xyz);
-    } else if (TargetGamut > 2.5 && TargetGamut < 3.5) {
+    } else if (gamut < 2.5) {
         targetRGB = mul(XYZ_TO_REC2020, xyz);
     } else {
-        // Current Monitor (0) or Working Space (4): chromaticity triangle test
+        // Custom: CIE xy chromaticity triangle test against bound primaries.
         float sum = xyz.x + xyz.y + xyz.z;
         float2 xy = (sum > 0.0001) ? float2(xyz.x / sum, xyz.y / sum) : D65_WHITE;
         float2 v0 = mb - mr, v1 = mg - mr, v2 = xy - mr;
@@ -442,15 +443,14 @@ float4 main(
 // overlay color.
 //
 // TargetRange selects the [min,max] nit window:
-//   0 = Current Monitor (host injects MonMinNits_hidden / MonMaxNits_hidden
-//                        from the live display's DXGI luminance)
-//   1 = SDR              (0 .. 80 nits)
-//   2 = HDR 400          (0 .. 400 nits)
-//   3 = HDR 1000         (0 .. 1000 nits)
-//   4 = HDR 4000         (0 .. 4000 nits)
-//   5 = HDR 10000        (0 .. 10000 nits)
-//   6 = Custom           (use MinNits / MaxNits sliders directly)
-//   7 = Working Space    (host injects from the active/simulated display)
+//   0 = SDR              (0 .. 80 nits)
+//   1 = HDR 400          (0 .. 400 nits)
+//   2 = HDR 1000         (0 .. 1000 nits)
+//   3 = HDR 4000         (0 .. 4000 nits)
+//   4 = HDR 10000        (0 .. 10000 nits)
+//   5 = Custom           (use MinNits / MaxNits sliders directly; bind
+//                         to `Working Space.MinNits/PeakNits` for
+//                         monitor-matched analysis.)
 Texture2D Source : register(t0);
 
 cbuffer constants : register(b0) {
@@ -462,9 +462,6 @@ cbuffer constants : register(b0) {
     float OverlayB;
     float OverlayStrength;
     float Mode; // 0 = Out-of-Range, 1 = In-Range
-    // Host-injected monitor luminance range (used by modes 0 and 7).
-    float MonMinNits_hidden;
-    float MonMaxNits_hidden;
 };
 
 float4 main(
@@ -477,33 +474,22 @@ float4 main(
     // ScRGBLuminanceNits: scRGB luminance * 80 (1.0 = 80 nits SDR white).
     float nits = ScRGBLuminanceNits(color.rgb);
 
-    // Force compiler to keep hidden cbuffer entries (D2D won't update them
-    // otherwise — same trick as Gamut Highlight).
-    float monMin = MonMinNits_hidden;
-    float monMax = MonMaxNits_hidden;
-
     // Pick effective range.
     float effMin = MinNits;
     float effMax = MaxNits;
-    if (TargetRange < 0.5) {              // Current Monitor
-        effMin = monMin;
-        effMax = monMax;
-    } else if (TargetRange < 1.5) {       // SDR
+    if (TargetRange < 0.5) {              // SDR
         effMin = 0.0;   effMax = 80.0;
-    } else if (TargetRange < 2.5) {       // HDR 400
+    } else if (TargetRange < 1.5) {       // HDR 400
         effMin = 0.0;   effMax = 400.0;
-    } else if (TargetRange < 3.5) {       // HDR 1000
+    } else if (TargetRange < 2.5) {       // HDR 1000
         effMin = 0.0;   effMax = 1000.0;
-    } else if (TargetRange < 4.5) {       // HDR 4000
+    } else if (TargetRange < 3.5) {       // HDR 4000
         effMin = 0.0;   effMax = 4000.0;
-    } else if (TargetRange < 5.5) {       // HDR 10000
+    } else if (TargetRange < 4.5) {       // HDR 10000
         effMin = 0.0;   effMax = 10000.0;
-    } else if (TargetRange < 6.5) {       // Custom
+    } else {                               // Custom
         effMin = MinNits;
         effMax = MaxNits;
-    } else {                               // Working Space
-        effMin = monMin;
-        effMax = monMax;
     }
 
     // Defensive: degenerate range collapses to "everything out-of-range".
@@ -642,25 +628,26 @@ float4 main(
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Highlight";
-            desc.effectId = L"Gamut Highlight"; desc.effectVersion = 2;
+            desc.effectId = L"Gamut Highlight"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.subcategory = L"Highlights";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + s_outOfGamutHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"TargetGamut",     L"float", 0.0f, 0.0f, 4.0f, 1.0f, { L"Current Monitor", L"Rec.709", L"DCI-P3", L"Rec.2020", L"Working Space" } },
+                { L"TargetGamut",     L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020", L"Custom" } },
                 { L"OverlayR",        L"float", 1.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayG",        L"float", 0.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayB",        L"float", 1.0f,  0.0f, 1.0f, 0.01f },
                 { L"OverlayStrength", L"float", 0.7f,  0.0f, 1.0f, 0.01f },
                 { L"Mode",            L"float", 0.0f,  0.0f, 1.0f, 1.0f, { L"Out-of-Gamut", L"In-Gamut" } },
-            };
-            // Hidden cbuffer properties: primaries auto-injected by host.
-            desc.hiddenDefaults = {
-                { L"PrimRedX_hidden",   0.64f }, { L"PrimRedY_hidden",   0.33f },
-                { L"PrimGreenX_hidden", 0.30f }, { L"PrimGreenY_hidden", 0.60f },
-                { L"PrimBlueX_hidden",  0.15f }, { L"PrimBlueY_hidden",  0.06f },
+                // Custom-mode primaries (sRGB/Rec.709 D65 defaults). Bind
+                // these to `Working Space.RedPrimary` etc. for monitor-matched
+                // analysis. Hidden in the Properties panel and graph node
+                // until TargetGamut is set to "Custom".
+                { L"RedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+                { L"GreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+                { L"BluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -669,34 +656,30 @@ float4 main(
         // Range-based companion to Gamut Highlight: tints pixels whose
         // luminance (in nits) falls outside the active nit range. The Mode
         // toggle inverts the test so the user can isolate either the
-        // out-of-range or in-range pixels. TargetRange picks among the
-        // current monitor's reported luminance, common HDR presets, a
-        // user-specified Custom range, or the Preview-Mode display.
+        // out-of-range or in-range pixels. TargetRange picks among common
+        // HDR presets or a user-specified Custom range. For monitor-matched
+        // analysis, set TargetRange to "Custom" and bind MinNits/MaxNits to
+        // `Working Space.MinNits` / `Working Space.PeakNits`.
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Luminance Highlight";
-            desc.effectId = L"Luminance Highlight"; desc.effectVersion = 3;
+            desc.effectId = L"Luminance Highlight"; desc.effectVersion = 4;
             desc.category = L"Analysis";
             desc.subcategory = L"Highlights";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + s_luminanceHighlightHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"TargetRange",     L"float", 0.0f,   0.0f, 7.0f, 1.0f,
-                    { L"Current Monitor", L"SDR (0-80)", L"HDR 400", L"HDR 1000",
-                      L"HDR 4000", L"HDR 10000", L"Custom", L"Working Space" } },
-                { L"MinNits",         L"float", 0.0f,   0.0f, 10000.0f, 1.0f },
-                { L"MaxNits",         L"float", 100.0f, 0.0f, 10000.0f, 1.0f },
+                { L"TargetRange",     L"float", 0.0f,   0.0f, 5.0f, 1.0f,
+                    { L"SDR (0-80)", L"HDR 400", L"HDR 1000", L"HDR 4000",
+                      L"HDR 10000", L"Custom" } },
+                { L"MinNits",         L"float", 0.0f,    0.0f, 10000.0f, 1.0f, {}, L"TargetRange == 5" },
+                { L"MaxNits",         L"float", 1000.0f, 0.0f, 10000.0f, 10.0f, {}, L"TargetRange == 5" },
                 { L"OverlayR",        L"float", 1.0f,   0.0f, 1.0f, 0.01f },
                 { L"OverlayG",        L"float", 0.0f,   0.0f, 1.0f, 0.01f },
                 { L"OverlayB",        L"float", 1.0f,   0.0f, 1.0f, 0.01f },
                 { L"OverlayStrength", L"float", 0.7f,   0.0f, 1.0f, 0.01f },
                 { L"Mode",            L"float", 0.0f,   0.0f, 1.0f, 1.0f, { L"Out-of-Range", L"In-Range" } },
-            };
-            // Hidden: host injects current/preview monitor luminance range.
-            desc.hiddenDefaults = {
-                { L"MonMinNits_hidden", 0.0f },
-                { L"MonMaxNits_hidden", 1000.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -849,13 +832,12 @@ cbuffer constants : register(b0) {
     uint ShowRec2020;   // 1=show gamut triangle
     float Brightness;   // scatter dot brightness (default 2.0)
     float DiagramSize;  // output size in pixels (default 512)
-    uint ShowMonitor;   // 1=show current monitor gamut triangle
-    float MonRedX_hidden;      // Monitor primary red x (auto-injected)
-    float MonRedY_hidden;
-    float MonGreenX_hidden;
-    float MonGreenY_hidden;
-    float MonBlueX_hidden;
-    float MonBlueY_hidden;
+    uint ShowMonitor;   // 1=show "monitor" gamut triangle drawn from
+                        // RedPrimary/GreenPrimary/BluePrimary (typically
+                        // bound to the Working Space node).
+    float2 RedPrimary;
+    float2 GreenPrimary;
+    float2 BluePrimary;
 };
 
 // CIE 1931 2-degree observer spectral locus (sampled at 10nm, 380-700nm)
@@ -981,9 +963,9 @@ float4 main(
         result.rgb = lerp(result.rgb, float3(0,0.5,1) * lineBright, e * 0.8);
     }
     if (ShowMonitor > 0.5) {
-        float2 mR = float2(MonRedX_hidden, MonRedY_hidden);
-        float2 mG = float2(MonGreenX_hidden, MonGreenY_hidden);
-        float2 mB = float2(MonBlueX_hidden, MonBlueY_hidden);
+        float2 mR = RedPrimary;
+        float2 mG = GreenPrimary;
+        float2 mB = BluePrimary;
         float e = GamutTriangle(xy, mR, mG, mB, thickness);
         result.rgb = lerp(result.rgb, float3(1, 0.8, 0) * lineBright, e * 0.9);
     }
@@ -1015,7 +997,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"CIE Chromaticity Plot";
-            desc.effectId = L"CIE Chromaticity Plot"; desc.effectVersion = 4;
+            desc.effectId = L"CIE Chromaticity Plot"; desc.effectVersion = 5;
             desc.category = L"Analysis";
             desc.subcategory = L"Scopes";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -1027,12 +1009,12 @@ float4 main(
                 { L"ShowRec2020",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"Brightness",   L"float", 2.0f,  0.1f, 10.0f, 0.1f },
                 { L"DiagramSize",  L"float", 512.0f, 128.0f, 4096.0f, 64.0f },
+                // Custom-primary triangle ("monitor" gamut). Bind these to
+                // `Working Space.RedPrimary` etc. for monitor-matched plotting.
                 { L"ShowMonitor",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
-            };
-            desc.hiddenDefaults = {
-                { L"MonRedX_hidden",   0.64f }, { L"MonRedY_hidden",   0.33f },
-                { L"MonGreenX_hidden", 0.30f }, { L"MonGreenY_hidden", 0.60f },
-                { L"MonBlueX_hidden",  0.15f }, { L"MonBlueY_hidden",  0.06f },
+                { L"RedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"ShowMonitor == 1" },
+                { L"GreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"ShowMonitor == 1" },
+                { L"BluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"ShowMonitor == 1" },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1045,14 +1027,21 @@ float4 main(
 // Gamut Source - generates all colors within a selected color gamut
 // Fixed coordinate system centered on D65 white point. Scale fits Rec.2020
 // so all three gamuts share the same spatial mapping.
+//
+// Gamut modes:
+//   0 = Rec.709
+//   1 = DCI-P3
+//   2 = Rec.2020
+//   3 = Custom  (uses RedPrimary/GreenPrimary/BluePrimary; bind to
+//                Working Space.RedPrimary etc. for a monitor-matched source.)
 
 cbuffer constants : register(b0) {
-    float Gamut;        // 0=Rec.709, 1=DCI-P3, 2=Rec.2020, 3=Working Space
+    float Gamut;
     float Luminance;    // nits (default 80.0, maps to scRGB 1.0)
     float OutputSize;   // pixels (default 1024)
-    float WsRedX_hidden;   float WsRedY_hidden;
-    float WsGreenX_hidden; float WsGreenY_hidden;
-    float WsBlueX_hidden;  float WsBlueY_hidden;
+    float2 RedPrimary;
+    float2 GreenPrimary;
+    float2 BluePrimary;
 };
 
 float4 main(
@@ -1061,13 +1050,17 @@ float4 main(
 {
     float size = max(OutputSize, 128.0);
 
+    // Read all cbuffer vars at top to keep DXC from optimizing them out.
+    float gamut = Gamut;
+    float2 cR = RedPrimary;
+    float2 cG = GreenPrimary;
+    float2 cB = BluePrimary;
+
     // Select gamut primaries
     float2 r, g, b;
-    if (Gamut > 2.5)     { r = float2(WsRedX_hidden, WsRedY_hidden);
-                           g = float2(WsGreenX_hidden, WsGreenY_hidden);
-                           b = float2(WsBlueX_hidden, WsBlueY_hidden); }
-    else if (Gamut > 1.5){ r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }
-    else if (Gamut > 0.5){ r = GAMUT_P3_R;   g = GAMUT_P3_G;   b = GAMUT_P3_B; }
+    if (gamut > 2.5)     { r = cR; g = cG; b = cB; }
+    else if (gamut > 1.5){ r = GAMUT_2020_R; g = GAMUT_2020_G; b = GAMUT_2020_B; }
+    else if (gamut > 0.5){ r = GAMUT_P3_R;   g = GAMUT_P3_G;   b = GAMUT_P3_B; }
     else                 { r = GAMUT_709_R;  g = GAMUT_709_G;  b = GAMUT_709_B; }
 
     float2 center = D65_WHITE;
@@ -1092,20 +1085,18 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Source";
-            desc.effectId = L"Gamut Source"; desc.effectVersion = 2;
+            desc.effectId = L"Gamut Source"; desc.effectVersion = 3;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutSourceHLSL;
             desc.inputNames = {};
             desc.parameters = {
-                { L"Gamut",      L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020", L"Working Space" } },
+                { L"Gamut",      L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020", L"Custom" } },
                 { L"Luminance",  L"float", 80.0f, 0.01f, 10000.0f, 10.0f },
                 { L"OutputSize", L"float", 512.0f, 128.0f, 4096.0f, 64.0f },
-            };
-            desc.hiddenDefaults = {
-                { L"WsRedX_hidden",   0.64f }, { L"WsRedY_hidden",   0.33f },
-                { L"WsGreenX_hidden", 0.30f }, { L"WsGreenY_hidden", 0.60f },
-                { L"WsBlueX_hidden",  0.15f }, { L"WsBlueY_hidden",  0.06f },
+                { L"RedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"Gamut == 3" },
+                { L"GreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"Gamut == 3" },
+                { L"BluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"Gamut == 3" },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1796,10 +1787,10 @@ float4 main(
 cbuffer Constants : register(b0)
 {
     float DiagramSize; // output size in pixels
-    float TargetGamut; // 0 = sRGB, 1 = DCI-P3, 2 = BT.2020, 3 = Working Space
-    float WsRedX_hidden;   float WsRedY_hidden;
-    float WsGreenX_hidden; float WsGreenY_hidden;
-    float WsBlueX_hidden;  float WsBlueY_hidden;
+    float TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
+    float2 RedPrimary;
+    float2 GreenPrimary;
+    float2 BluePrimary;
 };
 
 Texture2D InputTexture : register(t0);
@@ -1830,12 +1821,18 @@ float4 main(
 
     float3 bg = float3(0.05, 0.05, 0.05);
 
+    // Read all cbuffer vars at top so DXC keeps them resident.
+    float gamutF = TargetGamut;
+    float2 cR = RedPrimary;
+    float2 cG = GreenPrimary;
+    float2 cB = BluePrimary;
+
     // Draw target gamut triangle
     float2 tR, tG, tB;
-    uint gamut = (uint)TargetGamut;
+    uint gamut = (uint)gamutF;
     if (gamut == 1)      { tR = GAMUT_P3_R; tG = GAMUT_P3_G; tB = GAMUT_P3_B; }
     else if (gamut == 2) { tR = GAMUT_2020_R; tG = GAMUT_2020_G; tB = GAMUT_2020_B; }
-    else if (gamut == 3) { tR = float2(WsRedX_hidden, WsRedY_hidden); tG = float2(WsGreenX_hidden, WsGreenY_hidden); tB = float2(WsBlueX_hidden, WsBlueY_hidden); }
+    else if (gamut == 3) { tR = cR; tG = cG; tB = cB; }
     else                 { tR = GAMUT_709_R; tG = GAMUT_709_G; tB = GAMUT_709_B; }
 
     float lineW = 0.003;
@@ -1887,19 +1884,17 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Coverage";
-            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 2;
+            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutCoverageHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"DiagramSize",  L"float", 512.0f, 128.0f, 4096.0f, 64.0f },
-                { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
-            };
-            desc.hiddenDefaults = {
-                { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },
-                { L"WsGreenX_hidden", 0.30f }, { L"WsGreenY_hidden", 0.60f },
-                { L"WsBlueX_hidden", 0.15f }, { L"WsBlueY_hidden", 0.06f },
+                { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" } },
+                { L"RedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+                { L"GreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+                { L"BluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1917,12 +1912,15 @@ float4 main(
 cbuffer Constants : register(b0)
 {
     float Mode;        // 0=Clip, 1=Nearest, 2=Compress, 3=Fit Gamut
-    float TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Working Space
+    float TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
     float Strength;    // 0=bypass, 1=full mapping
-    float SourceGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Working Space
-    float WsRedX_hidden;   float WsRedY_hidden;
-    float WsGreenX_hidden; float WsGreenY_hidden;
-    float WsBlueX_hidden;  float WsBlueY_hidden;
+    float SourceGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
+    float2 TargetRedPrimary;
+    float2 TargetGreenPrimary;
+    float2 TargetBluePrimary;
+    float2 SourceRedPrimary;
+    float2 SourceGreenPrimary;
+    float2 SourceBluePrimary;
 };
 
 Texture2D InputTexture : register(t0);
@@ -2018,12 +2016,22 @@ float4 main(
     float lum = dot(max(color.rgb, 0.0), float3(0.2126, 0.7152, 0.0722));
     if (lum < 1e-5) return color;
 
+    // Read all cbuffer vars at top so DXC keeps them resident.
+    float targetF = TargetGamut;
+    float sourceF = SourceGamut;
+    float2 ctR = TargetRedPrimary;
+    float2 ctG = TargetGreenPrimary;
+    float2 ctB = TargetBluePrimary;
+    float2 csR = SourceRedPrimary;
+    float2 csG = SourceGreenPrimary;
+    float2 csB = SourceBluePrimary;
+
     // Get target gamut primaries
     float2 gR, gG, gB;
-    uint gamut = (uint)TargetGamut;
+    uint gamut = (uint)targetF;
     if (gamut == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
     else if (gamut == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
-    else if (gamut == 3) { gR = float2(WsRedX_hidden, WsRedY_hidden); gG = float2(WsGreenX_hidden, WsGreenY_hidden); gB = float2(WsBlueX_hidden, WsBlueY_hidden); }
+    else if (gamut == 3) { gR = ctR; gG = ctG; gB = ctB; }
     else                 { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
 
     uint mode = (uint)Mode;
@@ -2062,10 +2070,10 @@ float4 main(
     {
         // Fit Gamut: uniformly scale all chromaticities toward D65 white.
         float2 sR, sG, sB;
-        uint sg = (uint)SourceGamut;
+        uint sg = (uint)sourceF;
         if (sg == 1)      { sR = GAMUT_P3_R; sG = GAMUT_P3_G; sB = GAMUT_P3_B; }
         else if (sg == 2) { sR = GAMUT_2020_R; sG = GAMUT_2020_G; sB = GAMUT_2020_B; }
-        else if (sg == 3) { sR = float2(WsRedX_hidden, WsRedY_hidden); sG = float2(WsGreenX_hidden, WsGreenY_hidden); sB = float2(WsBlueX_hidden, WsBlueY_hidden); }
+        else if (sg == 3) { sR = csR; sG = csG; sB = csB; }
         else              { sR = GAMUT_709_R; sG = GAMUT_709_G; sB = GAMUT_709_B; }
 
         float scale = ComputeFitScale(sR, sG, sB, gR, gG, gB);
@@ -2120,7 +2128,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Map";
-            desc.effectId = L"Gamut Map"; desc.effectVersion = 3;
+            desc.effectId = L"Gamut Map"; desc.effectVersion = 4;
             desc.category = L"Analysis";
             desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2128,14 +2136,22 @@ float4 main(
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"Mode",        L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Clip", L"Nearest Point", L"Compress to White", L"Fit Gamut" } },
-                { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+                { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
-                { L"SourceGamut", L"float", 2.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" }, L"Mode == 3" },
-            };
-            desc.hiddenDefaults = {
-                { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },
-                { L"WsGreenX_hidden", 0.30f }, { L"WsGreenY_hidden", 0.60f },
-                { L"WsBlueX_hidden", 0.15f }, { L"WsBlueY_hidden", 0.06f },
+                { L"SourceGamut", L"float", 2.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" }, L"Mode == 3" },
+                // Custom-mode primaries. Bind to Working Space.RedPrimary etc.
+                // Target primaries appear when TargetGamut == 3 (Custom).
+                { L"TargetRedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+                { L"TargetGreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+                { L"TargetBluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+                // Source primaries appear when Mode == 3 (Fit Gamut) AND
+                // SourceGamut == 3 (Custom). Currently only one visibleWhen
+                // condition is supported per parameter, so we gate on the
+                // narrower SourceGamut == 3 — this is correct because the
+                // SourceGamut parameter itself is gated on Mode == 3.
+                { L"SourceRedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.708f, 0.292f }, 0.0f, 1.0f, 0.001f, {}, L"SourceGamut == 3" },
+                { L"SourceGreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.170f, 0.797f }, 0.0f, 1.0f, 0.001f, {}, L"SourceGamut == 3" },
+                { L"SourceBluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.131f, 0.046f }, 0.0f, 1.0f, 0.001f, {}, L"SourceGamut == 3" },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2150,12 +2166,15 @@ float4 main(
 cbuffer Constants : register(b0)
 {
     float Mode;          // 0=Nearest on Shell, 1=Compress to Neutral, 2=Fit to Shell
-    float TargetGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Working Space
+    float TargetGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
     float Strength;      // 0=bypass, 1=full
-    float SourceGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Working Space
-    float WsRedX_hidden;   float WsRedY_hidden;
-    float WsGreenX_hidden; float WsGreenY_hidden;
-    float WsBlueX_hidden;  float WsBlueY_hidden;
+    float SourceGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
+    float2 TargetRedPrimary;
+    float2 TargetGreenPrimary;
+    float2 TargetBluePrimary;
+    float2 SourceRedPrimary;
+    float2 SourceGreenPrimary;
+    float2 SourceBluePrimary;
 };
 
 Texture2D InputTexture : register(t0);
@@ -2280,11 +2299,21 @@ float4 main(
     float lum = dot(max(color.rgb, 0.0), float3(0.2126, 0.7152, 0.0722));
     if (lum < 1e-5) return color;
 
+    // Read all cbuffer vars at top so DXC keeps them resident.
+    float targetF = TargetGamut;
+    float sourceF = SourceGamut;
+    float2 ctR = TargetRedPrimary;
+    float2 ctG = TargetGreenPrimary;
+    float2 ctB = TargetBluePrimary;
+    float2 csR = SourceRedPrimary;
+    float2 csG = SourceGreenPrimary;
+    float2 csB = SourceBluePrimary;
+
     float2 gR, gG, gB;
-    uint g = (uint)TargetGamut;
+    uint g = (uint)targetF;
     if (g == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
     else if (g == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
-    else if (g == 3) { gR = float2(WsRedX_hidden, WsRedY_hidden); gG = float2(WsGreenX_hidden, WsGreenY_hidden); gB = float2(WsBlueX_hidden, WsBlueY_hidden); }
+    else if (g == 3) { gR = ctR; gG = ctG; gB = ctB; }
     else             { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
 
     // Use CIE xy triangle test for reliable in/out-of-gamut detection,
@@ -2300,10 +2329,10 @@ float4 main(
     {
         // Fit to Shell: uniformly scale all Ct/Cp toward neutral axis.
         float2 sR, sG, sB;
-        uint sg = (uint)SourceGamut;
+        uint sg = (uint)sourceF;
         if (sg == 1)      { sR = GAMUT_P3_R; sG = GAMUT_P3_G; sB = GAMUT_P3_B; }
         else if (sg == 2) { sR = GAMUT_2020_R; sG = GAMUT_2020_G; sB = GAMUT_2020_B; }
-        else if (sg == 3) { sR = float2(WsRedX_hidden, WsRedY_hidden); sG = float2(WsGreenX_hidden, WsGreenY_hidden); sB = float2(WsBlueX_hidden, WsBlueY_hidden); }
+        else if (sg == 3) { sR = csR; sG = csG; sB = csB; }
         else              { sR = GAMUT_709_R; sG = GAMUT_709_G; sB = GAMUT_709_B; }
 
         float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
@@ -2365,7 +2394,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Gamut Map";
-            desc.effectId = L"ICtCp Gamut Map"; desc.effectVersion = 8;
+            desc.effectId = L"ICtCp Gamut Map"; desc.effectVersion = 9;
             desc.category = L"Analysis";
             desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2373,14 +2402,15 @@ float4 main(
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"Mode",        L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Nearest on Shell", L"Compress to Neutral", L"Fit to Shell" } },
-                { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+                { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
-                { L"SourceGamut", L"float", 2.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" }, L"Mode == 2" },
-            };
-            desc.hiddenDefaults = {
-                { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },
-                { L"WsGreenX_hidden", 0.30f }, { L"WsGreenY_hidden", 0.60f },
-                { L"WsBlueX_hidden", 0.15f }, { L"WsBlueY_hidden", 0.06f },
+                { L"SourceGamut", L"float", 2.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" }, L"Mode == 2" },
+                { L"TargetRedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+                { L"TargetGreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+                { L"TargetBluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+                { L"SourceRedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.708f, 0.292f }, 0.0f, 1.0f, 0.001f, {}, L"SourceGamut == 3" },
+                { L"SourceGreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.170f, 0.797f }, 0.0f, 1.0f, 0.001f, {}, L"SourceGamut == 3" },
+                { L"SourceBluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.131f, 0.046f }, 0.0f, 1.0f, 0.001f, {}, L"SourceGamut == 3" },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2396,9 +2426,9 @@ cbuffer Constants : register(b0)
     float DiagramSize;
     float TargetGamut;
     float Intensity;   // Which I level to highlight (PQ domain, 0-1)
-    float WsRedX_hidden;   float WsRedY_hidden;
-    float WsGreenX_hidden; float WsGreenY_hidden;
-    float WsBlueX_hidden;  float WsBlueY_hidden;
+    float2 RedPrimary;
+    float2 GreenPrimary;
+    float2 BluePrimary;
 };
 
 Texture2D InputTexture : register(t0);
@@ -2433,11 +2463,17 @@ float4 main(
     float size = max(DiagramSize, 256.0);
     float2 ctcp = (uv0.xy - 0.5) * 1.0;
 
+    // Read all cbuffer vars at top so DXC keeps them resident.
+    float gamutF = TargetGamut;
+    float2 cR = RedPrimary;
+    float2 cG = GreenPrimary;
+    float2 cB = BluePrimary;
+
     float2 gR, gG, gB;
-    uint g = (uint)TargetGamut;
+    uint g = (uint)gamutF;
     if (g == 1)      { gR = GAMUT_P3_R; gG = GAMUT_P3_G; gB = GAMUT_P3_B; }
     else if (g == 2) { gR = GAMUT_2020_R; gG = GAMUT_2020_G; gB = GAMUT_2020_B; }
-    else if (g == 3) { gR = float2(WsRedX_hidden, WsRedY_hidden); gG = float2(WsGreenX_hidden, WsGreenY_hidden); gB = float2(WsBlueX_hidden, WsBlueY_hidden); }
+    else if (g == 3) { gR = cR; gG = cG; gB = cB; }
     else             { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
 
     float3 color = float3(0.01, 0.01, 0.01);
@@ -2488,7 +2524,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Boundary";
-            desc.effectId = L"ICtCp Boundary"; desc.effectVersion = 2;
+            desc.effectId = L"ICtCp Boundary"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2496,13 +2532,11 @@ float4 main(
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"DiagramSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
-                { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+                { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" } },
                 { L"Intensity",   L"float", 0.5f, 0.05f, 0.95f, 0.05f },
-            };
-            desc.hiddenDefaults = {
-                { L"WsRedX_hidden", 0.64f }, { L"WsRedY_hidden", 0.33f },
-                { L"WsGreenX_hidden", 0.30f }, { L"WsGreenY_hidden", 0.60f },
-                { L"WsBlueX_hidden", 0.15f }, { L"WsBlueY_hidden", 0.06f },
+                { L"RedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+                { L"GreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+                { L"BluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2548,38 +2582,51 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
 
         // ---- ICtCp Tone Map (HDR -> SDR) ----
         // Compresses I-channel only via Reinhard, leaving Ct/Cp untouched
-        // so hue and saturation are preserved by construction. Both peaks
-        // are in nits and converted to I-coordinates (PQ values) before
-        // the curve is applied.
+        // so HUE is preserved by construction. Saturation may shift slightly
+        // when ToneLift > 0 because lifting I without rescaling chroma
+        // reduces apparent colorfulness. Both peaks are in nits and converted
+        // to I-coordinates (PQ values) before the curve is applied.
+        //
+        // ToneLift adds a configurable mid-bump on top of the compression so
+        // dark/mid scenes can be brightened toward "D2D HDR Tone Map"-style
+        // output. ToneLift = 0 is pure peak-only compression (preserves HDR
+        // creative intent). ToneLift ~= 0.6 approximates D2D HDR Tone Map's
+        // dark-end lift on typical HDR content.
         {
             static const std::string ictcpToneMapHLSL = R"HLSL(
-// ICtCp Tone Map (HDR -> SDR), I-channel Reinhard
+// ICtCp Tone Map (HDR -> SDR), I-channel Reinhard with optional mid-bump
 Texture2D Source : register(t0);
 SamplerState Sampler : register(s0);
 
 cbuffer constants : register(b0) {
     float SourcePeakNits;        // typical 1000-10000
-    float TargetPeakNits;        // SDR target; used when SdrWhiteSource = 0
-    float SdrWhiteSource;        // 0 = User Value, 1 = Working Space
-    float Strength;              // 0..1 lerp from identity to compressed
-    float WsSdrWhiteNits_hidden; // host-injected: active working-space SDR white
-                                 //   (= live monitor when no preset selected,
-                                 //    or preset's SDR white when one is)
+    float TargetPeakNits;        // SDR target peak (e.g. 80, 203)
+    float Strength;              // 0..1 lerp from identity to compressed+lifted
+    float ToneLift;              // 0..1 mid-tone lift on top of compression
 };
 
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
 {
-    float wsNits = WsSdrWhiteNits_hidden;        // bind to silence DXC
-    float src    = SdrWhiteSource;               // bind
-    float targetNits = (src > 0.5) ? wsNits : TargetPeakNits;
-
     float4 color = Source.Load(int3(uv, 0));
     float3 ictcp = ScRGBToICtCp(color.rgb);
 
     float peakIn  = NitsToI(SourcePeakNits);
-    float peakOut = NitsToI(targetNits);
+    float peakOut = NitsToI(TargetPeakNits);
     float compressed = ReinhardCompressI(ictcp.x, peakIn, peakOut);
-    ictcp.x = lerp(ictcp.x, compressed, saturate(Strength));
+
+    // Anchored polynomial lift in I-space, applied AFTER compression.
+    // Curve: f(x) = x + a*x*(1-x), evaluated in normalized [0, peakOut]
+    // space then scaled back to I units. Properties:
+    //   f(0)   = 0           (preserves true black)
+    //   f(1)   = 1           (preserves peakOut anchor)
+    //   f'(0)  = 1 + a       (controlled finite toe slope; no shadow blow-up)
+    //   max bump occurs near x = 0.5 (mid-tone region), magnitude = a/4
+    float a = saturate(ToneLift);
+    float invPeakOut = 1.0 / max(peakOut, 1e-6);
+    float xn = saturate(compressed * invPeakOut);
+    float lifted = (xn + a * xn * (1.0 - xn)) * peakOut;
+
+    ictcp.x = lerp(ictcp.x, lifted, saturate(Strength));
 
     float3 outRgb = ICtCpToScRGB(ictcp);
     return float4(outRgb, color.a);
@@ -2587,7 +2634,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Tone Map (HDR -> SDR)";
-            desc.effectId = L"ICtCp Tone Map"; desc.effectVersion = 8;
+            desc.effectId = L"ICtCp Tone Map"; desc.effectVersion = 10;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2596,16 +2643,8 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
             desc.parameters = {
                 { L"SourcePeakNits", L"float", 1000.0f, 100.0f, 10000.0f, 50.0f },
                 { L"TargetPeakNits", L"float", 203.0f, 80.0f, 500.0f, 1.0f },
-                { L"SdrWhiteSource", L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"User Value", L"Working Space" } },
                 { L"Strength",       L"float", 1.0f, 0.0f, 1.0f, 0.05f },
-            };
-            // Hidden: host writes the active working-space SDR white
-            // every frame. "Working Space" in the SdrWhiteSource enum
-            // pulls from this; with the Current Monitor profile
-            // selected (the default) it equals the live OS-reported
-            // value, otherwise it equals the chosen preset / ICC.
-            desc.hiddenDefaults = {
-                { L"WsSdrWhiteNits_hidden", 80.0f },
+                { L"ToneLift",       L"float", 0.0f, 0.0f, 1.0f, 0.05f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2620,19 +2659,13 @@ Texture2D Source : register(t0);
 SamplerState Sampler : register(s0);
 
 cbuffer constants : register(b0) {
-    float SourcePeakNits;        // SDR source; used when SdrWhiteSource = 0
+    float SourcePeakNits;        // SDR source peak (e.g. 80, 203)
     float TargetPeakNits;        // typical 1000-10000
-    float SdrWhiteSource;        // 0 = User Value, 1 = Working Space
     float Strength;              // 0..1 lerp from identity to expanded
-    float WsSdrWhiteNits_hidden;
 };
 
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
 {
-    float wsNits = WsSdrWhiteNits_hidden;
-    float src    = SdrWhiteSource;
-    float sourceNits = (src > 0.5) ? wsNits : SourcePeakNits;
-
     float4 color = Source.Load(int3(uv, 0));
     float3 ictcp = ScRGBToICtCp(color.rgb);
 
@@ -2641,7 +2674,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
     // peakOut and the *expanded* (HDR) range as peakIn. The input I lives
     // in [0, peakOut_I] (SDR range) and the helper returns an I in
     // [0, peakIn_I] (HDR range).
-    float sdrI = NitsToI(sourceNits);
+    float sdrI = NitsToI(SourcePeakNits);
     float hdrI = NitsToI(TargetPeakNits);
     float expanded = ReinhardExpandI(ictcp.x, hdrI, sdrI);
     ictcp.x = lerp(ictcp.x, expanded, saturate(Strength));
@@ -2652,7 +2685,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Inverse Tone Map (SDR -> HDR)";
-            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 9;
+            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 10;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2661,11 +2694,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
             desc.parameters = {
                 { L"SourcePeakNits", L"float", 203.0f, 80.0f, 500.0f, 1.0f },
                 { L"TargetPeakNits", L"float", 1000.0f, 100.0f, 10000.0f, 50.0f },
-                { L"SdrWhiteSource", L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"User Value", L"Working Space" } },
                 { L"Strength",       L"float", 1.0f, 0.0f, 1.0f, 0.05f },
-            };
-            desc.hiddenDefaults = {
-                { L"WsSdrWhiteNits_hidden", 80.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2726,36 +2755,17 @@ cbuffer constants : register(b0) {
     float KneeNits;     // start of the rolloff (e.g. 200)
     float PeakNits;     // end of the rolloff       (e.g. 1000)
     float Amount;       // [0..1], how far to desaturate at peak (1 = grayscale at peak)
-    float SdrWhiteSource;        // 0 = User Value (Knee/Peak literal), 1 = Working Space (= WsSdrWhiteNits_hidden)
-    float WsSdrWhiteNits_hidden; // host-injected working-space SDR white
 };
 
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
 {
-    float wsNits = WsSdrWhiteNits_hidden;
-    float src    = SdrWhiteSource;
-
-    // Working-space mode: Knee = working-space SDR white,
-    // Peak = working-space SDR white * (PeakNits / KneeNits) so the
-    // user's stored ratio (e.g. 1000/200 = 5x) follows the active
-    // profile. Falls back to literal nits when in User Value mode.
-    float knee = KneeNits;
-    float peak = PeakNits;
-    if (src > 0.5)
-    {
-        float ratio = (KneeNits > 0.0) ? (PeakNits / KneeNits) : 5.0;
-        knee = wsNits;
-        peak = wsNits * ratio;
-    }
-
     float4 color = Source.Load(int3(uv, 0));
     float3 ictcp = ScRGBToICtCp(color.rgb);
 
-    // Map I (PQ) back to nits
-    // way the user's parameters mean what they say even though the
-    // I axis is non-linear.
+    // Map I (PQ) back to nits so the user's parameters mean what they say
+    // even though the I axis is non-linear.
     float nits = IToNits(ictcp.x);
-    float t = saturate((nits - knee) / max(peak - knee, 1e-3));
+    float t = saturate((nits - KneeNits) / max(PeakNits - KneeNits, 1e-3));
     float scale = 1.0 - saturate(Amount) * smoothstep(0.0, 1.0, t);
 
     ictcp.y *= scale;
@@ -2766,7 +2776,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Highlight Desaturation";
-            desc.effectId = L"ICtCp Highlight Desaturation"; desc.effectVersion = 2;
+            desc.effectId = L"ICtCp Highlight Desaturation"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2776,10 +2786,6 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
                 { L"KneeNits",       L"float", 200.0f,  10.0f, 5000.0f, 10.0f },
                 { L"PeakNits",       L"float", 1000.0f, 50.0f, 10000.0f, 50.0f },
                 { L"Amount",         L"float", 1.0f,    0.0f,  1.0f,    0.05f },
-                { L"SdrWhiteSource", L"float", 1.0f,    0.0f,  1.0f,    1.0f, { L"User Value", L"Working Space" } },
-            };
-            desc.hiddenDefaults = {
-                { L"WsSdrWhiteNits_hidden", 80.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -3040,9 +3046,6 @@ void main(uint3 GTid : SV_GroupThreadID)
 //   1 = Nits (Y * 80)
 //
 // ClippedFraction: fraction of pixels whose luminance >= ClipNits.
-// ClipSource enum:
-//   0 = User Value (ClipNits literal)
-//   1 = Working Space (ClipNits = WsSdrWhiteNits_hidden, BT.2408 default)
 
 Texture2D<float4> Source : register(t0);
 RWStructuredBuffer<float4> Result : register(u0);
@@ -3052,10 +3055,7 @@ cbuffer Constants : register(b0)
     uint Width;
     uint Height;
     uint Units;        // 0 = Normalized, 1 = Nits
-    uint ClipSource;   // 0 = User Value, 1 = Working Space
     float ClipNits;
-    float WsSdrWhiteNits_hidden;
-    // Padding to multiple of 16 bytes if needed.
 };
 
 #define GROUP_SIZE 32
@@ -3086,7 +3086,6 @@ void main(uint3 GTid : SV_GroupThreadID)
 
     // Resolve clip threshold (always in nits internally).
     float clipNitsResolved = ClipNits;
-    if (ClipSource == 1) clipNitsResolved = WsSdrWhiteNits_hidden;
 
     float tMin = 1e30;
     float tMax = -1e30;
@@ -3188,7 +3187,7 @@ void main(uint3 GTid : SV_GroupThreadID)
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"Luminance Statistics";
-            desc.effectId = L"Luminance Statistics"; desc.effectVersion = 1;
+            desc.effectId = L"Luminance Statistics"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.subcategory = L"Statistics";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -3197,11 +3196,7 @@ void main(uint3 GTid : SV_GroupThreadID)
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"Units",      L"float", 1.0f,    0.0f, 1.0f,    1.0f, { L"Normalized", L"Nits" } },
-                { L"ClipSource", L"float", 1.0f,    0.0f, 1.0f,    1.0f, { L"User Value", L"Working Space" } },
                 { L"ClipNits",   L"float", 203.0f, 10.0f, 10000.0f, 1.0f },
-            };
-            desc.hiddenDefaults = {
-                { L"WsSdrWhiteNits_hidden", 80.0f },
             };
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
             desc.analysisFields = {
@@ -3416,11 +3411,11 @@ void main(uint3 GTid : SV_GroupThreadID)
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Parameter";
-            desc.effectId = L"Gamut Parameter"; desc.effectVersion = 1;
+            desc.effectId = L"Gamut Parameter"; desc.effectVersion = 2;
             desc.category = L"Parameter";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.parameters = {
-                { L"Value", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Working Space" } },
+                { L"Value", L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020" } },
             };
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
             desc.analysisFields = {
@@ -3496,6 +3491,68 @@ void main(uint3 GTid : SV_GroupThreadID)
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
             desc.analysisFields = {
                 { L"Result", Graph::AnalysisFieldType::Float },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Working Space Parameter Node ----
+        // A first-class, host-driven parameter node that mirrors the active
+        // display profile (live or simulated) as 14 typed analysis output
+        // fields. Lets graphs wire other nodes (tone mapper, OOG, etc.) to
+        // the live working space via the property-binding system instead of
+        // duplicating per-effect "follow the display" toggles. Updated by
+        // MainWindow::UpdateWorkingSpaceNodes() whenever the display profile
+        // changes; values are written into node->properties keyed by field
+        // name and unpacked into the analysis output by the regular
+        // parameter-node branch in GraphEvaluator.
+        {
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Working Space";
+            desc.effectId = L"Working Space"; desc.effectVersion = 1;
+            desc.category = L"Parameter";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            // No parameters — values are entirely host-driven. Properties
+            // panel will be empty for this node, exactly the desired UX.
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                // Display mode (Float, encoded as 0=SDR, 1=WCG/ACM, 2=HDR).
+                { L"ActiveColorMode",   Graph::AnalysisFieldType::Float },
+                // Capability + user-toggle flags (Float-as-bool, 0/1).
+                { L"HdrSupported",      Graph::AnalysisFieldType::Float },
+                { L"HdrUserEnabled",    Graph::AnalysisFieldType::Float },
+                { L"WcgSupported",      Graph::AnalysisFieldType::Float },
+                { L"WcgUserEnabled",    Graph::AnalysisFieldType::Float },
+                { L"IsSimulated",       Graph::AnalysisFieldType::Float },
+                // Luminance levels in nits.
+                { L"SdrWhiteNits",      Graph::AnalysisFieldType::Float },
+                { L"PeakNits",          Graph::AnalysisFieldType::Float },
+                { L"MinNits",           Graph::AnalysisFieldType::Float },
+                { L"MaxFullFrameNits",  Graph::AnalysisFieldType::Float },
+                // Color primaries as CIE xy (Float2).
+                { L"RedPrimary",        Graph::AnalysisFieldType::Float2 },
+                { L"GreenPrimary",      Graph::AnalysisFieldType::Float2 },
+                { L"BluePrimary",       Graph::AnalysisFieldType::Float2 },
+                { L"WhitePoint",        Graph::AnalysisFieldType::Float2 },
+            };
+            // Bootstrap defaults — sRGB SDR. Lets the node show meaningful
+            // values immediately on creation, even before MainWindow's
+            // UpdateWorkingSpaceNodes() has had a chance to run.
+            using winrt::Windows::Foundation::Numerics::float2;
+            desc.hiddenDefaults = {
+                { L"ActiveColorMode",   Graph::PropertyValue{ 0.0f } },
+                { L"HdrSupported",      Graph::PropertyValue{ 0.0f } },
+                { L"HdrUserEnabled",    Graph::PropertyValue{ 0.0f } },
+                { L"WcgSupported",      Graph::PropertyValue{ 0.0f } },
+                { L"WcgUserEnabled",    Graph::PropertyValue{ 0.0f } },
+                { L"IsSimulated",       Graph::PropertyValue{ 0.0f } },
+                { L"SdrWhiteNits",      Graph::PropertyValue{ 80.0f } },
+                { L"PeakNits",          Graph::PropertyValue{ 80.0f } },
+                { L"MinNits",           Graph::PropertyValue{ 0.5f } },
+                { L"MaxFullFrameNits",  Graph::PropertyValue{ 80.0f } },
+                { L"RedPrimary",        Graph::PropertyValue{ float2{ 0.640f, 0.330f } } },
+                { L"GreenPrimary",      Graph::PropertyValue{ float2{ 0.300f, 0.600f } } },
+                { L"BluePrimary",       Graph::PropertyValue{ float2{ 0.150f, 0.060f } } },
+                { L"WhitePoint",        Graph::PropertyValue{ float2{ 0.3127f, 0.3290f } } },
             };
             m_effects.push_back(std::move(desc));
         }

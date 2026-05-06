@@ -34,6 +34,12 @@ namespace ShaderLab
         m_routes.push_back({ method, pathPrefix, std::move(handler) });
     }
 
+    void McpHttpServer::SetActivityCallback(ActivityCallback cb)
+    {
+        std::lock_guard lock(m_activityMutex);
+        m_activityCallback = std::move(cb);
+    }
+
     bool McpHttpServer::Start(uint16_t port)
     {
         if (m_running.load())
@@ -297,6 +303,35 @@ namespace ShaderLab
             OutputDebugStringA(("[MCP] headers:\n" + headers + "\n").c_str());
         }
         Response resp = RouteRequest(method, path, body);
+
+        // Notify the activity callback BEFORE we send the response so
+        // the caller's UI indicator pulses as close to the request edge
+        // as possible.  Failure to format the peer address is non-fatal.
+        {
+            ActivityCallback cb;
+            {
+                std::lock_guard lock(m_activityMutex);
+                cb = m_activityCallback;
+            }
+            if (cb)
+            {
+                std::string peerStr;
+                sockaddr_in peer{};
+                int peerLen = sizeof(peer);
+                if (getpeername(s, reinterpret_cast<sockaddr*>(&peer), &peerLen) == 0)
+                {
+                    char ipBuf[64]{};
+                    inet_ntop(AF_INET, &peer.sin_addr, ipBuf, sizeof(ipBuf));
+                    peerStr = std::format("{}:{}", ipBuf, ntohs(peer.sin_port));
+                }
+                std::string methodUtf8;
+                methodUtf8.reserve(method.size());
+                for (wchar_t wc : method)
+                    methodUtf8.push_back(static_cast<char>(wc & 0x7F));
+                try { cb(methodUtf8, path, resp.statusCode, peerStr); }
+                catch (...) { OutputDebugStringA("[MCP] activity callback threw\n"); }
+            }
+        }
 
         std::string statusText;
         switch (resp.statusCode)

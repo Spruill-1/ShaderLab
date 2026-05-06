@@ -5,6 +5,7 @@
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <cstdint>
 
 // Forward-declare to avoid pulling winsock headers into every TU.
@@ -27,6 +28,20 @@ namespace ShaderLab
 
         using Handler = std::function<Response(const std::wstring& path, const std::string& body)>;
 
+        // Activity callback: invoked on the listener thread immediately after each
+        // request is routed (one call per HTTP request, regardless of route match).
+        // The callback MUST be cheap and thread-safe — UI updates should be deferred
+        // to the UI thread by the consumer.  Arguments:
+        //   method      — HTTP verb (e.g. "GET", "POST")
+        //   path        — full request path (after query strip)
+        //   statusCode  — final HTTP status returned to the client
+        //   peerAddress — "127.0.0.1:54321" style string for the remote endpoint
+        using ActivityCallback = std::function<void(
+            const std::string& method,
+            const std::wstring& path,
+            uint16_t statusCode,
+            const std::string& peerAddress)>;
+
         McpHttpServer() = default;
         ~McpHttpServer();
 
@@ -35,6 +50,10 @@ namespace ShaderLab
         void Stop();
         bool IsRunning() const { return m_running.load(); }
         uint16_t Port() const { return m_port; }
+
+        // Register a callback invoked after every HTTP request the server handles.
+        // Set to nullptr to clear.  Safe to call before or after Start().
+        void SetActivityCallback(ActivityCallback cb);
 
         // Route a request programmatically (used by the MCP JSON-RPC handler).
         Response RouteRequest(const std::wstring& method, const std::wstring& path, const std::string& body);
@@ -55,5 +74,8 @@ namespace ShaderLab
         std::jthread        m_thread;
         std::atomic<bool>   m_running{ false };
         uint16_t            m_port{ 0 };
+
+        std::mutex          m_activityMutex;
+        ActivityCallback    m_activityCallback;
     };
 }

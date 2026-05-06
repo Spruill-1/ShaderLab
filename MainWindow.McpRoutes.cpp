@@ -5,6 +5,7 @@
 #include "Effects/CustomComputeShaderEffect.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/SourceNodeFactory.h"
+#include "Rendering/IccProfileParser.h"
 #include "Version.h"
 
 // Helper: narrow string from wide string.
@@ -17,11 +18,84 @@ static std::string ToUtf8(const std::wstring& ws)
     return s;
 }
 
+// Helper: escape a string for embedding into a JSON string literal.
+// Escapes backslash, quote, and control characters per RFC 8259.
+// Use everywhere we splice user/host strings (HLSL source, paths, error
+// messages, profile names) into a JSON response body.
+static std::string JsonEscape(std::string_view s)
+{
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (char ch : s)
+    {
+        unsigned char uc = static_cast<unsigned char>(ch);
+        switch (ch)
+        {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (uc < 0x20)
+                {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", uc);
+                    out += buf;
+                }
+                else
+                {
+                    out.push_back(ch);
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+static std::string JsonEscape(const std::wstring& ws)
+{
+    return JsonEscape(ToUtf8(ws));
+}
+
 static std::string GuidToString(const GUID& g)
 {
     wchar_t buf[64]{};
     StringFromGUID2(g, buf, 64);
     return ToUtf8(buf);
+}
+
+// Base64 (standard alphabet, '=' padding, no line wrapping).
+static std::string Base64Encode(const uint8_t* data, size_t len)
+{
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    if (len == 0) return out;
+    out.reserve(((len + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 2 < len)
+    {
+        uint32_t v = (uint32_t(data[i]) << 16) | (uint32_t(data[i + 1]) << 8) | uint32_t(data[i + 2]);
+        out.push_back(kAlphabet[(v >> 18) & 0x3F]);
+        out.push_back(kAlphabet[(v >> 12) & 0x3F]);
+        out.push_back(kAlphabet[(v >> 6) & 0x3F]);
+        out.push_back(kAlphabet[v & 0x3F]);
+        i += 3;
+    }
+    if (i < len)
+    {
+        uint32_t v = uint32_t(data[i]) << 16;
+        bool two = (i + 1 < len);
+        if (two) v |= uint32_t(data[i + 1]) << 8;
+        out.push_back(kAlphabet[(v >> 18) & 0x3F]);
+        out.push_back(kAlphabet[(v >> 12) & 0x3F]);
+        out.push_back(two ? kAlphabet[(v >> 6) & 0x3F] : '=');
+        out.push_back('=');
+    }
+    return out;
 }
 
 // Helper: serialize a PropertyValue to a JSON fragment string.
@@ -233,31 +307,86 @@ static std::string NodeToJson(const ::ShaderLab::Graph::EffectNode& node)
 
 namespace winrt::ShaderLab::implementation
 {
-    // Helper: dispatch a lambda to the UI thread and block until completion.
+    // Dispatch a lambda to the UI thread and block until completion.
     // Returns the result from the lambda. Must NOT be called from the UI thread.
+    //
+    // Key correctness properties:
+    //   * The state (result/exception/event) lives in a shared_ptr captured by
+    //     the lambda, so if we time out and the caller returns, the lambda can
+    //     still safely write to it without dangling references.
+    //   * We always check the wait result before reading the result so a timeout
+    //     won't deref an empty optional. On timeout we throw so the calling
+    //     route returns a 500 instead of producing garbage.
+    //   * Non-void return only -- DispatchSync<void> isn't supported.
     template<typename F>
     auto MainWindow::DispatchSync(F&& fn) -> decltype(fn())
     {
         using R = decltype(fn());
-        std::optional<R> result;
-        std::exception_ptr ex;
-        HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        DispatcherQueue().TryEnqueue([&]()
+        struct State
         {
-            try { result = fn(); }
-            catch (...) { ex = std::current_exception(); }
-            SetEvent(event);
+            std::optional<R>      result;
+            std::exception_ptr    ex;
+            HANDLE                event{ nullptr };
+            ~State() { if (event) CloseHandle(event); }
+        };
+        auto state = std::make_shared<State>();
+        state->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!state->event)
+            throw std::runtime_error("DispatchSync: CreateEventW failed");
+
+        // Move the lambda into a shared_ptr so it stays alive even if the
+        // DispatcherQueue holds the callback longer than this scope.
+        auto fnPtr = std::make_shared<std::decay_t<F>>(std::forward<F>(fn));
+        DispatcherQueue().TryEnqueue([state, fnPtr]()
+        {
+            try { state->result = (*fnPtr)(); }
+            catch (...) { state->ex = std::current_exception(); }
+            SetEvent(state->event);
         });
-        WaitForSingleObject(event, 10000); // 10s timeout
-        CloseHandle(event);
-        if (ex) std::rethrow_exception(ex);
-        return *result;
+
+        // 30s timeout -- generous for stats/readback paths but still a
+        // backstop against a wedged UI thread.
+        DWORD wait = WaitForSingleObject(state->event, 30000);
+        if (wait != WAIT_OBJECT_0)
+            throw std::runtime_error("DispatchSync: UI thread did not respond within 30s");
+        if (state->ex) std::rethrow_exception(state->ex);
+        if (!state->result.has_value())
+            throw std::runtime_error("DispatchSync: lambda completed without producing a result");
+        return std::move(*state->result);
     }
 
     void MainWindow::SetupMcpRoutes()
     {
         if (!m_mcpServer)
             m_mcpServer = std::make_unique<::ShaderLab::McpHttpServer>();
+
+        // Activity callback: fires on the listener thread once per HTTP request.
+        // We update atomic state + a small mutexed string snapshot; the UI render
+        // tick polls these and refreshes the indicator dot + tooltip.  Keeping
+        // this side cheap and non-blocking ensures we don't introduce lock-step
+        // between MCP responses and the UI thread.
+        m_mcpServer->SetActivityCallback(
+            [this](const std::string& method,
+                   const std::wstring& path,
+                   uint16_t statusCode,
+                   const std::string& peerAddress)
+            {
+                using clk = std::chrono::system_clock;
+                auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    clk::now().time_since_epoch()).count();
+                m_mcpLastActivityMs.store(nowMs, std::memory_order_relaxed);
+                m_mcpRequestCount.fetch_add(1, std::memory_order_relaxed);
+                {
+                    std::lock_guard lock(m_mcpLastReqMutex);
+                    m_mcpLastReqMethod = method;
+                    m_mcpLastReqPath = ToUtf8(path);
+                    m_mcpLastReqPeer = peerAddress;
+                    m_mcpLastReqStatus = statusCode;
+                    if (!peerAddress.empty())
+                        m_mcpKnownPeers.insert(peerAddress);
+                }
+                m_mcpUiUpdateSeq.fetch_add(1, std::memory_order_release);
+            });
 
         // =====================================================================
         // GET /  — Health check / probe (some MCP clients GET / before POST).
@@ -1359,6 +1488,721 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
+        // Graph editor view (snapshot + pan/zoom)
+        // =====================================================================
+
+        // POST /graph/snapshot — body: { "inline": bool? }
+        // Captures the live node-graph view at the swap-chain panel size.
+        // Always writes PNG to a unique %TEMP% file. When inline=true, also
+        // returns base64-encoded bytes in the response.
+        m_mcpServer->AddRoute(L"POST", L"/graph/snapshot", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                bool wantInline = false;
+                if (!body.empty())
+                {
+                    winrt::Windows::Data::Json::JsonObject jo{ nullptr };
+                    if (winrt::Windows::Data::Json::JsonObject::TryParse(winrt::to_hstring(body), jo))
+                    {
+                        if (jo.HasKey(L"inline"))
+                        {
+                            auto v = jo.GetNamedValue(L"inline");
+                            if (v.ValueType() == winrt::Windows::Data::Json::JsonValueType::Boolean)
+                                wantInline = v.GetBoolean();
+                        }
+                    }
+                }
+
+                auto pngData = CaptureGraphAsPng();
+                if (pngData.empty())
+                    return { 500, R"({"error":"Snapshot failed"})" };
+
+                // Unique temp filename to avoid concurrent-capture overwrites.
+                static std::atomic<uint32_t> s_seq{ 0 };
+                uint32_t seq = s_seq.fetch_add(1, std::memory_order_relaxed);
+                wchar_t tempPath[MAX_PATH]{};
+                GetTempPathW(MAX_PATH, tempPath);
+                std::wstring filePath = std::format(L"{}shaderlab_graph_snapshot_{}_{}.png",
+                    tempPath, GetCurrentProcessId(), seq);
+                HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_WRITE, 0, nullptr,
+                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hFile == INVALID_HANDLE_VALUE)
+                    return { 500, R"({"error":"Failed to create temp file"})" };
+                DWORD written = 0;
+                WriteFile(hFile, pngData.data(), static_cast<DWORD>(pngData.size()), &written, nullptr);
+                CloseHandle(hFile);
+
+                auto pathUtf8 = ToUtf8(filePath);
+                std::string escapedPath;
+                for (char c : pathUtf8) { if (c == '\\') escapedPath += "\\\\"; else escapedPath += c; }
+
+                if (wantInline)
+                {
+                    auto b64 = Base64Encode(pngData.data(), pngData.size());
+                    return { 200, std::format(
+                        "{{\"path\":\"{}\",\"size\":{},\"width\":{},\"height\":{},"
+                        "\"mimeType\":\"image/png\",\"base64\":\"{}\"}}",
+                        escapedPath, pngData.size(),
+                        m_graphPanelWidth, m_graphPanelHeight, b64) };
+                }
+                return { 200, std::format(
+                    "{{\"path\":\"{}\",\"size\":{},\"width\":{},\"height\":{},\"mimeType\":\"image/png\"}}",
+                    escapedPath, pngData.size(),
+                    m_graphPanelWidth, m_graphPanelHeight) };
+            });
+        });
+
+        // GET /graph/view — current pan/zoom + viewport + content bounds
+        m_mcpServer->AddRoute(L"GET", L"/graph/view", [this](const std::wstring&, const std::string&)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                m_nodeGraphController.RebuildLayout();
+                auto pan = m_nodeGraphController.PanOffset();
+                float zoom = m_nodeGraphController.Zoom();
+                auto b = m_nodeGraphController.ContentBounds();
+                float cw = (std::max)(0.0f, b.right - b.left);
+                float ch = (std::max)(0.0f, b.bottom - b.top);
+                return { 200, std::format(
+                    "{{\"zoom\":{:.6f},\"panX\":{:.6f},\"panY\":{:.6f}"
+                    ",\"viewportW\":{},\"viewportH\":{}"
+                    ",\"contentBounds\":{{\"x\":{:.6f},\"y\":{:.6f},\"w\":{:.6f},\"h\":{:.6f}}}"
+                    ",\"zoomLimits\":{{\"min\":0.1,\"max\":5.0}}"
+                    "}}",
+                    zoom, pan.x, pan.y,
+                    m_graphPanelWidth, m_graphPanelHeight,
+                    b.left, b.top, cw, ch) };
+            });
+        });
+
+        // POST /graph/view — body: { zoom?, panX?, panY? }
+        m_mcpServer->AddRoute(L"POST", L"/graph/view", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                winrt::Windows::Data::Json::JsonObject jo{ nullptr };
+                if (!winrt::Windows::Data::Json::JsonObject::TryParse(winrt::to_hstring(body), jo))
+                    return { 400, R"({"error":"Invalid JSON body"})" };
+
+                auto pan = m_nodeGraphController.PanOffset();
+                float zoom = m_nodeGraphController.Zoom();
+                bool changed = false;
+
+                if (jo.HasKey(L"zoom"))
+                {
+                    auto v = jo.GetNamedValue(L"zoom");
+                    if (v.ValueType() != winrt::Windows::Data::Json::JsonValueType::Number)
+                        return { 400, R"({"error":"'zoom' must be a number"})" };
+                    zoom = static_cast<float>(v.GetNumber());
+                    m_nodeGraphController.SetZoom(zoom);
+                    changed = true;
+                }
+                if (jo.HasKey(L"panX"))
+                {
+                    auto v = jo.GetNamedValue(L"panX");
+                    if (v.ValueType() != winrt::Windows::Data::Json::JsonValueType::Number)
+                        return { 400, R"({"error":"'panX' must be a number"})" };
+                    pan.x = static_cast<float>(v.GetNumber());
+                    changed = true;
+                }
+                if (jo.HasKey(L"panY"))
+                {
+                    auto v = jo.GetNamedValue(L"panY");
+                    if (v.ValueType() != winrt::Windows::Data::Json::JsonValueType::Number)
+                        return { 400, R"({"error":"'panY' must be a number"})" };
+                    pan.y = static_cast<float>(v.GetNumber());
+                    changed = true;
+                }
+                if (jo.HasKey(L"panX") || jo.HasKey(L"panY"))
+                    m_nodeGraphController.SetPanOffset(pan.x, pan.y);
+
+                // Re-read post-clamp.
+                auto p2 = m_nodeGraphController.PanOffset();
+                float z2 = m_nodeGraphController.Zoom();
+                return { 200, std::format(
+                    "{{\"ok\":true,\"changed\":{},\"zoom\":{:.6f},\"panX\":{:.6f},\"panY\":{:.6f}}}",
+                    changed ? "true" : "false", z2, p2.x, p2.y) };
+            });
+        });
+
+        // POST /graph/view/fit — body: { padding?:number (DIPs, default 40) }
+        m_mcpServer->AddRoute(L"POST", L"/graph/view/fit", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                float padding = 40.0f;
+                if (!body.empty())
+                {
+                    winrt::Windows::Data::Json::JsonObject jo{ nullptr };
+                    if (winrt::Windows::Data::Json::JsonObject::TryParse(winrt::to_hstring(body), jo)
+                        && jo.HasKey(L"padding"))
+                    {
+                        auto v = jo.GetNamedValue(L"padding");
+                        if (v.ValueType() == winrt::Windows::Data::Json::JsonValueType::Number)
+                            padding = static_cast<float>(v.GetNumber());
+                    }
+                }
+                FitGraphView(padding);
+                auto p = m_nodeGraphController.PanOffset();
+                float z = m_nodeGraphController.Zoom();
+                auto b = m_nodeGraphController.ContentBounds();
+                bool empty = !(b.right > b.left && b.bottom > b.top);
+                return { 200, std::format(
+                    "{{\"ok\":true,\"empty\":{},\"zoom\":{:.6f},\"panX\":{:.6f},\"panY\":{:.6f}}}",
+                    empty ? "true" : "false", z, p.x, p.y) };
+            });
+        });
+
+        // =====================================================================
+        // GET /display/profiles  — All built-in presets + the active profile
+        // =====================================================================
+        m_mcpServer->AddRoute(L"GET", L"/display/profiles", [this](const std::wstring&, const std::string&)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                using namespace ::ShaderLab::Rendering;
+
+                auto serializeProfile = [](const DisplayProfile& p) {
+                    return std::format(
+                        "{{\"name\":\"{}\",\"hdrEnabled\":{},\"bitsPerColor\":{}"
+                        ",\"sdrWhiteNits\":{:.2f},\"peakNits\":{:.2f}"
+                        ",\"minNits\":{:.4f},\"maxFullFrameNits\":{:.2f}"
+                        ",\"gamut\":\"{}\",\"isSimulated\":{}"
+                        ",\"primaryRed\":[{:.4f},{:.4f}]"
+                        ",\"primaryGreen\":[{:.4f},{:.4f}]"
+                        ",\"primaryBlue\":[{:.4f},{:.4f}]"
+                        ",\"whitePoint\":[{:.4f},{:.4f}]}}",
+                        JsonEscape(p.profileName),
+                        p.caps.hdrEnabled ? "true" : "false",
+                        p.caps.bitsPerColor,
+                        p.caps.sdrWhiteLevelNits, p.caps.maxLuminanceNits,
+                        p.caps.minLuminanceNits, p.caps.maxFullFrameLuminanceNits,
+                        JsonEscape(GamutIdToString(p.gamut)),
+                        p.isSimulated ? "true" : "false",
+                        p.primaryRed.x, p.primaryRed.y,
+                        p.primaryGreen.x, p.primaryGreen.y,
+                        p.primaryBlue.x, p.primaryBlue.y,
+                        p.whitePoint.x, p.whitePoint.y);
+                };
+
+                std::string json = "{\"presets\":[";
+                for (size_t i = 0; i < m_displayPresets.size(); ++i)
+                {
+                    if (i) json += ",";
+                    json += "{\"index\":" + std::to_string(i) + ",\"profile\":";
+                    json += serializeProfile(m_displayPresets[i]);
+                    json += "}";
+                }
+                json += "],\"active\":" + serializeProfile(m_displayMonitor.ActiveProfile());
+                json += ",\"live\":" + serializeProfile(m_displayMonitor.LiveProfile());
+                json += ",\"isSimulated\":";
+                json += (m_displayMonitor.IsSimulated() ? "true" : "false");
+                if (m_loadedIccProfile.has_value())
+                {
+                    json += ",\"loadedIcc\":" + serializeProfile(m_loadedIccProfile.value());
+                }
+                json += "}";
+                return { 200, json };
+            });
+        });
+
+        // =====================================================================
+        // POST /display/profile  — Apply a simulated profile
+        // Body: exactly one of:
+        //   {"preset":"PresetP3_1000"}
+        //   {"presetIndex":3}
+        //   {"iccPath":"C:\\path\\to\\file.icc"}
+        //   {"custom":{name?, hdrEnabled?, sdrWhiteNits?, peakNits, minNits?,
+        //              maxFullFrameNits?, primaryRed[2], primaryGreen[2],
+        //              primaryBlue[2], whitePoint[2], gamut?}}
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/display/profile", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                using namespace ::ShaderLab::Rendering;
+                namespace WDJ = winrt::Windows::Data::Json;
+
+                WDJ::JsonObject jo{ nullptr };
+                if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
+                    return { 400, R"({"error":"Invalid JSON body"})" };
+
+                // Mutex check: exactly one source.
+                int count = 0;
+                if (jo.HasKey(L"preset"))      ++count;
+                if (jo.HasKey(L"presetIndex")) ++count;
+                if (jo.HasKey(L"iccPath"))     ++count;
+                if (jo.HasKey(L"custom"))      ++count;
+                if (count != 1)
+                    return { 400, R"({"error":"Specify exactly one of: preset, presetIndex, iccPath, custom"})" };
+
+                std::optional<DisplayProfile> chosen;
+
+                // ---- preset by name (factory function name) ----
+                if (jo.HasKey(L"preset"))
+                {
+                    auto name = std::wstring(jo.GetNamedString(L"preset"));
+                    DisplayProfile p{};
+                    if      (name == L"PresetSrgbSdr"     || name == L"sRGB SDR (80 nits)")              p = PresetSrgbSdr();
+                    else if (name == L"PresetSrgb270"     || name == L"sRGB SDR (270 nits, typical laptop)") p = PresetSrgb270();
+                    else if (name == L"PresetAdobeRGB"    || name == L"Adobe RGB (1998)")                p = PresetAdobeRGB();
+                    else if (name == L"PresetP3_600"      || name == L"DCI-P3 HDR (600 nits, MacBook Pro-class)") p = PresetP3_600();
+                    else if (name == L"PresetP3_1000"     || name == L"DCI-P3 HDR (1000 nits, reference monitor)") p = PresetP3_1000();
+                    else if (name == L"PresetBT2020_1000" || name == L"BT.2020 HDR (1000 nits, HDR TV)")  p = PresetBT2020_1000();
+                    else if (name == L"PresetBT2020_4000" || name == L"BT.2020 HDR (4000 nits, mastering)") p = PresetBT2020_4000();
+                    else
+                        return { 400, std::format(R"({{"error":"Unknown preset: {}"}})", JsonEscape(name)) };
+                    chosen = p;
+                }
+                else if (jo.HasKey(L"presetIndex"))
+                {
+                    auto idx = static_cast<size_t>(jo.GetNamedNumber(L"presetIndex"));
+                    if (idx >= m_displayPresets.size())
+                        return { 400, std::format("{{\"error\":\"presetIndex out of range (0-{})\"}}",
+                            m_displayPresets.size() - 1) };
+                    chosen = m_displayPresets[idx];
+                }
+                else if (jo.HasKey(L"iccPath"))
+                {
+                    auto path = std::wstring(jo.GetNamedString(L"iccPath"));
+                    if (!std::filesystem::exists(path))
+                        return { 400, std::format(R"({{"error":"ICC file not found: {}"}})", JsonEscape(path)) };
+                    auto parsed = IccProfileParser::LoadFromFile(path);
+                    if (!parsed.has_value() || !parsed->valid)
+                        return { 400, std::format(R"({{"error":"Failed to parse ICC profile: {}"}})", JsonEscape(path)) };
+                    chosen = DisplayProfileFromIcc(parsed.value());
+                    m_loadedIccProfile = chosen;
+                }
+                else // custom
+                {
+                    auto co = jo.GetNamedObject(L"custom");
+                    DisplayProfile p{};
+                    p.isSimulated = true;
+
+                    if (co.HasKey(L"name"))
+                        p.profileName = std::wstring(co.GetNamedString(L"name"));
+                    else
+                        p.profileName = L"Custom MCP profile";
+
+                    p.caps.hdrEnabled = co.HasKey(L"hdrEnabled") && co.GetNamedBoolean(L"hdrEnabled");
+                    p.caps.colorSpace = p.caps.hdrEnabled
+                        ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                        : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+                    p.caps.bitsPerColor = p.caps.hdrEnabled ? 10 : 8;
+                    p.caps.sdrWhiteLevelNits     = co.HasKey(L"sdrWhiteNits")     ? static_cast<float>(co.GetNamedNumber(L"sdrWhiteNits"))     : (p.caps.hdrEnabled ? 203.0f : 80.0f);
+                    if (!co.HasKey(L"peakNits"))
+                        return { 400, R"({"error":"custom profile requires 'peakNits'"})" };
+                    p.caps.maxLuminanceNits      = static_cast<float>(co.GetNamedNumber(L"peakNits"));
+                    p.caps.minLuminanceNits      = co.HasKey(L"minNits")          ? static_cast<float>(co.GetNamedNumber(L"minNits"))          : 0.5f;
+                    p.caps.maxFullFrameLuminanceNits = co.HasKey(L"maxFullFrameNits") ? static_cast<float>(co.GetNamedNumber(L"maxFullFrameNits")) : p.caps.maxLuminanceNits;
+
+                    auto readChroma = [&](const wchar_t* key, ChromaticityXY& dst) -> bool {
+                        if (!co.HasKey(key)) return true; // default already set
+                        auto arr = co.GetNamedArray(key);
+                        if (arr.Size() != 2) return false;
+                        dst.x = static_cast<float>(arr.GetNumberAt(0));
+                        dst.y = static_cast<float>(arr.GetNumberAt(1));
+                        return true;
+                    };
+                    if (!readChroma(L"primaryRed",   p.primaryRed)   ||
+                        !readChroma(L"primaryGreen", p.primaryGreen) ||
+                        !readChroma(L"primaryBlue",  p.primaryBlue)  ||
+                        !readChroma(L"whitePoint",   p.whitePoint))
+                        return { 400, R"({"error":"primaries / whitePoint must be 2-element arrays"})" };
+
+                    p.gamut = GamutId::Custom;
+                    if (co.HasKey(L"gamut"))
+                    {
+                        auto gn = std::wstring(co.GetNamedString(L"gamut"));
+                        if      (gn == L"sRGB")    p.gamut = GamutId::sRGB;
+                        else if (gn == L"DCI-P3"  || gn == L"P3" || gn == L"DCI_P3")   p.gamut = GamutId::DCI_P3;
+                        else if (gn == L"BT.2020" || gn == L"BT2020" || gn == L"Rec2020") p.gamut = GamutId::BT2020;
+                        else                       p.gamut = GamutId::Custom;
+                    }
+                    chosen = p;
+                }
+
+                ApplyDisplayProfile(chosen.value());
+                auto active = m_displayMonitor.ActiveProfile();
+                return { 200, std::format(
+                    R"({{"ok":true,"applied":"{}","hdrEnabled":{},"peakNits":{:.2f}}})",
+                    JsonEscape(active.profileName),
+                    active.caps.hdrEnabled ? "true" : "false",
+                    active.caps.maxLuminanceNits) };
+            });
+        });
+
+        // =====================================================================
+        // POST /display/profile/clear  — Revert to the live OS-reported profile
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/display/profile/clear", [this](const std::wstring&, const std::string&)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                RevertToLiveDisplay();
+                return { 200, R"({"ok":true,"isSimulated":false})" };
+            });
+        });
+
+        // =====================================================================
+        // POST /render/capture-node  — Capture any node's output as PNG.
+        // Body: { nodeId, inline?:bool }
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/render/capture-node", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                namespace WDJ = winrt::Windows::Data::Json;
+                WDJ::JsonObject jo{ nullptr };
+                if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
+                    return { 400, R"({"error":"Invalid JSON body"})" };
+                if (!jo.HasKey(L"nodeId"))
+                    return { 400, R"({"error":"'nodeId' is required"})" };
+                uint32_t nodeId = static_cast<uint32_t>(jo.GetNamedNumber(L"nodeId"));
+                bool wantInline = jo.HasKey(L"inline")
+                    && jo.GetNamedValue(L"inline").ValueType() == WDJ::JsonValueType::Boolean
+                    && jo.GetNamedBoolean(L"inline");
+
+                bool notFound = false, notReady = false;
+                auto pngData = CaptureNodeAsPng(nodeId, notFound, notReady);
+                if (notFound)
+                    return { 404, std::format(R"({{"error":"Node {} not found"}})", nodeId) };
+                if (notReady)
+                    return { 409, std::format(R"({{"error":"Node {} is not yet evaluated","notReady":true}})", nodeId) };
+                if (pngData.empty())
+                    return { 500, R"({"error":"Capture failed"})" };
+
+                static std::atomic<uint32_t> s_seq{ 0 };
+                uint32_t seq = s_seq.fetch_add(1, std::memory_order_relaxed);
+                wchar_t tempPath[MAX_PATH]{};
+                GetTempPathW(MAX_PATH, tempPath);
+                std::wstring filePath = std::format(L"{}shaderlab_node_{}_{}_{}.png",
+                    tempPath, GetCurrentProcessId(), nodeId, seq);
+                HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_WRITE, 0, nullptr,
+                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hFile == INVALID_HANDLE_VALUE)
+                    return { 500, R"({"error":"Failed to create temp file"})" };
+                DWORD written = 0;
+                WriteFile(hFile, pngData.data(), static_cast<DWORD>(pngData.size()), &written, nullptr);
+                CloseHandle(hFile);
+
+                std::string escapedPath = JsonEscape(ToUtf8(filePath));
+                if (wantInline)
+                {
+                    auto b64 = Base64Encode(pngData.data(), pngData.size());
+                    return { 200, std::format(
+                        R"({{"path":"{}","size":{},"nodeId":{},"mimeType":"image/png","base64":"{}"}})",
+                        escapedPath, pngData.size(), nodeId, b64) };
+                }
+                return { 200, std::format(
+                    R"({{"path":"{}","size":{},"nodeId":{},"mimeType":"image/png"}})",
+                    escapedPath, pngData.size(), nodeId) };
+            });
+        });
+
+        // =====================================================================
+        // POST /render/image-stats  — Per-channel min/max/mean/median/p95.
+        // Body: { nodeId, nonzeroOnly?:bool, channels?:["luminance","r","g","b","a"] }
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/render/image-stats", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                namespace WDJ = winrt::Windows::Data::Json;
+                WDJ::JsonObject jo{ nullptr };
+                if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
+                    return { 400, R"({"error":"Invalid JSON body"})" };
+                if (!jo.HasKey(L"nodeId"))
+                    return { 400, R"({"error":"'nodeId' is required"})" };
+                uint32_t nodeId = static_cast<uint32_t>(jo.GetNamedNumber(L"nodeId"));
+                bool nonzeroOnly = jo.HasKey(L"nonzeroOnly")
+                    && jo.GetNamedValue(L"nonzeroOnly").ValueType() == WDJ::JsonValueType::Boolean
+                    && jo.GetNamedBoolean(L"nonzeroOnly");
+
+                // Parse channel list (default: all five).
+                std::vector<uint32_t>    chans;
+                std::vector<std::string> chanNames;
+                auto addChan = [&](const std::wstring& name, uint32_t code) {
+                    chans.push_back(code);
+                    chanNames.push_back(ToUtf8(name));
+                };
+                if (jo.HasKey(L"channels"))
+                {
+                    auto arr = jo.GetNamedArray(L"channels");
+                    for (uint32_t i = 0; i < arr.Size(); ++i)
+                    {
+                        auto n = std::wstring(arr.GetStringAt(i));
+                        if      (n == L"luminance" || n == L"y") addChan(L"luminance", 0);
+                        else if (n == L"r")                       addChan(L"r", 1);
+                        else if (n == L"g")                       addChan(L"g", 2);
+                        else if (n == L"b")                       addChan(L"b", 3);
+                        else if (n == L"a")                       addChan(L"a", 4);
+                        else
+                            return ::ShaderLab::McpHttpServer::Response{ 400,
+                                std::format(R"({{"error":"Unknown channel: {}"}})", JsonEscape(n)) };
+                    }
+                }
+                if (chans.empty())
+                {
+                    addChan(L"luminance", 0);
+                    addChan(L"r", 1);
+                    addChan(L"g", 2);
+                    addChan(L"b", 3);
+                    addChan(L"a", 4);
+                }
+
+                RenderFrame();
+                auto* image = ResolveDisplayImage(nodeId);
+                if (!image)
+                {
+                    auto* node = m_graph.FindNode(nodeId);
+                    if (!node) return { 404, std::format(R"({{"error":"Node {} not found"}})", nodeId) };
+                    return { 409, std::format(R"({{"error":"Node {} is not yet evaluated","notReady":true}})", nodeId) };
+                }
+
+                auto* dc = m_renderEngine.D2DDeviceContext();
+                if (!dc) return { 500, R"({"error":"No D2D device context"})" };
+
+                auto stats = m_graphEvaluator.ComputeStandaloneStats(dc, image, chans, nonzeroOnly);
+                if (stats.size() != chans.size())
+                    return { 500, R"({"error":"GPU reduction failed"})" };
+
+                std::string json = std::format(R"({{"nodeId":{},"nonzeroOnly":{},"channels":[)",
+                    nodeId, nonzeroOnly ? "true" : "false");
+                for (size_t i = 0; i < stats.size(); ++i)
+                {
+                    if (i) json += ",";
+                    const auto& s = stats[i];
+                    float nzPct = (s.totalPixels > 0)
+                        ? static_cast<float>(s.nonzeroPixels) / static_cast<float>(s.totalPixels) : 0.0f;
+                    json += std::format(
+                        "{{\"channel\":\"{}\",\"min\":{:.6f},\"max\":{:.6f},\"mean\":{:.6f}"
+                        ",\"median\":{:.6f},\"p95\":{:.6f},\"sum\":{:.6f}"
+                        ",\"samples\":{},\"totalPixels\":{},\"nonzeroPixels\":{},\"nonzeroFraction\":{:.6f}}}",
+                        chanNames[i], s.min, s.max, s.mean, s.median, s.p95, s.sum,
+                        s.samples, s.totalPixels, s.nonzeroPixels, nzPct);
+                }
+                json += "]}";
+                return { 200, json };
+            });
+        });
+
+        // =====================================================================
+        // POST /render/pixel-region  — Read FP32 RGBA pixel grid.
+        // Body: { nodeId, x, y, w, h }   (capped at 32x32 = 1024 pixels)
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/render/pixel-region", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                namespace WDJ = winrt::Windows::Data::Json;
+                WDJ::JsonObject jo{ nullptr };
+                if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
+                    return { 400, R"({"error":"Invalid JSON body"})" };
+                for (auto k : { L"nodeId", L"x", L"y", L"w", L"h" })
+                    if (!jo.HasKey(k))
+                        return { 400, std::format(R"({{"error":"Missing required field: {}"}})",
+                            ToUtf8(std::wstring(k))) };
+
+                uint32_t nodeId = static_cast<uint32_t>(jo.GetNamedNumber(L"nodeId"));
+                int32_t  x      = static_cast<int32_t>(jo.GetNamedNumber(L"x"));
+                int32_t  y      = static_cast<int32_t>(jo.GetNamedNumber(L"y"));
+                uint32_t w      = static_cast<uint32_t>(jo.GetNamedNumber(L"w"));
+                uint32_t h      = static_cast<uint32_t>(jo.GetNamedNumber(L"h"));
+
+                // Cap region area at 32x32 (1024 pixels).  Per-axis cap of 64
+                // lets the agent ask for a thin strip (e.g. 64x4) but never
+                // more than 1024 total samples.
+                if (w == 0 || h == 0)
+                    return { 400, R"({"error":"w and h must be > 0"})" };
+                if (w > 64 || h > 64 || (w * h) > 1024)
+                    return { 400, "{\"error\":\"Region too large (cap: each axis <= 64, total area <= 1024)\"}" };
+
+                std::vector<float> pixels;
+                uint32_t actualW = 0, actualH = 0;
+                bool notFound = false, notReady = false;
+                bool ok = ReadPixelRegion(nodeId, x, y, w, h, pixels,
+                    actualW, actualH, notFound, notReady);
+                if (notFound) return { 404, std::format(R"({{"error":"Node {} not found"}})", nodeId) };
+                if (notReady) return { 409, std::format(R"({{"error":"Node {} is not yet evaluated","notReady":true}})", nodeId) };
+                if (!ok)      return { 404, R"({"error":"Region is empty after clipping to image bounds"})" };
+
+                std::string json = std::format(
+                    R"({{"nodeId":{},"requestedX":{},"requestedY":{},"requestedW":{},"requestedH":{})"
+                    R"(,"actualW":{},"actualH":{},"channelOrder":["r","g","b","a"],"pixels":[)",
+                    nodeId, x, y, w, h, actualW, actualH);
+                for (size_t i = 0; i < pixels.size(); ++i)
+                {
+                    if (i) json += ",";
+                    json += std::format("{:.6f}", pixels[i]);
+                }
+                json += "]}";
+                return { 200, json };
+            });
+        });
+
+        // =====================================================================
+        // GET /preview/view  — Current preview pan/zoom + image bounds
+        // =====================================================================
+        m_mcpServer->AddRoute(L"GET", L"/preview/view", [this](const std::wstring&, const std::string&)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                auto bounds = GetPreviewImageBounds();
+                float imgW = (std::max)(0.0f, bounds.right - bounds.left);
+                float imgH = (std::max)(0.0f, bounds.bottom - bounds.top);
+                return { 200, std::format(
+                    R"({{"zoom":{:.6f},"panX":{:.6f},"panY":{:.6f})"
+                    R"(,"previewNodeId":{},"imageBounds":{{"x":{:.4f},"y":{:.4f},"w":{:.4f},"h":{:.4f}}})"
+                    R"(,"zoomLimits":{{"min":0.01,"max":100.0}}}})",
+                    m_previewZoom, m_previewPanX, m_previewPanY,
+                    m_previewNodeId, bounds.left, bounds.top, imgW, imgH) };
+            });
+        });
+
+        // =====================================================================
+        // POST /preview/view  — Set preview pan/zoom (any subset).
+        // Body: { zoom?, panX?, panY? }   zoom clamped to [0.01, 100.0]
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/preview/view", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                namespace WDJ = winrt::Windows::Data::Json;
+                WDJ::JsonObject jo{ nullptr };
+                if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
+                    return { 400, R"({"error":"Invalid JSON body"})" };
+
+                bool changed = false;
+                if (jo.HasKey(L"zoom"))
+                {
+                    auto v = jo.GetNamedValue(L"zoom");
+                    if (v.ValueType() != WDJ::JsonValueType::Number)
+                        return { 400, R"({"error":"'zoom' must be a number"})" };
+                    float z = static_cast<float>(v.GetNumber());
+                    z = (std::clamp)(z, 0.01f, 100.0f);
+                    m_previewZoom = z;
+                    changed = true;
+                }
+                if (jo.HasKey(L"panX"))
+                {
+                    auto v = jo.GetNamedValue(L"panX");
+                    if (v.ValueType() != WDJ::JsonValueType::Number)
+                        return { 400, R"({"error":"'panX' must be a number"})" };
+                    m_previewPanX = static_cast<float>(v.GetNumber());
+                    changed = true;
+                }
+                if (jo.HasKey(L"panY"))
+                {
+                    auto v = jo.GetNamedValue(L"panY");
+                    if (v.ValueType() != WDJ::JsonValueType::Number)
+                        return { 400, R"({"error":"'panY' must be a number"})" };
+                    m_previewPanY = static_cast<float>(v.GetNumber());
+                    changed = true;
+                }
+                if (changed) m_forceRender = true;
+
+                return { 200, std::format(
+                    R"({{"ok":true,"changed":{},"zoom":{:.6f},"panX":{:.6f},"panY":{:.6f}}})",
+                    changed ? "true" : "false",
+                    m_previewZoom, m_previewPanX, m_previewPanY) };
+            });
+        });
+
+        // =====================================================================
+        // POST /preview/view/fit  — Fit preview image to viewport.
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/preview/view/fit", [this](const std::wstring&, const std::string&)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                FitPreviewToView();
+                m_forceRender = true;
+                return { 200, std::format(
+                    R"({{"ok":true,"zoom":{:.6f},"panX":{:.6f},"panY":{:.6f}}})",
+                    m_previewZoom, m_previewPanX, m_previewPanY) };
+            });
+        });
+
+        // =====================================================================
+        // GET /effect/hlsl/{nodeId}  — Read HLSL source for a custom-shader
+        // node.  Library effects are also reported with isLibraryEffect=true.
+        // =====================================================================
+        m_mcpServer->AddRoute(L"GET", L"/effect/hlsl/", [this](const std::wstring& path, const std::string&)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                // path = "/effect/hlsl/{id}"  (length of prefix = 13)
+                if (path.size() <= 13)
+                    return { 400, R"({"error":"Missing nodeId in URL"})" };
+                uint32_t nodeId = 0;
+                try { nodeId = static_cast<uint32_t>(std::stoul(path.substr(13))); }
+                catch (...) { return { 400, R"({"error":"Invalid nodeId"})" }; }
+
+                auto* node = m_graph.FindNode(nodeId);
+                if (!node) return { 404, std::format(R"({{"error":"Node {} not found"}})", nodeId) };
+
+                std::string runtimeErr = JsonEscape(ToUtf8(node->runtimeError));
+
+                if (!node->customEffect.has_value())
+                {
+                    return { 200, std::format(
+                        R"({{"nodeId":{},"hasCustomEffect":false,"name":"{}","runtimeError":"{}"}})",
+                        nodeId, JsonEscape(ToUtf8(node->name)), runtimeErr) };
+                }
+
+                const auto& def = node->customEffect.value();
+                std::string shaderTypeStr = (def.shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader)
+                    ? "PixelShader" : "ComputeShader";
+
+                std::string inputsJson = "[";
+                for (size_t i = 0; i < def.inputNames.size(); ++i)
+                {
+                    if (i) inputsJson += ",";
+                    inputsJson += "\"" + JsonEscape(ToUtf8(def.inputNames[i])) + "\"";
+                }
+                inputsJson += "]";
+
+                std::string paramsJson = "[";
+                for (size_t i = 0; i < def.parameters.size(); ++i)
+                {
+                    if (i) paramsJson += ",";
+                    paramsJson += "{\"name\":\"" + JsonEscape(ToUtf8(def.parameters[i].name)) + "\"}";
+                }
+                paramsJson += "]";
+
+                bool isLib = !def.shaderLabEffectId.empty();
+                std::string libBlock;
+                if (isLib)
+                {
+                    libBlock = std::format(
+                        R"(,"isLibraryEffect":true,"shaderLabEffectId":"{}","shaderLabEffectVersion":{})",
+                        JsonEscape(ToUtf8(def.shaderLabEffectId)),
+                        def.shaderLabEffectVersion);
+                }
+                else
+                {
+                    libBlock = R"(,"isLibraryEffect":false)";
+                }
+
+                return { 200, std::format(
+                    R"({{"nodeId":{},"hasCustomEffect":true,"name":"{}","shaderType":"{}")"
+                    R"(,"hlslSource":"{}","inputNames":{},"parameters":{},"bytecodeSize":{})"
+                    R"(,"isCompiled":{},"runtimeError":"{}"{}}})",
+                    nodeId,
+                    JsonEscape(ToUtf8(node->name)),
+                    shaderTypeStr,
+                    JsonEscape(ToUtf8(def.hlslSource)),
+                    inputsJson, paramsJson,
+                    def.compiledBytecode.size(),
+                    def.isCompiled() ? "true" : "false",
+                    runtimeErr,
+                    libBlock) };
+            });
+        });
+
+        // =====================================================================
         // POST /  — MCP JSON-RPC 2.0 endpoint (Streamable HTTP transport)
         // =====================================================================
         m_mcpServer->AddRoute(L"POST", L"/", [this](const std::wstring&, const std::string& body)
@@ -1452,7 +2296,21 @@ namespace winrt::ShaderLab::implementation
 {"name":"list_effects","description":"List all available effects (Built-in D2D + ShaderLab) with categories","inputSchema":{"type":"object","properties":{}}},
 {"name":"graph_overview","description":"Compact graph summary: nodes (id, name, type, error), edges, preview node","inputSchema":{"type":"object","properties":{}}},
 {"name":"get_display_info","description":"Current display capabilities, active profile, pipeline format, app version","inputSchema":{"type":"object","properties":{}}},
-{"name":"graph_rename_node","description":"Rename a node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"name":{"type":"string"}},"required":["nodeId","name"]}}
+{"name":"graph_rename_node","description":"Rename a node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"name":{"type":"string"}},"required":["nodeId","name"]}},
+{"name":"graph_snapshot","description":"Capture a PNG snapshot of the live node-graph editor view at the current pan/zoom and panel size. With inline=true returns the image as MCP image content (base64). Without inline, returns the temp file path only.","inputSchema":{"type":"object","properties":{"inline":{"type":"boolean","description":"If true, return the PNG bytes inline as MCP image content"}}}},
+{"name":"graph_get_view","description":"Get the node-graph view's current zoom, pan offset, viewport size, and the bounding box of all nodes (in canvas space).","inputSchema":{"type":"object","properties":{}}},
+{"name":"graph_set_view","description":"Pan and/or zoom the node-graph editor view. Any subset of {zoom, panX, panY} may be supplied. Changes apply immediately to the live UI. zoom is clamped to [0.1, 5.0]; pan has no clamp. Coordinate convention: screen = zoom * canvas + pan.","inputSchema":{"type":"object","properties":{"zoom":{"type":"number"},"panX":{"type":"number"},"panY":{"type":"number"}}}},
+{"name":"graph_fit_view","description":"Fit the node-graph view to show all nodes with the given viewport-space padding (DIPs, default 40). No-op when the graph is empty.","inputSchema":{"type":"object","properties":{"padding":{"type":"number"}}}},
+{"name":"list_display_profiles","description":"List all built-in display profile presets and the currently active simulated/live profile. Returns full caps (HDR, peak nits, SDR white) and CIE primaries.","inputSchema":{"type":"object","properties":{}}},
+{"name":"set_display_profile","description":"Apply a simulated display profile (overrides OS-reported caps until cleared). Specify exactly ONE of: preset (factory or display name), presetIndex (0-based), iccPath (.icc/.icm file), custom (full chroma + nits spec).","inputSchema":{"type":"object","properties":{"preset":{"type":"string"},"presetIndex":{"type":"number"},"iccPath":{"type":"string"},"custom":{"type":"object","properties":{"name":{"type":"string"},"hdrEnabled":{"type":"boolean"},"sdrWhiteNits":{"type":"number"},"peakNits":{"type":"number"},"minNits":{"type":"number"},"maxFullFrameNits":{"type":"number"},"primaryRed":{"type":"array","items":{"type":"number"}},"primaryGreen":{"type":"array","items":{"type":"number"}},"primaryBlue":{"type":"array","items":{"type":"number"}},"whitePoint":{"type":"array","items":{"type":"number"}},"gamut":{"type":"string"}},"required":["peakNits"]}}}},
+{"name":"clear_simulated_profile","description":"Revert to the live OS-reported display profile (clears any simulated/preset/ICC override).","inputSchema":{"type":"object","properties":{}}},
+{"name":"render_capture_node","description":"Capture any node's resolved output as PNG (FORCES a render frame so dirty nodes evaluate). With inline=true returns the image as MCP image content (base64). 404 if node missing; 409 with notReady=true if the node is dirty / has unconnected inputs.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"inline":{"type":"boolean"}},"required":["nodeId"]}},
+{"name":"preview_get_view","description":"Get the preview pane's current zoom + pan + image bounds + zoom limits.","inputSchema":{"type":"object","properties":{}}},
+{"name":"preview_set_view","description":"Set the preview pane's zoom and/or pan. zoom clamped to [0.01, 100.0]. Returns post-clamp values.","inputSchema":{"type":"object","properties":{"zoom":{"type":"number"},"panX":{"type":"number"},"panY":{"type":"number"}}}},
+{"name":"preview_fit_view","description":"Fit the preview image to the preview viewport (auto zoom + center).","inputSchema":{"type":"object","properties":{}}},
+{"name":"image_stats","description":"GPU-accelerated per-channel image statistics (min/max/mean/median/p95/sum + nonzero counts). Forces a render frame first so the target node is fresh. Channels default to luminance+R+G+B+A; pass channels:[\"luminance\"] to skip the others. nonzeroOnly excludes zero pixels from min/max/mean/sum.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"nonzeroOnly":{"type":"boolean"},"channels":{"type":"array","items":{"type":"string","enum":["luminance","r","g","b","a"]}}},"required":["nodeId"]}},
+{"name":"read_pixel_region","description":"Read a small w x h region of FP32 RGBA pixels from a node's output (scRGB linear-light). Region is capped at 32x32 (1024 pixels) and per-axis at 64. Pixels are returned row-major as a flat float array (RGBARGBA...).","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"x":{"type":"number"},"y":{"type":"number"},"w":{"type":"number"},"h":{"type":"number"}},"required":["nodeId","x","y","w","h"]}},
+{"name":"effect_get_hlsl","description":"Read a node's custom-effect HLSL source, parameter list, compile state, and last runtime error. For non-custom nodes returns hasCustomEffect=false (200, not 404). For ShaderLab library effects, also includes isLibraryEffect=true + shaderLabEffectId/Version.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}}
 ]})JSON";
                     return { 200, wrapResult(tools) };
                 }
@@ -1650,6 +2508,93 @@ namespace winrt::ShaderLab::implementation
                             PopulateAddNodeFlyout();
                             return { 200, R"({"ok":true})" };
                         });
+                    }
+                    else if (toolName == "graph_snapshot")
+                    {
+                        // Forward to REST handler. Re-serialize args to JSON so
+                        // the route gets a proper body containing {inline:bool}.
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/snapshot", argsStr);
+
+                        // When the agent requested inline image bytes, repack
+                        // the response as MCP-native image content (not text).
+                        bool wantInline = false;
+                        if (args.HasKey(L"inline"))
+                        {
+                            auto v = args.GetNamedValue(L"inline");
+                            if (v.ValueType() == winrt::Windows::Data::Json::JsonValueType::Boolean)
+                                wantInline = v.GetBoolean();
+                        }
+                        if (wantInline && restResp.statusCode == 200)
+                        {
+                            // Parse base64 + mimeType out of the REST response
+                            // and emit MCP image content directly so we skip
+                            // the text-escape wrapping below.
+                            winrt::Windows::Data::Json::JsonObject ro{ nullptr };
+                            if (winrt::Windows::Data::Json::JsonObject::TryParse(
+                                    winrt::to_hstring(restResp.body), ro)
+                                && ro.HasKey(L"base64") && ro.HasKey(L"mimeType"))
+                            {
+                                auto b64 = ToUtf8(std::wstring(ro.GetNamedString(L"base64")));
+                                auto mime = ToUtf8(std::wstring(ro.GetNamedString(L"mimeType")));
+                                std::string content = std::format(
+                                    R"JSON({{"content":[{{"type":"image","data":"{}","mimeType":"{}"}}],"isError":false}})JSON",
+                                    b64, mime);
+                                return { 200, wrapResult(content) };
+                            }
+                        }
+                    }
+                    else if (toolName == "graph_get_view")
+                        restResp = m_mcpServer->RouteRequest(L"GET", L"/graph/view", "");
+                    else if (toolName == "graph_set_view")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/view", argsStr);
+                    else if (toolName == "graph_fit_view")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/view/fit", argsStr);
+                    else if (toolName == "list_display_profiles")
+                        restResp = m_mcpServer->RouteRequest(L"GET", L"/display/profiles", "");
+                    else if (toolName == "set_display_profile")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/display/profile", argsStr);
+                    else if (toolName == "clear_simulated_profile")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/display/profile/clear", "");
+                    else if (toolName == "preview_get_view")
+                        restResp = m_mcpServer->RouteRequest(L"GET", L"/preview/view", "");
+                    else if (toolName == "preview_set_view")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/preview/view", argsStr);
+                    else if (toolName == "preview_fit_view")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/preview/view/fit", "");
+                    else if (toolName == "image_stats")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/render/image-stats", argsStr);
+                    else if (toolName == "read_pixel_region")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/render/pixel-region", argsStr);
+                    else if (toolName == "effect_get_hlsl")
+                    {
+                        auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(L"nodeId"));
+                        restResp = m_mcpServer->RouteRequest(L"GET",
+                            std::format(L"/effect/hlsl/{}", nodeId), "");
+                    }
+                    else if (toolName == "render_capture_node")
+                    {
+                        // Forward to REST handler; if inline=true was requested
+                        // and we got a successful PNG back, repack as MCP-native
+                        // image content (mirroring the graph_snapshot flow).
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/render/capture-node", argsStr);
+                        bool wantInline = args.HasKey(L"inline")
+                            && args.GetNamedValue(L"inline").ValueType() == winrt::Windows::Data::Json::JsonValueType::Boolean
+                            && args.GetNamedBoolean(L"inline");
+                        if (wantInline && restResp.statusCode == 200)
+                        {
+                            winrt::Windows::Data::Json::JsonObject ro{ nullptr };
+                            if (winrt::Windows::Data::Json::JsonObject::TryParse(
+                                    winrt::to_hstring(restResp.body), ro)
+                                && ro.HasKey(L"base64") && ro.HasKey(L"mimeType"))
+                            {
+                                auto b64 = ToUtf8(std::wstring(ro.GetNamedString(L"base64")));
+                                auto mime = ToUtf8(std::wstring(ro.GetNamedString(L"mimeType")));
+                                std::string content = std::format(
+                                    R"JSON({{"content":[{{"type":"image","data":"{}","mimeType":"{}"}}],"isError":false}})JSON",
+                                    b64, mime);
+                                return { 200, wrapResult(content) };
+                            }
+                        }
                     }
 
                     bool isError = restResp.statusCode >= 400;
