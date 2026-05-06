@@ -1080,56 +1080,12 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // POST /graph/bind-property — Bind a property to an analysis output field
+        // POST /graph/bind-property -- moved to Engine/Mcp/EngineMcpRoutes.cpp
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/graph/bind-property", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            try
-            {
-                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
-                uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
-                auto propName = std::wstring(jobj.GetNamedString(L"propertyName"));
-                uint32_t srcNodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"sourceNodeId"));
-                auto srcFieldName = std::wstring(jobj.GetNamedString(L"sourceFieldName"));
-                uint32_t srcComponent = jobj.HasKey(L"sourceComponent")
-                    ? static_cast<uint32_t>(jobj.GetNamedNumber(L"sourceComponent")) : 0;
-
-                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                    auto err = m_graph.BindProperty(nodeId, propName, srcNodeId, srcFieldName, srcComponent);
-                    if (!err.empty())
-                    {
-                        std::string errUtf8 = ToUtf8(err);
-                        return { 400, "{\"error\":\"" + errUtf8 + "\"}" };
-                    }
-                    m_nodeGraphController.RebuildLayout();
-                    return { 200, R"({"ok":true})" };
-                });
-            }
-            catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
-        });
 
         // =====================================================================
-        // POST /graph/unbind-property — Remove a property binding
+        // POST /graph/unbind-property -- moved to Engine/Mcp/EngineMcpRoutes.cpp
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/graph/unbind-property", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            try
-            {
-                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
-                uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
-                auto propName = std::wstring(jobj.GetNamedString(L"propertyName"));
-
-                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                    if (!m_graph.UnbindProperty(nodeId, propName))
-                        return { 404, R"({"error":"No binding for that property"})" };
-                    m_nodeGraphController.RebuildLayout();
-                    return { 200, R"({"ok":true})" };
-                });
-            }
-            catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
-        });
 
         // =====================================================================
         // GET /analysis/{id} — Read analysis output fields

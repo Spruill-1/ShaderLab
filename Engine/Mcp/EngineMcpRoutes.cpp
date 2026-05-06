@@ -164,6 +164,57 @@ namespace ShaderLab::Mcp
                 });
         }
 
+        // ---- POST /graph/bind-property — bind property to analysis output -
+        // Note: the GUI's m_nodeGraphController.RebuildLayout() drops out;
+        // the render tick will pick up the dirty state and rebuild
+        // automatically. Headless host has no canvas anyway.
+        void RegisterBindProperty(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/graph/bind-property",
+                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                        try
+                        {
+                            auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
+                            uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
+                            auto propName = std::wstring(jobj.GetNamedString(L"propertyName"));
+                            uint32_t srcNodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"sourceNodeId"));
+                            auto srcFieldName = std::wstring(jobj.GetNamedString(L"sourceFieldName"));
+                            uint32_t srcComponent = jobj.HasKey(L"sourceComponent")
+                                ? static_cast<uint32_t>(jobj.GetNamedNumber(L"sourceComponent")) : 0;
+
+                            auto err = ctx.graph->BindProperty(nodeId, propName, srcNodeId, srcFieldName, srcComponent);
+                            if (!err.empty())
+                                return Json(400, "{\"error\":\"" + WideToUtf8(err) + "\"}");
+                            return Json(200, R"({"ok":true})");
+                        }
+                        catch (...) { return Json(400, R"({"error":"Invalid request"})"); }
+                    });
+                });
+        }
+
+        // ---- POST /graph/unbind-property -----------------------------------
+        void RegisterUnbindProperty(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/graph/unbind-property",
+                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                        try
+                        {
+                            auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
+                            uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
+                            auto propName = std::wstring(jobj.GetNamedString(L"propertyName"));
+                            if (!ctx.graph->UnbindProperty(nodeId, propName))
+                                return Json(404, R"({"error":"No binding for that property"})");
+                            return Json(200, R"({"ok":true})");
+                        }
+                        catch (...) { return Json(400, R"({"error":"Invalid request"})"); }
+                    });
+                });
+        }
+
         // ---- POST /graph/set-property — mutates m_graph -------------------
         void RegisterSetProperty(McpHttpServer& server, IEngineCommandSink& sink)
         {
@@ -433,6 +484,8 @@ namespace ShaderLab::Mcp
         RegisterRegistry(server);
         RegisterConnect(server, sink);
         RegisterDisconnect(server, sink);
+        RegisterBindProperty(server, sink);
+        RegisterUnbindProperty(server, sink);
         RegisterSetProperty(server, sink);
         RegisterImageStats(server, sink);
         RegisterPixelRegion(server, sink);
