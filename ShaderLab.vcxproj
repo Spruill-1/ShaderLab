@@ -185,6 +185,15 @@
     <ClCompile Include="MainWindow.xaml.cpp">
       <DependentUpon>MainWindow.xaml</DependentUpon>
     </ClCompile>
+    <ClCompile Include="MainWindow.WorkingSpace.cpp">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="MainWindow.GraphFileIo.cpp">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="MainWindow.RenderTick.cpp">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </ClCompile>
     <ClCompile Include="MainWindow.McpRoutes.cpp" />
     <ClCompile Include="EffectDesignerWindow.xaml.cpp">
       <DependentUpon>EffectDesignerWindow.xaml</DependentUpon>
