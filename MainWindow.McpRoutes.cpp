@@ -532,64 +532,9 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // GET /registry/effects  — Built-in D2D effects
+        // GET /registry -- moved to Engine/Mcp/EngineMcpRoutes.cpp
+        // (Phase 7 migration). Static D2D effect catalog, no Dispatch needed.
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/registry", [](const std::wstring& path, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            auto& reg = ::ShaderLab::Effects::EffectRegistry::Instance();
-
-            if (path.starts_with(L"/registry/effect/"))
-            {
-                auto name = path.substr(17);
-                auto* desc = reg.FindByName(name);
-                if (!desc) return { 404, R"({"error":"Effect not found"})" };
-
-                std::string json = "{";
-                json += "\"name\":\"" + ToUtf8(std::wstring(desc->name)) + "\"";
-                json += ",\"category\":\"" + ToUtf8(std::wstring(desc->category)) + "\"";
-                json += ",\"clsid\":\"" + GuidToString(desc->clsid) + "\"";
-                json += std::format(",\"inputCount\":{}", desc->inputPins.size());
-
-                json += ",\"properties\":{";
-                bool first = true;
-                for (const auto& [key, meta] : desc->propertyMetadata)
-                {
-                    if (!first) json += ",";
-                    json += "\"" + ToUtf8(key) + "\":{";
-                    json += std::format("\"min\":{:.4f},\"max\":{:.4f},\"step\":{:.4f}",
-                        meta.minValue, meta.maxValue, meta.step);
-                    if (!meta.enumLabels.empty())
-                    {
-                        json += ",\"enumLabels\":[";
-                        for (size_t i = 0; i < meta.enumLabels.size(); ++i)
-                        {
-                            if (i > 0) json += ",";
-                            json += "\"" + ToUtf8(meta.enumLabels[i]) + "\"";
-                        }
-                        json += "]";
-                    }
-                    json += "}";
-                    first = false;
-                }
-                json += "}}";
-                return { 200, json };
-            }
-
-            // List all effects.
-            std::string json = "[";
-            bool first = true;
-            for (const auto& desc : reg.All())
-            {
-                if (!first) json += ",";
-                json += "{\"name\":\"" + ToUtf8(std::wstring(desc.name)) + "\"";
-                json += ",\"category\":\"" + ToUtf8(std::wstring(desc.category)) + "\"";
-                json += std::format(",\"inputCount\":{}}}", desc.inputPins.size());
-                first = false;
-            }
-            json += "]";
-            return { 200, json };
-        });
 
         // =====================================================================
         // GET /custom-effects  — Custom effects in graph
@@ -847,99 +792,10 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // POST /graph/set-property
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/graph/set-property", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            try
-            {
-                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
-                uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
-                auto key = std::wstring(jobj.GetNamedString(L"key"));
-                auto val = jobj.GetNamedValue(L"value");
-
-                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                    auto* node = m_graph.FindNode(nodeId);
-                    if (!node) return { 404, R"({"error":"Node not found"})" };
-
-                    switch (val.ValueType())
-                    {
-                    case winrt::Windows::Data::Json::JsonValueType::Number:
-                    {
-                        // Check if this parameter is declared as uint and store as uint32_t.
-                        bool isUint = false;
-                        if (node->customEffect.has_value())
-                        {
-                            for (const auto& p : node->customEffect->parameters)
-                            {
-                                if (p.name == key && p.typeName == L"uint")
-                                { isUint = true; break; }
-                            }
-                        }
-                        // Also check existing property type.
-                        auto existIt = node->properties.find(key);
-                        if (existIt != node->properties.end() &&
-                            std::holds_alternative<uint32_t>(existIt->second))
-                            isUint = true;
-
-                        if (isUint)
-                            node->properties[key] = static_cast<uint32_t>(val.GetNumber());
-                        else
-                            node->properties[key] = static_cast<float>(val.GetNumber());
-                        break;
-                    }
-                    case winrt::Windows::Data::Json::JsonValueType::Boolean:
-                        node->properties[key] = val.GetBoolean();
-                        break;
-                    case winrt::Windows::Data::Json::JsonValueType::String:
-                        node->properties[key] = std::wstring(val.GetString());
-                        break;
-                    case winrt::Windows::Data::Json::JsonValueType::Array:
-                    {
-                        auto arr = val.GetArray();
-                        if (arr.Size() == 2)
-                            node->properties[key] = winrt::Windows::Foundation::Numerics::float2{
-                                static_cast<float>(arr.GetAt(0).GetNumber()),
-                                static_cast<float>(arr.GetAt(1).GetNumber()) };
-                        else if (arr.Size() == 3)
-                            node->properties[key] = winrt::Windows::Foundation::Numerics::float3{
-                                static_cast<float>(arr.GetAt(0).GetNumber()),
-                                static_cast<float>(arr.GetAt(1).GetNumber()),
-                                static_cast<float>(arr.GetAt(2).GetNumber()) };
-                        else if (arr.Size() == 4)
-                            node->properties[key] = winrt::Windows::Foundation::Numerics::float4{
-                                static_cast<float>(arr.GetAt(0).GetNumber()),
-                                static_cast<float>(arr.GetAt(1).GetNumber()),
-                                static_cast<float>(arr.GetAt(2).GetNumber()),
-                                static_cast<float>(arr.GetAt(3).GetNumber()) };
-                        break;
-                    }
-                    default:
-                        return { 400, R"({"error":"Unsupported value type"})" };
-                    }
-                    node->dirty = true;
-                    m_graph.MarkAllDirty();
-
-                    // Handle special node flags set via properties.
-                    if (key == L"isPlaying")
-                    {
-                        auto* bv = std::get_if<bool>(&node->properties[key]);
-                        if (bv) node->isPlaying = *bv;
-                    }
-
-                    // Sync shaderPath property to the dedicated node field (for source/shader nodes).
-                    if (key == L"shaderPath")
-                    {
-                        auto* sv = std::get_if<std::wstring>(&node->properties[key]);
-                        if (sv) node->shaderPath = *sv;
-                    }
-
-                    return { 200, R"({"ok":true})" };
-                });
-            }
-            catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
-        });
+        // POST /graph/set-property -- moved to Engine/Mcp/EngineMcpRoutes.cpp
+        // (Phase 7 migration). Mutates m_graph through IEngineCommandSink.
+        // =====================================================================
 
         // =====================================================================
         // POST /graph/load
@@ -1932,91 +1788,9 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
-        // POST /render/image-stats  — Per-channel min/max/mean/median/p95.
-        // Body: { nodeId, nonzeroOnly?:bool, channels?:["luminance","r","g","b","a"] }
+        // POST /render/image-stats -- moved to Engine/Mcp/EngineMcpRoutes.cpp
+        // (Phase 7 migration). Engine-pure GPU reduction over a node's output.
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/render/image-stats", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                namespace WDJ = winrt::Windows::Data::Json;
-                WDJ::JsonObject jo{ nullptr };
-                if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
-                    return { 400, R"({"error":"Invalid JSON body"})" };
-                if (!jo.HasKey(L"nodeId"))
-                    return { 400, R"({"error":"'nodeId' is required"})" };
-                uint32_t nodeId = static_cast<uint32_t>(jo.GetNamedNumber(L"nodeId"));
-                bool nonzeroOnly = jo.HasKey(L"nonzeroOnly")
-                    && jo.GetNamedValue(L"nonzeroOnly").ValueType() == WDJ::JsonValueType::Boolean
-                    && jo.GetNamedBoolean(L"nonzeroOnly");
-
-                // Parse channel list (default: all five).
-                std::vector<uint32_t>    chans;
-                std::vector<std::string> chanNames;
-                auto addChan = [&](const std::wstring& name, uint32_t code) {
-                    chans.push_back(code);
-                    chanNames.push_back(ToUtf8(name));
-                };
-                if (jo.HasKey(L"channels"))
-                {
-                    auto arr = jo.GetNamedArray(L"channels");
-                    for (uint32_t i = 0; i < arr.Size(); ++i)
-                    {
-                        auto n = std::wstring(arr.GetStringAt(i));
-                        if      (n == L"luminance" || n == L"y") addChan(L"luminance", 0);
-                        else if (n == L"r")                       addChan(L"r", 1);
-                        else if (n == L"g")                       addChan(L"g", 2);
-                        else if (n == L"b")                       addChan(L"b", 3);
-                        else if (n == L"a")                       addChan(L"a", 4);
-                        else
-                            return ::ShaderLab::McpHttpServer::Response{ 400,
-                                std::format(R"({{"error":"Unknown channel: {}"}})", JsonEscape(n)) };
-                    }
-                }
-                if (chans.empty())
-                {
-                    addChan(L"luminance", 0);
-                    addChan(L"r", 1);
-                    addChan(L"g", 2);
-                    addChan(L"b", 3);
-                    addChan(L"a", 4);
-                }
-
-                RenderFrame();
-                auto* image = ResolveDisplayImage(nodeId);
-                if (!image)
-                {
-                    auto* node = m_graph.FindNode(nodeId);
-                    if (!node) return { 404, std::format(R"({{"error":"Node {} not found"}})", nodeId) };
-                    return { 409, std::format(R"({{"error":"Node {} is not yet evaluated","notReady":true}})", nodeId) };
-                }
-
-                auto* dc = m_renderEngine.D2DDeviceContext();
-                if (!dc) return { 500, R"({"error":"No D2D device context"})" };
-
-                auto stats = m_graphEvaluator.ComputeStandaloneStats(dc, image, chans, nonzeroOnly);
-                if (stats.size() != chans.size())
-                    return { 500, R"({"error":"GPU reduction failed"})" };
-
-                std::string json = std::format(R"({{"nodeId":{},"nonzeroOnly":{},"channels":[)",
-                    nodeId, nonzeroOnly ? "true" : "false");
-                for (size_t i = 0; i < stats.size(); ++i)
-                {
-                    if (i) json += ",";
-                    const auto& s = stats[i];
-                    float nzPct = (s.totalPixels > 0)
-                        ? static_cast<float>(s.nonzeroPixels) / static_cast<float>(s.totalPixels) : 0.0f;
-                    json += std::format(
-                        "{{\"channel\":\"{}\",\"min\":{:.6f},\"max\":{:.6f},\"mean\":{:.6f}"
-                        ",\"median\":{:.6f},\"p95\":{:.6f},\"sum\":{:.6f}"
-                        ",\"samples\":{},\"totalPixels\":{},\"nonzeroPixels\":{},\"nonzeroFraction\":{:.6f}}}",
-                        chanNames[i], s.min, s.max, s.mean, s.median, s.p95, s.sum,
-                        s.samples, s.totalPixels, s.nonzeroPixels, nzPct);
-                }
-                json += "]}";
-                return { 200, json };
-            });
-        });
 
         // =====================================================================
         // POST /render/pixel-region — moved to Engine/Mcp/EngineMcpRoutes.cpp
