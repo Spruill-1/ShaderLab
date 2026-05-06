@@ -224,6 +224,17 @@ namespace winrt::ShaderLab::implementation
         window->m_forceRender = true;
     }
 
+    void MainWindow::GuiEngineCommandSink::OnCustomEffectRecompiled(uint32_t /*nodeId*/)
+    {
+        // Custom effect bytecode + parameters changed: rebuild the
+        // canvas layout (parameter pins may have changed), enforce
+        // unique effect names, and refresh the Add Node flyout. Same
+        // calls EffectDesignerWindow's "Update in Graph" path makes.
+        window->m_nodeGraphController.RebuildLayout();
+        window->PopulateAddNodeFlyout();
+        window->m_forceRender = true;
+    }
+
     void MainWindow::SetupMcpRoutes()
     {
         if (!m_mcpServer)
@@ -413,99 +424,10 @@ namespace winrt::ShaderLab::implementation
         // =====================================================================
         // POST /effect/compile
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/effect/compile", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            try
-            {
-                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
-                uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
-                auto hlsl = std::wstring(jobj.GetNamedString(L"hlsl"));
-
-                // Compilation itself is thread-safe. Do it here.
-                std::string hlslUtf8 = ToUtf8(hlsl);
-                for (auto& ch : hlslUtf8) { if (ch == '\r') ch = '\n'; }
-
-                // Need to check node type before compiling.
-                auto* checkNode = m_graph.FindNode(nodeId);
-                if (!checkNode || !checkNode->customEffect.has_value())
-                    return { 404, R"({"error":"Custom effect node not found"})" };
-
-                std::string target = (checkNode->customEffect->shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader)
-                    ? "ps_5_0" : "cs_5_0";
-                auto result = ::ShaderLab::Effects::ShaderCompiler::CompileFromString(
-                    hlslUtf8, "McpCompile", "main", target);
-
-                if (!result.succeeded)
-                {
-                    auto errMsg = ToUtf8(result.ErrorMessage());
-                    std::string escaped;
-                    for (char c : errMsg) { if (c == '"') escaped += "\\\""; else if (c == '\n') escaped += "\\n"; else escaped += c; }
-                    return { 200, std::format("{{\"compiled\":false,\"error\":\"{}\"}}", escaped) };
-                }
-
-                auto* blob = result.bytecode.get();
-                std::vector<uint8_t> bytecode(blob->GetBufferSize());
-                memcpy(bytecode.data(), blob->GetBufferPointer(), blob->GetBufferSize());
-
-                // Apply to node on UI thread.
-                // Also update analysis fields if provided.
-                std::vector<::ShaderLab::Graph::AnalysisFieldDescriptor> newFields;
-                bool hasAnalysisFields = jobj.HasKey(L"analysisFields");
-                if (hasAnalysisFields)
-                {
-                    auto fieldsArr = jobj.GetNamedArray(L"analysisFields");
-                    for (uint32_t fi = 0; fi < fieldsArr.Size(); ++fi)
-                    {
-                        auto fobj = fieldsArr.GetObjectAt(fi);
-                        ::ShaderLab::Graph::AnalysisFieldDescriptor fd;
-                        fd.name = std::wstring(fobj.GetNamedString(L"name"));
-                        auto typeTag = std::wstring(fobj.GetNamedString(L"type"));
-                        if (typeTag == L"float")         fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float;
-                        else if (typeTag == L"float2")    fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float2;
-                        else if (typeTag == L"float3")    fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float3;
-                        else if (typeTag == L"float4")    fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float4;
-                        else if (typeTag == L"floatarray")  fd.type = ::ShaderLab::Graph::AnalysisFieldType::FloatArray;
-                        else if (typeTag == L"float2array") fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float2Array;
-                        else if (typeTag == L"float3array") fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float3Array;
-                        else if (typeTag == L"float4array") fd.type = ::ShaderLab::Graph::AnalysisFieldType::Float4Array;
-                        if (fobj.HasKey(L"length"))
-                            fd.arrayLength = static_cast<uint32_t>(fobj.GetNamedNumber(L"length"));
-                        newFields.push_back(std::move(fd));
-                    }
-                }
-
-                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                    auto* node = m_graph.FindNode(nodeId);
-                    if (!node || !node->customEffect.has_value())
-                        return { 404, R"({"error":"Node not found"})" };
-                    auto& def = node->customEffect.value();
-                    def.hlslSource = hlsl;
-                    def.compiledBytecode = std::move(bytecode);
-                    // Always generate a new GUID on recompile so D2D registers
-                    // the updated shader under a fresh CLSID.
-                    CoCreateGuid(&def.shaderGuid);
-
-                    // Update analysis fields if provided.
-                    if (hasAnalysisFields)
-                    {
-                        def.analysisFields = std::move(newFields);
-                        def.analysisOutputType = def.analysisFields.empty()
-                            ? ::ShaderLab::Graph::AnalysisOutputType::None
-                            : ::ShaderLab::Graph::AnalysisOutputType::Typed;
-                    }
-
-                    node->dirty = true;
-                    m_graph.MarkAllDirty();
-                    m_graphEvaluator.UpdateNodeShader(nodeId, *node);
-                    EnforceCustomEffectNameUniqueness(nodeId);
-                    m_nodeGraphController.RebuildLayout();
-                    PopulateAddNodeFlyout();
-                    return { 200, std::format("{{\"compiled\":true,\"bytecodeSize\":{}}}", def.compiledBytecode.size()) };
-                });
-            }
-            catch (...) { return { 400, R"({"error":"Invalid request"})" }; }
-        });
+        // -- moved to Engine/Mcp/EngineMcpRoutes.cpp (Phase 7).
+        //    Mirrors EffectDesignerWindow Update-in-Graph; fires
+        //    OnCustomEffectRecompiled hook.
+        // =====================================================================
 
         // =====================================================================
         // GET /render/pixel/{x}/{y}

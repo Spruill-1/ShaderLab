@@ -109,6 +109,12 @@ namespace ShaderLab::Mcp
         virtual void OnGraphCleared() {}
         virtual void OnGraphLoaded() {}
         virtual void OnGraphStructureChanged() {}  // edges added/removed
+
+        // Custom effect HLSL recompiled: shader bytecode + parameters
+        // changed. GUI rebuilds the canvas layout (parameter pins may
+        // have changed), enforces unique effect names, and refreshes
+        // the Add Node flyout. Default = no-op (headless).
+        virtual void OnCustomEffectRecompiled(uint32_t /*nodeId*/) {}
     };
 
     // Register all engine-pure routes on the given server. Idempotent:

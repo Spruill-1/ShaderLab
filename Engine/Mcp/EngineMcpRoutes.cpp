@@ -9,6 +9,7 @@
 #include "../../Effects/EffectRegistry.h"
 #include "../../Effects/ShaderLabEffects.h"
 #include "../../Effects/SourceNodeFactory.h"
+#include "../../Effects/ShaderCompiler.h"
 #include "../../Effects/CustomComputeShaderEffect.h"
 #include "../../Effects/CustomPixelShaderEffect.h"
 #include "../../Version.h"
@@ -1278,6 +1279,161 @@ namespace ShaderLab::Mcp
                     });
                 });
         }
+        // ---- POST /effect/compile — recompile a custom-effect node's HLSL -
+        // Body: { nodeId, hlsl, analysisFields?:[...] }
+        // Compiles HLSL via D3DCompile (ps_5_0 or cs_5_0 based on the
+        // node's existing shaderType), then applies the new bytecode +
+        // generates a new shaderGuid + updates analysis fields. Fires
+        // OnCustomEffectRecompiled so the GUI rebuilds the canvas
+        // layout (parameter pins may have changed) and Add Node flyout.
+        // Mirrors EffectDesignerWindow's "Update in Graph" path.
+        void RegisterCompileEffect(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/effect/compile",
+                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                        try
+                        {
+                            auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
+                            uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
+                            auto hlsl = std::wstring(jobj.GetNamedString(L"hlsl"));
+
+                            // Normalize line endings before D3DCompile.
+                            std::string hlslUtf8 = WideToUtf8(hlsl);
+                            for (auto& ch : hlslUtf8) { if (ch == '\r') ch = '\n'; }
+
+                            auto* node = ctx.graph->FindNode(nodeId);
+                            if (!node || !node->customEffect.has_value())
+                                return Json(404,
+                                    R"({"error":"Custom effect node not found"})");
+
+                            using CST = ::ShaderLab::Graph::CustomShaderType;
+                            std::string target =
+                                (node->customEffect->shaderType == CST::PixelShader)
+                                ? "ps_5_0" : "cs_5_0";
+                            auto result = ::ShaderLab::Effects::ShaderCompiler::CompileFromString(
+                                hlslUtf8, "McpCompile", "main", target);
+
+                            if (!result.succeeded)
+                            {
+                                std::string err = JsonEscape(WideToUtf8(result.ErrorMessage()));
+                                return Json(200, std::format(
+                                    "{{\"compiled\":false,\"error\":\"{}\"}}", err));
+                            }
+
+                            auto* blob = result.bytecode.get();
+                            std::vector<uint8_t> bytecode(blob->GetBufferSize());
+                            std::memcpy(bytecode.data(), blob->GetBufferPointer(),
+                                blob->GetBufferSize());
+
+                            // Optional analysisFields update.
+                            using AFT = ::ShaderLab::Graph::AnalysisFieldType;
+                            std::vector<::ShaderLab::Graph::AnalysisFieldDescriptor> newFields;
+                            bool hasAnalysisFields = jobj.HasKey(L"analysisFields");
+                            if (hasAnalysisFields)
+                            {
+                                auto fieldsArr = jobj.GetNamedArray(L"analysisFields");
+                                for (uint32_t fi = 0; fi < fieldsArr.Size(); ++fi)
+                                {
+                                    auto fobj = fieldsArr.GetObjectAt(fi);
+                                    ::ShaderLab::Graph::AnalysisFieldDescriptor fd;
+                                    fd.name = std::wstring(fobj.GetNamedString(L"name"));
+                                    auto typeTag = std::wstring(fobj.GetNamedString(L"type"));
+                                    if (typeTag == L"float")        fd.type = AFT::Float;
+                                    else if (typeTag == L"float2")  fd.type = AFT::Float2;
+                                    else if (typeTag == L"float3")  fd.type = AFT::Float3;
+                                    else if (typeTag == L"float4")  fd.type = AFT::Float4;
+                                    else if (typeTag == L"floatarray")  fd.type = AFT::FloatArray;
+                                    else if (typeTag == L"float2array") fd.type = AFT::Float2Array;
+                                    else if (typeTag == L"float3array") fd.type = AFT::Float3Array;
+                                    else if (typeTag == L"float4array") fd.type = AFT::Float4Array;
+                                    if (fobj.HasKey(L"length"))
+                                        fd.arrayLength = static_cast<uint32_t>(
+                                            fobj.GetNamedNumber(L"length"));
+                                    newFields.push_back(std::move(fd));
+                                }
+                            }
+
+                            // Apply: bytecode + fresh shaderGuid + optional fields.
+                            auto& def = node->customEffect.value();
+                            def.hlslSource = hlsl;
+                            def.compiledBytecode = std::move(bytecode);
+                            ::CoCreateGuid(&def.shaderGuid);
+                            if (hasAnalysisFields)
+                            {
+                                def.analysisFields = std::move(newFields);
+                                def.analysisOutputType = def.analysisFields.empty()
+                                    ? ::ShaderLab::Graph::AnalysisOutputType::None
+                                    : ::ShaderLab::Graph::AnalysisOutputType::Typed;
+                            }
+
+                            node->dirty = true;
+                            ctx.graph->MarkAllDirty();
+                            ctx.evaluator->UpdateNodeShader(nodeId, *node);
+
+                            // Auto-rename if another custom-effect node has the
+                            // same display name but different HLSL. Same
+                            // policy MainWindow::EnforceCustomEffectNameUniqueness
+                            // applies to the EffectDesigner "Update in Graph"
+                            // path: append " (N)" suffix until unique.
+                            const auto& modHlsl = def.hlslSource;
+                            const auto& modName = node->name;
+                            bool conflict = false;
+                            for (const auto& other : ctx.graph->Nodes())
+                            {
+                                if (other.id == nodeId) continue;
+                                if (other.name != modName) continue;
+                                if (!other.customEffect.has_value()) continue;
+                                if (other.customEffect->hlslSource != modHlsl)
+                                {
+                                    conflict = true;
+                                    break;
+                                }
+                            }
+                            if (conflict)
+                            {
+                                std::wstring baseName = modName;
+                                auto parenPos = baseName.rfind(L" (");
+                                if (parenPos != std::wstring::npos && baseName.back() == L')')
+                                    baseName = baseName.substr(0, parenPos);
+                                for (int suffix = 2; suffix < 100; ++suffix)
+                                {
+                                    std::wstring candidate = baseName + L" ("
+                                        + std::to_wstring(suffix) + L")";
+                                    bool taken = false;
+                                    for (const auto& other : ctx.graph->Nodes())
+                                    {
+                                        if (other.id == nodeId) continue;
+                                        if (other.name == candidate &&
+                                            other.customEffect.has_value() &&
+                                            other.customEffect->hlslSource != modHlsl)
+                                        {
+                                            taken = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!taken)
+                                    {
+                                        node->name = candidate;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            sink.OnCustomEffectRecompiled(nodeId);
+
+                            return Json(200, std::format(
+                                "{{\"compiled\":true,\"bytecodeSize\":{}}}",
+                                def.compiledBytecode.size()));
+                        }
+                        catch (...)
+                        {
+                            return Json(400, R"({"error":"Invalid request"})");
+                        }
+                    });
+                });
+        }
     }
 
     void RegisterEngineRoutes(McpHttpServer& server, IEngineCommandSink& sink)
@@ -1299,5 +1455,6 @@ namespace ShaderLab::Mcp
         RegisterCustomEffects(server, sink);
         RegisterAnalysisOutput(server, sink);
         RegisterCaptureNode(server, sink);
+        RegisterCompileEffect(server, sink);
     }
 }
