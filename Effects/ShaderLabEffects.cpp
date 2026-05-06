@@ -28,7 +28,7 @@ Texture2D Source : register(t0);
 cbuffer constants : register(b0) {
     float MinNits;     // default 0.0
     float MaxNits;     // default 10000.0
-    float ColormapMode; // 0=Turbo, 1=Inferno
+    uint ColormapMode; // 0=Turbo, 1=Inferno
 };
 
 float4 main(
@@ -58,12 +58,12 @@ float4 main(
 Texture2D Source : register(t0);
 
 cbuffer constants : register(b0) {
-    float TargetGamut;
+    uint TargetGamut;
     float OverlayR;
     float OverlayG;
     float OverlayB;
     float OverlayStrength;
-    float Mode;
+    uint Mode;
     float2 RedPrimary;
     float2 GreenPrimary;
     float2 BluePrimary;
@@ -139,14 +139,14 @@ float4 main(
 Texture2D Source : register(t0);
 
 cbuffer constants : register(b0) {
-    float TargetRange;
+    uint TargetRange;
     float MinNits;
     float MaxNits;
     float OverlayR;
     float OverlayG;
     float OverlayB;
     float OverlayStrength;
-    float Mode; // 0 = Out-of-Range, 1 = In-Range
+    uint Mode; // 0 = Out-of-Range, 1 = In-Range
 };
 
 float4 main(
@@ -295,7 +295,7 @@ float4 main(
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Luminance Heatmap";
-            desc.effectId = L"Luminance Heatmap"; desc.effectVersion = 1;
+            desc.effectId = L"Luminance Heatmap"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.subcategory = L"Highlights";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -313,7 +313,7 @@ float4 main(
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Highlight";
-            desc.effectId = L"Gamut Highlight"; desc.effectVersion = 3;
+            desc.effectId = L"Gamut Highlight"; desc.effectVersion = 4;
             desc.category = L"Analysis";
             desc.subcategory = L"Highlights";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -348,7 +348,7 @@ float4 main(
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Luminance Highlight";
-            desc.effectId = L"Luminance Highlight"; desc.effectVersion = 4;
+            desc.effectId = L"Luminance Highlight"; desc.effectVersion = 5;
             desc.category = L"Analysis";
             desc.subcategory = L"Highlights";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -911,7 +911,7 @@ float4 main(
 // Source effect: no input required.
 
 cbuffer constants : register(b0) {
-    float GradientType;  // 0=Linear horizontal, 1=Linear vertical, 2=Radial
+    uint GradientType;  // 0=Linear horizontal, 1=Linear vertical, 2=Radial
     float StartR;   // start color (scRGB)
     float StartG;
     float StartB;
@@ -947,7 +947,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gradient Generator";
-            desc.effectId = L"Gradient Generator"; desc.effectVersion = 1;
+            desc.effectId = L"Gradient Generator"; desc.effectVersion = 2;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gradientHLSL;
@@ -1129,10 +1129,10 @@ float4 main(
 
 cbuffer Constants : register(b0)
 {
-    float Method;     // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000
+    uint Method;     // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000
     float Scale;      // Multiplier for visualization (higher = more sensitive)
     float MaxDeltaE;  // Clamp for colormap (dE at this value = full red)
-    float OutputMode; // 0 = Heatmap (Turbo colormap), 1 = Grayscale dE / MaxDeltaE
+    uint OutputMode; // 0 = Heatmap (Turbo colormap), 1 = Grayscale dE / MaxDeltaE
 };
 
 Texture2D InputTexture : register(t0);   // Reference
@@ -1249,7 +1249,7 @@ float4 main(
     float3 labTest = ScRGBToLab(test.rgb);
 
     float dE;
-    uint method = (uint)Method;
+    uint method = Method;
     if (method == 1)      dE = DeltaE94(labRef, labTest);
     else if (method == 2) dE = DeltaE2000(labRef, labTest);
     else                  dE = DeltaE76(labRef, labTest);
@@ -1279,7 +1279,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Delta E Comparator";
-            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 4;
+            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 5;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -1355,7 +1355,7 @@ float4 main(
 cbuffer Constants : register(b0)
 {
     float WaveformSize;  // Output height in pixels
-    float Mode;          // 0 = Luma, 1 = RGB Parade, 2 = RGB Overlay
+    uint Mode;          // 0 = Luma, 1 = RGB Parade, 2 = RGB Overlay
     float Gain;          // Brightness gain for the waveform traces
     float MaxNits;       // Max nits for the Y axis (default 1000)
 };
@@ -1375,7 +1375,7 @@ float4 main(
         return float4(0, 0, 0, 1);
 
     float outW, outH;
-    uint mode = (uint)Mode;
+    uint mode = Mode;
 
     // Output size: width matches source, height = WaveformSize
     outW = dims.x;
@@ -1469,7 +1469,7 @@ float4 main(
             ShaderLabEffectDescriptor desc;
             desc.name = L"Waveform Monitor";
             desc.subcategory = L"Scopes";
-            desc.effectId = L"Waveform Monitor"; desc.effectVersion = 1;
+            desc.effectId = L"Waveform Monitor"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + waveformHLSL;
@@ -1492,7 +1492,7 @@ float4 main(
 cbuffer Constants : register(b0)
 {
     float DiagramSize; // output size in pixels
-    float TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
+    uint TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
     float2 RedPrimary;
     float2 GreenPrimary;
     float2 BluePrimary;
@@ -1589,7 +1589,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Coverage";
-            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 3;
+            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 4;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutCoverageHLSL;
@@ -1616,10 +1616,10 @@ float4 main(
 
 cbuffer Constants : register(b0)
 {
-    float Mode;        // 0=Clip, 1=Nearest, 2=Compress, 3=Fit Gamut
-    float TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
+    uint Mode;        // 0=Clip, 1=Nearest, 2=Compress, 3=Fit Gamut
+    uint TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
     float Strength;    // 0=bypass, 1=full mapping
-    float SourceGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
+    uint SourceGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
     float2 TargetRedPrimary;
     float2 TargetGreenPrimary;
     float2 TargetBluePrimary;
@@ -1739,7 +1739,7 @@ float4 main(
     else if (gamut == 3) { gR = ctR; gG = ctG; gB = ctB; }
     else                 { gR = GAMUT_709_R; gG = GAMUT_709_G; gB = GAMUT_709_B; }
 
-    uint mode = (uint)Mode;
+    uint mode = Mode;
 
     if (mode == 0)
     {
@@ -1775,7 +1775,7 @@ float4 main(
     {
         // Fit Gamut: uniformly scale all chromaticities toward D65 white.
         float2 sR, sG, sB;
-        uint sg = (uint)sourceF;
+        uint sg = SourceGamut;
         if (sg == 1)      { sR = GAMUT_P3_R; sG = GAMUT_P3_G; sB = GAMUT_P3_B; }
         else if (sg == 2) { sR = GAMUT_2020_R; sG = GAMUT_2020_G; sB = GAMUT_2020_B; }
         else if (sg == 3) { sR = csR; sG = csG; sB = csB; }
@@ -1833,7 +1833,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Map";
-            desc.effectId = L"Gamut Map"; desc.effectVersion = 4;
+            desc.effectId = L"Gamut Map"; desc.effectVersion = 5;
             desc.category = L"Analysis";
             desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -1870,10 +1870,10 @@ float4 main(
 
 cbuffer Constants : register(b0)
 {
-    float Mode;          // 0=Nearest on Shell, 1=Compress to Neutral, 2=Fit to Shell
-    float TargetGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
+    uint Mode;          // 0=Nearest on Shell, 1=Compress to Neutral, 2=Fit to Shell
+    uint TargetGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
     float Strength;      // 0=bypass, 1=full
-    float SourceGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
+    uint SourceGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
     float2 TargetRedPrimary;
     float2 TargetGreenPrimary;
     float2 TargetBluePrimary;
@@ -2028,13 +2028,13 @@ float4 main(
     if (xyzSum < 1e-6) return color;
     float2 cieXY = float2(xyz.x / xyzSum, xyz.y / xyzSum);
 
-    uint mode = (uint)Mode;
+    uint mode = Mode;
 
     if (mode == 2)
     {
         // Fit to Shell: uniformly scale all Ct/Cp toward neutral axis.
         float2 sR, sG, sB;
-        uint sg = (uint)sourceF;
+        uint sg = SourceGamut;
         if (sg == 1)      { sR = GAMUT_P3_R; sG = GAMUT_P3_G; sB = GAMUT_P3_B; }
         else if (sg == 2) { sR = GAMUT_2020_R; sG = GAMUT_2020_G; sB = GAMUT_2020_B; }
         else if (sg == 3) { sR = csR; sG = csG; sB = csB; }
@@ -2099,7 +2099,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Gamut Map";
-            desc.effectId = L"ICtCp Gamut Map"; desc.effectVersion = 9;
+            desc.effectId = L"ICtCp Gamut Map"; desc.effectVersion = 10;
             desc.category = L"Analysis";
             desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2129,7 +2129,7 @@ float4 main(
 cbuffer Constants : register(b0)
 {
     float DiagramSize;
-    float TargetGamut;
+    uint TargetGamut;
     float Intensity;   // Which I level to highlight (PQ domain, 0-1)
     float2 RedPrimary;
     float2 GreenPrimary;
@@ -2229,7 +2229,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Boundary";
-            desc.effectId = L"ICtCp Boundary"; desc.effectVersion = 3;
+            desc.effectId = L"ICtCp Boundary"; desc.effectVersion = 4;
             desc.category = L"Analysis";
             desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
