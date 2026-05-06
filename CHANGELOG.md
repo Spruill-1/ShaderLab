@@ -3,6 +3,15 @@
 All notable changes to ShaderLab will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+- **`OutputMode` parameter on the `Delta E Comparator` effect** (effectVersion 2 → 3). Two modes: `0 = Heatmap` (default — Turbo colormap, prior behavior) and `1 = Grayscale dE`. Grayscale mode writes `saturate(dE / MaxDeltaE)` to all three RGB channels, which makes a downstream `Luminance Statistics` node read true mean/p95/max color-difference values directly off the GPU — no CPU pixel readback required. Enables live in-graph dE telemetry while sweeping a tone-mapper's parameters: bind / drive any input, watch the mean dE field update in the Properties panel each frame.
+  - Read all uniforms unconditionally before the mode branch (mirrors gotcha #2 in CLAUDE.md so D3DCompile can't strip `OutputMode` if the agent only ever uses heatmap mode).
+
+### Changed
+- **`README.md` decision log #52** updated with a cleaner empirical result on `Colors of Journey_1002.mp4`. Earlier entry said `ToneLift ≈ 0.6` matches D2D within ~10 %; that was matching the dark/mid *luminance levels* visually. A proper CIEDE2000 fidelity-to-source measurement (using the new Grayscale dE + LumStats live-readout pipeline) shows the *color-accuracy* optimum is `ToneLift ≈ 0.30`, with mean dE 9–32 % lower than D2D HDR Tone Map across three frames spanning 0.5 → 124 nit p95 source brightness. The default of `0.0` (pure peak compression, neutral) is retained.
+
 ## [1.4.0] - 2026-05-05
 
 ### Removed

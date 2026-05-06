@@ -1444,9 +1444,10 @@ float4 main(
 
 cbuffer Constants : register(b0)
 {
-    float Method;    // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000
-    float Scale;     // Multiplier for visualization (higher = more sensitive)
-    float MaxDeltaE; // Clamp for colormap (dE at this value = full red)
+    float Method;     // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000
+    float Scale;      // Multiplier for visualization (higher = more sensitive)
+    float MaxDeltaE;  // Clamp for colormap (dE at this value = full red)
+    float OutputMode; // 0 = Heatmap (Turbo colormap), 1 = Grayscale dE / MaxDeltaE
 };
 
 Texture2D InputTexture : register(t0);   // Reference
@@ -1565,26 +1566,40 @@ float4 main(
 
     dE *= Scale;
 
+    // Always read OutputMode unconditionally so D3DCompile can't strip it
+    // (gotcha #2 in CLAUDE.md). Branch on the read value below.
+    float mode = OutputMode;
+
     // Map to colormap: 0 = black (exact match), MaxDeltaE = full red.
     float t = saturate(dE / max(MaxDeltaE, 0.01));
-    float3 color = TurboColormap(t) * smoothstep(0.0, 0.02, t);
 
+    if (mode > 0.5)
+    {
+        // Grayscale dE: gray = saturate(dE / MaxDeltaE), output to RGB.
+        // This makes mean(R) directly readable as fractional dE — a
+        // downstream Luminance Statistics node yields live mean/p95/max
+        // dE values without needing CPU readback of every pixel.
+        return float4(t, t, t, 1.0);
+    }
+
+    float3 color = TurboColormap(t) * smoothstep(0.0, 0.02, t);
     return float4(color, 1.0);
 }
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Delta E Comparator";
-            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 2;
+            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + deltaEHLSL;
             desc.inputNames = { L"Reference", L"Test" };
             desc.parameters = {
-                { L"Method",    L"float", 2.0f, 0.0f, 2.0f, 1.0f, { L"CIE76", L"CIE94", L"CIEDE2000" } },
-                { L"Scale",     L"float", 1.0f, 0.1f, 10.0f, 0.1f },
-                { L"MaxDeltaE", L"float", 1.0f, 0.1f, 100.0f, 0.1f },
+                { L"Method",     L"float", 2.0f, 0.0f, 2.0f, 1.0f, { L"CIE76", L"CIE94", L"CIEDE2000" } },
+                { L"Scale",      L"float", 1.0f, 0.1f, 10.0f, 0.1f },
+                { L"MaxDeltaE",  L"float", 1.0f, 0.1f, 100.0f, 0.1f },
+                { L"OutputMode", L"float", 0.0f, 0.0f, 1.0f, 1.0f, { L"Heatmap", L"Grayscale dE" } },
             };
             m_effects.push_back(std::move(desc));
         }
