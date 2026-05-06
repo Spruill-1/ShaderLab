@@ -115,7 +115,6 @@
     <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\MathExpression.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
-    <ClInclude Include="Rendering\ToneMapper.h" />
     <ClInclude Include="Effects\CustomComputeShaderEffect.h" />
     <ClInclude Include="Effects\CustomPixelShaderEffect.h" />
     <ClInclude Include="Effects\EffectRegistry.h" />
@@ -143,7 +142,6 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
-    <ClCompile Include="Rendering\ToneMapper.cpp" />
     <ClCompile Include="Effects\CustomComputeShaderEffect.cpp" />
     <ClCompile Include="Effects\CustomPixelShaderEffect.cpp" />
     <ClCompile Include="Effects\EffectRegistry.cpp" />

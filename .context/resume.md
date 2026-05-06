@@ -65,7 +65,7 @@ Every effect carries a stable `effectId` + numeric `effectVersion`; saved graphs
 - **Always scRGB FP16 pipeline** (`DXGI_FORMAT_R16G16B16A16_FLOAT`, `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`). DWM/ACM handles final display conversion.
 - **Refresh-rate-driven render loop** (60–240 Hz) — interval re-derived from `EnumDisplaySettings(dmDisplayFrequency)` on every display change.
 - Dirty-gated render loop with **dirty propagation pre-pass** (any dirty node marks its direct downstream consumers dirty before evaluation; runs again after `TickAndUploadVideos` so video updates flow through analysis-only compute nodes too).
-- Built-in `ToneMapper` retained (5 modes: None, Reinhard, ACES Filmic, Hable, SDR Clamp) but defaults to **None** — users build tone mappers as graph effects (the ICtCp suite is the preferred path).
+- No built-in tone-mapping pass in the render path — users build tone mappers as graph effects (the ICtCp suite is the preferred path). Decision-log entry #54 retired the legacy `Rendering/ToneMapper` class in the Phase-1 cleanup.
 - Display profile mocking (presets + ICC file loading via `mscms.dll`).
 - Monitor gamut detection from `DXGI_OUTPUT_DESC1` primaries.
 - **OS-reported SDR white level** queried via `DisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL)`, tracks the *Settings → Display → HDR → "SDR content brightness"* slider; exposed to graphs as `working_space.SdrWhiteNits`. Effects pull the value via property bindings — no per-frame host injection.
@@ -242,10 +242,9 @@ ShaderLab\
 │   ├── EffectNode.h / EffectEdge.h
 │   └── EffectGraph.h / .cpp        # DAG, topo sort, JSON, bindings, versioning
 │
-├── Rendering\                      # (engine) eval + display + tone + math
+├── Rendering\                      # (engine) eval + display + math
 │   ├── RenderEngine.h / .cpp       # (app-only) D3D11 + D2D1 + swap chain
 │   ├── GraphEvaluator.h / .cpp     # Topological eval, dirty propagation, deferred D3D11 compute
-│   ├── ToneMapper.h / .cpp         # 5 tone map modes (defaults to None)
 │   ├── FalseColorOverlay.h / .cpp  # False color rendering overlay
 │   ├── DisplayMonitor.h / .cpp     # HDR/SDR detection, primaries, OS SDR white, jthread
 │   ├── DisplayProfile.h            # Profile structs, presets

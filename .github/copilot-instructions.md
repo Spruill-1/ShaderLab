@@ -2,7 +2,7 @@
 
 ## Project Identity
 
-ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging Direct2D shader effects with full HDR/WCG support. The primary goals are fixing issues with the existing D2D tonemapper effect and adding capabilities to the color correction effect.
+ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging Direct2D shader effects with full HDR/WCG support. The primary focus is building tone-mapping and color-correction effects as graph nodes, with empirical fidelity tooling — Delta E Comparator + Luminance Statistics + Working Space node form a closed-loop CIEDE2000 readout that lets us tune effect parameters against measured color accuracy, not visual impression.
 
 ## Hard Rules
 
@@ -27,10 +27,9 @@ MainWindow (WinUI 3 XAML)
   ├── RenderEngine        — D3D11 + D2D1 device stack, DXGI swap chain, BeginDraw/EndDraw/Present
   ├── DisplayMonitor      — HDR/SDR detection, WM_DISPLAYCHANGE + adapter-change jthread
   ├── GraphEvaluator      — Topological walk of EffectGraph, per-node D2D effect cache, dirty gating
-  ├── ToneMapper          — D2D WhiteLevelAdjustment + HdrToneMap + ColorMatrix exposure chain
   ├── EffectGraph (DAG)   — Nodes, edges, Kahn's topo sort, JSON serialization (Windows.Data.Json)
   ├── SourceNodeFactory   — WIC image loading (HDR/SDR format split) + Flood fill sources
-  ├── ShaderLabEffects    — 9 built-in effects (analysis + source) with embedded HLSL + color math
+  ├── ShaderLabEffects    — 30+ built-in effects (analysis + source + tone mapping) with embedded HLSL + color math
   ├── ShaderEditorCtrl    — Live HLSL compile (D3DCompile), D3DReflect auto-property generation
   ├── NodeGraphController — D2D-rendered canvas: bezier edges, color-coded nodes, pan/zoom, hit-test
   ├── PixelInspectorCtrl  — GPU readback (1×1 D2D1Bitmap1), scRGB→sRGB/PQ/luminance conversions
@@ -39,13 +38,13 @@ MainWindow (WinUI 3 XAML)
   └── EffectDesignerWindow — Modal window for creating/editing custom pixel/compute shader effects
 ```
 
-Render loop: `DispatcherQueueTimer` at 16ms → `GraphEvaluator.Evaluate()` → `ToneMapper.Apply()` → `BeginDraw` → `DrawImage` → `EndDraw` → `Present`.
+Render loop: `DispatcherQueueTimer` (refresh-rate-driven, 60–240 Hz) → `GraphEvaluator.Evaluate()` → `BeginDraw` → `DrawImage` → `EndDraw` → `Present`. There is no built-in tone-mapping pass in the render path — users build tone mappers as graph effects (the ICtCp suite is the preferred path).
 
 ## Namespace Convention
 
 All code lives under `ShaderLab::` with sub-namespaces matching directories:
 - `ShaderLab::Graph` — data model (EffectGraph, EffectNode, EffectEdge, PropertyValue)
-- `ShaderLab::Rendering` — device stack, swap chain, evaluator, tone mapping
+- `ShaderLab::Rendering` — device stack, swap chain, evaluator, display monitoring, GPU reduction
 - `ShaderLab::Effects` — effect registry, custom effects, shader compilation, image loading
 - `ShaderLab::Controls` — UI controllers (decoupled from XAML views)
 - `winrt::ShaderLab::implementation` — WinRT XAML types (App, MainWindow)
@@ -67,9 +66,9 @@ All code lives under `ShaderLab::` with sub-namespaces matching directories:
 ### Naming
 - **Member variables**: `m_` prefix (`m_graph`, `m_renderEngine`, `m_refCount`)
 - **Methods**: PascalCase (`AddNode`, `PrepareForRender`, `TopologicalSort`)
-- **Enums**: PascalCase values (`NodeType::BuiltInEffect`, `ToneMapMode::ACESFilmic`)
+- **Enums**: PascalCase values (`NodeType::BuiltInEffect`, `AnalysisFieldType::Float2`)
 - **Structs**: PascalCase, used for plain data (`EffectNode`, `DisplayCapabilities`, `ShaderVariable`)
-- **Classes**: PascalCase, used for stateful objects with methods (`EffectGraph`, `RenderEngine`, `ToneMapper`)
+- **Classes**: PascalCase, used for stateful objects with methods (`EffectGraph`, `RenderEngine`, `GraphEvaluator`)
 
 ### File Organization
 - **Header-only**: Small data structs and inline constants (`NodeType.h`, `PropertyValue.h`, `DisplayInfo.h`, `PipelineFormat.h`, `EffectEdge.h`, `EffectNode.h`)
@@ -94,12 +93,13 @@ When creating new D2D effects (the core purpose of this tool):
 
 ## Tone Mapping & Color Correction (Primary Development Focus)
 
-The tone mapping system (`Rendering/ToneMapper.h/.cpp`) and color correction are where active development happens:
-- Current tone map modes: None, Reinhard, ACES Filmic (Narkowicz 2015), Hable (Uncharted 2), SDR Clamp
-- Uses D2D built-in effects: `CLSID_D2D1WhiteLevelAdjustment`, `CLSID_D2D1HdrToneMap`, `CLSID_D2D1ColorMatrix`
-- Reference math implementations exist inline for each operator (for porting to custom shaders)
-- Pipeline works in scRGB FP16 linear light (1.0 = 80 nits SDR white)
-- **Goals**: Fix issues with the existing D2D tonemapper effect; extend the color correction effect with additional capabilities
+Active development centers on **tone-mapping and color-correction effects authored as graph nodes** — not a built-in tone-mapping pass. The render pipeline is intentionally pass-through (scRGB FP16 in, scRGB FP16 out); users compose tone mappers and color correction from graph effects, validate them with empirical fidelity tooling, and iterate.
+
+- **Pipeline is scRGB FP16 linear light** (1.0 = 80 nits SDR white). No fixed built-in tone-mapping pass — DWM/ACM handles final display conversion.
+- **The ICtCp suite** in `Effects/ShaderLabEffects.cpp` (Tone Map / Inverse Tone Map / Saturation / Highlight Desaturation / Round-Trip Validator / Gamut Map / Boundary) is the preferred path for tone-mapping work. Math lives in `GetColorMathHLSL()` (PQ/HLG transfer functions, BT.709/2020/P3 matrices, anchored Reinhard / Möbius, scRGB↔ICtCp).
+- **Empirical fidelity loop**: `Delta E Comparator` (Heatmap or Grayscale dE mode) + `Luminance Statistics` (D3D11 compute reduction) + `Working Space` node (mirrors active display profile) lets you measure CIEDE2000 mean/p95/max color difference *while sweeping a parameter*, on the GPU, every frame. This is the canonical way to evaluate any new tone-mapping or color-correction work.
+- **Working Space node** is the single path for tracking the active display profile. Effects expose first-class `RedPrimary` / `GreenPrimary` / `BluePrimary` / `WhitePoint` (Float2) and peak/SDR-white nit parameters; bind them from `working_space.*` outputs to follow Display Settings or simulated profiles automatically.
+- **D2D's built-in `CLSID_D2D1HdrToneMap`** applies a fixed BT.2408-style mid-tone lift independent of `InputMaxLuminance` (decision log #52). Useful as a reference, not a building block — its lift is opinionated and fixed.
 
 ## Key Technical Context
 

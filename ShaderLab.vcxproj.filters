@@ -61,9 +61,6 @@
     <ClInclude Include="Rendering\D3D11ComputeRunner.h">
       <Filter>Rendering</Filter>
     </ClInclude>
-    <ClInclude Include="Rendering\ToneMapper.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
     <ClInclude Include="Rendering\IccProfileParser.h">
       <Filter>Rendering</Filter>
     </ClInclude>

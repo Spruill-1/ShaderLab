@@ -159,7 +159,6 @@
     <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
     <ClInclude Include="Rendering\RenderEngine.h" />
-    <ClInclude Include="Rendering\ToneMapper.h" />
     <ClInclude Include="Rendering\FalseColorOverlay.h" />
   </ItemGroup>
   <ItemGroup>
