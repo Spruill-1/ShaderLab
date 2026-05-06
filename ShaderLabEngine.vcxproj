@@ -130,6 +130,7 @@
     <ClCompile Include="pch_engine.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="EngineExport.cpp" />
     <ClCompile Include="Graph\EffectGraph.cpp" />
     <ClCompile Include="Rendering\D3D11ComputeRunner.cpp" />
     <ClCompile Include="Rendering\DisplayMonitor.cpp" />

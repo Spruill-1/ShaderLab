@@ -5,6 +5,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **Phase 6: engine ABI versioning + Bootstrap.ps1 + CI onboarding smoke.** New `SHADERLAB_ENGINE_ABI_VERSION` constant in `EngineExport.h` (currently 1) plus C-linkage `ShaderLab_GetAbiVersion()` exported from the engine DLL. `MainWindow::MainWindow` calls it on startup and aborts with a friendly message-box if the loaded DLL's reported version doesn't match the headers we compiled against — catches the "you forgot to redeploy the engine" class of confusion that otherwise manifests as obscure runtime failures. Independent of `Version.h::VersionMajor` (the app version) and `Version.h::GraphFormatVersion` (the JSON schema). Bumped manually whenever a public engine symbol's signature or behavior breaks consumers.
+- **`Bootstrap.ps1` at repo root.** One-command setup for fresh clones: runs `scripts/EnsureDevCert.ps1` + `scripts/EnsureExprTk.ps1` + NuGet restore, with optional `-Build` flag for a Debug|x64 smoke build. Documented as the only first-time setup step.
+- **CI `bootstrap-smoke` job.** Clean clone → `Bootstrap.ps1 -Build` → run tests. Catches onboarding-cliff regressions automatically on every PR, separate from the build-and-test matrix.
+
 ### Fixed
 - **`DeltaE2000` NaN when one input has C == 0 (a == b == 0).** Found by the Phase 2 test bench against Sharma reference pair 6 (50,-1,2) vs (50,0,0). `atan2(0, 0)` is implementation-defined and was propagating NaN through `hp_avg = h1p + h2p`. Guarded both `h1p` and `h2p` with a `Cnp < 1e-10 ? 0.0 : atan2(...)` check; downstream `hp_avg` already short-circuits when `C1p * C2p < 1e-10`, so the achromatic-point hue values never feed back into the result. Sharma pair 6 now passes within the 5e-3 tolerance the other Sharma pairs use. Effect version `Delta E Comparator` 3 → 4. Tracked from `p2-bug-de2000-nan`.
 

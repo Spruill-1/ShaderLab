@@ -10,6 +10,7 @@
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/StatisticsEffect.h"
 #include "Version.h"
+#include "EngineExport.h"
 #include <microsoft.ui.xaml.media.dxinterop.h>
 
 using namespace winrt;
@@ -20,6 +21,20 @@ namespace winrt::ShaderLab::implementation
     MainWindow::MainWindow()
     {
         InitializeComponent();
+
+        // Engine ABI compatibility check. Mismatch means the loaded
+        // ShaderLabEngine.dll is from a different build than the headers
+        // we compiled against -- abort early with a friendly message
+        // instead of failing later in an obscure way.
+        if (::ShaderLab_GetAbiVersion() != SHADERLAB_ENGINE_ABI_VERSION)
+        {
+            wchar_t msg[256];
+            swprintf_s(msg, L"ShaderLab engine ABI mismatch (header %u, DLL %u). Rebuild and redeploy.",
+                static_cast<unsigned>(SHADERLAB_ENGINE_ABI_VERSION),
+                static_cast<unsigned>(::ShaderLab_GetAbiVersion()));
+            ::MessageBoxW(nullptr, msg, L"ShaderLab", MB_OK | MB_ICONERROR);
+            ::ExitProcess(1);
+        }
 
         Title(std::wstring(L"ShaderLab v") + ::ShaderLab::VersionString + L" \u2014 HDR Shader Effect Development");
         // After Title() we'll refresh from RefreshTitleBar() once a graph
