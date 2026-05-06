@@ -147,7 +147,7 @@ The built-in effects library lives in `Effects/ShaderLabEffects.h/.cpp`:
 - **Categories**:
   - **Analysis** (4): Luminance Heatmap (PS), Out-of-Gamut Highlight (CS), CIE Chromaticity Plot (CS), Vectorscope (CS)
   - **Source** (5): Gamut Source (PS), Color Checker (PS), Zone Plate (PS), Gradient Generator (PS), HDR Test Pattern (PS)
-- **Hidden defaults**: Host-managed properties (e.g., monitor primaries for OOG Highlight) are marked `isHidden = true` in `ParameterDefinition`. They don't appear in the Properties panel but are written by the host before each evaluate.
+- No `_hidden` suffix convention. (Removed in Phase-0 cleanup. Sink-only properties — e.g., the Working Space node's `ActiveColorMode`, `SdrWhiteNits`, primaries — live in `ShaderLabEffectDescriptor::hiddenDefaults` without any `_hidden` suffix, and are kept off the UI by the customEffect declared-parameter filter. The Working Space node + property bindings is the only path for tracking the active display profile.)
 - **Analysis outputs**: Compute shader analysis effects declare `AnalysisFieldDef` entries that describe their output fields (name, type, count). These are read back to CPU via `GraphEvaluator` and can be bound to downstream properties.
 
 ## Effect Designer

@@ -3878,9 +3878,6 @@ namespace winrt::ShaderLab::implementation
                 // Math Expression: Expression is rendered above as a dedicated control.
                 if (isMathExpression && key == L"Expression")
                     continue;
-                // Skip hidden properties (convention: name ends with _hidden).
-                if (key.size() > 7 && key.ends_with(L"_hidden"))
-                    continue;
                 // For nodes with a customEffect, only render properties that
                 // correspond to a declared parameter. Properties that exist
                 // solely as host-driven bootstrap values (e.g. Working Space,

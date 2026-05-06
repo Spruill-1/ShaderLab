@@ -3,6 +3,11 @@
 All notable changes to ShaderLab will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Removed
+- **`_hidden` suffix filter and the `Graph/EffectNode2.h` orphan file.** Phase-0 health pass: the `_hidden` property name filter (in `MainWindow.xaml.cpp` Properties-panel rebuild and `Controls/NodeGraphController.cpp` data-pin discovery) had been demoted to legacy-compatibility-only by decision #51. Removed both filter sites; sink-only properties on the Working Space node are still kept off the UI by the existing customEffect declared-parameter filter, so no behavior change for current effects. Old graphs that still carry `WsRedX_hidden` / `MonMaxNits_hidden` / `SdrWhiteNits_hidden` keys load with the keys present in memory but inert (no shader cbuffer references them; non-customEffect nodes never had them; customEffect nodes filter their Properties panel by declared parameters). Cross-version graph compatibility is not currently promised. Decision log entries #35 and #51 updated; copilot-instructions and resume.md updated. Also deleted `Graph/EffectNode2.h` (empty 0-byte orphan, never referenced) and the stray `output.jxr` test artifact at the repo root (already gitignored).
+
 ## [1.4.1] - 2026-05-05
 
 ### Added

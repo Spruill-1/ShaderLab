@@ -57,7 +57,7 @@ Every effect carries a stable `effectId` + numeric `effectVersion`; saved graphs
 - `PropertyValue` variant: `float`, `int32`, `uint32`, `bool`, `wstring`, `float2`, `float3`, `float4`, `D2D1_MATRIX_5X4_F`, `vector<float>`.
 - Per-component property bindings (Grasshopper-style data flow), with array (whole-vector) bindings for LUT-shaped fields.
 - Enum labels for named dropdown parameters; `bool` rendered as `ToggleSwitch`.
-- `_hidden` suffix convention (legacy / compatibility only after decision #51): properties ending in `_hidden` are excluded from the UI and data pins. Older saved graphs may carry stale `WsRedX_hidden` / `MonMaxNits_hidden` / `SdrWhiteNits_hidden` keys; those are inert because the shader cbuffer no longer references them and the host writers were removed. New effects must not declare `_hidden` parameters; use the `Working Space` node + bindings instead.
+- No `_hidden` suffix convention (removed in Phase-0 cleanup, v1.4.x). Earlier saved graphs may carry stale `WsRedX_hidden` / `MonMaxNits_hidden` / `SdrWhiteNits_hidden` keys; those load into memory but are inert (no shader cbuffer references them, no UI surfaces them). Cross-version graph compatibility is not currently promised. Sink-only properties (e.g., the Working Space node's `ActiveColorMode`, `SdrWhiteNits`, primaries) live in `ShaderLabEffectDescriptor::hiddenDefaults` without the `_hidden` suffix and are kept off the UI by the customEffect declared-parameter filter.
 - `visibleWhen` conditional visibility on parameters (`"Mode == 1"`, `"Strength > 0"`, etc.).
 - Visual data pins (orange diamonds) on the node graph for binding connections.
 
