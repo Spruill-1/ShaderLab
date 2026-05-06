@@ -89,6 +89,46 @@ namespace ShaderLab::Effects
         return node;
     }
 
+    EffectNode SourceNodeFactory::CreateDxgiDuplicateOutputSourceNode(
+        uint32_t adapterIndex,
+        uint32_t outputIndex,
+        const std::wstring& displayName)
+    {
+        EffectNode node;
+        node.type = NodeType::Source;
+        node.name = displayName.empty()
+            ? std::format(L"DXGI Output {}:{}", adapterIndex, outputIndex)
+            : displayName;
+        node.properties[L"IsDxgiDuplicateOutput"] = true;
+        node.properties[L"AdapterIndex"] = static_cast<uint32_t>(adapterIndex);
+        node.properties[L"OutputIndex"] = static_cast<uint32_t>(outputIndex);
+        node.properties[L"RawFP16"] = true;
+        node.outputPins.push_back({ L"Frame", 0 });
+
+        node.analysisOutput.type = AnalysisOutputType::Typed;
+        node.analysisOutput.fields.push_back({ L"Width", AnalysisFieldType::Float, {} });
+        node.analysisOutput.fields.push_back({ L"Height", AnalysisFieldType::Float, {} });
+        node.analysisOutput.fields.push_back({ L"Frames", AnalysisFieldType::Float, {} });
+        return node;
+    }
+
+    EffectNode SourceNodeFactory::CreateWindowsGraphicsCaptureSourceNode(
+        const std::wstring& displayName)
+    {
+        EffectNode node;
+        node.type = NodeType::Source;
+        node.name = displayName.empty() ? L"Windows Graphics Capture" : displayName;
+        node.properties[L"IsWindowsGraphicsCapture"] = true;
+        node.properties[L"RawFP16"] = true;
+        node.outputPins.push_back({ L"Frame", 0 });
+
+        node.analysisOutput.type = AnalysisOutputType::Typed;
+        node.analysisOutput.fields.push_back({ L"Width", AnalysisFieldType::Float, {} });
+        node.analysisOutput.fields.push_back({ L"Height", AnalysisFieldType::Float, {} });
+        node.analysisOutput.fields.push_back({ L"Frames", AnalysisFieldType::Float, {} });
+        return node;
+    }
+
     // -----------------------------------------------------------------------
     // Source preparation (needs D2D device context)
     // -----------------------------------------------------------------------
@@ -102,6 +142,87 @@ namespace ShaderLab::Effects
     {
         if (!dc || node.type != NodeType::Source)
             return;
+
+        auto isDxgiIt = node.properties.find(L"IsDxgiDuplicateOutput");
+        if (isDxgiIt != node.properties.end())
+        {
+            auto* boolVal = std::get_if<bool>(&isDxgiIt->second);
+            if (boolVal && *boolVal)
+            {
+                if (!d3dDevice)
+                    return;
+
+                uint32_t adapterIndex = 0;
+                uint32_t outputIndex = 0;
+                bool rawFP16 = true;
+                if (auto it = node.properties.find(L"AdapterIndex"); it != node.properties.end())
+                    if (auto* v = std::get_if<uint32_t>(&it->second)) adapterIndex = *v;
+                if (auto it = node.properties.find(L"OutputIndex"); it != node.properties.end())
+                    if (auto* v = std::get_if<uint32_t>(&it->second)) outputIndex = *v;
+                if (auto it = node.properties.find(L"RawFP16"); it != node.properties.end())
+                    if (auto* v = std::get_if<bool>(&it->second)) rawFP16 = *v;
+
+                auto& provider = m_dxgiCaptureCache[node.id];
+                if (provider && (provider->AdapterIndex() != adapterIndex || provider->OutputIndex() != outputIndex || provider->RawFP16() != rawFP16))
+                    provider.reset();
+                if (!provider)
+                {
+                    provider = std::make_unique<DxgiDuplicationSourceProvider>();
+                    if (!provider->Open(dc, d3dDevice, adapterIndex, outputIndex, rawFP16))
+                    {
+                        node.runtimeError = L"Failed to open DXGI output capture: " + provider->LastError();
+                        m_dxgiCaptureCache.erase(node.id);
+                        return;
+                    }
+                    node.properties[L"OutputName"] = provider->OutputName();
+                    node.runtimeError.clear();
+                }
+                node.cachedOutput = provider->CurrentBitmap();
+                return;
+            }
+        }
+
+        auto isWgcIt = node.properties.find(L"IsWindowsGraphicsCapture");
+        if (isWgcIt != node.properties.end())
+        {
+            auto* boolVal = std::get_if<bool>(&isWgcIt->second);
+            if (boolVal && *boolVal)
+            {
+                if (!d3dDevice)
+                    return;
+
+                auto& provider = m_wgcCaptureCache[node.id];
+                if (!provider)
+                {
+                    bool rawFP16 = true;
+                    if (auto it = node.properties.find(L"RawFP16"); it != node.properties.end())
+                        if (auto* v = std::get_if<bool>(&it->second)) rawFP16 = *v;
+
+                    auto pendingIt = m_pendingWgcItems.find(node.id);
+                    if (pendingIt == m_pendingWgcItems.end() || !pendingIt->second.has_value() || !pendingIt->second.value())
+                    {
+                        node.runtimeError = L"Choose a window or monitor for this Windows Graphics Capture source.";
+                        return;
+                    }
+
+                    provider = std::make_unique<WindowsGraphicsCaptureSourceProvider>();
+                    if (!provider->Open(dc, d3dDevice, pendingIt->second.value(), rawFP16))
+                    {
+                        node.runtimeError = L"Failed to open Windows Graphics Capture source: " + provider->LastError();
+                        m_wgcCaptureCache.erase(node.id);
+                        return;
+                    }
+                    if (!provider->ItemName().empty())
+                    {
+                        node.name = provider->ItemName();
+                        node.properties[L"CaptureItemName"] = provider->ItemName();
+                    }
+                    node.runtimeError.clear();
+                }
+                node.cachedOutput = provider->CurrentBitmap();
+                return;
+            }
+        }
 
         // --- Video source ---
         auto isVideoIt = node.properties.find(L"IsVideo");
@@ -249,6 +370,9 @@ namespace ShaderLab::Effects
         m_bitmapCache.clear();
         m_floodCache.clear();
         m_videoCache.clear();
+        m_dxgiCaptureCache.clear();
+        m_wgcCaptureCache.clear();
+        m_pendingWgcItems.clear();
         m_lastClockTime.clear();
     }
 
@@ -402,6 +526,93 @@ namespace ShaderLab::Effects
             }
         }
         return anyNewFrame;
+    }
+
+    bool SourceNodeFactory::TickAndUploadLiveCaptures(
+        std::vector<Graph::EffectNode>& nodes,
+        ID2D1DeviceContext5* dc)
+    {
+        bool anyNewFrame = false;
+
+        auto updateAnalysis = [](Graph::EffectNode& node, uint32_t width, uint32_t height, uint64_t frames)
+        {
+            node.analysisOutput.type = Graph::AnalysisOutputType::Typed;
+            node.analysisOutput.fields.clear();
+            Graph::AnalysisFieldValue widthFv;
+            widthFv.name = L"Width"; widthFv.type = Graph::AnalysisFieldType::Float;
+            widthFv.components[0] = static_cast<float>(width);
+            node.analysisOutput.fields.push_back(std::move(widthFv));
+            Graph::AnalysisFieldValue heightFv;
+            heightFv.name = L"Height"; heightFv.type = Graph::AnalysisFieldType::Float;
+            heightFv.components[0] = static_cast<float>(height);
+            node.analysisOutput.fields.push_back(std::move(heightFv));
+            Graph::AnalysisFieldValue framesFv;
+            framesFv.name = L"Frames"; framesFv.type = Graph::AnalysisFieldType::Float;
+            framesFv.components[0] = static_cast<float>(frames);
+            node.analysisOutput.fields.push_back(std::move(framesFv));
+        };
+
+        for (auto& [id, provider] : m_dxgiCaptureCache)
+        {
+            if (!provider || !provider->IsOpen()) continue;
+
+            Graph::EffectNode* nodePtr = nullptr;
+            for (auto& node : nodes)
+                if (node.id == id) { nodePtr = &node; break; }
+
+            if (provider->CaptureNextFrame(dc))
+            {
+                anyNewFrame = true;
+                if (nodePtr)
+                {
+                    nodePtr->cachedOutput = provider->CurrentBitmap();
+                    nodePtr->dirty = true;
+                }
+            }
+
+            if (nodePtr)
+                updateAnalysis(*nodePtr, provider->Width(), provider->Height(), provider->FrameCount());
+        }
+
+        for (auto& [id, provider] : m_wgcCaptureCache)
+        {
+            if (!provider || !provider->IsOpen()) continue;
+
+            Graph::EffectNode* nodePtr = nullptr;
+            for (auto& node : nodes)
+                if (node.id == id) { nodePtr = &node; break; }
+
+            if (provider->CaptureNextFrame(dc))
+            {
+                anyNewFrame = true;
+                if (nodePtr)
+                {
+                    nodePtr->cachedOutput = provider->CurrentBitmap();
+                    nodePtr->dirty = true;
+                }
+            }
+
+            if (nodePtr)
+                updateAnalysis(*nodePtr, provider->Width(), provider->Height(), provider->FrameCount());
+        }
+
+        return anyNewFrame;
+    }
+
+    void SourceNodeFactory::RegisterGraphicsCaptureItem(
+        uint32_t nodeId,
+        winrt::Windows::Graphics::Capture::GraphicsCaptureItem const& item)
+    {
+        if (item)
+        {
+            m_pendingWgcItems[nodeId] = item;
+            m_wgcCaptureCache.erase(nodeId);
+        }
+        else
+        {
+            m_pendingWgcItems.erase(nodeId);
+            m_wgcCaptureCache.erase(nodeId);
+        }
     }
 
     VideoSourceProvider* SourceNodeFactory::GetVideoProvider(uint32_t nodeId)
