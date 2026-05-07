@@ -552,7 +552,6 @@ namespace ShaderLab::Controls
 
         for (uint32_t nodeId : m_selection.selectedNodeIds)
         {
-            // RemoveNode() already protects the last Output node.
             m_graph->RemoveNode(nodeId);
             m_visuals.erase(nodeId);
         }

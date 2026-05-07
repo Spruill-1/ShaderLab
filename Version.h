@@ -13,11 +13,11 @@
 namespace ShaderLab
 {
     constexpr uint32_t VersionMajor = 1;
-    constexpr uint32_t VersionMinor = 4;
-    constexpr uint32_t VersionPatch = 1;
+    constexpr uint32_t VersionMinor = 5;
+    constexpr uint32_t VersionPatch = 0;
 
     // Human-readable version string.
-    constexpr const wchar_t* VersionString = L"1.4.1";
+    constexpr const wchar_t* VersionString = L"1.5.0";
 
     // Graph format version. Increment when serialization format changes.
     // Graphs saved with a higher format version cannot be loaded by older apps.

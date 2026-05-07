@@ -39,6 +39,19 @@ namespace winrt::ShaderLab::implementation
         // up live values immediately without hooking every AddNode site.
         UpdateWorkingSpaceNodes();
 
+        // Tick live capture providers (DXGI Desktop Duplication, Windows
+        // Graphics Capture). These don't go through the dirty/video-
+        // provider path the rest of the source-prep loop uses, so call
+        // their dedicated tick here. A captured frame marks the source
+        // node dirty so the existing needsEval gate triggers a re-eval
+        // and present.
+        if (auto* dc5 = static_cast<ID2D1DeviceContext5*>(m_renderEngine.D2DDeviceContext()))
+        {
+            auto& nodes = const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes());
+            if (m_sourceFactory.TickAndUploadLiveCaptures(nodes, dc5))
+                m_forceRender = true;
+        }
+
         // Tick clock nodes: advance time.
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
         {

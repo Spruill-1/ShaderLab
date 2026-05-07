@@ -23,14 +23,14 @@ namespace ShaderLab::Graph
 
     void EffectGraph::RemoveNode(uint32_t nodeId)
     {
-        // Protect the last Output node — always keep at least one.
-        auto* target = FindNode(nodeId);
-        if (target && target->type == NodeType::Output)
-        {
-            auto outputIds = GetOutputNodeIds();
-            if (outputIds.size() <= 1)
-                return;  // Refuse to delete the last Output node.
-        }
+        // Note: previously this method refused to delete the last Output
+        // node ("always keep at least one"). That protection was removed
+        // because closing an Output node's external window now removes
+        // the node (PresentOutputWindows in MainWindow.xaml.cpp), and
+        // refusing the removal left the graph with a dangling Output
+        // node and no window. The render path tolerates an output-less
+        // graph just fine -- nothing is "needed" so evaluation no-ops
+        // until the user adds a new Output node.
 
         // Remove all edges referencing this node.
         std::erase_if(m_edges, [nodeId](const EffectEdge& e)

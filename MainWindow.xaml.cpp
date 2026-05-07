@@ -2784,6 +2784,7 @@ namespace winrt::ShaderLab::implementation
 
         // ---- Image source: file path + Browse button ----
         bool isVideoSource = false;
+        bool isLiveCaptureSource = false;
         {
             auto isVideoIt = node->properties.find(L"IsVideo");
             if (isVideoIt != node->properties.end())
@@ -2791,10 +2792,23 @@ namespace winrt::ShaderLab::implementation
                 auto* bv = std::get_if<bool>(&isVideoIt->second);
                 if (bv && *bv) isVideoSource = true;
             }
+            // DXGI Desktop Duplication / Windows Graphics Capture sources
+            // own their bitmap from a live capture provider; they have no
+            // file path to browse to and the "Image Path" UI is misleading.
+            for (const auto* key : { L"IsDxgiDuplicateOutput", L"IsWindowsGraphicsCapture" })
+            {
+                auto it = node->properties.find(key);
+                if (it != node->properties.end())
+                {
+                    auto* bv = std::get_if<bool>(&it->second);
+                    if (bv && *bv) { isLiveCaptureSource = true; break; }
+                }
+            }
         }
 
         if (node->type == ::ShaderLab::Graph::NodeType::Source &&
-            !(node->effectClsid.has_value()) && !isVideoSource)
+            !(node->effectClsid.has_value()) &&
+            !isVideoSource && !isLiveCaptureSource)
         {
             auto pathLabel = Controls::TextBlock();
             pathLabel.Text(L"Image Path");
