@@ -13,6 +13,8 @@
 #include "Version.h"
 #include "EngineExport.h"
 #include <microsoft.ui.xaml.media.dxinterop.h>
+#include <shlobj.h>
+#include <KnownFolders.h>
 
 using namespace winrt;
 using namespace Microsoft::UI::Xaml;
@@ -463,6 +465,17 @@ namespace winrt::ShaderLab::implementation
 
         ::ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
         OutputDebugStringW(L"[CustomFX] Registered engine D2D effects\n");
+
+        // Phase 8: enable on-disk bytecode cache under %LOCALAPPDATA%.
+        // Background-reap entries older than 90 days on engine init.
+        wchar_t* localAppData = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &localAppData)) && localAppData)
+        {
+            std::wstring cacheRoot = std::wstring(localAppData) + L"\\ShaderLab\\bytecode";
+            ::CoTaskMemFree(localAppData);
+            ::ShaderLab::Effects::ConfigureBytecodeCache(cacheRoot);
+            OutputDebugStringW((L"[CustomFX] BytecodeCache root: " + cacheRoot + L"\n").c_str());
+        }
 
         m_customEffectsRegistered = true;
     }

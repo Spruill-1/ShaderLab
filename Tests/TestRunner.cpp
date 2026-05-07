@@ -647,6 +647,63 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
         TEST("BytecodeCache_PrecompileGpuVariantReady", wg.status == BytecodeStatus::Ready);
 
         cache.Clear();
+
+        // ---- Disk persistence (Phase 8 p8-cache-disk) -------------------
+        // Configure a temp disk root, compile, verify file written,
+        // then clear in-memory and verify GetOrCompile re-reads from
+        // disk (not from a fresh D3DCompile).
+        wchar_t tmpPath[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, tmpPath);
+        std::wstring diskRoot = std::wstring(tmpPath) + L"shaderlab_bytecode_cache_test";
+        cache.SetDiskCacheRoot(diskRoot);
+        // Wipe any leftover state from a previous test run -- we want
+        // a known-empty disk + memory state for the assertions below.
+        cache.ClearDisk();
+        cache.Clear();
+
+        BytecodeCompileRequest diskReq;
+        diskReq.key.sourceHash         = HashCanonicalSource(canonical);
+        diskReq.key.paramSignatureHash = HashParamSignature({});
+        diskReq.key.includeLibraryHash = IncludeLibraryHash();
+        diskReq.key.macroBitset        = 0;
+        diskReq.key.entryPoint         = "main";
+        diskReq.key.target             = "ps_5_0";
+        diskReq.metadata.effectId      = L"DiskPersistTest";
+        diskReq.metadata.version       = 1;
+        diskReq.hlslSource             = canonical;
+
+        auto d1 = cache.GetOrCompile(diskReq);
+        TEST("BytecodeCache_DiskCompileReady", d1.status == BytecodeStatus::Ready);
+        TEST("BytecodeCache_DiskCompileNotFromCache", !d1.fromCache);
+
+        // Verify a .cso file landed under the expected hierarchy.
+        std::wstring expectedDir = diskRoot + L"\\DiskPersistTest\\1";
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = ::FindFirstFileW((expectedDir + L"\\*.cso").c_str(), &fd);
+        bool csoExists = (h != INVALID_HANDLE_VALUE);
+        if (csoExists) ::FindClose(h);
+        TEST("BytecodeCache_DiskFileWritten", csoExists);
+
+        // Clear the in-memory cache; subsequent GetOrCompile must
+        // hydrate from disk, not recompile.
+        cache.Clear();
+        size_t inlineBefore = cache.GetStats().inlineCompiles;
+        auto d2 = cache.GetOrCompile(diskReq);
+        size_t inlineAfter = cache.GetStats().inlineCompiles;
+        TEST("BytecodeCache_DiskRehydrateReady", d2.status == BytecodeStatus::Ready);
+        TEST("BytecodeCache_DiskRehydrateFromCache", d2.fromCache);
+        TEST("BytecodeCache_DiskRehydrateNoNewCompile", inlineAfter == inlineBefore);
+        TEST("BytecodeCache_DiskRehydrateBytecodeMatches",
+             d2.bytecode.size() == d1.bytecode.size() &&
+             memcmp(d2.bytecode.data(), d1.bytecode.data(), d1.bytecode.size()) == 0);
+
+        // Reaper: ClearDisk wipes everything.
+        auto reapStats = cache.ClearDisk();
+        TEST("BytecodeCache_ClearDiskFreedAtLeastOne", reapStats.filesDeleted >= 1);
+
+        // Cleanup: disable disk cache so subsequent tests don't pollute.
+        cache.SetDiskCacheRoot(L"");
+        cache.Clear();
     }
 
     void TestEffectChain()

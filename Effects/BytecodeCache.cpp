@@ -203,20 +203,43 @@ namespace ShaderLab::Effects
     // Lookup
     // -----------------------------------------------------------------------
 
-    BytecodeCacheResult BytecodeCache::TryGet(const BytecodeCompileKey& key) const
+    BytecodeCacheResult BytecodeCache::TryGet(const BytecodeCompileKey& key)
     {
-        std::lock_guard<std::mutex> g(m_mutex);
         BytecodeCacheResult r;
-        auto it = m_entries.find(key);
-        if (it == m_entries.end())
         {
-            r.status = BytecodeStatus::NotRequested;
+            std::lock_guard<std::mutex> g(m_mutex);
+            auto it = m_entries.find(key);
+            if (it != m_entries.end())
+            {
+                r.status       = it->second.status;
+                r.bytecode     = it->second.bytecode;
+                r.errorMessage = it->second.errorMessage;
+                r.fromCache    = (r.status == BytecodeStatus::Ready);
+                return r;
+            }
+        }
+        // Disk fallback: hydrate the in-memory map if the file exists.
+        std::vector<uint8_t> fromDisk;
+        if (TryLoadFromDisk(key, fromDisk))
+        {
+            std::lock_guard<std::mutex> g(m_mutex);
+            // Re-check after acquiring the lock (another thread may have
+            // populated the entry while we read the file).
+            auto it = m_entries.find(key);
+            if (it == m_entries.end())
+            {
+                Entry& e = m_entries[key];
+                e.status         = BytecodeStatus::Ready;
+                e.bytecode       = fromDisk;
+                e.insertionOrder = m_nextInsertionOrder++;
+                m_currentBytes += e.bytecode.size();
+            }
+            r.status    = BytecodeStatus::Ready;
+            r.bytecode  = std::move(fromDisk);
+            r.fromCache = true;
             return r;
         }
-        r.status       = it->second.status;
-        r.bytecode     = it->second.bytecode;
-        r.errorMessage = it->second.errorMessage;
-        r.fromCache    = (r.status == BytecodeStatus::Ready);
+        r.status = BytecodeStatus::NotRequested;
         return r;
     }
 
@@ -261,7 +284,7 @@ namespace ShaderLab::Effects
     BytecodeCacheResult BytecodeCache::GetOrCompile(
         BytecodeCompileRequest request, uint32_t timeoutMs)
     {
-        // Fast path: existing Ready/Failed entry.
+        // Fast path: existing Ready/Failed entry in memory.
         {
             std::lock_guard<std::mutex> g(m_mutex);
             auto it = m_entries.find(request.key);
@@ -285,7 +308,37 @@ namespace ShaderLab::Effects
                     m_cacheHits.fetch_add(1, std::memory_order_relaxed);
                     return r;
                 }
-                // Pending: fall through to the wait/inline-compile path below.
+                // Pending: fall through to wait/inline-compile path.
+            }
+        }
+
+        // Disk fallback BEFORE inline compile -- a previous-session
+        // bytecode is much cheaper than re-running D3DCompile.
+        {
+            std::vector<uint8_t> fromDisk;
+            if (TryLoadFromDisk(request.key, fromDisk))
+            {
+                std::lock_guard<std::mutex> g(m_mutex);
+                auto it = m_entries.find(request.key);
+                if (it == m_entries.end() ||
+                    it->second.status == BytecodeStatus::Pending)
+                {
+                    Entry& e = m_entries[request.key];
+                    if (e.insertionOrder == 0)
+                        e.insertionOrder = m_nextInsertionOrder++;
+                    if (e.bytecode.size() != fromDisk.size())
+                        m_currentBytes += fromDisk.size() - e.bytecode.size();
+                    e.bytecode = std::move(fromDisk);
+                    e.status   = BytecodeStatus::Ready;
+                    e.errorMessage.clear();
+                }
+                BytecodeCacheResult r;
+                r.status    = BytecodeStatus::Ready;
+                r.bytecode  = m_entries[request.key].bytecode;
+                r.fromCache = true;
+                m_cacheHits.fetch_add(1, std::memory_order_relaxed);
+                m_readyCv.notify_all();
+                return r;
             }
         }
 
@@ -322,14 +375,15 @@ namespace ShaderLab::Effects
         // already present, then compile on this thread.
         Entry localEntry;
         BytecodeStatus finalStatus;
+        BytecodeCacheMetadata metaCopy;
+        BytecodeCompileKey    keyCopy;
+        std::vector<uint8_t>  bytecodeForDisk;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
             auto& e = m_entries[request.key];
             if (e.status == BytecodeStatus::Ready ||
                 e.status == BytecodeStatus::Failed)
             {
-                // Worker raced and won between our wait timeout and
-                // re-acquiring the lock. Use its result.
                 BytecodeCacheResult r;
                 r.status       = e.status;
                 r.bytecode     = e.bytecode;
@@ -339,14 +393,23 @@ namespace ShaderLab::Effects
             }
             if (e.insertionOrder == 0)
                 e.insertionOrder = m_nextInsertionOrder++;
-            // Compile drops + reacquires the lock internally.
-            finalStatus = DoCompile(request, lock, e);
-            // Snapshot for return outside the lock.
-            localEntry = e;
+            finalStatus      = DoCompile(request, lock, e);
+            localEntry       = e;
+            keyCopy          = request.key;
+            metaCopy         = request.metadata;
+            if (finalStatus == BytecodeStatus::Ready)
+                bytecodeForDisk = e.bytecode;
             EnforceByteLimit_NoLock();
         }
         m_inlineCompiles.fetch_add(1, std::memory_order_relaxed);
         m_readyCv.notify_all();
+
+        // Persist outside the lock (best-effort; don't block render).
+        if (!bytecodeForDisk.empty() && !m_diskRoot.empty())
+        {
+            std::lock_guard<std::mutex> g(m_mutex);
+            WriteToDisk(keyCopy, metaCopy, bytecodeForDisk);
+        }
 
         BytecodeCacheResult r;
         r.status       = finalStatus;
@@ -442,6 +505,328 @@ namespace ShaderLab::Effects
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Disk persistence (Phase 8 p8-cache-disk)
+    // -----------------------------------------------------------------------
+    //
+    // Layout: <root>\<effectIdSafe>\<version>\<keyHashHex>.cso
+    //
+    // The keyHash combines all bytecode-determining fields into a single
+    // 64-bit value: source + paramSig + includeLib + macroBitset + entry +
+    // target. Two metadata fields (effectIdSafe, version) live in the
+    // path purely so a human can inspect the cache and so the reaper can
+    // find stale-version directories cheaply.
+
+    namespace {
+        std::wstring SanitizeForFilesystem(std::wstring_view in)
+        {
+            std::wstring out;
+            out.reserve(in.size());
+            for (wchar_t c : in)
+            {
+                if ((c >= L'A' && c <= L'Z') ||
+                    (c >= L'a' && c <= L'z') ||
+                    (c >= L'0' && c <= L'9') ||
+                    c == L'_' || c == L'-' || c == L'.')
+                    out.push_back(c);
+                else
+                    out.push_back(L'_');
+            }
+            // Cap length to keep paths well under MAX_PATH even for
+            // deep cache trees. 64 chars is plenty for human-readable
+            // effect names; collisions resolved by keyHash.
+            if (out.size() > 64) out.resize(64);
+            if (out.empty()) out = L"_unnamed";
+            return out;
+        }
+
+        std::wstring HexFormat(uint64_t v)
+        {
+            wchar_t buf[17];
+            swprintf_s(buf, L"%016llx", static_cast<unsigned long long>(v));
+            return buf;
+        }
+
+        bool EnsureDirectoryRecursive(const std::wstring& path)
+        {
+            // CreateDirectoryW fails if the path doesn't exist or any
+            // parent is missing. Walk up and create as we go.
+            if (path.empty()) return false;
+            // Quick check: already exists?
+            DWORD attrs = ::GetFileAttributesW(path.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES &&
+                (attrs & FILE_ATTRIBUTE_DIRECTORY))
+                return true;
+
+            // Walk parent.
+            size_t slash = path.find_last_of(L"\\/");
+            if (slash != std::wstring::npos && slash > 2)  // skip drive letter
+            {
+                if (!EnsureDirectoryRecursive(path.substr(0, slash)))
+                    return false;
+            }
+            BOOL ok = ::CreateDirectoryW(path.c_str(), nullptr);
+            if (!ok)
+            {
+                DWORD err = ::GetLastError();
+                if (err == ERROR_ALREADY_EXISTS) return true;
+                return false;
+            }
+            return true;
+        }
+    }
+
+    void BytecodeCache::SetDiskCacheRoot(std::wstring rootPath)
+    {
+        std::lock_guard<std::mutex> g(m_mutex);
+        m_diskRoot = std::move(rootPath);
+        if (!m_diskRoot.empty())
+            EnsureDirectoryRecursive(m_diskRoot);
+    }
+
+    std::wstring BytecodeCache::KeyToDiskPath(
+        const BytecodeCompileKey& key,
+        const BytecodeCacheMetadata& meta) const
+    {
+        // Caller holds m_mutex.
+        if (m_diskRoot.empty()) return {};
+
+        // Single 64-bit hash of the full key for the filename.
+        BytecodeCompileKeyHash hasher;
+        const uint64_t keyHash = static_cast<uint64_t>(hasher(key));
+
+        std::wstring effectIdSafe = SanitizeForFilesystem(
+            meta.effectId.empty() ? L"_unknown" : meta.effectId);
+
+        std::wstring path = m_diskRoot;
+        if (!path.empty() && path.back() != L'\\') path.push_back(L'\\');
+        path += effectIdSafe;
+        path.push_back(L'\\');
+        path += std::to_wstring(meta.version);
+        path.push_back(L'\\');
+        path += HexFormat(keyHash);
+        path += L".cso";
+        return path;
+    }
+
+    bool BytecodeCache::TryLoadFromDisk(
+        const BytecodeCompileKey& key,
+        std::vector<uint8_t>& outBytecode) const
+    {
+        // The on-disk filename is keyed by the FULL hash of all
+        // bytecode-determining fields. We don't have effectId/version
+        // for keys not in memory -- the disk layout uses metadata for
+        // human-readable hierarchy, but lookup is by hash so we need
+        // to know the directory. To keep `TryGet` cheap, we walk all
+        // immediate `<effectIdSafe>/<version>/` children looking for
+        // a file named `<keyHashHex>.cso`. With a typical cache of
+        // 5-50 effects, that's a fast operation.
+        if (m_diskRoot.empty()) return false;
+        BytecodeCompileKeyHash hasher;
+        std::wstring fname = HexFormat(static_cast<uint64_t>(hasher(key))) + L".cso";
+
+        WIN32_FIND_DATAW fdEffect{};
+        std::wstring effectGlob = m_diskRoot;
+        if (!effectGlob.empty() && effectGlob.back() != L'\\') effectGlob.push_back(L'\\');
+        effectGlob += L"*";
+        HANDLE hEffect = ::FindFirstFileW(effectGlob.c_str(), &fdEffect);
+        if (hEffect == INVALID_HANDLE_VALUE) return false;
+        bool found = false;
+        std::wstring foundPath;
+        do {
+            if (!(fdEffect.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (fdEffect.cFileName[0] == L'.') continue;
+            std::wstring effectDir = m_diskRoot;
+            if (effectDir.back() != L'\\') effectDir.push_back(L'\\');
+            effectDir += fdEffect.cFileName;
+
+            WIN32_FIND_DATAW fdVer{};
+            std::wstring verGlob = effectDir + L"\\*";
+            HANDLE hVer = ::FindFirstFileW(verGlob.c_str(), &fdVer);
+            if (hVer == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (!(fdVer.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (fdVer.cFileName[0] == L'.') continue;
+                std::wstring candidate = effectDir + L"\\" + fdVer.cFileName + L"\\" + fname;
+                DWORD a = ::GetFileAttributesW(candidate.c_str());
+                if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY))
+                {
+                    foundPath = std::move(candidate);
+                    found = true;
+                    break;
+                }
+            } while (::FindNextFileW(hVer, &fdVer));
+            ::FindClose(hVer);
+            if (found) break;
+        } while (::FindNextFileW(hEffect, &fdEffect));
+        ::FindClose(hEffect);
+
+        if (!found) return false;
+
+        // Read the file.
+        HANDLE hFile = ::CreateFileW(foundPath.c_str(), GENERIC_READ,
+            FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER sz{};
+        if (!::GetFileSizeEx(hFile, &sz) || sz.QuadPart <= 0 ||
+            sz.QuadPart > 16ull * 1024 * 1024)  // 16 MB sanity cap
+        {
+            ::CloseHandle(hFile);
+            return false;
+        }
+        outBytecode.resize(static_cast<size_t>(sz.QuadPart));
+        DWORD got = 0;
+        BOOL ok = ::ReadFile(hFile, outBytecode.data(),
+            static_cast<DWORD>(outBytecode.size()), &got, nullptr);
+        ::CloseHandle(hFile);
+        if (!ok || got != outBytecode.size())
+        {
+            outBytecode.clear();
+            return false;
+        }
+        // Touch atime so the reaper sees the load. Use SetFileTime with
+        // current FILETIME on the LastAccessTime field.
+        FILETIME now{};
+        ::GetSystemTimeAsFileTime(&now);
+        HANDLE hTouch = ::CreateFileW(foundPath.c_str(), FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hTouch != INVALID_HANDLE_VALUE)
+        {
+            ::SetFileTime(hTouch, nullptr, &now, &now);
+            ::CloseHandle(hTouch);
+        }
+        return true;
+    }
+
+    void BytecodeCache::WriteToDisk(
+        const BytecodeCompileKey& key,
+        const BytecodeCacheMetadata& meta,
+        const std::vector<uint8_t>& bytecode)
+    {
+        // Caller holds m_mutex (we do file I/O while holding the lock
+        // -- not great but cache-disk writes are ~10 KB and the worker
+        // thread does this off the render path).
+        if (m_diskRoot.empty() || bytecode.empty()) return;
+        std::wstring path = KeyToDiskPath(key, meta);
+        if (path.empty()) return;
+
+        // Create parent dir.
+        size_t slash = path.find_last_of(L'\\');
+        if (slash == std::wstring::npos) return;
+        if (!EnsureDirectoryRecursive(path.substr(0, slash))) return;
+
+        // Atomic write: temp file in parent dir + MoveFileEx replace.
+        std::wstring tmp = path + L".tmp";
+        HANDLE hFile = ::CreateFileW(tmp.c_str(), GENERIC_WRITE,
+            0, nullptr, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) return;
+        DWORD written = 0;
+        BOOL ok = ::WriteFile(hFile, bytecode.data(),
+            static_cast<DWORD>(bytecode.size()), &written, nullptr);
+        ::CloseHandle(hFile);
+        if (!ok || written != bytecode.size())
+        {
+            ::DeleteFileW(tmp.c_str());
+            return;
+        }
+        if (!::MoveFileExW(tmp.c_str(), path.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        {
+            ::DeleteFileW(tmp.c_str());
+        }
+    }
+
+    BytecodeCache::ReapResult BytecodeCache::ReapDisk(uint64_t staleThresholdSec)
+    {
+        ReapResult r{};
+        std::wstring root;
+        {
+            std::lock_guard<std::mutex> g(m_mutex);
+            root = m_diskRoot;
+        }
+        if (root.empty()) return r;
+
+        // FILETIME = 100ns since 1601. Threshold: now - staleThresholdSec.
+        // Special case: staleThresholdSec == 0 means "reap everything"
+        // (force threshold above all possible atimes).
+        FILETIME nowFt{};
+        ::GetSystemTimeAsFileTime(&nowFt);
+        ULARGE_INTEGER nowUli; nowUli.LowPart = nowFt.dwLowDateTime;
+        nowUli.HighPart = nowFt.dwHighDateTime;
+        ULONGLONG thresholdUli;
+        const bool reapAll = (staleThresholdSec == 0);
+        if (reapAll)
+            thresholdUli = ~0ull;  // any atime is < this; everything reaped.
+        else
+            thresholdUli = nowUli.QuadPart -
+                (static_cast<ULONGLONG>(staleThresholdSec) * 10'000'000ull);
+
+        // Walk root\effectIdSafe\version\*.cso
+        WIN32_FIND_DATAW fdE{};
+        std::wstring effectGlob = root;
+        if (effectGlob.back() != L'\\') effectGlob.push_back(L'\\');
+        effectGlob += L"*";
+        HANDLE hE = ::FindFirstFileW(effectGlob.c_str(), &fdE);
+        if (hE == INVALID_HANDLE_VALUE) return r;
+        do {
+            if (!(fdE.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (fdE.cFileName[0] == L'.') continue;
+            std::wstring effectDir = root;
+            if (effectDir.back() != L'\\') effectDir.push_back(L'\\');
+            effectDir += fdE.cFileName;
+
+            WIN32_FIND_DATAW fdV{};
+            std::wstring vGlob = effectDir + L"\\*";
+            HANDLE hV = ::FindFirstFileW(vGlob.c_str(), &fdV);
+            if (hV == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (!(fdV.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (fdV.cFileName[0] == L'.') continue;
+                std::wstring vDir = effectDir + L"\\" + fdV.cFileName;
+                WIN32_FIND_DATAW fdF{};
+                std::wstring fGlob = vDir + L"\\*.cso";
+                HANDLE hF = ::FindFirstFileW(fGlob.c_str(), &fdF);
+                if (hF == INVALID_HANDLE_VALUE) continue;
+                do {
+                    ULARGE_INTEGER atime;
+                    atime.LowPart  = fdF.ftLastAccessTime.dwLowDateTime;
+                    atime.HighPart = fdF.ftLastAccessTime.dwHighDateTime;
+                    if (atime.QuadPart >= thresholdUli) continue;
+
+                    std::wstring full = vDir + L"\\" + fdF.cFileName;
+                    LARGE_INTEGER sz{};
+                    sz.LowPart  = fdF.nFileSizeLow;
+                    sz.HighPart = fdF.nFileSizeHigh;
+                    if (::DeleteFileW(full.c_str()))
+                    {
+                        ++r.filesDeleted;
+                        r.bytesFreed += static_cast<size_t>(sz.QuadPart);
+                    }
+                    else
+                    {
+                        ++r.errors;
+                    }
+                } while (::FindNextFileW(hF, &fdF));
+                ::FindClose(hF);
+                // Try to rmdir empty version dir (best-effort).
+                ::RemoveDirectoryW(vDir.c_str());
+            } while (::FindNextFileW(hV, &fdV));
+            ::FindClose(hV);
+            ::RemoveDirectoryW(effectDir.c_str());
+        } while (::FindNextFileW(hE, &fdE));
+        ::FindClose(hE);
+        return r;
+    }
+
+    BytecodeCache::ReapResult BytecodeCache::ClearDisk()
+    {
+        // staleThresholdSec=0 is the "reap everything" sentinel.
+        return ReapDisk(0);
+    }
+
     BytecodeCache::Stats BytecodeCache::GetStats() const
     {
         Stats s{};
@@ -501,6 +886,16 @@ namespace ShaderLab::Effects
             DoCompile(req, lock, it->second);
             EnforceByteLimit_NoLock();
             m_workerCompiles.fetch_add(1, std::memory_order_relaxed);
+
+            // Persist to disk on success (best-effort, with the lock
+            // held -- file writes are small and the worker is off the
+            // render thread).
+            if (it->second.status == BytecodeStatus::Ready &&
+                !m_diskRoot.empty())
+            {
+                WriteToDisk(req.key, req.metadata, it->second.bytecode);
+            }
+
             lock.unlock();
             m_readyCv.notify_all();
         }

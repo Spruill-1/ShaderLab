@@ -150,10 +150,20 @@ namespace ShaderLab::Effects
         BytecodeCache& operator=(const BytecodeCache&) = delete;
 
         // Non-blocking lookup. Returns a copy of cached state. `status`
-        // can be NotRequested / Pending / Ready / Failed.
-        BytecodeCacheResult TryGet(const BytecodeCompileKey& key) const;
+        // can be NotRequested / Pending / Ready / Failed. If the entry
+        // is not in memory but exists on disk, this method silently
+        // hydrates the in-memory map with the disk bytecode and returns
+        // a Ready result (this is why the method is non-const).
+        BytecodeCacheResult TryGet(const BytecodeCompileKey& key);
 
         BytecodeStatus GetStatus(const BytecodeCompileKey& key) const;
+
+        // Configure the on-disk cache root. Call once during engine
+        // init (via EngineExports). If empty (default), persistence is
+        // disabled and the cache is purely in-memory. Path is created
+        // recursively if missing.
+        void SetDiskCacheRoot(std::wstring rootPath);
+        const std::wstring& GetDiskCacheRoot() const { return m_diskRoot; }
 
         // Idempotent enqueue. If status is already Pending or Ready,
         // no-op. If status is Failed, no-op (caller must explicitly
@@ -190,6 +200,16 @@ namespace ShaderLab::Effects
 
         // Reaper hooks (Phase 8 cache disk + reaper work).
         void Clear();
+
+        // Reap stale on-disk entries. Files not modified within
+        // `staleThresholdSec` are deleted. Returns counts.
+        struct ReapResult { size_t filesDeleted; size_t bytesFreed; size_t errors; };
+        ReapResult ReapDisk(uint64_t staleThresholdSec);
+
+        // Delete everything under the disk cache root. In-memory
+        // entries are preserved (next render still works without
+        // re-compile), but any future restart will recompile.
+        ReapResult ClearDisk();
 
         struct Stats
         {
@@ -257,7 +277,20 @@ namespace ShaderLab::Effects
         size_t                                                                           m_currentBytes{ 0 };
 
         // Tunables.
-        size_t m_maxBytes{ 256ull * 1024 * 1024 };  // 256 MB.
+        size_t       m_maxBytes{ 256ull * 1024 * 1024 };  // 256 MB.
+        std::wstring m_diskRoot;                          // empty = disabled.
+
+        // Disk helpers.
+        std::wstring KeyToDiskPath(
+            const BytecodeCompileKey& key,
+            const BytecodeCacheMetadata& meta) const;
+        bool TryLoadFromDisk(
+            const BytecodeCompileKey& key,
+            std::vector<uint8_t>& outBytecode) const;
+        void WriteToDisk(
+            const BytecodeCompileKey& key,
+            const BytecodeCacheMetadata& meta,
+            const std::vector<uint8_t>& bytecode);
 
         // Stats (atomic so GetStats is lock-free for the counters).
         mutable std::atomic<size_t> m_inlineCompiles{ 0 };

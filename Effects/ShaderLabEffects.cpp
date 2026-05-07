@@ -1,8 +1,11 @@
 #include "pch_engine.h"
 #include "ShaderLabEffects.h"
+#include "BytecodeCache.h"
 #include "CustomComputeShaderEffect.h"
 #include "CustomComputeBridgeEffect.h"
 #include "CustomPixelShaderEffect.h"
+
+#include <thread>
 
 namespace ShaderLab::Effects
 {
@@ -12,6 +15,18 @@ namespace ShaderLab::Effects
         CustomPixelShaderEffect::RegisterEffect(factory);
         CustomComputeShaderEffect::RegisterEffect(factory);
         CustomComputeBridgeEffect::RegisterEffect(factory);
+    }
+
+    void ConfigureBytecodeCache(std::wstring rootPath, uint64_t staleThresholdSec)
+    {
+        BytecodeCache::Instance().SetDiskCacheRoot(rootPath);
+        if (rootPath.empty() || staleThresholdSec == 0) return;
+        // Background reap so engine init isn't blocked on a directory
+        // walk. Detached jthread; the cache itself is robust to
+        // concurrent access.
+        std::thread([staleThresholdSec]() {
+            BytecodeCache::Instance().ReapDisk(staleThresholdSec);
+        }).detach();
     }
 
     // Shared color-math HLSL extracted to Effects/ColorMath.cpp
