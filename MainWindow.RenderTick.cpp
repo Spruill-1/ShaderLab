@@ -378,6 +378,18 @@ namespace winrt::ShaderLab::implementation
 
         // Process deferred D3D11 compute dispatches inside the active D2D
         // draw session, where all effect chains are fully materialized.
+        // Phase 8c: install the per-frame CPU-analysis interest set so
+        // ProcessDeferredCompute knows which compute nodes need to read
+        // their structured buffer back to CPU. Currently just the
+        // selected node so the Properties panel + canvas value labels
+        // stay live for the user's focus. Every other compute node
+        // whose downstream consumers are entirely GPU-routed will skip
+        // its CopyResource + Map round-trip.
+        {
+            std::unordered_set<uint32_t> interest;
+            if (m_selectedNodeId != 0) interest.insert(m_selectedNodeId);
+            m_graphEvaluator.SetCpuAnalysisInterest(std::move(interest));
+        }
         uint32_t computeCount = static_cast<uint32_t>(m_graphEvaluator.DeferredComputeCount());
         auto tComputeStart = std::chrono::high_resolution_clock::now();
         if (m_graphEvaluator.ProcessDeferredCompute(m_graph, drawDc))

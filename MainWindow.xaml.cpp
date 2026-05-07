@@ -10,6 +10,7 @@
 #include "Rendering/PixelReadback.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/DxgiDuplicationSourceProvider.h"
+#include "Effects/Performance.h"
 #include "Version.h"
 #include "EngineExport.h"
 #include <microsoft.ui.xaml.media.dxinterop.h>
@@ -424,6 +425,15 @@ namespace winrt::ShaderLab::implementation
 
         // Create D3D11/D2D1 device stack and swap chain on the PreviewPanel.
         m_renderEngine.Initialize(m_hwnd, PreviewPanel(), format, m_devicePref);
+
+        // Phase 8c: enable skip-unneeded-CPU-readback. Every frame the
+        // RenderTick installs `{m_selectedNodeId}` as the CPU-analysis
+        // interest set, so the selected node's Properties panel stays
+        // live while every other compute analysis dispatch's Map() is
+        // skipped when its consumers are entirely GPU-routed.
+        // MCP /analysis/{id} reads temporarily disable the flag so they
+        // always return fresh values regardless of selection.
+        ::ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(true);
 
         // Now that we have a DXGI factory, register adapter-change monitoring.
         if (m_renderEngine.DXGIFactory())

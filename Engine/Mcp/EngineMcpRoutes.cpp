@@ -15,6 +15,7 @@
 #include "../../Effects/ShaderCompiler.h"
 #include "../../Effects/CustomComputeShaderEffect.h"
 #include "../../Effects/CustomPixelShaderEffect.h"
+#include "../../Effects/Performance.h"
 #include "../../Version.h"
 
 #include <winrt/Windows.Data.Json.h>
@@ -1064,6 +1065,25 @@ namespace ShaderLab::Mcp
                         catch (...) { return Json(400, R"({"error":"Invalid node ID"})"); }
                         auto* node = ctx.graph->FindNode(nodeId);
                         if (!node) return Json(404, R"({"error":"Node not found"})");
+
+                        // Phase 8c: ensure freshness. If the host has the
+                        // skip-readback flag enabled, the node's
+                        // analysisOutput.fields may be stale by 1+ frames.
+                        // Temporarily disable the flag, force a render,
+                        // then restore. Cost: one frame of full readback
+                        // per MCP analysis read (acceptable given MCP
+                        // calls are out-of-band and infrequent).
+                        const bool prevSkip =
+                            ::ShaderLab::Performance::IsSkipUnneededCpuReadbackEnabled();
+                        if (prevSkip && ctx.renderFrame)
+                        {
+                            ::ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(false);
+                            ctx.renderFrame();
+                            ::ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(prevSkip);
+                            // Re-resolve: the graph could have changed.
+                            node = ctx.graph->FindNode(nodeId);
+                            if (!node) return Json(404, R"({"error":"Node not found"})");
+                        }
 
                         using AOT = ::ShaderLab::Graph::AnalysisOutputType;
                         if (node->analysisOutput.type != AOT::Typed ||
