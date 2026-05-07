@@ -2,6 +2,8 @@
 #include "GraphEvaluator.h"
 #include "../Effects/ShaderCompiler.h"
 #include "../Effects/BytecodeCache.h"
+#include "../Effects/Performance.h"
+#include "../Effects/IEngineComputeOutput.h"
 #include "MathExpression.h"
 
 using namespace ShaderLab::Graph;
@@ -1414,6 +1416,47 @@ namespace ShaderLab::Rendering
         {
             auto propIt = effectiveProps.find(propName);
             if (propIt == effectiveProps.end()) continue;
+
+            // Phase 8: detect GPU-routable bindings before doing CPU
+            // readback. A binding is GPU-routable when:
+            //   * the feature flag is on,
+            //   * the consumer's parameter is flagged gpuBindable in
+            //     its CustomEffectDefinition,
+            //   * the upstream effect publishes IEngineComputeOutput
+            //     (i.e. its cachedEffect QI's the interface).
+            //
+            // For v1 we only INCREMENT a telemetry counter; the actual
+            // SRV-to-shader binding path is consumer-effect-specific
+            // and lands in a follow-up commit per migrated effect.
+            // The CPU readback below still runs as the safe fallback.
+            if (Performance::IsGpuBindingsEnabled() &&
+                node.customEffect.has_value() &&
+                !binding.wholeArray)
+            {
+                bool propGpuBindable = false;
+                for (const auto& p : node.customEffect->parameters)
+                {
+                    if (p.name == propName) { propGpuBindable = p.gpuBindable; break; }
+                }
+                if (propGpuBindable && !binding.sources.empty() &&
+                    binding.sources[0].has_value())
+                {
+                    uint32_t srcId = binding.sources[0]->sourceNodeId;
+                    const EffectNode* srcNode = graph.FindNode(srcId);
+                    auto effIt = m_effectCache.find(srcId);
+                    if (srcNode && effIt != m_effectCache.end() && effIt->second)
+                    {
+                        winrt::com_ptr<Effects::IEngineComputeOutput> ieco;
+                        if (SUCCEEDED(effIt->second->QueryInterface(
+                            __uuidof(Effects::IEngineComputeOutput), ieco.put_void())))
+                        {
+                            // Detected. Counter for diagnostics; actual
+                            // routing is per-consumer-effect future work.
+                            Performance::IncrementGpuBindingDetection();
+                        }
+                    }
+                }
+            }
 
             // Whole-array mode.
             if (binding.wholeArray)
