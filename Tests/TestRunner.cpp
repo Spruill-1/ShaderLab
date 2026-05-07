@@ -491,6 +491,38 @@ void main(uint3 id : SV_DispatchThreadID) { output[id.xy] = float4(1,0,0,1); }
         auto csResult = ShaderLab::Effects::ShaderCompiler::CompileFromString(
             validCS, "test.hlsl", "main", "cs_5_0");
         TEST("ValidComputeShader", csResult.succeeded);
+
+        // ---- shaderlab_params.hlsli include + macro mode validation ---------
+        // Phase 8: a shader that uses SHADERLAB_PARAM should compile in
+        // both cbuffer mode (_SLPARAM_X_GPU=0) and GPU-bound mode
+        // (_SLPARAM_X_GPU=1). We don't reflect the resulting bytecode
+        // here -- the goal is just to prove the include resolver +
+        // macro injection wire all the way through D3DCompile without
+        // a syntax error in the macro file itself.
+        std::string macroPS = R"(
+#include "shaderlab_params.hlsli"
+Texture2D Source : register(t0);
+SHADERLAB_GPU_BUFFER(Exposure, t1)
+cbuffer Constants : register(b0) {
+    SHADERLAB_PARAM(float, Exposure)
+    float Padding;
+};
+float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
+    SHADERLAB_LOAD_PARAM(float, Exposure)
+    return Source.Load(int3(uv0.xy, 0)) * Exposure;
+}
+)";
+        // Default mode: parameter lives in cbuffer.
+        auto cbufferMode = ShaderLab::Effects::ShaderCompiler::CompileFromString(
+            macroPS, "test_param_cbuffer.hlsl", "main", "ps_5_0",
+            { { "_SLPARAM_Exposure_GPU", "0" } });
+        TEST("ShaderLabParamsHlsli_CbufferMode", cbufferMode.succeeded);
+
+        // GPU-bound mode: parameter comes from StructuredBuffer<float4>.
+        auto gpuMode = ShaderLab::Effects::ShaderCompiler::CompileFromString(
+            macroPS, "test_param_gpu.hlsl", "main", "ps_5_0",
+            { { "_SLPARAM_Exposure_GPU", "1" } });
+        TEST("ShaderLabParamsHlsli_GpuMode", gpuMode.succeeded);
     }
 
     void TestEffectChain()

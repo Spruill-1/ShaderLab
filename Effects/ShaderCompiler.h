@@ -64,6 +64,26 @@ namespace ShaderLab::Effects
             const std::string& entryPoint = "main",
             const std::string& target = "ps_5_0");
 
+        // Compile HLSL source with explicit preprocessor macros. Used
+        // by the GPU-binding feature to inject _SLPARAM_<name>_GPU=0|1
+        // sentinels per gpuBindable parameter. The compiler's include
+        // handler always resolves "shaderlab_params.hlsli" to the
+        // engine-embedded macro library; other includes are not
+        // supported (D3D_COMPILE_STANDARD_FILE_INCLUDE is intentionally
+        // bypassed since all ShaderLab shaders are in-memory strings).
+        //
+        // `macros` is a flat list of {name, definition} pairs, NOT
+        // null-terminated -- the ShaderCompiler appends the terminator
+        // internally. Both name and definition strings must outlive
+        // the call.
+        struct MacroDef { const char* name; const char* definition; };
+        static ShaderCompileResult CompileFromString(
+            const std::string& hlslSource,
+            const std::string& sourceName,
+            const std::string& entryPoint,
+            const std::string& target,
+            const std::vector<MacroDef>& macros);
+
         // Reflect a compiled shader to discover constant buffers and bindings.
         static ShaderReflectionResult Reflect(ID3DBlob* bytecode);
         static ShaderReflectionResult Reflect(const std::vector<uint8_t>& bytecode);

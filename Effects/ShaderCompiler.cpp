@@ -1,9 +1,45 @@
 #include "pch_engine.h"
 #include "ShaderCompiler.h"
+#include "ShaderLabParamsHlsl.h"
 #include "../Graph/PropertyValue.h"
+
+#include <cstring>
 
 namespace ShaderLab::Effects
 {
+    namespace
+    {
+        // ID3DInclude impl that resolves "shaderlab_params.hlsli" to
+        // the engine-embedded macro library. Any other include name
+        // returns E_FAIL -- ShaderLab effects don't include other
+        // headers (everything is compiled from in-memory strings),
+        // so a failed include is a useful signal that an effect
+        // author tried something the engine doesn't support.
+        struct ShaderLabIncludeHandler : ID3DInclude
+        {
+            HRESULT __stdcall Open(D3D_INCLUDE_TYPE,
+                LPCSTR pFileName, LPCVOID, LPCVOID* ppData, UINT* pBytes) override
+            {
+                if (!pFileName || !ppData || !pBytes) return E_POINTER;
+                if (std::strcmp(pFileName, kShaderLabParamsIncludeName) == 0)
+                {
+                    *ppData = GetShaderLabParamsHLSL();
+                    *pBytes = static_cast<UINT>(GetShaderLabParamsHLSLLength());
+                    return S_OK;
+                }
+                return E_FAIL;
+            }
+
+            HRESULT __stdcall Close(LPCVOID) override
+            {
+                // Static buffer; nothing to free.
+                return S_OK;
+            }
+        };
+
+        ShaderLabIncludeHandler s_includeHandler;
+    }
+
     // -----------------------------------------------------------------------
     // Error message helper
     // -----------------------------------------------------------------------
@@ -63,6 +99,16 @@ namespace ShaderLab::Effects
         const std::string& entryPoint,
         const std::string& target)
     {
+        return CompileFromString(hlslSource, sourceName, entryPoint, target, {});
+    }
+
+    ShaderCompileResult ShaderCompiler::CompileFromString(
+        const std::string& hlslSource,
+        const std::string& sourceName,
+        const std::string& entryPoint,
+        const std::string& target,
+        const std::vector<MacroDef>& macros)
+    {
         ShaderCompileResult result;
 
         UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
@@ -72,12 +118,21 @@ namespace ShaderLab::Effects
         flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
 #endif
 
+        // Convert MacroDef list to D3DCompile's null-terminated form.
+        // Names/definitions must outlive the call; the caller-owned
+        // const char* pointers are passed through unchanged.
+        std::vector<D3D_SHADER_MACRO> nativeMacros;
+        nativeMacros.reserve(macros.size() + 1);
+        for (const auto& m : macros)
+            nativeMacros.push_back({ m.name, m.definition });
+        nativeMacros.push_back({ nullptr, nullptr });
+
         HRESULT hr = D3DCompile(
             hlslSource.data(),
             hlslSource.size(),
             sourceName.c_str(),
-            nullptr,                // defines
-            D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            macros.empty() ? nullptr : nativeMacros.data(),
+            &s_includeHandler,
             entryPoint.c_str(),
             target.c_str(),
             flags,

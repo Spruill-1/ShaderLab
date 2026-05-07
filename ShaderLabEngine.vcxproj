@@ -118,6 +118,8 @@
     <ClInclude Include="Rendering\MathExpression.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
     <ClInclude Include="Rendering\CaptureNode.h" />
+    <ClInclude Include="Effects\ShaderLabParamsHlsl.h" />
+    <ClInclude Include="Effects\IEngineComputeOutput.h" />
     <ClInclude Include="Rendering\WorkingSpaceSync.h" />
     <ClInclude Include="Rendering\PixelReadback.h" />
     <ClInclude Include="Effects\CustomComputeShaderEffect.h" />
@@ -159,6 +161,7 @@
     <ClCompile Include="Effects\EffectRegistry.cpp" />
     <ClCompile Include="Effects\ImageLoader.cpp" />
     <ClCompile Include="Effects\ShaderCompiler.cpp" />
+    <ClCompile Include="Effects\ShaderLabParamsHlsl.cpp" />
     <ClCompile Include="Effects\ShaderLabEffects.cpp" />
     <ClCompile Include="Effects\DxgiDuplicationSourceProvider.cpp" />
     <ClCompile Include="Effects\WindowsGraphicsCaptureSourceProvider.cpp" />
