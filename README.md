@@ -369,7 +369,7 @@ The evaluator runs at the **monitor's refresh rate** (clamped to 60–240 Hz) vi
 | 33 | Multi-output windows via OutputWindow | Each Output node gets its own SwapChainPanel window. Shares D2D device context. Bidirectional sync: close window ↔ delete node. | Day 6 |
 | 34 | Effect versioning with effectId/effectVersion | Stable IDs survive renames. Per-node and batch upgrade buttons. Preserves user property values on upgrade. | Day 6 |
 | 35 | _hidden suffix convention (retired) | Originally used to hide host-managed working-space cbuffer properties from the Properties panel and pin list. **Retired in v1.4.x** — superseded by decision #51 (Working Space node + bindings) and then fully removed in the Phase-0 cleanup. The filter no longer exists in the codebase. Saved graphs that still carry stale `_hidden` keys load with the keys present in memory but inert (no shader cbuffer references them; non-customEffect nodes never had them; customEffect nodes filter their Properties panel by declared parameters, so stale keys remain invisible). Old graph compatibility is not promised. | Day 6 / retired Day 12 |
-| 36 | D3D11 compute via evaluator dispatch | Bypass D2D tiling for reduction operations. GpuReduction uses 32×32 thread group with groupshared memory. Only 32 bytes read back to CPU. | Day 6 |
+| 36 | D3D11 compute via evaluator dispatch | Bypass D2D tiling for reduction operations. The original `GpuReduction` helper used a 32×32 thread group with groupshared memory and 32-byte readback. **Retired in decision #63** when the `/render/image-stats` route was dropped — the equivalent capability is provided by user-authored `D3D11ComputeShader` effects (Channel / Luminance / Chromaticity Statistics) dispatched through `D3D11ComputeRunner`. | Day 6 |
 | 37 | ID2D1StatisticsEffect COM interface | D2D-compatible effect wrapper with custom interface for analysis results. Pass-through pixel shader + D3D11 compute dispatch. | Day 6 |
 | 38 | Parameter nodes as data-only graph elements | No shader, evaluator handles directly. Teal color, inline slider, don't switch preview. Four types: Float, Integer, Toggle, Gamut. | Day 6 |
 | 39 | CPU analysis → GPU reduction for Image Statistics | Moved from pixel shader (512K redundant reads) to CPU readback (exact, single pass) to D3D11 compute (GPU-resident, 32-byte readback). | Day 6 |
@@ -395,7 +395,8 @@ The evaluator runs at the **monitor's refresh rate** (clamped to 60–240 Hz) vi
 | 59 | `ShaderLabHeadless` console host — PNG render + FP32 pixel readback + `--script` JSON batch mode | The console host packages the engine's rendering + readback + MCP capabilities for use without a logged-in user. Three modes: PNG render (with optional D2D HdrToneMap pre-pass and `--no-tonemap` / `--input-peak-nits` / `--output-peak-nits` flags), FP32 pixel-region readback (`--pixels x,y,w,h` writing packed binary or CSV — bypasses tonemap entirely for full-accuracy scRGB sampling), and JSON batch script (`--script PATH --script-output PATH` walks an array of MCP-style ops through the engine route registry, accumulating per-step `{step, method, path, status, body}` entries). The script mode uses a `HeadlessSink : IEngineCommandSink` with synchronous `Dispatch` (the script thread is the only consumer of engine state) and no-op event hooks. **Use case:** the empirical fidelity loop the health plan called for now runs without WinUI — an agent can drive thousands of parameter combinations through the engine, sampling pixels and reading analysis fields, with no human in the loop. CI smoke (`Tests/RunHeadlessSmoke.ps1`) asserts a Luminance=80→200 set-property → image-stats sequence produces a 2.5× luminance mean ratio end-to-end, exercising set-property → dirty propagation → evaluator → GPU reduction → JSON response across the whole stack. **Lifetime gotcha discovered during the spike:** `node.cachedOutput` is a non-owning `ID2D1Image*` into the `GraphEvaluator`'s effect cache; the evaluator must outlive any consumer. Hoisted to file scope in the test runner; the headless host's `RunRender` keeps it alive for the duration of the render. | Day 12 |
 | 60 | DXGI Desktop Duplication + Windows Graphics Capture sources + graph viewer DPI fix | Two new live-capture sources land alongside the v1.5 work (Zachary's contribution, integrated). `Effects/DxgiDuplicationSourceProvider.{h,cpp}` (engine-side) wraps `IDXGIOutputDuplication` to capture an entire monitor; `Effects/WindowsGraphicsCaptureSourceProvider.{h,cpp}` (app-side) wraps the standard WinUI graphics-capture picker for capturing arbitrary windows or monitors. Both feed the graph as scRGB FP16 frames; SDR monitors land at scRGB 1.0 ≈ 80 nits, HDR monitors preserve their full range. Per-frame ticking goes through `SourceNodeFactory::TickAndUploadLiveCaptures`, called from `MainWindow::OnRenderTick` before the dirty-gated `needsEval` check so live captures advance every frame and trip the gate themselves. (Initial integration missed this wiring — the helper was defined but never called, so DXGI/WGC sources captured one frame and went stale; fixed in v1.5.0.) Same commit also lands a graph viewer DPI fix: the graph `SwapChainPanel` now sizes its backbuffer to physical pixels via `CompositionScaleX/Y` with a `CompositionScaleChanged` handler so nodes render sharp on high-DPI monitors. | Day 12 |
 | 61 | Closing an Output node's external window now removes the node from the graph (regression fix) | `PresentOutputWindows` already called `RemoveNode` on close, but `EffectGraph::RemoveNode` historically refused to delete the last Output node ("always keep at least one"). Net effect: closing an Output's X button removed the window but left a dangling Output node in the graph with no display surface. Lifted the protection. The render path tolerates an output-less graph fine — nothing is needed so evaluation no-ops until the user adds a new Output. Both right-click → Delete on the canvas and X-button-on-window paths now work end-to-end. The Image Path / Browse… UI in the Properties panel is also now hidden for live-capture sources (DXGI / WGC) where it makes no sense. | Day 12 |
-| 62 | Retire the `StatisticsEffect` D2D wrapper class + dead `GraphEvaluator::ComputeImageStatistics` | The `Effects::StatisticsEffect` class (ID2D1EffectImpl + ID2D1DrawTransform + custom ID2D1StatisticsEffect interface) was the original "Image Statistics" graph node from decision #37 (Day 6). It was superseded by the dedicated `Channel Statistics` / `Luminance Statistics` / `Chromaticity Statistics` ShaderLab effects (custom `D3D11ComputeShader` definitions dispatching through `Rendering::D3D11ComputeRunner`) which expose typed analysis fields directly via the data-pin binding system. The wrapper class still got registered with D2D at startup but no graph node referenced it anymore — and the README's "Standalone D2D Application" usage example pointed at an API path nobody was consuming. `GraphEvaluator::ComputeImageStatistics` was a similar leftover (never called from any live code path). Both deleted. `Rendering::GpuReduction` stays — it's still backing `GraphEvaluator::ComputeStandaloneStats`, which serves the `/render/image-stats` MCP route. The "Three Effect Types Compared" table in the README now correctly attributes the D3D11 hybrid path to the same `CustomComputeShaderEffect` class that handles D2D-tiled compute (the path is selected by `customEffect.shaderType`, not by a separate COM class). | Day 13 |
+| 62 | Retire the `StatisticsEffect` D2D wrapper class + dead `GraphEvaluator::ComputeImageStatistics` | The `Effects::StatisticsEffect` class (ID2D1EffectImpl + ID2D1DrawTransform + custom ID2D1StatisticsEffect interface) was the original "Image Statistics" graph node from decision #37 (Day 6). It was superseded by the dedicated `Channel Statistics` / `Luminance Statistics` / `Chromaticity Statistics` ShaderLab effects (custom `D3D11ComputeShader` definitions dispatching through `Rendering::D3D11ComputeRunner`) which expose typed analysis fields directly via the data-pin binding system. The wrapper class still got registered with D2D at startup but no graph node referenced it anymore — and the README's "Standalone D2D Application" usage example pointed at an API path nobody was consuming. `GraphEvaluator::ComputeImageStatistics` was a similar leftover (never called from any live code path). Both deleted. The "Three Effect Types Compared" table in the README now correctly attributes the D3D11 hybrid path to the same `CustomComputeShaderEffect` class that handles D2D-tiled compute (the path is selected by `customEffect.shaderType`, not by a separate COM class). | Day 13 |
+| 63 | Drop `/render/image-stats` route + `GraphEvaluator::ComputeStandaloneStats` + `Rendering::GpuReduction` | After decision #62 the only remaining caller of `GpuReduction` was `ComputeStandaloneStats`, backing the `/render/image-stats` MCP route. That route was a parallel implementation of "reduce an image to channel stats" — duplicating logic that the registered `Channel Statistics` / `Luminance Statistics` / `Chromaticity Statistics` graph effects already provide. **Stats stop being architecturally special.** Agents now use the standard MCP workflow: insert the desired Statistics node via `/graph/add-node`, connect it to the target node, force a render, read fields via `/analysis/<id>`. Removes ~480 LoC: 351 LoC `GpuReduction.{h,cpp}` + 43 LoC `ComputeStandaloneStats` + ~90 LoC `RegisterImageStats` route handler + smoke-test migration. **Behavioral discovery during the migration:** `DispatchUserD3D11Compute` calls `dc->DrawImage` internally to pre-render the upstream chain into an FP32 bitmap, and outside an active D2D draw session that DrawImage silently no-ops (compute reads black input). The GUI's `RenderFrame` already wraps `ProcessDeferredCompute` in `BeginDraw/EndDraw` for this reason; the headless host and the test runner did not. `ShaderLabHeadless` `runEval` and `RunRender` and the new `TestLuminanceStatistics` test bench now do, plus dirty propagation BFS to keep downstream analysis nodes re-dispatching after upstream property changes. | Day 13 |
 
 ---
 
@@ -474,7 +475,7 @@ ShaderLab/
 │
 ├── Engine/Mcp/                     # Engine DLL: MCP server + engine-pure routes
 │   ├── McpHttpServer.h / .cpp      # Winsock2 TCP server, route registration, JSON-RPC
-│   ├── EngineMcpRoutes.h / .cpp    # 21 engine-pure routes + IEngineCommandSink + EngineContext
+│   ├── EngineMcpRoutes.h / .cpp    # 20 engine-pure routes + IEngineCommandSink + EngineContext
 │
 ├── Tests/                          # ShaderLabTests + smoke scripts
 │   ├── TestRunner.cpp              # 113 tests (graph, evaluator, MCP, math bench)
@@ -508,7 +509,7 @@ ShaderLab/
 │   ├── PipelineFormat.h            # PipelineFormat struct (scRGB FP16 always)
 │   ├── RenderEngine.h / .cpp       # App-only D3D11 + D2D1 + swap chain lifecycle
 │   ├── GraphEvaluator.h / .cpp     # Topological walk, effect cache, dirty gating, D3D11 dispatch
-│   ├── GpuReduction.h / .cpp       # D3D11 compute reduction (32×32 thread group, 32-byte readback)
+    │   ├── D3D11ComputeRunner.h / .cpp # Generic D3D11 compute dispatch for user shaders
 │   ├── D3D11ComputeRunner.h / .cpp # Generic D3D11 compute dispatch for user shaders
 │   ├── PixelReadback.h / .cpp      # Engine helper: FP32 RGBA region readback
 │   ├── CaptureNode.h / .cpp        # Engine helper: D2D + WIC PNG encode of any node's output
@@ -866,14 +867,6 @@ classDiagram
         +GetInputCount()
     }
 
-    class GpuReduction {
-        -ID3D11ComputeShader* m_shader
-        -ID3D11Buffer* m_resultBuffer
-        -ID3D11Buffer* m_stagingBuffer
-        +Initialize(ID3D11Device*)
-        +Reduce(ctx, texture, channel, nonzeroOnly) ImageStats
-    }
-
     class D3D11ComputeRunner {
         <<RWStructuredBuffer<float4> path>>
         -ID3D11ComputeShader* m_shader
@@ -899,7 +892,6 @@ classDiagram
     ID2D1EffectImpl <|.. CustomComputeShaderEffect
 
     note for CustomComputeShaderEffect "D2D-tiled compute\nUAV cleared per tile\nNo atomics\n+ D3D11 hybrid mode dispatched\n by GraphEvaluator via D3D11ComputeRunner"
-    note for GpuReduction "Used by GraphEvaluator::ComputeStandaloneStats\nbacking the /render/image-stats MCP route"
 ```
 
 ### Data Flow: D2D → D3D11 Handoff
@@ -992,71 +984,12 @@ auto stats = m_gpuReduction.Reduce(d3dCtx, d3dTexture.get(), channel, nonzeroOnl
 node->analysisOutput.fields = { {"Min", stats.min}, {"Max", stats.max}, ... };
 ```
 
-### GPU Reduction Shader Pattern
-
-```hlsl
-// GpuReduction.cpp — embedded HLSL (cs_5_0)
-
-cbuffer Constants : register(b0) {
-    uint Width, Height, Channel, NonzeroOnly;
-};
-Texture2D<float4> Input : register(t0);
-RWBuffer<uint> Result : register(u0);  // 8 uints = 32 bytes
-
-#define GROUP_SIZE 32
-#define THREAD_COUNT (GROUP_SIZE * GROUP_SIZE)  // 1024
-
-groupshared float gs_min[THREAD_COUNT];
-groupshared float gs_max[THREAD_COUNT];
-groupshared float gs_sum[THREAD_COUNT];
-groupshared uint  gs_count[THREAD_COUNT];
-
-[numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
-void main(uint3 GTid : SV_GroupThreadID) {
-    uint tid = GTid.x + GTid.y * GROUP_SIZE;
-    float tMin = 1e30, tMax = -1e30, tSum = 0;
-    uint tCount = 0;
-
-    // Each thread strides across entire image
-    for (uint y = GTid.y; y < Height; y += GROUP_SIZE)
-        for (uint x = GTid.x; x < Width; x += GROUP_SIZE) {
-            float v = GetValue(Input[int2(x,y)], Channel);
-            tMin = min(tMin, v); tMax = max(tMax, v);
-            tSum += v; tCount++;
-        }
-
-    gs_min[tid] = tMin; gs_max[tid] = tMax;
-    gs_sum[tid] = tSum; gs_count[tid] = tCount;
-    GroupMemoryBarrierWithGroupSync();
-
-    // Parallel reduction in shared memory (10 steps for 1024 threads)
-    for (uint stride = THREAD_COUNT/2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            gs_min[tid] = min(gs_min[tid], gs_min[tid+stride]);
-            gs_max[tid] = max(gs_max[tid], gs_max[tid+stride]);
-            gs_sum[tid] += gs_sum[tid+stride];
-            gs_count[tid] += gs_count[tid+stride];
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-
-    // Thread 0 writes final results
-    if (tid == 0) {
-        Result[0] = asuint(gs_min[0]);
-        Result[1] = asuint(gs_max[0]);
-        Result[2] = asuint(gs_sum[0]);
-        Result[4] = gs_count[0];
-    }
-}
-```
-
 ### Known Limitations
 
-- **D2D→D3D11 flush required**: When rendering a D2D effect chain to a bitmap and then reading it with D3D11, `dc->Flush()` **must** be called between `DrawImage` and any D3D11 access to the underlying texture. D2D batches draw commands until `EndDraw()` or `Flush()` — without an explicit flush, D3D11 reads zeros from the texture. This applies to both `ComputeImageStatistics` and `DispatchUserD3D11Compute` in `GraphEvaluator`.
-- **D2D draw session required**: `ComputeStatistics(dc, image)` must be called with a dc that has an active D2D draw session (between `BeginDraw`/`EndDraw`) for chained effects to render correctly. D2D's deferred `ID2D1Image*` from `GetOutput()` only materializes to pixels during an active draw session. In ShaderLab, `ProcessDeferredCompute` runs inside the main `BeginDraw`/`EndDraw` pass.
+- **D2D→D3D11 flush required**: When rendering a D2D effect chain to a bitmap and then reading it with D3D11, `dc->Flush()` **must** be called between `DrawImage` and any D3D11 access to the underlying texture. D2D batches draw commands until `EndDraw()` or `Flush()` — without an explicit flush, D3D11 reads zeros from the texture. Applied in `DispatchUserD3D11Compute` in `GraphEvaluator`.
+- **D2D draw session required**: `ProcessDeferredCompute` must run inside an active `BeginDraw`/`EndDraw` session because `DispatchUserD3D11Compute` calls `dc->DrawImage` internally to pre-render the upstream chain into an FP32 bitmap. Outside a draw session that DrawImage silently no-ops and the compute reads a black input texture. The GUI's `RenderFrame`, the headless host's `runEval` / `RunRender`, and the test bench all wrap the call accordingly.
 - **No shader linking**: D3D11 compute shaders are opaque to D2D. They don't participate in D2D's shader linking optimization for chained pixel shader effects.
-- **Device sharing**: The D3D11 device must be the same one backing D2D. The effect acquires it lazily via `ID2D1Device2::GetDxgiDevice()` on first `ComputeStatistics` call.
-- **Single thread group**: Current `GpuReduction` dispatches `(1,1,1)` — one group of 1024 threads. For images larger than ~33 megapixels (1024² pixels per thread), a multi-dispatch pyramid would be needed.
+- **Single thread group per dispatch**: `D3D11ComputeRunner` dispatches `(1,1,1)` — one group of 1024 threads. For images larger than ~33 megapixels (1024² pixels per thread), a multi-dispatch pyramid would be needed.
 
 ## Effect Designer
 
@@ -1144,7 +1077,7 @@ The active display profile (live OS-reported caps or any simulated preset / ICC 
 
 The codebase is divided between a host-agnostic engine DLL and one or more host applications:
 
-- **`ShaderLabEngine.dll`** owns everything that doesn't need a UI thread or a swap chain: the `EffectGraph` model + JSON serialization, the `GraphEvaluator` (per-node D2D effect cache, dirty propagation, two-pass evaluate), `SourceNodeFactory` (image / video / DXGI / WGC sources), `EffectRegistry` (40+ wrapped D2D effects + 20+ ShaderLab effects with embedded HLSL), `DisplayMonitor` + ICC parsing, the `Effects/CustomPixelShaderEffect` / `CustomComputeShaderEffect` COM classes, the GPU-reduction path (`Rendering/GpuReduction.{h,cpp}`, `Rendering/D3D11ComputeRunner.{h,cpp}`), the `ShaderCompiler` (D3DCompile + D3DReflect), and **the MCP HTTP server itself plus all 21 engine-pure routes** (`Engine/Mcp/McpHttpServer.{h,cpp}` + `Engine/Mcp/EngineMcpRoutes.{h,cpp}`). Engine-pure helpers extracted for reuse: `Rendering/PixelReadback.{h,cpp}` (FP32 RGBA region readback), `Rendering/CaptureNode.{h,cpp}` (D2D + WIC PNG encode), `Rendering/WorkingSpaceSync.{h,cpp}` (Working Space parameter node refresh).
+- **`ShaderLabEngine.dll`** owns everything that doesn't need a UI thread or a swap chain: the `EffectGraph` model + JSON serialization, the `GraphEvaluator` (per-node D2D effect cache, dirty propagation, two-pass evaluate), `SourceNodeFactory` (image / video / DXGI / WGC sources), `EffectRegistry` (40+ wrapped D2D effects + 20+ ShaderLab effects with embedded HLSL), `DisplayMonitor` + ICC parsing, the `Effects/CustomPixelShaderEffect` / `CustomComputeShaderEffect` COM classes, the generic D3D11 compute dispatch helper (`Rendering/D3D11ComputeRunner.{h,cpp}`), the `ShaderCompiler` (D3DCompile + D3DReflect), and **the MCP HTTP server itself plus all 20 engine-pure routes** (`Engine/Mcp/McpHttpServer.{h,cpp}` + `Engine/Mcp/EngineMcpRoutes.{h,cpp}`). Engine-pure helpers extracted for reuse: `Rendering/PixelReadback.{h,cpp}` (FP32 RGBA region readback), `Rendering/CaptureNode.{h,cpp}` (D2D + WIC PNG encode), `Rendering/WorkingSpaceSync.{h,cpp}` (Working Space parameter node refresh).
 
 - **`ShaderLab.exe`** (the WinUI 3 host) keeps everything that genuinely needs WinUI: `MainWindow.xaml.{h,cpp}` (which itself is split into sibling partial TUs `MainWindow.WorkingSpace.cpp`, `MainWindow.GraphFileIo.cpp`, `MainWindow.RenderTick.cpp`, `MainWindow.McpRoutes.cpp` for the 16 UI-coupled routes), `Controls/NodeGraphController` (canvas rendering), `Controls/OutputWindow` (per-Output OS window), `Controls/ShaderEditorController`, the Effect Designer modal window, and `RenderEngine` (D3D11 + D2D1 device stack, `SwapChainPanel` binding).
 
@@ -1187,7 +1120,6 @@ ShaderLabHeadless --graph PATH --node ID --output PNG_PATH [options]
   | `op` | Maps to |
   |------|---------|
   | `set-property` | `POST /graph/set-property` |
-  | `image-stats` | `POST /render/image-stats` |
   | `pixel-region` | `POST /render/pixel-region` |
   | `capture-node` | `POST /render/capture-node` |
   | `get-graph` | `GET /graph` |
@@ -1195,15 +1127,18 @@ ShaderLabHeadless --graph PATH --node ID --output PNG_PATH [options]
   | `analysis` | `GET /analysis/<nodeId>` |
   | `render` | (internal) force a fresh evaluator pass — barrier between mutations and readbacks |
 
-  Example script:
+  Example script (insert a Luminance Statistics node, sweep upstream, read back):
 
   ```json
   {
     "steps": [
-      { "op": "image-stats", "nodeId": 5 },
-      { "op": "set-property", "nodeId": 3, "key": "Luminance", "value": 200.0 },
-      { "op": "image-stats", "nodeId": 5 },
-      { "op": "pixel-region", "nodeId": 5, "x": 0, "y": 0, "w": 8, "h": 8 }
+      { "method": "POST", "path": "/graph/add-node", "body": {"effectName":"Luminance Statistics"} },
+      { "method": "POST", "path": "/graph/connect", "body": {"srcId":1,"srcPin":0,"dstId":2,"dstPin":0} },
+      { "op": "render" },
+      { "op": "analysis", "nodeId": 2 },
+      { "op": "set-property", "nodeId": 1, "key": "Luminance", "value": 200.0 },
+      { "op": "render" },
+      { "op": "analysis", "nodeId": 2 }
     ]
   }
   ```
@@ -1218,11 +1153,11 @@ The MCP route registry (`RegisterEngineRoutes`) is what backs both the GUI host'
 
 1. **PNG capture** — render `Tests/fixtures/test_cli_basic.json` node 1 to PNG, verify exit code + valid PNG header.
 2. **FP32 pixel readback** — same fixture, `--pixels 0,0,4,4`, verify exact blob size + header bytes.
-3. **Script batch** — three-step script that asserts a Luminance=80→200 set-property → image-stats sequence produces a 2.5× luminance mean ratio. Exercises set-property → dirty propagation → evaluator → GPU reduction → JSON response across the whole stack.
+3. **Script batch** — 7-step script that adds a `Luminance Statistics` node, connects it to the source, reads its `Mean` analysis field, mutates the source's `Luminance` property from 80 to 200, re-renders, and reads `Mean` again. The ratio must be 2.5× — exercises add-node + connect + set-property + dirty propagation + ProcessDeferredCompute + analysis readback end-to-end through the standard graph-node path (no special MCP routes).
 
 ## MCP Server (AI Agent Integration)
 
-ShaderLab includes an embedded HTTP server implementing the **Model Context Protocol (MCP)** JSON-RPC 2.0 for programmatic control by AI agents. The server itself, plus 21 engine-pure routes, ships in the engine DLL — both the GUI host and `ShaderLabHeadless --script` mode register the same routes through the same `IEngineCommandSink` interface (see [Engine / Host Split](#engine--host-split)).
+ShaderLab includes an embedded HTTP server implementing the **Model Context Protocol (MCP)** JSON-RPC 2.0 for programmatic control by AI agents. The server itself, plus 20 engine-pure routes, ships in the engine DLL — both the GUI host and `ShaderLabHeadless --script` mode register the same routes through the same `IEngineCommandSink` interface (see [Engine / Host Split](#engine--host-split)).
 
 ### Connection
 

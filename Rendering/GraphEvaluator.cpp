@@ -2070,52 +2070,5 @@ namespace ShaderLab::Rendering
         return bitmap;
     }
 
-    // -----------------------------------------------------------------------
-    // GPU-accelerated image statistics
-    // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // Standalone (graph-mutation-free) image statistics for MCP queries.
-    // -----------------------------------------------------------------------
-    std::vector<ImageStats> GraphEvaluator::ComputeStandaloneStats(
-        ID2D1DeviceContext5* dc,
-        ID2D1Image* inputImage,
-        const std::vector<uint32_t>& channels,
-        bool nonzeroOnly)
-    {
-        std::vector<ImageStats> result;
-        if (!dc || !inputImage || channels.empty()) return result;
-
-        // Re-render the upstream chain to a fresh FP32 GPU bitmap.  EndDraw
-        // inside PreRenderInputBitmap flushes the D2D batch, so the surface
-        // is populated before the D3D11 compute pass below.
-        auto fp32 = PreRenderInputBitmap(dc, inputImage);
-        if (!fp32) return result;
-
-        // Pull the underlying D3D11 texture out of the D2D bitmap so we can
-        // hand it to GpuReduction (which speaks raw D3D11).
-        winrt::com_ptr<IDXGISurface> surface;
-        if (FAILED(fp32->GetSurface(surface.put()))) return result;
-        winrt::com_ptr<ID3D11Texture2D> tex;
-        if (FAILED(surface->QueryInterface(tex.put()))) return result;
-
-        winrt::com_ptr<ID3D11Device> device;
-        tex->GetDevice(device.put());
-        winrt::com_ptr<ID3D11DeviceContext> d3dCtx;
-        device->GetImmediateContext(d3dCtx.put());
-
-        if (!m_gpuReduction.IsInitialized())
-            m_gpuReduction.Initialize(device.get());
-
-        result.reserve(channels.size());
-        for (uint32_t ch : channels)
-        {
-            // Defensive: GpuReduction channel codes are 0=Y,1=R,2=G,3=B,4=A.
-            // Anything outside that range falls back to luminance.
-            uint32_t safe = (ch <= 4) ? ch : 0;
-            result.push_back(m_gpuReduction.Reduce(d3dCtx.get(), tex.get(), safe, nonzeroOnly));
-        }
-        return result;
-    }
 }
 

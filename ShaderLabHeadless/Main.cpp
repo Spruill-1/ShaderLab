@@ -131,7 +131,7 @@ L"Script batch mode (parameter sweeps without HTTP round-trips):\n"
 L"  --script PATH            JSON file with an array of MCP ops to run\n"
 L"                           against the loaded graph. Each op is either\n"
 L"                           {method,path,body} (raw HTTP shape) or\n"
-L"                           {op,...} shorthand (set-property, image-stats,\n"
+L"                           {op,...} shorthand (set-property, pixel-region,\n"
 L"                           pixel-region, capture-node, render).\n"
 L"                           In script mode --node and --output are not\n"
 L"                           required; instead provide --script-output for\n"
@@ -406,11 +406,18 @@ int RunRender(const Args& args)
             }
         }
     }
-    // Two-pass evaluate: the second pass picks up any effects that needed
-    // the first pass to instantiate. Mirrors the pattern in the test runner
-    // and in MainWindow::RenderFrame.
+    // Two-pass evaluate inside an active D2D draw session so that
+    // DispatchUserD3D11Compute's internal DrawImage actually renders.
+    // (Outside BeginDraw/EndDraw, DrawImage silently no-ops and any
+    // D3D11 compute analysis reads black input.)
+    dc->SetTarget(nullptr);
+    dc->BeginDraw();
     evaluator.Evaluate(graph, dc.get());
     evaluator.Evaluate(graph, dc.get());
+    evaluator.ProcessDeferredCompute(graph, dc.get());
+    if (graph.HasDirtyNodes())
+        evaluator.Evaluate(graph, dc.get());
+    dc->EndDraw();
 
     auto* node = graph.FindNode(args.nodeId);
     if (!node->cachedOutput) {
@@ -653,7 +660,6 @@ struct HeadlessSink : ShaderLab::Mcp::IEngineCommandSink
 //
 // Shorthand mappings (so common sweep ops don't need the verbose form):
 //   set-property   -> POST /graph/set-property
-//   image-stats    -> POST /render/image-stats
 //   pixel-region   -> POST /render/pixel-region
 //   capture-node   -> POST /render/capture-node
 //   render         -> internal: forces a fresh evaluation (useful as a
@@ -745,8 +751,47 @@ int RunScript(const Args& args)
     }
 
     auto runEval = [&]() {
+        // Propagate dirty flags downstream so D3D11 compute effects
+        // re-dispatch when upstream sources change. Mirrors the BFS
+        // walk in MainWindow::OnRenderTick -- without this, a
+        // set-property on an upstream node only re-evaluates that
+        // node, leaving downstream analysis nodes' cached output
+        // stale.
+        {
+            std::vector<uint32_t> queue;
+            for (const auto& node : graph.Nodes())
+                if (node.dirty) queue.push_back(node.id);
+            for (size_t i = 0; i < queue.size(); ++i)
+            {
+                for (const auto* edge : graph.GetOutputEdges(queue[i]))
+                {
+                    auto* dn = graph.FindNode(edge->destNodeId);
+                    if (dn && !dn->dirty)
+                    {
+                        dn->dirty = true;
+                        queue.push_back(edge->destNodeId);
+                    }
+                }
+            }
+        }
+
+        // Wrap the evaluator passes in a D2D draw session.
+        // DispatchUserD3D11Compute internally calls dc->DrawImage to
+        // pre-render the upstream chain into an FP32 bitmap before
+        // handing the texture off to D3D11. Without an active
+        // BeginDraw/EndDraw, that DrawImage silently no-ops and the
+        // compute shader reads a black texture (Min/Max/Mean = 0).
+        // Mirrors MainWindow::RenderFrame's structure.
+        dc->SetTarget(nullptr);
+        dc->BeginDraw();
         evaluator.Evaluate(graph, dc.get());
         evaluator.Evaluate(graph, dc.get());  // two-pass for late init
+        evaluator.ProcessDeferredCompute(graph, dc.get());
+        // Some compute nodes mark downstream dirty; one more sweep
+        // picks those up while the draw session is still active.
+        if (graph.HasDirtyNodes())
+            evaluator.Evaluate(graph, dc.get());
+        dc->EndDraw();
     };
     runEval();  // initial frame so capture/pixel-region routes have something to read
 
@@ -868,7 +913,6 @@ int RunScript(const Args& args)
                 bodyStr.data(), bn, nullptr, nullptr);
 
             if      (op == L"set-property")  { method = L"POST"; path = L"/graph/set-property";  body = bodyStr; }
-            else if (op == L"image-stats")   { method = L"POST"; path = L"/render/image-stats";  body = bodyStr; }
             else if (op == L"pixel-region")  { method = L"POST"; path = L"/render/pixel-region"; body = bodyStr; }
             else if (op == L"capture-node")  { method = L"POST"; path = L"/render/capture-node"; body = bodyStr; }
             else if (op == L"get-graph")     { method = L"GET";  path = L"/graph";               body.clear(); }

@@ -897,99 +897,6 @@ namespace ShaderLab::Mcp
                 });
         }
 
-        // ---- POST /render/image-stats — GPU reduction over a node ----------
-        void RegisterImageStats(McpHttpServer& server, IEngineCommandSink& sink)
-        {
-            server.AddRoute(L"POST", L"/render/image-stats",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
-                {
-                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
-                        WDJ::JsonObject jo{ nullptr };
-                        if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
-                            return Json(400, R"({"error":"Invalid JSON body"})");
-                        if (!jo.HasKey(L"nodeId"))
-                            return Json(400, R"({"error":"Missing required field: nodeId"})");
-
-                        uint32_t nodeId = static_cast<uint32_t>(jo.GetNamedNumber(L"nodeId"));
-                        bool nonzeroOnly = jo.HasKey(L"nonzeroOnly") && jo.GetNamedBoolean(L"nonzeroOnly");
-
-                        // Parse channel list (default: all five). The engine
-                        // takes uint32_t channel codes: 0=luminance, 1=r, 2=g,
-                        // 3=b, 4=a.
-                        std::vector<uint32_t>    chans;
-                        std::vector<std::string> chanNames;
-                        auto addChan = [&](const std::string& name, uint32_t code) {
-                            chans.push_back(code);
-                            chanNames.push_back(name);
-                        };
-                        if (jo.HasKey(L"channels"))
-                        {
-                            auto arr = jo.GetNamedArray(L"channels");
-                            for (uint32_t i = 0; i < arr.Size(); ++i)
-                            {
-                                auto n = WideToUtf8(arr.GetStringAt(i));
-                                if      (n == "luminance" || n == "y") addChan("luminance", 0);
-                                else if (n == "r")                     addChan("r", 1);
-                                else if (n == "g")                     addChan("g", 2);
-                                else if (n == "b")                     addChan("b", 3);
-                                else if (n == "a")                     addChan("a", 4);
-                                else
-                                    return Json(400, "{\"error\":\"Unknown channel: " + n + "\"}");
-                            }
-                        }
-                        if (chans.empty())
-                        {
-                            addChan("luminance", 0);
-                            addChan("r", 1);
-                            addChan("g", 2);
-                            addChan("b", 3);
-                            addChan("a", 4);
-                        }
-
-                        // Force a fresh frame, then resolve the node's image.
-                        if (ctx.renderFrame) ctx.renderFrame();
-                        auto* node = ctx.graph->FindNode(nodeId);
-                        if (!node)
-                            return Json(404, "{\"error\":\"Node " + std::to_string(nodeId) + " not found\"}");
-                        if (!node->cachedOutput || node->dirty)
-                            return Json(409, "{\"error\":\"Node " + std::to_string(nodeId)
-                                + " not yet evaluated\",\"notReady\":true}");
-
-                        // GraphEvaluator's DC type is ID2D1DeviceContext5; ours is
-                        // ID2D1DeviceContext. Cast through Q/I-style wrapper.
-                        auto* dc5 = static_cast<ID2D1DeviceContext5*>(ctx.dc);
-                        auto stats = ctx.evaluator->ComputeStandaloneStats(
-                            dc5, node->cachedOutput, chans, nonzeroOnly);
-                        if (stats.size() != chans.size())
-                            return Json(500, R"({"error":"GPU reduction failed"})");
-
-                        // Build response (matches pre-migration JSON shape exactly).
-                        std::string json = "{\"nodeId\":" + std::to_string(nodeId)
-                            + ",\"nonzeroOnly\":" + (nonzeroOnly ? "true" : "false")
-                            + ",\"channels\":[";
-                        char buf[512];
-                        for (size_t i = 0; i < stats.size(); ++i)
-                        {
-                            if (i) json += ",";
-                            const auto& s = stats[i];
-                            float nzPct = (s.totalPixels > 0)
-                                ? static_cast<float>(s.nonzeroPixels) / static_cast<float>(s.totalPixels) : 0.0f;
-                            int n = std::snprintf(buf, sizeof(buf),
-                                "{\"channel\":\"%s\",\"min\":%.6f,\"max\":%.6f,\"mean\":%.6f"
-                                ",\"median\":%.6f,\"p95\":%.6f,\"sum\":%.6f"
-                                ",\"samples\":%u,\"totalPixels\":%u,\"nonzeroPixels\":%u,\"nonzeroFraction\":%.6f}",
-                                chanNames[i].c_str(), s.min, s.max, s.mean, s.median, s.p95, s.sum,
-                                static_cast<unsigned>(s.samples),
-                                static_cast<unsigned>(s.totalPixels),
-                                static_cast<unsigned>(s.nonzeroPixels),
-                                nzPct);
-                            json.append(buf, n);
-                        }
-                        json += "]}";
-                        return Json(200, json);
-                    });
-                });
-        }
 
         void RegisterPixelRegion(McpHttpServer& server, IEngineCommandSink& sink)
         {
@@ -1661,7 +1568,6 @@ namespace ShaderLab::Mcp
         RegisterClear(server, sink);
         RegisterLoad(server, sink);
         RegisterSetProperty(server, sink);
-        RegisterImageStats(server, sink);
         RegisterPixelRegion(server, sink);
         RegisterGetGraph(server, sink);
         RegisterCustomEffects(server, sink);

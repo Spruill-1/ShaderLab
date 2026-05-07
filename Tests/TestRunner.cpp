@@ -549,6 +549,57 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
         TEST("ThreeNodeChain", inv && HasOutput(*inv));
     }
 
+    // Direct exercise of Luminance Statistics (D3D11 compute path) so we can
+    // tell whether a Mean=0 readback is a Luminance Statistics-specific bug
+    // or something the headless host introduces.
+    void TestLuminanceStatistics()
+    {
+        printf("\n=== Luminance Statistics (D3D11 compute) ===\n");
+        auto& registry = ShaderLab::Effects::ShaderLabEffects::Instance();
+        auto* lumDesc = registry.FindByName(L"Luminance Statistics");
+        if (!lumDesc) { TEST("LumStatsDescriptorFound", false); return; }
+
+        ShaderLab::Graph::EffectGraph g;
+        ShaderLab::Effects::SourceNodeFactory sf;
+        auto srcNode = ShaderLab::Effects::ShaderLabEffects::CreateNode(
+            *registry.FindByName(L"Gamut Source"));
+        auto statsNode = ShaderLab::Effects::ShaderLabEffects::CreateNode(*lumDesc);
+        auto srcId = g.AddNode(std::move(srcNode));
+        auto statsId = g.AddNode(std::move(statsNode));
+        g.Connect(srcId, 0, statsId, 0);
+        Evaluate(g, sf);
+        // Wrap ProcessDeferredCompute in a BeginDraw/EndDraw because
+        // DispatchUserD3D11Compute calls dc->DrawImage internally, and
+        // outside an active draw session that DrawImage is a silent
+        // no-op (the compute shader reads a black input texture).
+        // Mirrors MainWindow::RenderFrame's structure.
+        g_dc->SetTarget(nullptr);
+        g_dc->BeginDraw();
+        g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+        g_dc->EndDraw();
+
+        auto* n = g.FindNode(statsId);
+        TEST("LumStats_NodeExists", n != nullptr);
+        if (!n) return;
+        TEST("LumStats_AnalysisFieldsPopulated", !n->analysisOutput.fields.empty());
+
+        float mean = 0.0f, maxVal = 0.0f;
+        for (const auto& f : n->analysisOutput.fields) {
+            if (f.name == L"Mean") mean = f.components[0];
+            if (f.name == L"Max")  maxVal = f.components[0];
+        }
+        // Gamut Source at Luminance=80 covers part of the 64x64 image with
+        // gamut-shaped fill. Max should reach ~80 nits; Mean should be a
+        // small but positive fraction of that. Both being 0 is the
+        // "DrawImage outside draw session" failure mode.
+        TEST("LumStats_MaxIsPositive", maxVal > 0.0f);
+        TEST("LumStats_MeanIsPositive", mean > 0.0f);
+        if (mean == 0.0f || maxVal == 0.0f) {
+            printf("    (debug) Mean=%.4f Max=%.4f -- D3D11 dispatch likely not reading source\n",
+                mean, maxVal);
+        }
+    }
+
     // ----- Phase 7 spike: headless pixel readback ----------------------------
     //
     // The Phase 7 plan to move the MCP server engine-side and add a
@@ -728,6 +779,7 @@ int main(int argc, char* argv[])
     TestClockNode();
     TestShaderCompilation();
     TestEffectChain();
+    TestLuminanceStatistics();
     TestHeadlessReadback();
 
     // ---- Math test bench (Phase 2) -----------------------------------------

@@ -88,26 +88,35 @@ try {
     Remove-Item $bin
 
     # ---- Script batch mode (--script) -------------------------------------
-    # Validates that loading a graph + walking an array of MCP-style ops
-    # via the engine route registry produces a structured JSON response
-    # document. The 2x luminance set-property invariant catches:
-    #   * set-property routing to /graph/set-property
+    # Validates the standard MCP workflow for ad-hoc analysis: insert a
+    # Luminance Statistics node, connect upstream, evaluate, read fields,
+    # mutate upstream parameter, re-evaluate, read fields again. The 2.5x
+    # luminance set-property invariant catches:
+    #   * graph mutation routing (add-node, connect, set-property)
+    #   * ProcessDeferredCompute dispatching D3D11 compute analysis nodes
     #   * dirty propagation through the evaluator
-    #   * image-stats re-evaluating before reduction
+    #   * /analysis/{id} returning the freshly-populated typed fields
     #   * shorthand op -> route translation in RunScript
+    #
+    # Fixture has Gamut Source as node id=1 and nextId=2, so the new
+    # Luminance Statistics node will be id=2 deterministically.
     $scriptText = @'
 {
   "steps": [
-    { "op": "image-stats", "nodeId": 1 },
+    { "method": "POST", "path": "/graph/add-node", "body": {"effectName":"Luminance Statistics"} },
+    { "method": "POST", "path": "/graph/connect", "body": {"srcId":1,"srcPin":0,"dstId":2,"dstPin":0} },
+    { "op": "render" },
+    { "op": "analysis", "nodeId": 2 },
     { "op": "set-property", "nodeId": 1, "key": "Luminance", "value": 200.0 },
-    { "op": "image-stats", "nodeId": 1 }
+    { "op": "render" },
+    { "op": "analysis", "nodeId": 2 }
   ]
 }
 '@
     $scriptPath = Join-Path $env:TEMP "shaderlab_smoke_script_$([guid]::NewGuid().ToString('N')).json"
     $scriptOut  = Join-Path $env:TEMP "shaderlab_smoke_script_out_$([guid]::NewGuid().ToString('N')).json"
     Set-Content -Path $scriptPath -Value $scriptText -Encoding UTF8
-    Write-Host "Script batch: 3 steps -> $scriptOut"
+    Write-Host "Script batch: 7 steps -> $scriptOut"
     & $exe --graph $fixture --script $scriptPath --script-output $scriptOut --adapter warp
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Script mode exited $LASTEXITCODE"
@@ -120,33 +129,35 @@ try {
         exit 1
     }
     $doc = Get-Content $scriptOut -Raw | ConvertFrom-Json
-    if ($doc.stepCount -ne 3 -or $doc.results.Count -ne 3) {
+    if ($doc.stepCount -ne 7 -or $doc.results.Count -ne 7) {
         Remove-Item $scriptPath, $scriptOut
-        Write-Error "Script result count $($doc.results.Count) != 3"
+        Write-Error "Script result count $($doc.results.Count) != 7"
         exit 1
     }
-    $statusBefore = $doc.results[0].status
-    $statusAfter  = $doc.results[2].status
-    if ($statusBefore -ne 200 -or $statusAfter -ne 200) {
+    foreach ($i in 0..6) {
+        if ($doc.results[$i].status -ne 200) {
+            Remove-Item $scriptPath, $scriptOut
+            Write-Error "Step $i did not return 200 (got $($doc.results[$i].status))"
+            exit 1
+        }
+    }
+    # Pull Mean field from the Luminance Statistics analysis output before
+    # and after the set-property. Doubling the source Luminance (80 -> 200)
+    # should produce a 2.5x rise in the Mean nit value.
+    $meanBefore = ($doc.results[3].body.fields | Where-Object name -eq 'Mean').value[0]
+    $meanAfter  = ($doc.results[6].body.fields | Where-Object name -eq 'Mean').value[0]
+    if ($meanBefore -le 0 -or $meanAfter -le 0) {
         Remove-Item $scriptPath, $scriptOut
-        Write-Error "Image-stats steps did not return 200 (got $statusBefore, $statusAfter)"
+        Write-Error "Mean values were zero (before=$meanBefore, after=$meanAfter)"
         exit 1
     }
-    # Luminance=80 vs 200 -> mean ratio should be 2.5x.
-    $lumBefore = ($doc.results[0].body.channels | Where-Object channel -eq 'luminance').mean
-    $lumAfter  = ($doc.results[2].body.channels | Where-Object channel -eq 'luminance').mean
-    if ($lumBefore -le 0 -or $lumAfter -le 0) {
-        Remove-Item $scriptPath, $scriptOut
-        Write-Error "Luminance means were zero (before=$lumBefore, after=$lumAfter)"
-        exit 1
-    }
-    $ratio = $lumAfter / $lumBefore
+    $ratio = $meanAfter / $meanBefore
     if ([math]::Abs($ratio - 2.5) -gt 0.05) {
         Remove-Item $scriptPath, $scriptOut
-        Write-Error "Luminance ratio $ratio not ~2.5 (set-property -> image-stats invariant broken)"
+        Write-Error "Mean ratio $ratio not ~2.5 (set-property -> Luminance Statistics invariant broken)"
         exit 1
     }
-    Write-Host "PASS: script batch ratio $('{0:N3}' -f $ratio) ~ 2.5 (set-property -> image-stats end-to-end)"
+    Write-Host "PASS: script batch ratio $('{0:N3}' -f $ratio) ~ 2.5 (graph-node analysis end-to-end)"
     Remove-Item $scriptPath, $scriptOut
 
     exit 0

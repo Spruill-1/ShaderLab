@@ -6,7 +6,6 @@
 #include "../Effects/CustomPixelShaderEffect.h"
 #include "../Effects/CustomComputeShaderEffect.h"
 #include "../Effects/ShaderCompiler.h"
-#include "GpuReduction.h"
 #include "D3D11ComputeRunner.h"
 
 namespace ShaderLab::Rendering
@@ -57,24 +56,6 @@ namespace ShaderLab::Rendering
         // Update an existing cached effect's shader bytecode in-place (for recompile).
         // If the effect isn't cached yet, does nothing (next Evaluate will create it).
         void UpdateNodeShader(uint32_t nodeId, const Graph::EffectNode& node);
-
-        // Compute statistics for an arbitrary D2D image without mutating any
-        // graph node.  Pre-renders the image to a fresh FP32 GPU bitmap (reusing
-        // PreRenderInputBitmap) and runs a separate GpuReduction pass per
-        // requested channel.
-        //
-        // channels: list of GpuReduction channel codes
-        //   0 = luminance (Rec.709), 1 = R, 2 = G, 3 = B, 4 = A.
-        // nonzeroOnly: if true, samples with all-zero RGB are excluded (matches
-        //              the per-node analysis behaviour).
-        //
-        // Returns one ImageStats per channel in the order requested.  Returns an
-        // empty vector if pre-render fails or any channel reduction fails.
-        std::vector<ImageStats> ComputeStandaloneStats(
-            ID2D1DeviceContext5* dc,
-            ID2D1Image* inputImage,
-            const std::vector<uint32_t>& channels,
-            bool nonzeroOnly);
 
     private:
         // Create or retrieve the cached D2D effect for a built-in effect node.
@@ -159,9 +140,6 @@ namespace ShaderLab::Rendering
         // but source effects generate their own content.
         winrt::com_ptr<ID2D1Bitmap1> m_dummySourceBitmap;
         void EnsureDummySourceBitmap(ID2D1DeviceContext5* dc);
-
-        // GPU compute shader reduction for image statistics.
-        GpuReduction m_gpuReduction;
 
         // Per-node D3D11 compute runners for user-authored D3D11 compute effects.
         std::unordered_map<uint32_t, std::unique_ptr<D3D11ComputeRunner>> m_d3d11RunnerCache;

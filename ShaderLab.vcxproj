@@ -154,7 +154,7 @@
     <ClInclude Include="Rendering\DisplayMonitor.h" />
     <ClInclude Include="Rendering\DisplayProfile.h" />
     <ClInclude Include="Rendering\GraphEvaluator.h" />
-    <ClInclude Include="Rendering\GpuReduction.h" />
+    <ClInclude Include="Rendering\D3D11ComputeRunner.h" />
     <ClInclude Include="Rendering\D3D11ComputeRunner.h" />
     <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
