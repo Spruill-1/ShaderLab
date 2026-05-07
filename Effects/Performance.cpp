@@ -51,4 +51,16 @@ namespace ShaderLab::Performance
     {
         g_skipped.fetch_add(1, std::memory_order_relaxed);
     }
+
+    namespace { std::atomic<uint32_t> g_hintThrottleMs{ 2000 }; }
+
+    uint32_t CpuAnalysisHintThrottleMs()
+    {
+        return g_hintThrottleMs.load(std::memory_order_relaxed);
+    }
+
+    void SetCpuAnalysisHintThrottleMs(uint32_t ms)
+    {
+        g_hintThrottleMs.store(ms, std::memory_order_relaxed);
+    }
 }

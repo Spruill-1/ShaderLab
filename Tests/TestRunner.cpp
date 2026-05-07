@@ -1073,6 +1073,70 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
 
             ShaderLab::Performance::SetGpuBindingsEnabled(false);
         }
+
+        // ---- Sub-test 4: hint throttle ---------------------------------
+        // With throttle large, repeated frames with the same hint do NOT
+        // re-readback so SkippedCpuReadbacks() advances. With throttle 0,
+        // every frame reads back so the skipped counter stays put.
+        {
+            ShaderLab::Effects::SourceNodeFactory sf;
+            ShaderLab::Graph::EffectGraph g;
+            uint32_t srcId, statsId, ictcpId;
+            buildGraph(g, srcId, statsId, ictcpId);
+            // Drop the LumStats <- ICtCp binding so LumStats is purely
+            // a host-hint readback target (no CPU-routed binding consumer
+            // would force readback every frame).
+            g.UnbindProperty(ictcpId, L"TargetPeakNits");
+
+            ShaderLab::Performance::SetGpuBindingsEnabled(true);
+            ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(true);
+            ShaderLab::Performance::SetCpuAnalysisHintThrottleMs(60'000);
+            g_evaluator.SetCpuAnalysisInterest({ statsId });
+
+            // First eval pair (fresh hint -> read).
+            Evaluate(g, sf);
+            g_dc->SetTarget(nullptr);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+            Evaluate(g, sf);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+
+            uint64_t beforeSkipped = ShaderLab::Performance::SkippedCpuReadbacks();
+            for (int i = 0; i < 4; ++i)
+            {
+                Evaluate(g, sf);
+                g_dc->BeginDraw();
+                g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+                g_dc->EndDraw();
+            }
+            uint64_t afterSkipped = ShaderLab::Performance::SkippedCpuReadbacks();
+            TEST("SkipReadback_HintThrottleSkipsRepeatFrames",
+                 afterSkipped > beforeSkipped);
+
+            ShaderLab::Performance::SetCpuAnalysisHintThrottleMs(0);
+            // With throttle=0 every frame should re-read LumStats, so the
+            // hinted node gets a fresh value. Mutate fields then check
+            // it gets repopulated by the next ProcessDeferredCompute.
+            auto* statsNode = g.FindNode(statsId);
+            if (statsNode)
+                statsNode->analysisOutput.fields.clear();
+            Evaluate(g, sf);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+            bool refreshed = statsNode &&
+                statsNode->analysisOutput.type == ShaderLab::Graph::AnalysisOutputType::Typed &&
+                !statsNode->analysisOutput.fields.empty();
+            TEST("SkipReadback_ThrottleZeroReadsHintEveryFrame", refreshed);
+
+            ShaderLab::Performance::SetCpuAnalysisHintThrottleMs(2000);
+            g_evaluator.ClearCpuAnalysisInterest();
+            ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(false);
+            ShaderLab::Performance::SetGpuBindingsEnabled(false);
+        }
     }
     //
     // The Phase 7 plan to move the MCP server engine-side and add a

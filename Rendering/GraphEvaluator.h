@@ -67,8 +67,23 @@ namespace ShaderLab::Rendering
         // as feeding a non-GPU-served binding will get readback.
         // When the skip-readback flag is off (the default), this set
         // is ignored and every compute dispatch reads back to CPU.
+        //
+        // Throttling: nodes that are newly added to interest get an
+        // immediate readback; subsequent frames are throttled to
+        // Performance::CpuAnalysisHintThrottleMs (default 2000 ms,
+        // 0.5 Hz). Re-selecting a node after it left interest treats
+        // it as fresh.
         void SetCpuAnalysisInterest(std::unordered_set<uint32_t> ids)
         {
+            // Drop the throttle timestamp for any node that left the
+            // interest set so a subsequent re-selection reads back
+            // immediately rather than waiting for the throttle window.
+            for (auto it = m_lastHintReadbackTime.begin();
+                 it != m_lastHintReadbackTime.end();)
+            {
+                if (!ids.count(it->first)) it = m_lastHintReadbackTime.erase(it);
+                else ++it;
+            }
             m_cpuAnalysisInterest = std::move(ids);
         }
         void AddCpuAnalysisInterest(uint32_t id)
@@ -78,6 +93,7 @@ namespace ShaderLab::Rendering
         void ClearCpuAnalysisInterest()
         {
             m_cpuAnalysisInterest.clear();
+            m_lastHintReadbackTime.clear();
         }
 
     private:
@@ -204,6 +220,20 @@ namespace ShaderLab::Rendering
         // populated on the CPU this frame (currently-selected node, MCP
         // targets, etc). Default empty.
         std::unordered_set<uint32_t> m_cpuAnalysisInterest;
+
+        // Phase 8c hint throttle: per-node timestamp of the last
+        // host-hint-driven readback. Used to rate-limit the selected-
+        // node / canvas-label readback to ~0.5 Hz (configurable via
+        // Performance::CpuAnalysisHintThrottleMs). Newly hinted nodes
+        // (added to interest after not being there) get an immediate
+        // readback because their entry is missing from this map.
+        // Hinted nodes that drop out of interest have their timestamp
+        // forgotten so re-selecting them later behaves as a fresh hint.
+        // CPU-routed bindings bypass this map entirely -- they always
+        // need a fresh value because the consumer reads it directly
+        // from `analysisOutput.fields` every frame.
+        std::unordered_map<uint32_t, std::chrono::steady_clock::time_point>
+            m_lastHintReadbackTime;
 
         // Phase 8 perf: per-input FP32 pre-render cache used by
         // ProcessDeferredCompute to amortize the source DrawImage

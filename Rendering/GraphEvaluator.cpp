@@ -683,9 +683,24 @@ namespace ShaderLab::Rendering
         std::unordered_set<uint32_t> needsReadback;
         if (skipFlag)
         {
-            // Seed with host hints.
-            needsReadback = m_cpuAnalysisInterest;
-            // Add every source whose binding cannot be GPU-served.
+            // Throttle host-hint readbacks (selected node, canvas value
+            // labels) to Performance::CpuAnalysisHintThrottleMs. CPU-
+            // routed bindings (added below) are unaffected because the
+            // consumer reads `analysisOutput.fields` every frame.
+            const auto throttle = std::chrono::milliseconds(
+                Performance::CpuAnalysisHintThrottleMs());
+            const auto nowTs = std::chrono::steady_clock::now();
+            for (uint32_t id : m_cpuAnalysisInterest)
+            {
+                auto it = m_lastHintReadbackTime.find(id);
+                const bool freshHint = (it == m_lastHintReadbackTime.end());
+                const bool dueAgain = !freshHint && (nowTs - it->second) >= throttle;
+                if (freshHint || dueAgain || throttle.count() == 0)
+                    needsReadback.insert(id);
+            }
+            // Add every source whose binding cannot be GPU-served. These
+            // are the consumers actual data dependencies and run every
+            // frame regardless of throttle.
             for (const auto& consumerNode : graph.Nodes())
             {
                 for (const auto& [propName, binding] : consumerNode.propertyBindings)
@@ -799,8 +814,17 @@ namespace ShaderLab::Rendering
             if (!preRendered)
                 preRendered = preRenderShared(deferred.inputImage);
 
+            const bool readback = isReadbackNeeded(node->id);
             DispatchViaBridge(dc, graph, *node, deferred.inputImage,
-                preRendered, bridge, isReadbackNeeded(node->id));
+                preRendered, bridge, readback);
+
+            // Phase 8c: record the timestamp for hinted nodes whose
+            // readback actually ran this frame so the throttle window
+            // starts now. Bindings-driven readbacks (consumer needs CPU
+            // value) intentionally don't update this map -- they fire
+            // every frame regardless of throttle.
+            if (readback && skipFlag && m_cpuAnalysisInterest.count(node->id))
+                m_lastHintReadbackTime[node->id] = std::chrono::steady_clock::now();
 
             bool hasImageOutput = !node->outputPins.empty();
             if (hasImageOutput && node->cachedOutput)
@@ -1347,6 +1371,7 @@ namespace ShaderLab::Rendering
         m_customImplCache.clear();
         m_bridgeImplCache.clear();
         m_sharedPreRenderCache.clear();
+        m_lastHintReadbackTime.clear();
         m_dummySourceBitmap = nullptr;
     }
 

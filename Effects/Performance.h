@@ -62,6 +62,20 @@ namespace ShaderLab::Performance
     SHADERLAB_API uint64_t SkippedCpuReadbacks();
     SHADERLAB_API void IncrementSkippedCpuReadbacks();
 
+    // Phase 8c throttle: when skip-readback is enabled, host-hinted CPU
+    // analysis reads (the selected-node Properties panel display, the
+    // node-graph canvas value labels) are throttled to this interval.
+    // CPU-routed *property bindings* are unaffected -- they still get
+    // a fresh value every frame because their consumer needs it.
+    //
+    // Default: 2000 ms (0.5 Hz). Static graphs effectively read once
+    // per selection because the values dont change between throttled
+    // readbacks; video graphs update twice per second which matches
+    // human-readable refresh rate. Set to 0 to disable throttling
+    // (every frame for hinted nodes).
+    SHADERLAB_API uint32_t CpuAnalysisHintThrottleMs();
+    SHADERLAB_API void SetCpuAnalysisHintThrottleMs(uint32_t ms);
+
     // Telemetry: count of bindings the evaluator detected as GPU-routable
     // since process start (whether or not actually routed).
     SHADERLAB_API uint64_t GpuBindingDetections();
