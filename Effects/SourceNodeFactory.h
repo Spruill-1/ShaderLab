@@ -5,6 +5,8 @@
 #include "../Graph/EffectNode.h"
 #include "ImageLoader.h"
 #include "VideoSourceProvider.h"
+#include "DxgiDuplicationSourceProvider.h"
+#include "WindowsGraphicsCaptureSourceProvider.h"
 
 namespace ShaderLab::Effects
 {
@@ -39,6 +41,14 @@ namespace ShaderLab::Effects
             const std::wstring& filePath,
             const std::wstring& displayName = L"");
 
+        static Graph::EffectNode CreateDxgiDuplicateOutputSourceNode(
+            uint32_t adapterIndex,
+            uint32_t outputIndex,
+            const std::wstring& displayName = L"");
+
+        static Graph::EffectNode CreateWindowsGraphicsCaptureSourceNode(
+            const std::wstring& displayName = L"Windows Graphics Capture");
+
         // Returns true if the file extension indicates a video file.
         static bool IsVideoFile(const std::wstring& filePath);
 
@@ -65,6 +75,14 @@ namespace ShaderLab::Effects
             ID2D1DeviceContext5* dc,
             double deltaSeconds);
 
+        bool TickAndUploadLiveCaptures(
+            std::vector<Graph::EffectNode>& nodes,
+            ID2D1DeviceContext5* dc);
+
+        void RegisterGraphicsCaptureItem(
+            uint32_t nodeId,
+            winrt::Windows::Graphics::Capture::GraphicsCaptureItem const& item);
+
         // Get the video provider for a node (for UI controls).
         VideoSourceProvider* GetVideoProvider(uint32_t nodeId);
 
@@ -82,6 +100,10 @@ namespace ShaderLab::Effects
 
         // Cached video providers: nodeId → video provider.
         std::unordered_map<uint32_t, std::unique_ptr<VideoSourceProvider>> m_videoCache;
+
+        std::unordered_map<uint32_t, std::unique_ptr<DxgiDuplicationSourceProvider>> m_dxgiCaptureCache;
+        std::unordered_map<uint32_t, std::unique_ptr<WindowsGraphicsCaptureSourceProvider>> m_wgcCaptureCache;
+        std::unordered_map<uint32_t, std::optional<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>> m_pendingWgcItems;
 
         // Last clock-driven seek time per node — used to detect a paused
         // Clock so the video doesn't free-run when the bound Time stops

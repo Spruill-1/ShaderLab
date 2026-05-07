@@ -192,6 +192,7 @@ namespace winrt::ShaderLab::implementation
         void OnAddFloodSourceClicked(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        winrt::fire_and_forget AddWindowsGraphicsCaptureSourceAsync();
         void OnNodeAdded(uint32_t nodeId);
         void OnPreviewPointerDragged(
             winrt::Windows::Foundation::IInspectable const& sender,
@@ -304,9 +305,12 @@ namespace winrt::ShaderLab::implementation
         winrt::com_ptr<ID2D1SolidColorBrush> m_graphGridBrush;
         uint32_t m_graphPanelWidth{ 0 };
         uint32_t m_graphPanelHeight{ 0 };
+        float m_graphPanelDipsWidth{ 0.0f };
+        float m_graphPanelDipsHeight{ 0.0f };
 
         void InitializeGraphPanel();
-        void ResizeGraphPanel(uint32_t w, uint32_t h);
+        void ResizeGraphPanel(float widthDips, float heightDips);
+        void UpdateGraphPanelScale();
         void RenderNodeGraph();
         D2D1_POINT_2F GraphPanelPointerToCanvas(
             winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);

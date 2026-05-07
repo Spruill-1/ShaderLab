@@ -1,345 +1,157 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <ItemGroup>
-    <Filter Include="Graph">
-      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Rendering">
-      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Effects">
-      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Controls">
-      <UniqueIdentifier>{D9D6E242-F8AF-4e16-AE04-014B56B4B6F0}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Assets">
-      <UniqueIdentifier>{A1E28C87-1D94-4BAA-9B68-5C43B0E9F248}</UniqueIdentifier>
-    </Filter>
-  </ItemGroup>
-  <!-- Header Files -->
-  <ItemGroup>
-    <ClInclude Include="pch.h" />
-    <ClInclude Include="App.xaml.h" />
-    <ClInclude Include="MainWindow.xaml.h" />
-    <ClInclude Include="Graph\NodeType.h">
-      <Filter>Graph</Filter>
-    </ClInclude>
-    <ClInclude Include="Graph\PropertyValue.h">
-      <Filter>Graph</Filter>
-    </ClInclude>
-    <ClInclude Include="Graph\EffectNode.h">
-      <Filter>Graph</Filter>
-    </ClInclude>
-    <ClInclude Include="Graph\EffectEdge.h">
-      <Filter>Graph</Filter>
-    </ClInclude>
-    <ClInclude Include="Graph\EffectGraph.h">
-      <Filter>Graph</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\DisplayInfo.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\DisplayMonitor.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\DisplayProfile.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\PipelineFormat.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\RenderEngine.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\GraphEvaluator.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\GpuReduction.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\D3D11ComputeRunner.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\IccProfileParser.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\FalseColorOverlay.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Effects\ImageLoader.h">
-      <Filter>Effects</Filter>
-    </ClInclude>
-    <ClInclude Include="Effects\SourceNodeFactory.h">
-      <Filter>Effects</Filter>
-    </ClInclude>
-    <ClInclude Include="Effects\EffectRegistry.h">
-      <Filter>Effects</Filter>
-    </ClInclude>
-    <ClInclude Include="Effects\PropertyMetadata.h">
-      <Filter>Effects</Filter>
-    </ClInclude>
-    <ClInclude Include="Effects\ShaderCompiler.h">
-      <Filter>Effects</Filter>
-    </ClInclude>
-    <ClInclude Include="Effects\ShaderLabEffects.h">
-      <Filter>Effects</Filter>
-    </ClInclude>
-    <ClInclude Include="Effects\VideoSourceProvider.h">
-      <Filter>Effects</Filter>
-    </ClInclude>
-    <ClInclude Include="Effects\CustomPixelShaderEffect.h">
-      <Filter>Effects</Filter>
-    </ClInclude>
-    <ClInclude Include="Effects\CustomComputeShaderEffect.h">
-      <Filter>Effects</Filter>
-    </ClInclude>
-    <ClInclude Include="Effects\StatisticsEffect.h">
-      <Filter>Effects</Filter>
-    </ClInclude>
-    <ClInclude Include="Controls\ShaderEditorController.h">
-      <Filter>Controls</Filter>
-    </ClInclude>
-    <ClInclude Include="Controls\NodeGraphController.h">
-      <Filter>Controls</Filter>
-    </ClInclude>
-    <ClInclude Include="Controls\OutputWindow.h">
-      <Filter>Controls</Filter>
-    </ClInclude>
-    <ClInclude Include="Controls\NodeLog.h">
-      <Filter>Controls</Filter>
-    </ClInclude>
-    <ClInclude Include="Controls\LogWindow.h">
-      <Filter>Controls</Filter>
-    </ClInclude>
-    <ClInclude Include="Controls\PixelInspectorController.h">
-      <Filter>Controls</Filter>
-    </ClInclude>
-    <ClInclude Include="Controls\PixelTraceController.h">
-      <Filter>Controls</Filter>
-    </ClInclude>
-    <ClInclude Include="Version.h" />
-  </ItemGroup>
-  <!-- Source Files -->
-  <ItemGroup>
-    <ClCompile Include="pch.cpp" />
-    <ClCompile Include="App.xaml.cpp" />
-    <ClCompile Include="MainWindow.xaml.cpp" />
-    <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
-    <ClCompile Include="Rendering\RenderEngine.cpp">
-      <Filter>Rendering</Filter>
-    </ClCompile>
-    <ClCompile Include="Controls\ShaderEditorController.cpp">
-      <Filter>Controls</Filter>
-    </ClCompile>
-    <ClCompile Include="Controls\NodeGraphController.cpp">
-      <Filter>Controls</Filter>
-    </ClCompile>
-    <ClCompile Include="Controls\OutputWindow.cpp">
-      <Filter>Controls</Filter>
-    </ClCompile>
-    <ClCompile Include="Controls\LogWindow.cpp">
-      <Filter>Controls</Filter>
-    </ClCompile>
-    <ClCompile Include="Controls\PixelInspectorController.cpp">
-      <Filter>Controls</Filter>
-    </ClCompile>
-    <ClCompile Include="Controls\PixelTraceController.cpp">
-      <Filter>Controls</Filter>
-    </ClCompile>
-    <ClCompile Include="MainWindow.McpRoutes.cpp" />
-  </ItemGroup>
-  <!-- XAML -->
-  <ItemGroup>
-    <ApplicationDefinition Include="App.xaml" />
-    <Page Include="MainWindow.xaml" />
-  </ItemGroup>
-  <!-- IDL -->
-  <ItemGroup>
-    <Midl Include="MainWindow.idl" />
-  </ItemGroup>
-  <!-- Assets -->
-  <ItemGroup>
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\SplashScreen.scale-200.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square150x150Logo.scale-200.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Wide310x150Logo.scale-200.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\SmallTile.scale-100.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\SmallTile.scale-125.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\SmallTile.scale-150.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\SmallTile.scale-200.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\SmallTile.scale-400.png">
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\LargeTile.scale-100.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\LargeTile.scale-125.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\LargeTile.scale-150.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\LargeTile.scale-200.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\LargeTile.scale-400.png">
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.targetsize-16.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.targetsize-24.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.targetsize-32.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.targetsize-48.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.targetsize-256.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.altform-unplated_targetsize-16.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.altform-unplated_targetsize-24.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.altform-unplated_targetsize-32.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.altform-unplated_targetsize-48.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.altform-unplated_targetsize-256.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.altform-lightunplated_targetsize-16.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.altform-lightunplated_targetsize-24.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.altform-lightunplated_targetsize-32.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.altform-lightunplated_targetsize-48.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\Square44x44Logo.scale-200.altform-lightunplated_targetsize-256.png">
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\StoreLogo.scale-100.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\StoreLogo.scale-125.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\StoreLogo.scale-150.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\StoreLogo.scale-200.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\StoreLogo.scale-400.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\BadgeLogo.scale-100.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\BadgeLogo.scale-125.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\BadgeLogo.scale-150.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\BadgeLogo.scale-200.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\BadgeLogo.scale-400.png">
-      <Filter>Assets</Filter>
-    </Image>
-  </ItemGroup>
-  <!-- Other -->
-  <ItemGroup>
-    <None Include="packages.config" />
-    <Manifest Include="app.manifest" />
-    <AppxManifest Include="Package.appxmanifest" />
-    <None Include=".github\workflows\ci.yml" />
-    <None Include=".github\workflows\release.yml" />
-    <None Include=".gitignore" />
-    <None Include="scripts\Install.ps1" />
-    <None Include="ShaderLab.vcxproj.filters" />
-    <None Include="scripts\EnsureMiniz.ps1" />
-  </ItemGroup>
   <ItemGroup>
     <Natvis Include="$(MSBuildThisFileDirectory)..\..\natvis\wil.natvis" />
     <Natvis Include="$(MSBuildThisFileDirectory)..\..\natvis\wil.natstepfilter" />
   </ItemGroup>
   <ItemGroup>
+    <Manifest Include="app.manifest" />
+  </ItemGroup>
+  <ItemGroup>
+    <ApplicationDefinition Include="App.xaml" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Controls\NodeGraphController.cpp" />
+    <ClCompile Include="Controls\OutputWindow.cpp" />
+    <ClCompile Include="Controls\LogWindow.cpp" />
+    <ClCompile Include="Controls\PixelInspectorController.cpp" />
+    <ClCompile Include="Controls\PixelTraceController.cpp" />
+    <ClCompile Include="Controls\ShaderEditorController.cpp" />
+    <ClCompile Include="pch.cpp" />
+    <ClCompile Include="MainWindow.McpRoutes.cpp" />
+    <ClCompile Include="MainWindow.GraphFileIo.cpp" />
+    <ClCompile Include="MainWindow.RenderTick.cpp" />
+    <ClCompile Include="MainWindow.WorkingSpace.cpp" />
+    <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
+    <ClCompile Include="Rendering\RenderEngine.cpp" />
+    <ClCompile Include="Effects\DxgiDuplicationSourceProvider.cpp" />
+    <ClCompile Include="Effects\WindowsGraphicsCaptureSourceProvider.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Controls\NodeGraphController.h" />
+    <ClInclude Include="Controls\OutputWindow.h" />
+    <ClInclude Include="Controls\NodeLog.h" />
+    <ClInclude Include="Controls\LogWindow.h" />
+    <ClInclude Include="Controls\PixelInspectorController.h" />
+    <ClInclude Include="Controls\PixelTraceController.h" />
+    <ClInclude Include="Controls\ShaderEditorController.h" />
+    <ClInclude Include="Effects\CustomComputeShaderEffect.h" />
+    <ClInclude Include="Effects\CustomPixelShaderEffect.h" />
+    <ClInclude Include="Effects\EffectRegistry.h" />
+    <ClInclude Include="Effects\PropertyMetadata.h" />
+    <ClInclude Include="Effects\ImageLoader.h" />
+    <ClInclude Include="Effects\ShaderCompiler.h" />
+    <ClInclude Include="Effects\ShaderLabEffects.h" />
+    <ClInclude Include="Effects\VideoSourceProvider.h" />
+    <ClInclude Include="Version.h" />
+    <ClInclude Include="Effects\SourceNodeFactory.h" />
+    <ClInclude Include="Graph\EffectEdge.h" />
+    <ClInclude Include="Graph\EffectGraph.h" />
+    <ClInclude Include="Graph\EffectNode.h" />
+    <ClInclude Include="Graph\NodeType.h" />
+    <ClInclude Include="Graph\PropertyValue.h" />
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="Rendering\DisplayInfo.h" />
+    <ClInclude Include="Rendering\DisplayMonitor.h" />
+    <ClInclude Include="Rendering\DisplayProfile.h" />
+    <ClInclude Include="Rendering\GraphEvaluator.h" />
+    <ClInclude Include="Rendering\GpuReduction.h" />
+    <ClInclude Include="Rendering\D3D11ComputeRunner.h" />
+    <ClInclude Include="Effects\StatisticsEffect.h" />
+    <ClInclude Include="Rendering\IccProfileParser.h" />
+    <ClInclude Include="Rendering\PipelineFormat.h" />
+    <ClInclude Include="Rendering\RenderEngine.h" />
+    <ClInclude Include="Rendering\ToneMapper.h" />
+    <ClInclude Include="Rendering\FalseColorOverlay.h" />
+    <ClInclude Include="Effects\DxgiDuplicationSourceProvider.h" />
+    <ClInclude Include="Effects\WindowsGraphicsCaptureSourceProvider.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Assets\BadgeLogo.scale-100.png" />
+    <Image Include="Assets\BadgeLogo.scale-125.png" />
+    <Image Include="Assets\BadgeLogo.scale-150.png" />
+    <Image Include="Assets\BadgeLogo.scale-200.png" />
+    <Image Include="Assets\BadgeLogo.scale-400.png" />
+    <Image Include="Assets\LargeTile.scale-100.png" />
+    <Image Include="Assets\LargeTile.scale-125.png" />
+    <Image Include="Assets\LargeTile.scale-150.png" />
+    <Image Include="Assets\LargeTile.scale-200.png" />
+    <Image Include="Assets\LargeTile.scale-400.png" />
+    <Image Include="Assets\SmallTile.scale-100.png" />
+    <Image Include="Assets\SmallTile.scale-125.png" />
+    <Image Include="Assets\SmallTile.scale-150.png" />
+    <Image Include="Assets\SmallTile.scale-200.png" />
+    <Image Include="Assets\SmallTile.scale-400.png" />
+    <Image Include="Assets\SplashScreen.scale-100.png" />
+    <Image Include="Assets\SplashScreen.scale-125.png" />
+    <Image Include="Assets\SplashScreen.scale-150.png" />
+    <Image Include="Assets\SplashScreen.scale-200.png" />
+    <Image Include="Assets\SplashScreen.scale-400.png" />
+    <Image Include="Assets\Square150x150Logo.scale-100.png" />
+    <Image Include="Assets\Square150x150Logo.scale-125.png" />
+    <Image Include="Assets\Square150x150Logo.scale-150.png" />
+    <Image Include="Assets\Square150x150Logo.scale-200.png" />
+    <Image Include="Assets\Square150x150Logo.scale-400.png" />
+    <Image Include="Assets\Square44x44Logo.altform-lightunplated_targetsize-16.png" />
+    <Image Include="Assets\Square44x44Logo.altform-lightunplated_targetsize-24.png" />
+    <Image Include="Assets\Square44x44Logo.altform-lightunplated_targetsize-256.png" />
+    <Image Include="Assets\Square44x44Logo.altform-lightunplated_targetsize-32.png" />
+    <Image Include="Assets\Square44x44Logo.altform-lightunplated_targetsize-48.png" />
+    <Image Include="Assets\Square44x44Logo.altform-unplated_targetsize-16.png" />
+    <Image Include="Assets\Square44x44Logo.altform-unplated_targetsize-256.png" />
+    <Image Include="Assets\Square44x44Logo.altform-unplated_targetsize-32.png" />
+    <Image Include="Assets\Square44x44Logo.altform-unplated_targetsize-48.png" />
+    <Image Include="Assets\Square44x44Logo.scale-100.png" />
+    <Image Include="Assets\Square44x44Logo.scale-125.png" />
+    <Image Include="Assets\Square44x44Logo.scale-150.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.altform-lightunplated_targetsize-16.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.altform-lightunplated_targetsize-24.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.altform-lightunplated_targetsize-256.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.altform-lightunplated_targetsize-32.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.altform-lightunplated_targetsize-48.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.altform-unplated_targetsize-16.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.altform-unplated_targetsize-24.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.altform-unplated_targetsize-256.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.altform-unplated_targetsize-32.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.altform-unplated_targetsize-48.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.targetsize-16.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.targetsize-24.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.targetsize-256.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.targetsize-32.png" />
+    <Image Include="Assets\Square44x44Logo.scale-200.targetsize-48.png" />
+    <Image Include="Assets\Square44x44Logo.scale-400.png" />
+    <Image Include="Assets\Square44x44Logo.targetsize-16.png" />
+    <Image Include="Assets\Square44x44Logo.targetsize-24.png" />
+    <Image Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png" />
+    <Image Include="Assets\Square44x44Logo.targetsize-256.png" />
+    <Image Include="Assets\Square44x44Logo.targetsize-32.png" />
+    <Image Include="Assets\Square44x44Logo.targetsize-48.png" />
+    <Image Include="Assets\StoreLogo.scale-100.png" />
+    <Image Include="Assets\StoreLogo.scale-125.png" />
+    <Image Include="Assets\StoreLogo.scale-150.png" />
+    <Image Include="Assets\StoreLogo.scale-200.png" />
+    <Image Include="Assets\StoreLogo.scale-400.png" />
+    <Image Include="Assets\Wide310x150Logo.scale-100.png" />
+    <Image Include="Assets\Wide310x150Logo.scale-125.png" />
+    <Image Include="Assets\Wide310x150Logo.scale-150.png" />
+    <Image Include="Assets\Wide310x150Logo.scale-200.png" />
+    <Image Include="Assets\Wide310x150Logo.scale-400.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <AppxManifest Include="Package.appxmanifest" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include=".github\workflows\ci.yml" />
+    <None Include=".github\workflows\release.yml" />
+    <None Include=".gitignore" />
+    <None Include="packages.config" />
+    <None Include="scripts\EnsureMiniz.ps1" />
+    <None Include="scripts\Install.ps1" />
+    <None Include="ShaderLab.vcxproj.filters" />
+  </ItemGroup>
+  <ItemGroup>
+    <Page Include="MainWindow.xaml" />
     <Page Include="EffectDesignerWindow.xaml" />
   </ItemGroup>
 </Project>

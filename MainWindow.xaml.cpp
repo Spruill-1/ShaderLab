@@ -10,6 +10,7 @@
 #include "Rendering/PixelReadback.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/StatisticsEffect.h"
+#include "Effects/DxgiDuplicationSourceProvider.h"
 #include "Version.h"
 #include "EngineExport.h"
 #include <microsoft.ui.xaml.media.dxinterop.h>
@@ -180,10 +181,16 @@ namespace winrt::ShaderLab::implementation
         PreviewPanel().Loaded([this](auto&&, auto&&) { OnPreviewPanelLoaded(); });
         NodeGraphPanel().SizeChanged([this](auto&&, winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& e)
         {
-            // Use DIP dimensions directly — DXGI stretches to physical pixels.
-            auto w = static_cast<uint32_t>((std::max)(1.0f, static_cast<float>(e.NewSize().Width)));
-            auto h = static_cast<uint32_t>((std::max)(1.0f, static_cast<float>(e.NewSize().Height)));
-            ResizeGraphPanel(w, h);
+            ResizeGraphPanel(
+                static_cast<float>(e.NewSize().Width),
+                static_cast<float>(e.NewSize().Height));
+        });
+        NodeGraphPanel().CompositionScaleChanged([this](auto&&, auto&&)
+        {
+            UpdateGraphPanelScale();
+            ResizeGraphPanel(
+                static_cast<float>(NodeGraphPanel().ActualWidth()),
+                static_cast<float>(NodeGraphPanel().ActualHeight()));
         });
         NodeGraphContainer().PointerPressed({ this, &MainWindow::OnGraphPanelPointerPressed });
         NodeGraphContainer().PointerMoved({ this, &MainWindow::OnGraphPanelPointerMoved });
@@ -1285,6 +1292,44 @@ namespace winrt::ShaderLab::implementation
                         BrowseVideoForSourceNode();
                     });
                     subItem.Items().Append(videoSourceItem);
+
+                    auto dxgiCaptureGroup = MUX::MenuFlyoutSubItem();
+                    dxgiCaptureGroup.Text(L"DXGI DuplicateOutput");
+                    auto outputs = ::ShaderLab::Effects::DxgiDuplicationSourceProvider::EnumerateOutputs();
+                    for (const auto& output : outputs)
+                    {
+                        auto item = MUX::MenuFlyoutItem();
+                        std::wstring text = output.deviceName.empty()
+                            ? std::format(L"Adapter {} Output {}", output.adapterIndex, output.outputIndex)
+                            : std::format(L"{} ({},{})", output.deviceName, output.adapterIndex, output.outputIndex);
+                        item.Text(winrt::hstring(text));
+                        item.Click([this, output, text](auto&&, auto&&)
+                        {
+                            auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateDxgiDuplicateOutputSourceNode(
+                                output.adapterIndex,
+                                output.outputIndex,
+                                L"DXGI " + text);
+                            auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
+                            OnNodeAdded(nodeId);
+                        });
+                        dxgiCaptureGroup.Items().Append(item);
+                    }
+                    if (dxgiCaptureGroup.Items().Size() == 0)
+                    {
+                        auto unavailable = MUX::MenuFlyoutItem();
+                        unavailable.Text(L"No outputs available");
+                        unavailable.IsEnabled(false);
+                        dxgiCaptureGroup.Items().Append(unavailable);
+                    }
+                    subItem.Items().Append(dxgiCaptureGroup);
+
+                    auto wgcSourceItem = MUX::MenuFlyoutItem();
+                    wgcSourceItem.Text(L"Windows Graphics Capture...");
+                    wgcSourceItem.Click([this](auto&&, auto&&)
+                    {
+                        AddWindowsGraphicsCaptureSourceAsync();
+                    });
+                    subItem.Items().Append(wgcSourceItem);
                 }
             }
 
@@ -1452,6 +1497,31 @@ namespace winrt::ShaderLab::implementation
 
         auto* graphNode = m_graph.FindNode(nodeId);
         if (graphNode && m_renderEngine.D2DDeviceContext())
+        {
+            m_sourceFactory.PrepareSourceNode(*graphNode, m_renderEngine.D2DDeviceContext(), 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+        }
+
+        OnNodeAdded(nodeId);
+    }
+
+    winrt::fire_and_forget MainWindow::AddWindowsGraphicsCaptureSourceAsync()
+    {
+        auto strong = get_strong();
+
+        winrt::Windows::Graphics::Capture::GraphicsCapturePicker picker;
+        picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
+
+        auto item = co_await picker.PickSingleItemAsync();
+        if (!item) co_return;
+
+        std::wstring name = item.DisplayName().empty()
+            ? L"Windows Graphics Capture"
+            : std::wstring(item.DisplayName().c_str());
+        auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateWindowsGraphicsCaptureSourceNode(name);
+        auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
+        m_sourceFactory.RegisterGraphicsCaptureItem(nodeId, item);
+
+        if (auto* graphNode = m_graph.FindNode(nodeId); graphNode && m_renderEngine.D2DDeviceContext())
         {
             m_sourceFactory.PrepareSourceNode(*graphNode, m_renderEngine.D2DDeviceContext(), 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
         }
@@ -2007,10 +2077,15 @@ namespace winrt::ShaderLab::implementation
             return;
 
         auto panel = NodeGraphPanel();
-        m_graphPanelWidth = static_cast<uint32_t>((std::max)(1.0f, static_cast<float>(panel.ActualWidth())));
-        m_graphPanelHeight = static_cast<uint32_t>((std::max)(1.0f, static_cast<float>(panel.ActualHeight())));
-        if (m_graphPanelWidth == 0) m_graphPanelWidth = 400;
-        if (m_graphPanelHeight == 0) m_graphPanelHeight = 300;
+        m_graphPanelDipsWidth = (std::max)(1.0f, static_cast<float>(panel.ActualWidth()));
+        m_graphPanelDipsHeight = (std::max)(1.0f, static_cast<float>(panel.ActualHeight()));
+        if (m_graphPanelDipsWidth <= 1.0f) m_graphPanelDipsWidth = 400.0f;
+        if (m_graphPanelDipsHeight <= 1.0f) m_graphPanelDipsHeight = 300.0f;
+
+        float scaleX = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleX()));
+        float scaleY = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleY()));
+        m_graphPanelWidth = static_cast<uint32_t>((std::max)(1.0f, std::ceil(m_graphPanelDipsWidth * scaleX)));
+        m_graphPanelHeight = static_cast<uint32_t>((std::max)(1.0f, std::ceil(m_graphPanelDipsHeight * scaleY)));
 
         DXGI_SWAP_CHAIN_DESC1 desc{};
         desc.Width = m_graphPanelWidth;
@@ -2036,6 +2111,7 @@ namespace winrt::ShaderLab::implementation
         // Bind swap chain to the panel.
         auto panelNative = panel.as<ISwapChainPanelNative>();
         panelNative->SetSwapChain(m_graphSwapChain.get());
+        UpdateGraphPanelScale();
 
         // Create render target.
         auto* dc = m_renderEngine.D2DDeviceContext();
@@ -2048,14 +2124,28 @@ namespace winrt::ShaderLab::implementation
         dc->CreateBitmapFromDxgiSurface(surface.get(), bmpProps, m_graphRenderTarget.put());
 
         m_nodeGraphController.SetViewportSize(
-            static_cast<float>(m_graphPanelWidth),
-            static_cast<float>(m_graphPanelHeight));
+            m_graphPanelDipsWidth,
+            m_graphPanelDipsHeight);
     }
 
-    void MainWindow::ResizeGraphPanel(uint32_t w, uint32_t h)
+    void MainWindow::ResizeGraphPanel(float widthDips, float heightDips)
     {
+        auto panel = NodeGraphPanel();
+        m_graphPanelDipsWidth = (std::max)(1.0f, widthDips);
+        m_graphPanelDipsHeight = (std::max)(1.0f, heightDips);
+
+        float scaleX = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleX()));
+        float scaleY = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleY()));
+        auto w = static_cast<uint32_t>((std::max)(1.0f, std::ceil(m_graphPanelDipsWidth * scaleX)));
+        auto h = static_cast<uint32_t>((std::max)(1.0f, std::ceil(m_graphPanelDipsHeight * scaleY)));
+
+        m_nodeGraphController.SetViewportSize(m_graphPanelDipsWidth, m_graphPanelDipsHeight);
+
         if (!m_graphSwapChain || (w == m_graphPanelWidth && h == m_graphPanelHeight))
+        {
+            m_nodeGraphController.SetNeedsRedraw();
             return;
+        }
 
         m_graphPanelWidth = w;
         m_graphPanelHeight = h;
@@ -2074,9 +2164,26 @@ namespace winrt::ShaderLab::implementation
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
         dc->CreateBitmapFromDxgiSurface(surface.get(), bmpProps, m_graphRenderTarget.put());
 
-        m_nodeGraphController.SetViewportSize(
-            static_cast<float>(m_graphPanelWidth),
-            static_cast<float>(m_graphPanelHeight));
+        m_nodeGraphController.SetNeedsRedraw();
+    }
+
+    void MainWindow::UpdateGraphPanelScale()
+    {
+        if (!m_graphSwapChain)
+            return;
+
+        winrt::com_ptr<IDXGISwapChain2> swapChain2;
+        if (FAILED(m_graphSwapChain->QueryInterface(IID_PPV_ARGS(swapChain2.put()))))
+            return;
+
+        auto panel = NodeGraphPanel();
+        float scaleX = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleX()));
+        float scaleY = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleY()));
+
+        DXGI_MATRIX_3X2_F matrix{};
+        matrix._11 = 1.0f / scaleX;
+        matrix._22 = 1.0f / scaleY;
+        swapChain2->SetMatrixTransform(&matrix);
     }
 
     void MainWindow::InitializeTraceSwatchPanel()
@@ -2230,18 +2337,16 @@ namespace winrt::ShaderLab::implementation
         winrt::com_ptr<ID2D1Image> oldTarget;
         dc->GetTarget(oldTarget.put());
 
-        // The graph swap chain is sized in DIPs (not physical pixels), so
-        // render at 96 DPI so D2D coordinates match the DIP-based pointer
-        // input.  The XAML compositor handles scaling to physical pixels.
         float oldDpiX, oldDpiY;
         dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
+        float graphDpiX = 96.0f * (std::max)(1.0f, static_cast<float>(NodeGraphPanel().CompositionScaleX()));
+        float graphDpiY = 96.0f * (std::max)(1.0f, static_cast<float>(NodeGraphPanel().CompositionScaleY()));
+        dc->SetDpi(graphDpiX, graphDpiY);
 
         dc->SetTarget(m_graphRenderTarget.get());
         dc->BeginDraw();
 
-        D2D1_SIZE_F viewSize = { static_cast<float>(m_graphPanelWidth),
-                                 static_cast<float>(m_graphPanelHeight) };
+        D2D1_SIZE_F viewSize = { m_graphPanelDipsWidth, m_graphPanelDipsHeight };
         RenderGraphScene(dc, viewSize);
 
         dc->EndDraw();

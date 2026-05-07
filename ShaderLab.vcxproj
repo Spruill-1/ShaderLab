@@ -125,12 +125,14 @@
     <ClInclude Include="Controls\ShaderEditorController.h" />
     <ClInclude Include="Effects\CustomComputeShaderEffect.h" />
     <ClInclude Include="Effects\CustomPixelShaderEffect.h" />
+    <ClInclude Include="Effects\DxgiDuplicationSourceProvider.h" />
     <ClInclude Include="Effects\EffectRegistry.h" />
     <ClInclude Include="Effects\PropertyMetadata.h" />
     <ClInclude Include="Effects\ImageLoader.h" />
     <ClInclude Include="Effects\ShaderCompiler.h" />
     <ClInclude Include="Effects\ShaderLabEffects.h" />
     <ClInclude Include="Effects\VideoSourceProvider.h" />
+    <ClInclude Include="Effects\WindowsGraphicsCaptureSourceProvider.h" />
     <ClInclude Include="Version.h" />
     <ClInclude Include="Effects\SourceNodeFactory.h" />
     <ClInclude Include="Graph\EffectEdge.h" />
