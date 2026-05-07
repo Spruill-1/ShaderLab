@@ -100,6 +100,26 @@ namespace ShaderLab::Effects
         // a non-owning `ID2D1Bitmap1*`. Returns nullptr for analysis-
         // only effects.
         virtual ID2D1Bitmap1* STDMETHODCALLTYPE GetImageOutput() = 0;
+
+        // Phase 8 GPU-binding (consumer side). The evaluator calls
+        // this for each binding it routes upstream-effect-SRV ->
+        // consumer-t-slot before each dispatch. Bindings are cleared
+        // automatically at the end of every Dispatch so a stale
+        // binding doesn't leak into the next frame's dispatch.
+        // Slot is the HLSL `t<slot>` register (1, 2, ...). srv is
+        // the upstream effect's IEngineComputeOutput::GetAnalysisSrv()
+        // result (non-owning -- caller guarantees lifetime through the
+        // dispatch call).
+        virtual HRESULT STDMETHODCALLTYPE SetGpuBinding(
+            UINT32 slot, ID3D11ShaderResourceView* srv) = 0;
+
+        // Set the dispatch dimensions for the next call. Defaults to
+        // (1,1,1) for analysis-only effects; image-producing per-pixel
+        // effects (e.g. ICtCp Tone Map after migration) call this
+        // before Dispatch with (W/tx, H/ty, 1) where tx,ty are the
+        // shader's [numthreads] dimensions.
+        virtual HRESULT STDMETHODCALLTYPE SetDispatchDims(
+            UINT32 x, UINT32 y, UINT32 z) = 0;
     };
 
     // The actual D2D effect class. Implements:
@@ -188,6 +208,11 @@ namespace ShaderLab::Effects
         ID2D1Bitmap1* STDMETHODCALLTYPE GetImageOutput() override
         { return m_imageOutput.get(); }
 
+        HRESULT STDMETHODCALLTYPE SetGpuBinding(
+            UINT32 slot, ID3D11ShaderResourceView* srv) override;
+        HRESULT STDMETHODCALLTYPE SetDispatchDims(
+            UINT32 x, UINT32 y, UINT32 z) override;
+
         // ---- IEngineComputeOutput ----
         HRESULT STDMETHODCALLTYPE GetAnalysisSrv(
             ID3D11ShaderResourceView** out) override;
@@ -229,6 +254,15 @@ namespace ShaderLab::Effects
         UINT32                          m_imageOutputH{ 0 };
 
         UINT64 m_lastEvaluatedFrame{ 0 };
+
+        // Phase 8 GPU-binding state, cleared at end of each Dispatch.
+        std::vector<ID3D11ShaderResourceView*> m_gpuBindingSrvs;
+        std::vector<UINT32>                    m_gpuBindingSlots;
+
+        // Dispatch dimensions for the next call. Default (1,1,1).
+        UINT32 m_dispatchX{ 1 };
+        UINT32 m_dispatchY{ 1 };
+        UINT32 m_dispatchZ{ 1 };
 
         // Helpers.
         HRESULT EnsurePassThroughShader();

@@ -163,7 +163,10 @@ namespace ShaderLab::Rendering
         ID3D11Texture2D* inputTexture,
         const std::vector<BYTE>& cbufferData,
         uint32_t resultCount,
-        ID3D11Texture2D* imageOutputTexture)
+        ID3D11Texture2D* imageOutputTexture,
+        uint32_t dispatchX, uint32_t dispatchY, uint32_t dispatchZ,
+        const std::vector<ID3D11ShaderResourceView*>& extraSrvs,
+        const std::vector<uint32_t>& extraSrvSlots)
     {
         std::vector<float> result;
         if (!m_shader || !m_context || !inputTexture)
@@ -234,17 +237,38 @@ namespace ShaderLab::Rendering
         m_context->CSSetShader(m_shader.get(), nullptr, 0);
         ID3D11ShaderResourceView* srvs[] = { srv.get() };
         m_context->CSSetShaderResources(0, 1, srvs);
+
+        // Phase 8: GPU-bound parameters arrive as extra SRVs. Each
+        // (slot, srv) pair binds the upstream IEngineComputeOutput's
+        // structured-buffer SRV at the consumer's t-slot. Bind
+        // individually so non-contiguous slots (e.g. t1 and t3)
+        // work without a contiguous-array constraint.
+        size_t maxExtra = (std::min)(extraSrvs.size(), extraSrvSlots.size());
+        for (size_t i = 0; i < maxExtra; ++i)
+        {
+            ID3D11ShaderResourceView* one[1] = { extraSrvs[i] };
+            m_context->CSSetShaderResources(extraSrvSlots[i], 1, one);
+        }
+
         ID3D11UnorderedAccessView* uavs[2] = { m_resultUAV.get(), imageUAV.get() };
         UINT uavCount = imageUAV ? 2u : 1u;
         m_context->CSSetUnorderedAccessViews(0, uavCount, uavs, nullptr);
         ID3D11Buffer* cbs[] = { m_cbuffer.get() };
         m_context->CSSetConstantBuffers(0, 1, cbs);
 
-        m_context->Dispatch(1, 1, 1);
+        m_context->Dispatch(
+            (std::max)(dispatchX, 1u),
+            (std::max)(dispatchY, 1u),
+            (std::max)(dispatchZ, 1u));
 
         // Clear shader state.
         ID3D11ShaderResourceView* nullSRV[] = { nullptr };
         m_context->CSSetShaderResources(0, 1, nullSRV);
+        for (size_t i = 0; i < maxExtra; ++i)
+        {
+            ID3D11ShaderResourceView* none[1] = { nullptr };
+            m_context->CSSetShaderResources(extraSrvSlots[i], 1, none);
+        }
         ID3D11UnorderedAccessView* nullUAVs[2] = { nullptr, nullptr };
         m_context->CSSetUnorderedAccessViews(0, uavCount, nullUAVs, nullptr);
         m_context->CSSetShader(nullptr, nullptr, 0);

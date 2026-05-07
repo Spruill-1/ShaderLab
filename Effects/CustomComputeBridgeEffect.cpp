@@ -367,17 +367,45 @@ float4 main(
         // Drive the dispatch through the runner's existing entry. This
         // populates the runner's structured-buffer SRV (analysis output)
         // and reads it back to floats. The image-output side runs in
-        // parallel via a u1 binding the bridge sets up below.
+        // parallel via a u1 binding the bridge sets up below. Phase 8
+        // GPU bindings (m_gpuBindingSrvs / m_gpuBindingSlots) flow
+        // through as extra SRVs at consumer-declared t-slots.
         auto floats = m_runner.DispatchWithImageOutput(
             inputTex.get(),
             cbBytes,
             analysisFloat4Count,
-            m_imageOutputTex.get());
+            m_imageOutputTex.get(),
+            m_dispatchX, m_dispatchY, m_dispatchZ,
+            m_gpuBindingSrvs, m_gpuBindingSlots);
 
         if (outAnalysisFloats)
             *outAnalysisFloats = std::move(floats);
 
+        // Reset per-frame state so the next dispatch starts clean.
+        m_gpuBindingSrvs.clear();
+        m_gpuBindingSlots.clear();
+        m_dispatchX = m_dispatchY = m_dispatchZ = 1;
+
         m_lastEvaluatedFrame++;
+        return S_OK;
+    }
+
+    HRESULT CustomComputeBridgeEffect::SetGpuBinding(
+        UINT32 slot, ID3D11ShaderResourceView* srv)
+    {
+        // Cleared automatically at end of each Dispatch; caller binds
+        // fresh per frame from the evaluator's binding-resolution pass.
+        m_gpuBindingSrvs.push_back(srv);
+        m_gpuBindingSlots.push_back(slot);
+        return S_OK;
+    }
+
+    HRESULT CustomComputeBridgeEffect::SetDispatchDims(
+        UINT32 x, UINT32 y, UINT32 z)
+    {
+        m_dispatchX = x;
+        m_dispatchY = y;
+        m_dispatchZ = z;
         return S_OK;
     }
 

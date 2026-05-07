@@ -70,11 +70,28 @@ namespace ShaderLab::Rendering
         // here while still publishing analysis values to the
         // structured buffer at u0. Pass nullptr for analysis-only.
         // Same readback contract as the regular Dispatch.
+        //
+        // dispatchX/Y/Z: number of thread groups. Defaults to (1,1,1)
+        // for analysis-only effects whose [numthreads] is sized to
+        // cover the analysis output internally (e.g. numthreads(64,1,1)
+        // running a per-thread loop over Width*Height pixels). Image-
+        // producing per-pixel effects pass (W/tx, H/ty, 1) where tx,ty
+        // are the [numthreads] dimensions.
+        //
+        // extraSrvs / extraSrvSlots: Phase 8 GPU-binding extension.
+        // For each entry, the SRV is bound at the named t-slot before
+        // dispatch. Used by the bridge to wire upstream
+        // IEngineComputeOutput SRVs into a consumer's
+        // SHADERLAB_GPU_BUFFER slots without a CPU readback round-trip.
+        // Pass empty vectors for the no-binding case.
         std::vector<float> DispatchWithImageOutput(
             ID3D11Texture2D* inputTexture,
             const std::vector<BYTE>& cbufferData,
             uint32_t resultCount,
-            ID3D11Texture2D* imageOutputTexture);
+            ID3D11Texture2D* imageOutputTexture,
+            uint32_t dispatchX = 1, uint32_t dispatchY = 1, uint32_t dispatchZ = 1,
+            const std::vector<ID3D11ShaderResourceView*>& extraSrvs = {},
+            const std::vector<uint32_t>& extraSrvSlots = {});
 
         bool IsInitialized() const { return m_device != nullptr; }
         bool HasShader() const { return m_shader != nullptr; }
