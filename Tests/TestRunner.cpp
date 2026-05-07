@@ -760,7 +760,14 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
         // outside an active draw session that DrawImage is a silent
         // no-op (the compute shader reads a black input texture).
         // Mirrors MainWindow::RenderFrame's structure.
+        // D2D custom effects need TWO evaluation passes for newly
+        // created effects -- first creates/initializes, second
+        // produces correct output.
         g_dc->SetTarget(nullptr);
+        g_dc->BeginDraw();
+        g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+        g_dc->EndDraw();
+        Evaluate(g, sf);
         g_dc->BeginDraw();
         g_evaluator.ProcessDeferredCompute(g, g_dc.get());
         g_dc->EndDraw();

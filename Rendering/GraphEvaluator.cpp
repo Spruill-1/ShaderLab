@@ -768,6 +768,7 @@ namespace ShaderLab::Rendering
                 }
             }
         }
+
         m_deferredCompute.clear();
         return true;
     }
@@ -1217,6 +1218,7 @@ namespace ShaderLab::Rendering
         m_outputCache.clear();
         m_customImplCache.clear();
         m_bridgeImplCache.clear();
+        m_sharedPreRenderCache.clear();
         m_dummySourceBitmap = nullptr;
     }
 
