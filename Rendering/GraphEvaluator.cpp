@@ -240,7 +240,22 @@ namespace ShaderLab::Rendering
                     bool hasImageOutput = !node->outputPins.empty();
                     // Image-producing compute: recompute when dirty or no cached output.
                     // Analysis-only compute: also recompute if no analysis fields yet.
+                    //
+                    // Phase 8c regression fix: when skip-readback is on AND this
+                    // compute consumer has any property binding, the CPU-side
+                    // binding-change detection (ResolveBindings) can't see
+                    // upstream changes -- the upstream skipped its Map() and
+                    // its `analysisOutput.fields` retain stale values. Without
+                    // this override the consumer's `dirty` flag never flips,
+                    // it never re-dispatches, and downstream rendering shows
+                    // a stale image even though the GPU SRV is fresh. Force
+                    // dispatch in that case so the consumer reads the latest
+                    // upstream SRV every frame.
+                    const bool skipReadbackBypassesDirty =
+                        Performance::IsSkipUnneededCpuReadbackEnabled() &&
+                        !node->propertyBindings.empty();
                     bool needsCompute = node->dirty ||
+                        skipReadbackBypassesDirty ||
                         (hasImageOutput && !node->cachedOutput) ||
                         (!hasImageOutput && node->analysisOutput.fields.empty());
                     if (inputImage && needsCompute)
