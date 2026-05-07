@@ -2314,30 +2314,42 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
         // dark-end lift on typical HDR content.
         {
             static const std::string ictcpToneMapHLSL = R"HLSL(
-// ICtCp Tone Map (HDR -> SDR), I-channel Reinhard with optional mid-bump
+// ICtCp Tone Map (HDR -> SDR), I-channel Reinhard with optional mid-bump.
+// Migrated to D3D11 compute (Phase 8) so it can consume upstream
+// IEngineComputeOutput SRVs directly via the SHADERLAB_GPU_BUFFER macros
+// when SourcePeakNits / TargetPeakNits are bound from a Luminance
+// Statistics or similar producer.
 #include "shaderlab_params.hlsli"
-Texture2D Source : register(t0);
-SamplerState Sampler : register(s0);
 
-// Phase 8 GPU-bindable parameters: when an upstream IEngineComputeOutput
-// drives one of these, the host injects _SLPARAM_<name>_GPU=1 and binds
-// a StructuredBuffer<float4> at the t-slot named here. Otherwise the
-// macros expand to a normal cbuffer slot (current behavior).
+// Inputs / outputs (bridge-provided):
+//   t0 -> input image (FP32 RGBA, scRGB linear)
+//   u1 -> output image (RWTexture2D<float4>, FP32 RGBA, scRGB linear)
+// Plus auto-injected Width/Height in the cbuffer + GPU-bindable params
+// at t1 (SourcePeakNits) and t2 (TargetPeakNits) when GPU mode is on.
+Texture2D<float4>        Source : register(t0);
+RWTexture2D<float4>      ImageOutput : register(u1);
+
 SHADERLAB_GPU_BUFFER(SourcePeakNits, t1)
 SHADERLAB_GPU_BUFFER(TargetPeakNits, t2)
 
 cbuffer constants : register(b0) {
+    uint   Width;
+    uint   Height;
     SHADERLAB_PARAM(float, SourcePeakNits)        // typical 1000-10000
     SHADERLAB_PARAM(float, TargetPeakNits)        // SDR target peak (e.g. 80, 203)
-    float Strength;              // 0..1 lerp from identity to compressed+lifted
-    float ToneLift;              // 0..1 mid-tone lift on top of compression
+    float  Strength;                              // 0..1 lerp from identity to compressed+lifted
+    float  ToneLift;                              // 0..1 mid-tone lift
 };
 
-float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
 {
+    if (dtid.x >= Width || dtid.y >= Height) return;
+
     SHADERLAB_LOAD_PARAM(float, SourcePeakNits)
     SHADERLAB_LOAD_PARAM(float, TargetPeakNits)
-    float4 color = Source.Load(int3(uv, 0));
+
+    float4 color = Source.Load(int3(dtid.xy, 0));
     float3 ictcp = ScRGBToICtCp(color.rgb);
 
     float peakIn  = NitsToI(SourcePeakNits);
@@ -2359,24 +2371,26 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
     ictcp.x = lerp(ictcp.x, lifted, saturate(Strength));
 
     float3 outRgb = ICtCpToScRGB(ictcp);
-    return float4(outRgb, color.a);
+    ImageOutput[dtid.xy] = float4(outRgb, color.a);
 }
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Tone Map (HDR -> SDR)";
-            desc.effectId = L"ICtCp Tone Map"; desc.effectVersion = 11;
+            desc.effectId = L"ICtCp Tone Map"; desc.effectVersion = 12;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + ictcpToneMapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                // SourcePeakNits + TargetPeakNits are flagged gpuBindable
-                // so an upstream Luminance Statistics' Mean / Max can
-                // drive them through the macro library when the GPU-
-                // binding feature flag is on. Default mode (flag off
-                // OR no upstream binding) is the same cbuffer slot the
-                // pre-Phase-8 shader used -- bytecode is byte-identical.
+                // SourcePeakNits + TargetPeakNits remain gpuBindable.
+                // Now in D3D11 compute, the host can route the upstream
+                // SRV directly into the consumer's t-slot via the
+                // bridge's SetGpuBinding -- no CPU readback round-trip.
                 Graph::ParameterDefinition{ L"SourcePeakNits", L"float", 1000.0f, 100.0f, 10000.0f, 50.0f, {}, L"", true },
                 Graph::ParameterDefinition{ L"TargetPeakNits", L"float",  203.0f,  80.0f,   500.0f,  1.0f, {}, L"", true },
                 Graph::ParameterDefinition{ L"Strength",       L"float",    1.0f,   0.0f,     1.0f, 0.05f },
