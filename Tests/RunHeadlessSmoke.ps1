@@ -87,6 +87,68 @@ try {
     Write-Host "PASS: pixel blob $($pbytes.Length) bytes, W=$w H=$h"
     Remove-Item $bin
 
+    # ---- Script batch mode (--script) -------------------------------------
+    # Validates that loading a graph + walking an array of MCP-style ops
+    # via the engine route registry produces a structured JSON response
+    # document. The 2x luminance set-property invariant catches:
+    #   * set-property routing to /graph/set-property
+    #   * dirty propagation through the evaluator
+    #   * image-stats re-evaluating before reduction
+    #   * shorthand op -> route translation in RunScript
+    $scriptText = @'
+{
+  "steps": [
+    { "op": "image-stats", "nodeId": 1 },
+    { "op": "set-property", "nodeId": 1, "key": "Luminance", "value": 200.0 },
+    { "op": "image-stats", "nodeId": 1 }
+  ]
+}
+'@
+    $scriptPath = Join-Path $env:TEMP "shaderlab_smoke_script_$([guid]::NewGuid().ToString('N')).json"
+    $scriptOut  = Join-Path $env:TEMP "shaderlab_smoke_script_out_$([guid]::NewGuid().ToString('N')).json"
+    Set-Content -Path $scriptPath -Value $scriptText -Encoding UTF8
+    Write-Host "Script batch: 3 steps -> $scriptOut"
+    & $exe --graph $fixture --script $scriptPath --script-output $scriptOut --adapter warp
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Script mode exited $LASTEXITCODE"
+        if (Test-Path $scriptPath) { Remove-Item $scriptPath }
+        if (Test-Path $scriptOut)  { Remove-Item $scriptOut }
+        exit $LASTEXITCODE
+    }
+    if (-not (Test-Path $scriptOut)) {
+        Write-Error "Script output not produced at $scriptOut"
+        exit 1
+    }
+    $doc = Get-Content $scriptOut -Raw | ConvertFrom-Json
+    if ($doc.stepCount -ne 3 -or $doc.results.Count -ne 3) {
+        Remove-Item $scriptPath, $scriptOut
+        Write-Error "Script result count $($doc.results.Count) != 3"
+        exit 1
+    }
+    $statusBefore = $doc.results[0].status
+    $statusAfter  = $doc.results[2].status
+    if ($statusBefore -ne 200 -or $statusAfter -ne 200) {
+        Remove-Item $scriptPath, $scriptOut
+        Write-Error "Image-stats steps did not return 200 (got $statusBefore, $statusAfter)"
+        exit 1
+    }
+    # Luminance=80 vs 200 -> mean ratio should be 2.5x.
+    $lumBefore = ($doc.results[0].body.channels | Where-Object channel -eq 'luminance').mean
+    $lumAfter  = ($doc.results[2].body.channels | Where-Object channel -eq 'luminance').mean
+    if ($lumBefore -le 0 -or $lumAfter -le 0) {
+        Remove-Item $scriptPath, $scriptOut
+        Write-Error "Luminance means were zero (before=$lumBefore, after=$lumAfter)"
+        exit 1
+    }
+    $ratio = $lumAfter / $lumBefore
+    if ([math]::Abs($ratio - 2.5) -gt 0.05) {
+        Remove-Item $scriptPath, $scriptOut
+        Write-Error "Luminance ratio $ratio not ~2.5 (set-property -> image-stats invariant broken)"
+        exit 1
+    }
+    Write-Host "PASS: script batch ratio $('{0:N3}' -f $ratio) ~ 2.5 (set-property -> image-stats end-to-end)"
+    Remove-Item $scriptPath, $scriptOut
+
     exit 0
 }
 finally {

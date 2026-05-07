@@ -38,11 +38,15 @@
 #include "EngineExport.h"
 #include "Graph/EffectGraph.h"
 #include "Rendering/GraphEvaluator.h"
+#include "Rendering/DisplayMonitor.h"
 #include "Effects/EffectRegistry.h"
 #include "Effects/SourceNodeFactory.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Rendering/PixelReadback.h"
+#include "Engine/Mcp/McpHttpServer.h"
+#include "Engine/Mcp/EngineMcpRoutes.h"
 
+#include <winrt/Windows.Data.Json.h>
 #include <wincodec.h>
 #include <cstdio>
 #include <cstring>
@@ -84,6 +88,15 @@ namespace
         int32_t      pixelY{ 0 };
         uint32_t     pixelW{ 1 };
         uint32_t     pixelH{ 1 };
+
+        // Script batch mode. When set, the host loads a graph and then
+        // walks an array of MCP-style operations (set-property, image-
+        // stats, capture-node, pixel-region, ...) writing per-step
+        // responses out as a JSON document. Designed for parameter
+        // sweeps where the agent wants 50+ engine queries per session
+        // without paying HTTP round-trip overhead each one.
+        std::wstring scriptPath;
+        std::wstring scriptOutputPath;  // empty -> stdout
     };
 
     void PrintUsage(const wchar_t* exeName)
@@ -112,7 +125,19 @@ L"                           extension .bin/.raw -> packed binary\n"
 L"                           (W,H header as two uint32, then floats);\n"
 L"                           .csv -> text 'x,y,r,g,b,a' rows.\n"
 L"                           Designed for MCP-driven full-accuracy\n"
-L"                           sampling. Region is clipped to image bounds.\n",
+L"                           sampling. Region is clipped to image bounds.\n"
+L"\n"
+L"Script batch mode (parameter sweeps without HTTP round-trips):\n"
+L"  --script PATH            JSON file with an array of MCP ops to run\n"
+L"                           against the loaded graph. Each op is either\n"
+L"                           {method,path,body} (raw HTTP shape) or\n"
+L"                           {op,...} shorthand (set-property, image-stats,\n"
+L"                           pixel-region, capture-node, render).\n"
+L"                           In script mode --node and --output are not\n"
+L"                           required; instead provide --script-output for\n"
+L"                           the per-step response document.\n"
+L"  --script-output PATH     Write the JSON response document here\n"
+L"                           (default: stdout).\n",
             exeName);
     }
 
@@ -173,10 +198,22 @@ L"                           sampling. Region is clipped to image bounds.\n",
                 out.pixelH = static_cast<uint32_t>(parsed[3]);
                 out.pixelMode = true;
             }
+            else if (a == L"--script")        { auto v = needNext(L"--script"); if (!v) return false; out.scriptPath = v; }
+            else if (a == L"--script-output") { auto v = needNext(L"--script-output"); if (!v) return false; out.scriptOutputPath = v; }
             else if (a == L"--help" || a == L"-h" || a == L"-?") { PrintUsage(argv[0]); return false; }
             else { std::wprintf(L"ERROR: unknown argument '%ls'\n", argv[i]); return false; }
         }
-        if (out.graphPath.empty() || out.outputPath.empty() || !out.hasNodeId)
+        // Required-arg policy depends on mode:
+        //   script mode  -> --graph + --script   (--node, --output ignored)
+        //   render mode  -> --graph + --node + --output
+        if (!out.scriptPath.empty())
+        {
+            if (out.graphPath.empty()) {
+                std::wprintf(L"ERROR: --graph is required (script mode)\n");
+                return false;
+            }
+        }
+        else if (out.graphPath.empty() || out.outputPath.empty() || !out.hasNodeId)
         {
             std::wprintf(L"ERROR: --graph, --node, and --output are required\n");
             return false;
@@ -270,6 +307,8 @@ L"                           sampling. Region is clipped to image bounds.\n",
 }
 
 int wmain(int argc, wchar_t* argv[]);
+
+int RunScript(const Args& args);
 
 // Render path extracted into a function so all locals (D2D bitmaps,
 // GraphEvaluator, com_ptrs) destruct cleanly before wmain calls
@@ -585,6 +624,381 @@ int RunRender(const Args& args)
     return 0;
 }
 
+// Headless command sink — synchronous Dispatch (no UI thread to marshal
+// to), all event hooks are no-ops since headless doesn't have a canvas
+// or status bar to keep in sync. The engine routes were designed so
+// that with this sink + a properly populated EngineContext, every
+// route migrated in Phase 7 works identically to the GUI host.
+struct HeadlessSink : ShaderLab::Mcp::IEngineCommandSink
+{
+    std::function<void(ShaderLab::Mcp::EngineContext&)> populateContext;
+
+    ShaderLab::McpHttpServer::Response Dispatch(
+        std::function<ShaderLab::McpHttpServer::Response(
+            ShaderLab::Mcp::EngineContext&)> closure) override
+    {
+        ShaderLab::Mcp::EngineContext ctx{};
+        populateContext(ctx);
+        return closure(ctx);
+    }
+};
+
+// Walk a script JSON document of MCP-style operations, dispatching each
+// through the engine route registry. Output is a JSON document with one
+// {step, status, body} entry per operation.
+//
+// Accepted step shapes:
+//   {"method":"GET|POST", "path":"/...", "body": <object|string>}
+//   {"op":"<shorthand>", ...key/value args...}
+//
+// Shorthand mappings (so common sweep ops don't need the verbose form):
+//   set-property   -> POST /graph/set-property
+//   image-stats    -> POST /render/image-stats
+//   pixel-region   -> POST /render/pixel-region
+//   capture-node   -> POST /render/capture-node
+//   render         -> internal: forces a fresh evaluation (useful as a
+//                     barrier between mutations and readbacks).
+//   get-graph      -> GET  /graph
+//   get-node       -> GET  /graph/node/{nodeId}
+//   analysis       -> GET  /analysis/{nodeId}
+int RunScript(const Args& args)
+{
+    namespace WDJ = winrt::Windows::Data::Json;
+
+    // ---- Engine setup (same shape as RunRender) ---------------------------
+    UINT d3dFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    winrt::com_ptr<ID3D11Device> baseDevice;
+    winrt::com_ptr<ID3D11DeviceContext> baseCtx;
+    HRESULT hr = D3D11CreateDevice(nullptr,
+        args.useWarp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE,
+        nullptr, d3dFlags,
+        featureLevels, ARRAYSIZE(featureLevels),
+        D3D11_SDK_VERSION, baseDevice.put(), nullptr, baseCtx.put());
+    if (FAILED(hr)) {
+        std::wprintf(L"FATAL: D3D11CreateDevice failed 0x%08X\n", static_cast<uint32_t>(hr));
+        return 3;
+    }
+    auto d3dDevice = baseDevice.as<ID3D11Device5>();
+    auto d3dContext = baseCtx.as<ID3D11DeviceContext4>();
+
+    winrt::com_ptr<ID3D10Multithread> mt;
+    d3dDevice.as(mt);
+    if (mt) mt->SetMultithreadProtected(TRUE);
+
+    winrt::com_ptr<ID2D1Factory7> d2dFactory;
+    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        __uuidof(ID2D1Factory7), reinterpret_cast<void**>(d2dFactory.put()));
+
+    winrt::com_ptr<IDXGIDevice> dxgiDev;
+    baseDevice->QueryInterface(dxgiDev.put());
+    winrt::com_ptr<ID2D1Device6> d2dDevice;
+    d2dFactory->CreateDevice(dxgiDev.as<IDXGIDevice>().get(),
+        reinterpret_cast<ID2D1Device**>(d2dDevice.put()));
+    winrt::com_ptr<ID2D1DeviceContext5> dc;
+    d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+        reinterpret_cast<ID2D1DeviceContext**>(dc.put()));
+
+    winrt::com_ptr<ID2D1Factory1> factory1;
+    d2dFactory->QueryInterface(factory1.put());
+    ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
+
+    // ---- Load graph -------------------------------------------------------
+    auto graphJson = ReadFileUtf8(args.graphPath);
+    if (graphJson.empty()) {
+        std::wprintf(L"FATAL: could not read graph file '%ls'\n", args.graphPath.c_str());
+        return 4;
+    }
+    int wcCount = MultiByteToWideChar(CP_UTF8, 0, graphJson.data(),
+        static_cast<int>(graphJson.size()), nullptr, 0);
+    std::wstring graphJsonW(wcCount, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, graphJson.data(),
+        static_cast<int>(graphJson.size()), graphJsonW.data(), wcCount);
+
+    ShaderLab::Graph::EffectGraph graph;
+    try {
+        graph = ShaderLab::Graph::EffectGraph::FromJson(winrt::hstring(graphJsonW));
+    } catch (winrt::hresult_error const& e) {
+        std::wprintf(L"FATAL: graph JSON parse failed (0x%08X): %ls\n",
+            static_cast<uint32_t>(e.code()), e.message().c_str());
+        return 5;
+    }
+
+    ShaderLab::Effects::SourceNodeFactory sourceFactory;
+    ShaderLab::Rendering::GraphEvaluator evaluator;
+    ShaderLab::Rendering::DisplayMonitor displayMonitor;  // headless: live caps default
+
+    // Prep source nodes once (loads media off disk). Properties on
+    // source nodes are typically static (file path); set-property on
+    // them won't trigger re-load, but most sweeps target downstream
+    // effect properties.
+    graph.MarkAllDirty();
+    for (auto& node : const_cast<std::vector<ShaderLab::Graph::EffectNode>&>(graph.Nodes()))
+    {
+        if (node.type == ShaderLab::Graph::NodeType::Source)
+        {
+            try {
+                sourceFactory.PrepareSourceNode(node, dc.get(), 0.0,
+                    d3dDevice.get(), d3dContext.get());
+            } catch (...) {}
+        }
+    }
+
+    auto runEval = [&]() {
+        evaluator.Evaluate(graph, dc.get());
+        evaluator.Evaluate(graph, dc.get());  // two-pass for late init
+    };
+    runEval();  // initial frame so capture/pixel-region routes have something to read
+
+    // ---- Build server + sink + register routes ----------------------------
+    HeadlessSink sink;
+    sink.populateContext = [&](ShaderLab::Mcp::EngineContext& ctx) {
+        ctx.graph          = &graph;
+        ctx.evaluator      = &evaluator;
+        ctx.displayMonitor = &displayMonitor;
+        ctx.sourceFactory  = &sourceFactory;
+        ctx.dc             = dc.get();
+        ctx.d3dDevice      = d3dDevice.get();
+        ctx.d3dContext     = d3dContext.get();
+        ctx.renderFrame    = runEval;  // routes that need fresh eval call this
+    };
+
+    ShaderLab::McpHttpServer server;
+    ShaderLab::Mcp::RegisterEngineRoutes(server, sink);
+
+    // ---- Read script JSON -------------------------------------------------
+    auto scriptText = ReadFileUtf8(args.scriptPath);
+    if (scriptText.empty()) {
+        std::wprintf(L"FATAL: could not read script file '%ls'\n", args.scriptPath.c_str());
+        return 4;
+    }
+    int scriptWc = MultiByteToWideChar(CP_UTF8, 0, scriptText.data(),
+        static_cast<int>(scriptText.size()), nullptr, 0);
+    std::wstring scriptW(scriptWc, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, scriptText.data(),
+        static_cast<int>(scriptText.size()), scriptW.data(), scriptWc);
+
+    // Script can be either a top-level array of steps OR an object with
+    // a "steps" array. The latter leaves room for future top-level
+    // metadata (description, version, env hints) without a breaking
+    // schema change.
+    WDJ::JsonArray steps{ nullptr };
+    {
+        WDJ::JsonValue v{ nullptr };
+        if (!WDJ::JsonValue::TryParse(winrt::hstring(scriptW), v)) {
+            std::wprintf(L"FATAL: script is not valid JSON\n");
+            return 5;
+        }
+        if (v.ValueType() == WDJ::JsonValueType::Array) {
+            steps = v.GetArray();
+        } else if (v.ValueType() == WDJ::JsonValueType::Object) {
+            auto obj = v.GetObject();
+            if (!obj.HasKey(L"steps")) {
+                std::wprintf(L"FATAL: script object must have a 'steps' array\n");
+                return 5;
+            }
+            steps = obj.GetNamedArray(L"steps");
+        } else {
+            std::wprintf(L"FATAL: script must be a JSON array or object with 'steps'\n");
+            return 5;
+        }
+    }
+
+    // ---- Walk steps -------------------------------------------------------
+    // Translate each step to (method, path, body string), invoke the
+    // server, and accumulate {step, status, body} into a result array.
+    // body is parsed as JSON when possible so consumers can navigate
+    // structured fields without re-parsing.
+    auto stepBodyToString = [](const WDJ::JsonValue& v) -> std::string {
+        if (v.ValueType() == WDJ::JsonValueType::String)
+        {
+            // Already-stringified body (escape-hatch when the agent
+            // wants byte-exact control over the request body).
+            auto h = v.GetString();
+            int n = WideCharToMultiByte(CP_UTF8, 0, h.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            std::string s(n > 0 ? n - 1 : 0, '\0');
+            if (n > 0) WideCharToMultiByte(CP_UTF8, 0, h.c_str(), -1, s.data(), n, nullptr, nullptr);
+            return s;
+        }
+        // Object / number / bool / null -> stringify.
+        auto h = v.Stringify();
+        int n = WideCharToMultiByte(CP_UTF8, 0, h.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        std::string s(n > 0 ? n - 1 : 0, '\0');
+        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, h.c_str(), -1, s.data(), n, nullptr, nullptr);
+        return s;
+    };
+
+    WDJ::JsonArray results;
+    for (uint32_t i = 0; i < steps.Size(); ++i)
+    {
+        WDJ::JsonObject stepObj{ nullptr };
+        if (steps.GetAt(i).ValueType() != WDJ::JsonValueType::Object)
+        {
+            WDJ::JsonObject err;
+            err.Insert(L"step", WDJ::JsonValue::CreateNumberValue(i));
+            err.Insert(L"status", WDJ::JsonValue::CreateNumberValue(400));
+            err.Insert(L"error", WDJ::JsonValue::CreateStringValue(L"Step is not an object"));
+            results.Append(err);
+            continue;
+        }
+        stepObj = steps.GetObjectAt(i);
+
+        std::wstring method, path;
+        std::string  body;
+
+        if (stepObj.HasKey(L"op"))
+        {
+            // Shorthand: translate to (method, path, body).
+            auto op = std::wstring(stepObj.GetNamedString(L"op"));
+            WDJ::JsonObject bodyObj;
+            for (auto kv : stepObj)
+            {
+                if (kv.Key() == L"op") continue;
+                bodyObj.Insert(kv.Key(), kv.Value());
+            }
+            // Stringify the body once; reused for every shorthand that
+            // mirrors a POST route. Stringify() returns the canonical
+            // JSON encoding so the engine routes parse it identically
+            // to a real HTTP request body.
+            auto bodyHstr = bodyObj.Stringify();
+            int bn = WideCharToMultiByte(CP_UTF8, 0, bodyHstr.c_str(), -1,
+                nullptr, 0, nullptr, nullptr);
+            std::string bodyStr(bn > 0 ? bn - 1 : 0, '\0');
+            if (bn > 0) WideCharToMultiByte(CP_UTF8, 0, bodyHstr.c_str(), -1,
+                bodyStr.data(), bn, nullptr, nullptr);
+
+            if      (op == L"set-property")  { method = L"POST"; path = L"/graph/set-property";  body = bodyStr; }
+            else if (op == L"image-stats")   { method = L"POST"; path = L"/render/image-stats";  body = bodyStr; }
+            else if (op == L"pixel-region")  { method = L"POST"; path = L"/render/pixel-region"; body = bodyStr; }
+            else if (op == L"capture-node")  { method = L"POST"; path = L"/render/capture-node"; body = bodyStr; }
+            else if (op == L"get-graph")     { method = L"GET";  path = L"/graph";               body.clear(); }
+            else if (op == L"get-node")      {
+                method = L"GET";
+                uint32_t id = stepObj.HasKey(L"nodeId")
+                    ? static_cast<uint32_t>(stepObj.GetNamedNumber(L"nodeId")) : 0;
+                path = L"/graph/node/" + std::to_wstring(id);
+                body.clear();
+            }
+            else if (op == L"analysis")      {
+                method = L"GET";
+                uint32_t id = stepObj.HasKey(L"nodeId")
+                    ? static_cast<uint32_t>(stepObj.GetNamedNumber(L"nodeId")) : 0;
+                path = L"/analysis/" + std::to_wstring(id);
+                body.clear();
+            }
+            else if (op == L"render")        {
+                // Internal: force a fresh evaluation. Useful as a
+                // barrier between a batch of property mutations and a
+                // subsequent readback when the agent wants to be
+                // explicit about ordering. Image-stats / pixel-region /
+                // capture-node already trigger evaluation themselves,
+                // so this is rarely needed.
+                runEval();
+                WDJ::JsonObject ok;
+                ok.Insert(L"step", WDJ::JsonValue::CreateNumberValue(i));
+                ok.Insert(L"status", WDJ::JsonValue::CreateNumberValue(200));
+                WDJ::JsonObject inner;
+                inner.Insert(L"ok", WDJ::JsonValue::CreateBooleanValue(true));
+                ok.Insert(L"body", inner);
+                results.Append(ok);
+                continue;
+            }
+            else
+            {
+                WDJ::JsonObject err;
+                err.Insert(L"step", WDJ::JsonValue::CreateNumberValue(i));
+                err.Insert(L"status", WDJ::JsonValue::CreateNumberValue(400));
+                err.Insert(L"error", WDJ::JsonValue::CreateStringValue(
+                    winrt::hstring(L"Unknown op: " + op)));
+                results.Append(err);
+                continue;
+            }
+        }
+        else if (stepObj.HasKey(L"path"))
+        {
+            method = stepObj.HasKey(L"method")
+                ? std::wstring(stepObj.GetNamedString(L"method"))
+                : L"GET";
+            path = std::wstring(stepObj.GetNamedString(L"path"));
+            if (stepObj.HasKey(L"body"))
+                body = stepBodyToString(stepObj.GetNamedValue(L"body"));
+        }
+        else
+        {
+            WDJ::JsonObject err;
+            err.Insert(L"step", WDJ::JsonValue::CreateNumberValue(i));
+            err.Insert(L"status", WDJ::JsonValue::CreateNumberValue(400));
+            err.Insert(L"error", WDJ::JsonValue::CreateStringValue(
+                L"Step must have either 'op' or 'path'"));
+            results.Append(err);
+            continue;
+        }
+
+        auto resp = server.RouteRequest(method, path, body);
+
+        WDJ::JsonObject entry;
+        entry.Insert(L"step", WDJ::JsonValue::CreateNumberValue(i));
+        entry.Insert(L"method", WDJ::JsonValue::CreateStringValue(winrt::hstring(method)));
+        entry.Insert(L"path", WDJ::JsonValue::CreateStringValue(winrt::hstring(path)));
+        entry.Insert(L"status", WDJ::JsonValue::CreateNumberValue(resp.statusCode));
+
+        // Attempt to parse response body as JSON; fall back to raw
+        // string if parsing fails (e.g. plain text error responses).
+        if (!resp.body.empty())
+        {
+            int rwc = MultiByteToWideChar(CP_UTF8, 0, resp.body.data(),
+                static_cast<int>(resp.body.size()), nullptr, 0);
+            std::wstring rwstr(rwc, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, resp.body.data(),
+                static_cast<int>(resp.body.size()), rwstr.data(), rwc);
+
+            WDJ::JsonValue parsed{ nullptr };
+            if (WDJ::JsonValue::TryParse(winrt::hstring(rwstr), parsed))
+                entry.Insert(L"body", parsed);
+            else
+                entry.Insert(L"body", WDJ::JsonValue::CreateStringValue(winrt::hstring(rwstr)));
+        }
+        else
+        {
+            entry.Insert(L"body", WDJ::JsonValue::CreateNullValue());
+        }
+        results.Append(entry);
+    }
+
+    // ---- Emit response document ------------------------------------------
+    WDJ::JsonObject outDoc;
+    outDoc.Insert(L"abiVersion", WDJ::JsonValue::CreateNumberValue(
+        static_cast<double>(::ShaderLab_GetAbiVersion())));
+    outDoc.Insert(L"stepCount", WDJ::JsonValue::CreateNumberValue(
+        static_cast<double>(steps.Size())));
+    outDoc.Insert(L"results", results);
+
+    auto outH = outDoc.Stringify();
+    int outN = WideCharToMultiByte(CP_UTF8, 0, outH.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string outUtf8(outN > 0 ? outN - 1 : 0, '\0');
+    if (outN > 0) WideCharToMultiByte(CP_UTF8, 0, outH.c_str(), -1, outUtf8.data(), outN, nullptr, nullptr);
+
+    if (!args.scriptOutputPath.empty())
+    {
+        std::ofstream f(args.scriptOutputPath, std::ios::binary);
+        if (!f) {
+            std::wprintf(L"FATAL: cannot open --script-output '%ls' for write\n",
+                args.scriptOutputPath.c_str());
+            return 7;
+        }
+        f.write(outUtf8.data(), static_cast<std::streamsize>(outUtf8.size()));
+        std::wprintf(L"OK: ran %u step(s) -> %ls\n",
+            steps.Size(), args.scriptOutputPath.c_str());
+    }
+    else
+    {
+        std::fwrite(outUtf8.data(), 1, outUtf8.size(), stdout);
+        std::fputc('\n', stdout);
+    }
+
+    return 0;
+}
+
 int wmain(int argc, wchar_t* argv[])
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -612,7 +1026,7 @@ int wmain(int argc, wchar_t* argv[])
     // and other engine objects destruct before MFShutdown / apartment
     // teardown. (GraphEvaluator owns com_ptrs to D2D effects that need
     // the factory alive at destruction time.)
-    int rc = RunRender(args);
+    int rc = !args.scriptPath.empty() ? RunScript(args) : RunRender(args);
 
     ::MFShutdown();
     winrt::uninit_apartment();
