@@ -42,12 +42,15 @@
 #include "Effects/EffectRegistry.h"
 #include "Effects/SourceNodeFactory.h"
 #include "Effects/ShaderLabEffects.h"
+#include "Effects/BytecodeCache.h"
 #include "Rendering/PixelReadback.h"
 #include "Engine/Mcp/McpHttpServer.h"
 #include "Engine/Mcp/EngineMcpRoutes.h"
 
 #include <winrt/Windows.Data.Json.h>
 #include <wincodec.h>
+#include <shlobj.h>
+#include <KnownFolders.h>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -97,6 +100,13 @@ namespace
         // without paying HTTP round-trip overhead each one.
         std::wstring scriptPath;
         std::wstring scriptOutputPath;  // empty -> stdout
+
+        // p8-cache-reaper: bytecode-cache management modes. When set,
+        // the headless host runs the requested op then exits without
+        // loading a graph or starting MCP. Useful for CI / cleanup.
+        bool          reapShaderCache{ false };
+        bool          clearShaderCache{ false };
+        uint64_t      reapStaleSec{ 90ull * 24 * 60 * 60 };  // 90 days default
     };
 
     void PrintUsage(const wchar_t* exeName)
@@ -137,7 +147,19 @@ L"                           In script mode --node and --output are not\n"
 L"                           required; instead provide --script-output for\n"
 L"                           the per-step response document.\n"
 L"  --script-output PATH     Write the JSON response document here\n"
-L"                           (default: stdout).\n",
+L"                           (default: stdout).\n"
+L"\n"
+L"Bytecode cache management (Phase 8 cache reaper):\n"
+L"  --reap-shader-cache      Delete cached shader bytecode (.cso) under\n"
+L"                           %%LOCALAPPDATA%%\\ShaderLab\\bytecode\\ that has not\n"
+L"                           been accessed within --reap-shader-cache-stale-sec\n"
+L"                           seconds. Reports filesDeleted/bytesFreed JSON.\n"
+L"                           Exits without loading a graph.\n"
+L"  --clear-shader-cache     Delete every cached shader bytecode entry.\n"
+L"                           Exits without loading a graph.\n"
+L"  --reap-shader-cache-stale-sec N\n"
+L"                           Threshold in seconds for --reap-shader-cache\n"
+L"                           (default: 7776000 = 90 days).\n",
             exeName);
     }
 
@@ -200,13 +222,25 @@ L"                           (default: stdout).\n",
             }
             else if (a == L"--script")        { auto v = needNext(L"--script"); if (!v) return false; out.scriptPath = v; }
             else if (a == L"--script-output") { auto v = needNext(L"--script-output"); if (!v) return false; out.scriptOutputPath = v; }
+            else if (a == L"--reap-shader-cache")   { out.reapShaderCache = true; }
+            else if (a == L"--clear-shader-cache")  { out.clearShaderCache = true; }
+            else if (a == L"--reap-shader-cache-stale-sec")
+            {
+                auto v = needNext(L"--reap-shader-cache-stale-sec"); if (!v) return false;
+                out.reapStaleSec = static_cast<uint64_t>(std::wcstoull(v, nullptr, 10));
+            }
             else if (a == L"--help" || a == L"-h" || a == L"-?") { PrintUsage(argv[0]); return false; }
             else { std::wprintf(L"ERROR: unknown argument '%ls'\n", argv[i]); return false; }
         }
         // Required-arg policy depends on mode:
+        //   cache mode   -> no required args
         //   script mode  -> --graph + --script   (--node, --output ignored)
         //   render mode  -> --graph + --node + --output
-        if (!out.scriptPath.empty())
+        if (out.reapShaderCache || out.clearShaderCache)
+        {
+            // No further validation -- cache modes don't need a graph.
+        }
+        else if (!out.scriptPath.empty())
         {
             if (out.graphPath.empty()) {
                 std::wprintf(L"ERROR: --graph is required (script mode)\n");
@@ -1061,6 +1095,31 @@ int wmain(int argc, wchar_t* argv[])
             static_cast<unsigned>(SHADERLAB_ENGINE_ABI_VERSION),
             static_cast<unsigned>(::ShaderLab_GetAbiVersion()));
         return 2;
+    }
+
+    // Cache management modes (Phase 8 cache reaper). Run before any
+    // engine init so we don't pay the D3D startup cost for a one-shot
+    // cleanup. Wires the same %LOCALAPPDATA% root the GUI app uses.
+    if (args.reapShaderCache || args.clearShaderCache)
+    {
+        wchar_t* localAppData = nullptr;
+        if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &localAppData)) ||
+            !localAppData)
+        {
+            std::wprintf(L"ERROR: could not resolve %%LOCALAPPDATA%%\n");
+            return 3;
+        }
+        std::wstring cacheRoot = std::wstring(localAppData) + L"\\ShaderLab\\bytecode";
+        ::CoTaskMemFree(localAppData);
+        ShaderLab::Effects::BytecodeCache::Instance().SetDiskCacheRoot(cacheRoot);
+        auto stats = args.clearShaderCache
+            ? ShaderLab::Effects::BytecodeCache::Instance().ClearDisk()
+            : ShaderLab::Effects::BytecodeCache::Instance().ReapDisk(args.reapStaleSec);
+        std::wprintf(
+            L"{\"filesDeleted\":%zu,\"bytesFreed\":%zu,\"errors\":%zu,\"mode\":\"%ls\"}\n",
+            stats.filesDeleted, stats.bytesFreed, stats.errors,
+            args.clearShaderCache ? L"clear" : L"reap");
+        return 0;
     }
 
     winrt::init_apartment();
