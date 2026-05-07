@@ -7,6 +7,7 @@
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/EffectRegistry.h"
 #include "Effects/ShaderCompiler.h"
+#include "Effects/BytecodeCache.h"
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
 
@@ -525,6 +526,129 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
         TEST("ShaderLabParamsHlsli_GpuMode", gpuMode.succeeded);
     }
 
+    // ------------------------------------------------------------------------
+    // BytecodeCache (Phase 8)
+    // ------------------------------------------------------------------------
+
+    void TestBytecodeCache()
+    {
+        printf("\n=== BytecodeCache ===\n");
+        using namespace ShaderLab::Effects;
+        auto& cache = BytecodeCache::Instance();
+        cache.Clear();
+
+        std::string hlsl = R"(
+Texture2D Source : register(t0);
+float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET
+{ return Source.Load(int3(uv0.xy, 0)); }
+)";
+        std::string canonical = CanonicalizeHlslSource(hlsl);
+
+        BytecodeCompileRequest req;
+        req.key.sourceHash         = HashCanonicalSource(canonical);
+        req.key.paramSignatureHash = HashParamSignature({});
+        req.key.includeLibraryHash = IncludeLibraryHash();
+        req.key.macroBitset        = 0;
+        req.key.entryPoint         = "main";
+        req.key.target             = "ps_5_0";
+        req.metadata.effectId      = L"BytecodeCacheTest";
+        req.metadata.version       = 1;
+        req.hlslSource             = canonical;
+
+        // First call -> miss -> inline compile -> Ready.
+        auto r1 = cache.GetOrCompile(req);
+        TEST("BytecodeCache_FirstCompileReady", r1.status == BytecodeStatus::Ready);
+        TEST("BytecodeCache_FirstCompileBytecodeNonEmpty", !r1.bytecode.empty());
+        TEST("BytecodeCache_FirstCompileNotFromCache", !r1.fromCache);
+
+        // Second call with identical key -> cache hit, identical bytecode.
+        auto r2 = cache.GetOrCompile(req);
+        TEST("BytecodeCache_SecondCompileReady", r2.status == BytecodeStatus::Ready);
+        TEST("BytecodeCache_SecondCompileFromCache", r2.fromCache);
+        TEST("BytecodeCache_SecondCompileBytecodeMatches",
+             r2.bytecode.size() == r1.bytecode.size() &&
+             memcmp(r2.bytecode.data(), r1.bytecode.data(), r1.bytecode.size()) == 0);
+
+        // Failed entry caches its diagnostic and doesn't recompile.
+        BytecodeCompileRequest bad = req;
+        bad.hlslSource             = "broken!";
+        bad.key.sourceHash         = HashCanonicalSource(bad.hlslSource);
+        auto bad1 = cache.GetOrCompile(bad);
+        TEST("BytecodeCache_BadCompileFailed", bad1.status == BytecodeStatus::Failed);
+        TEST("BytecodeCache_BadCompileHasDiagnostic", !bad1.errorMessage.empty());
+
+        auto bad2 = cache.GetOrCompile(bad);
+        TEST("BytecodeCache_BadCompileFromCacheOnRetry", bad2.fromCache);
+
+        // Macro bitset participates in identity: same source + different
+        // macro bits should produce a fresh entry, not reuse the
+        // baseline.
+        std::string macroPS = R"(
+#include "shaderlab_params.hlsli"
+Texture2D Source : register(t0);
+SHADERLAB_GPU_BUFFER(Exposure, t1)
+cbuffer Constants : register(b0) {
+    SHADERLAB_PARAM(float, Exposure)
+    float Padding;
+};
+float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
+    SHADERLAB_LOAD_PARAM(float, Exposure)
+    return Source.Load(int3(uv0.xy, 0)) * Exposure;
+}
+)";
+        std::string macroCanonical = CanonicalizeHlslSource(macroPS);
+        BytecodeCompileRequest mBase;
+        mBase.key.sourceHash         = HashCanonicalSource(macroCanonical);
+        mBase.key.paramSignatureHash = HashParamSignature({ "Exposure" });
+        mBase.key.includeLibraryHash = IncludeLibraryHash();
+        mBase.key.macroBitset        = 0;
+        mBase.key.entryPoint         = "main";
+        mBase.key.target             = "ps_5_0";
+        mBase.hlslSource             = macroCanonical;
+        mBase.gpuBindableParamNames  = { "Exposure" };
+
+        auto cb = cache.GetOrCompile(mBase);
+        TEST("BytecodeCache_MacroCbufferOK", cb.status == BytecodeStatus::Ready);
+
+        BytecodeCompileRequest mGpu = mBase;
+        mGpu.key.macroBitset = 1;
+        auto gp = cache.GetOrCompile(mGpu);
+        TEST("BytecodeCache_MacroGpuOK", gp.status == BytecodeStatus::Ready);
+        TEST("BytecodeCache_MacroVariantsDistinct",
+             cb.bytecode.size() != gp.bytecode.size() ||
+             memcmp(cb.bytecode.data(), gp.bytecode.data(), cb.bytecode.size()) != 0);
+
+        // PrecompileCommonShapes enqueues N+1 variants; verify they
+        // become Ready after a brief wait.
+        cache.Clear();
+        BytecodeCacheMetadata meta;
+        meta.effectId = L"PrecompileTest";
+        meta.version  = 1;
+        cache.PrecompileCommonShapes(meta, macroCanonical, "main", "ps_5_0", { "Exposure" });
+
+        // Wait up to 5s for both variants. Drives both the worker
+        // queue and (via timeoutMs) the inline-fallback path.
+        auto waitFor = [&](uint32_t bitset)
+        {
+            BytecodeCompileRequest r;
+            r.key.sourceHash         = HashCanonicalSource(macroCanonical);
+            r.key.paramSignatureHash = HashParamSignature({ "Exposure" });
+            r.key.includeLibraryHash = IncludeLibraryHash();
+            r.key.macroBitset        = bitset;
+            r.key.entryPoint         = "main";
+            r.key.target             = "ps_5_0";
+            r.hlslSource             = macroCanonical;
+            r.gpuBindableParamNames  = { "Exposure" };
+            return cache.GetOrCompile(r, 5000);
+        };
+        auto wb = waitFor(0);
+        auto wg = waitFor(1);
+        TEST("BytecodeCache_PrecompileBaselineReady", wb.status == BytecodeStatus::Ready);
+        TEST("BytecodeCache_PrecompileGpuVariantReady", wg.status == BytecodeStatus::Ready);
+
+        cache.Clear();
+    }
+
     void TestEffectChain()
     {
         printf("\n=== Effect Chain ===\n");
@@ -783,6 +907,7 @@ int main(int argc, char* argv[])
     TestMathNodes();
     TestClockNode();
     TestShaderCompilation();
+    TestBytecodeCache();
     TestEffectChain();
     TestLuminanceStatistics();
     TestHeadlessReadback();
