@@ -2315,18 +2315,28 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
         {
             static const std::string ictcpToneMapHLSL = R"HLSL(
 // ICtCp Tone Map (HDR -> SDR), I-channel Reinhard with optional mid-bump
+#include "shaderlab_params.hlsli"
 Texture2D Source : register(t0);
 SamplerState Sampler : register(s0);
 
+// Phase 8 GPU-bindable parameters: when an upstream IEngineComputeOutput
+// drives one of these, the host injects _SLPARAM_<name>_GPU=1 and binds
+// a StructuredBuffer<float4> at the t-slot named here. Otherwise the
+// macros expand to a normal cbuffer slot (current behavior).
+SHADERLAB_GPU_BUFFER(SourcePeakNits, t1)
+SHADERLAB_GPU_BUFFER(TargetPeakNits, t2)
+
 cbuffer constants : register(b0) {
-    float SourcePeakNits;        // typical 1000-10000
-    float TargetPeakNits;        // SDR target peak (e.g. 80, 203)
+    SHADERLAB_PARAM(float, SourcePeakNits)        // typical 1000-10000
+    SHADERLAB_PARAM(float, TargetPeakNits)        // SDR target peak (e.g. 80, 203)
     float Strength;              // 0..1 lerp from identity to compressed+lifted
     float ToneLift;              // 0..1 mid-tone lift on top of compression
 };
 
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
 {
+    SHADERLAB_LOAD_PARAM(float, SourcePeakNits)
+    SHADERLAB_LOAD_PARAM(float, TargetPeakNits)
     float4 color = Source.Load(int3(uv, 0));
     float3 ictcp = ScRGBToICtCp(color.rgb);
 
@@ -2354,17 +2364,23 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Tone Map (HDR -> SDR)";
-            desc.effectId = L"ICtCp Tone Map"; desc.effectVersion = 10;
+            desc.effectId = L"ICtCp Tone Map"; desc.effectVersion = 11;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + ictcpToneMapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"SourcePeakNits", L"float", 1000.0f, 100.0f, 10000.0f, 50.0f },
-                { L"TargetPeakNits", L"float", 203.0f, 80.0f, 500.0f, 1.0f },
-                { L"Strength",       L"float", 1.0f, 0.0f, 1.0f, 0.05f },
-                { L"ToneLift",       L"float", 0.0f, 0.0f, 1.0f, 0.05f },
+                // SourcePeakNits + TargetPeakNits are flagged gpuBindable
+                // so an upstream Luminance Statistics' Mean / Max can
+                // drive them through the macro library when the GPU-
+                // binding feature flag is on. Default mode (flag off
+                // OR no upstream binding) is the same cbuffer slot the
+                // pre-Phase-8 shader used -- bytecode is byte-identical.
+                Graph::ParameterDefinition{ L"SourcePeakNits", L"float", 1000.0f, 100.0f, 10000.0f, 50.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"TargetPeakNits", L"float",  203.0f,  80.0f,   500.0f,  1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"Strength",       L"float",    1.0f,   0.0f,     1.0f, 0.05f },
+                Graph::ParameterDefinition{ L"ToneLift",       L"float",    0.0f,   0.0f,     1.0f, 0.05f },
             };
             m_effects.push_back(std::move(desc));
         }
