@@ -1,12 +1,78 @@
 #include "pch_engine.h"
 #include "GraphEvaluator.h"
 #include "../Effects/ShaderCompiler.h"
+#include "../Effects/BytecodeCache.h"
 #include "MathExpression.h"
 
 using namespace ShaderLab::Graph;
 
 namespace ShaderLab::Rendering
 {
+    // ---- Phase 8 cache routing helpers (file-scope) -----------------------
+    //
+    // Build a BytecodeCompileRequest from a node's CustomEffectDefinition,
+    // then synchronously fetch-or-compile via BytecodeCache. Centralizes
+    // the canonicalize -> hash -> request pattern shared by:
+    //   * ShaderLab built-in effects (PixelShader / D2D-tiled compute), and
+    //   * D3D11 compute custom effects (the bridge's lazy compile).
+    //
+    // gpuBindableNames is filtered from def.parameters in stable index
+    // order; today no built-in effect sets gpuBindable=true so the list is
+    // empty and the bitset is 0 (= the baseline variant).
+    namespace {
+        Effects::BytecodeCacheResult CompileViaCache(
+            const std::wstring& effectId,
+            uint32_t            effectVersion,
+            const std::wstring& hlslSource,
+            const std::string&  target,
+            uint32_t            macroBitset,
+            const std::vector<std::string>& gpuBindableNames)
+        {
+            std::string canonical = Effects::CanonicalizeHlslSource(hlslSource);
+
+            Effects::BytecodeCompileRequest req;
+            req.key.sourceHash         = Effects::HashCanonicalSource(canonical);
+            req.key.paramSignatureHash = Effects::HashParamSignature(gpuBindableNames);
+            req.key.includeLibraryHash = Effects::IncludeLibraryHash();
+            req.key.macroBitset        = macroBitset;
+            req.key.entryPoint         = "main";
+            req.key.target             = target;
+            req.metadata.effectId      = effectId;
+            req.metadata.version       = effectVersion;
+            req.hlslSource             = std::move(canonical);
+            req.gpuBindableParamNames  = gpuBindableNames;
+
+            return Effects::BytecodeCache::Instance().GetOrCompile(std::move(req));
+        }
+
+        // Filter a definition's parameters to those flagged gpuBindable,
+        // returning their UTF-8 names in declared order. Empty today
+        // (no built-in effect has gpuBindable=true) but ready for
+        // p8-migrate-ictcp.
+        std::vector<std::string> ExtractGpuBindableNames(
+            const ShaderLab::Graph::CustomEffectDefinition& def)
+        {
+            std::vector<std::string> names;
+            names.reserve(def.parameters.size());
+            for (const auto& p : def.parameters)
+            {
+                if (!p.gpuBindable) continue;
+                std::string utf8;
+                int needed = ::WideCharToMultiByte(
+                    CP_UTF8, 0, p.name.data(), static_cast<int>(p.name.size()),
+                    nullptr, 0, nullptr, nullptr);
+                if (needed > 0)
+                {
+                    utf8.resize(static_cast<size_t>(needed));
+                    ::WideCharToMultiByte(
+                        CP_UTF8, 0, p.name.data(), static_cast<int>(p.name.size()),
+                        utf8.data(), needed, nullptr, nullptr);
+                }
+                names.push_back(std::move(utf8));
+            }
+            return names;
+        }
+    }
     // -----------------------------------------------------------------------
     // Main evaluation entry point
     // -----------------------------------------------------------------------
@@ -398,21 +464,19 @@ namespace ShaderLab::Rendering
                     auto& def = node->customEffect.value();
                     std::string target = (def.shaderType == CustomShaderType::PixelShader)
                         ? "ps_5_0" : "cs_5_0";
-                    std::string hlslUtf8(def.hlslSource.begin(), def.hlslSource.end());
-                    for (auto& ch : hlslUtf8)
-                        if (ch == '\r') ch = '\n';
-                    auto result = Effects::ShaderCompiler::CompileFromString(hlslUtf8, "ShaderLabEffect", "main", target);
-                    if (result.succeeded)
+                    auto gpuNames = ExtractGpuBindableNames(def);
+                    auto cached = CompileViaCache(
+                        node->name, /*effectVersion*/ 1u,
+                        def.hlslSource, target, /*macroBitset*/ 0u, gpuNames);
+                    if (cached.status == Effects::BytecodeStatus::Ready)
                     {
-                        auto* blob = result.bytecode.get();
-                        def.compiledBytecode.resize(blob->GetBufferSize());
-                        memcpy(def.compiledBytecode.data(), blob->GetBufferPointer(), blob->GetBufferSize());
+                        def.compiledBytecode = std::move(cached.bytecode);
                         CoCreateGuid(&def.shaderGuid);
                         node->dirty = true;
                     }
                     else
                     {
-                        node->runtimeError = L"Auto-compile failed: " + result.ErrorMessage();
+                        node->runtimeError = L"Auto-compile failed: " + cached.errorMessage;
                         node->cachedOutput = nullptr;
                         m_outputCache.erase(nodeId);
                         break;
@@ -649,21 +713,18 @@ namespace ShaderLab::Rendering
         // the installed shader.
         if (def.compiledBytecode.empty())
         {
-            std::string hlslUtf8 = winrt::to_string(def.hlslSource);
-            for (auto& ch : hlslUtf8) { if (ch == '\r') ch = '\n'; }
-            auto compiled = Effects::ShaderCompiler::CompileFromString(
-                hlslUtf8, "D3D11Compute", "main", "cs_5_0");
-            if (!compiled.bytecode)
+            auto gpuNames = ExtractGpuBindableNames(def);
+            auto cached = CompileViaCache(
+                node.name, /*effectVersion*/ 1u,
+                def.hlslSource, "cs_5_0", /*macroBitset*/ 0u, gpuNames);
+            if (cached.status != Effects::BytecodeStatus::Ready)
             {
-                std::wstring err = compiled.ErrorMessage();
-                node.runtimeError = err.empty()
+                node.runtimeError = cached.errorMessage.empty()
                     ? L"D3D11 compute shader compile failed"
-                    : std::move(err);
+                    : std::move(cached.errorMessage);
                 return;
             }
-            const BYTE* bcData = static_cast<const BYTE*>(compiled.bytecode->GetBufferPointer());
-            SIZE_T bcSize = compiled.bytecode->GetBufferSize();
-            def.compiledBytecode.assign(bcData, bcData + bcSize);
+            def.compiledBytecode = std::move(cached.bytecode);
             bridge->SetCompiledBytecode(def.compiledBytecode.data(),
                 static_cast<UINT32>(def.compiledBytecode.size()));
             node.runtimeError.clear();
