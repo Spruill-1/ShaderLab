@@ -45,21 +45,23 @@ namespace ShaderLab::Effects
 #define _SLBUF_0(name, slot)
 #define _SLBUF_1(name, slot) StructuredBuffer<float4> _SLBuf_##name : register(slot);
 
-// Inside cbuffer block. Expands to a slot when cbuffer-bound; expands
-// to nothing when GPU-bound (the value comes from the structured
-// buffer instead).
+// Inside cbuffer block. Expands to a value slot when cbuffer-bound;
+// expands to a uint INDEX slot when GPU-bound (the host packs the
+// upstream field's index in the analysis SRV at this offset).
 #define SHADERLAB_PARAM(type, name) \
     _SLPARAM_CAT(_SLPARAM_, _SLPARAM_##name##_GPU)(type, name)
 #define _SLPARAM_0(type, name) type name;
-#define _SLPARAM_1(type, name)
+#define _SLPARAM_1(type, name) uint _SLIdx_##name;
 
 // Inside function body, before any use of the parameter. Expands to
-// a local-variable assignment when GPU-bound; expands to nothing when
-// cbuffer-bound (the cbuffer slot is already in scope as a global).
+// a local-variable assignment when GPU-bound (read float4 at the
+// host-supplied index, swizzle to the requested type); expands to
+// nothing when cbuffer-bound (the cbuffer slot is already in scope
+// as a global).
 #define SHADERLAB_LOAD_PARAM(type, name) \
     _SLPARAM_CAT(_SLLOAD_, _SLPARAM_##name##_GPU)(type, name)
 #define _SLLOAD_0(type, name)
-#define _SLLOAD_1(type, name) type name = _SL_VEC_##type(_SLBuf_##name[0]);
+#define _SLLOAD_1(type, name) type name = _SL_VEC_##type(_SLBuf_##name[_SLIdx_##name]);
 
 #endif // SHADERLAB_PARAMS_HLSLI_INCLUDED
 )HLSL";

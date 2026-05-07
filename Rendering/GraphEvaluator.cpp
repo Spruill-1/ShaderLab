@@ -669,7 +669,7 @@ namespace ShaderLab::Rendering
                 continue;
             auto* bridge = bit->second;
 
-            DispatchViaBridge(dc, *node, deferred.inputImage,
+            DispatchViaBridge(dc, graph, *node, deferred.inputImage,
                 deferred.preRenderedInput.get(), bridge);
 
             bool hasImageOutput = !node->outputPins.empty();
@@ -715,6 +715,7 @@ namespace ShaderLab::Rendering
 
     void GraphEvaluator::DispatchViaBridge(
         ID2D1DeviceContext5* dc,
+        const EffectGraph& graph,
         EffectNode& node,
         ID2D1Image* inputImage,
         ID2D1Bitmap1* preRenderedInput,
@@ -773,6 +774,8 @@ namespace ShaderLab::Rendering
         struct GpuBindingEntry {
             uint32_t                                 gpuBindableIndex;
             uint32_t                                 slot;
+            uint32_t                                 fieldIndex;   // float4 index in upstream's analysis SRV
+            std::wstring                             paramName;    // for _SLIdx_<name> cbuffer slot lookup
             winrt::com_ptr<ID3D11ShaderResourceView> srv;
         };
         std::vector<GpuBindingEntry> bindingPlan;
@@ -818,9 +821,36 @@ namespace ShaderLab::Rendering
                 if (FAILED(ieco->GetAnalysisSrv(srv.put())) || !srv)
                     continue;
 
+                // Compute the upstream field's float4 index in the
+                // analysis SRV. The upstream's CustomEffectDefinition
+                // declares analysis fields in order; each field
+                // occupies pixelCount() float4 slots (floats / float2 /
+                // float3 / float4 = 1 slot each; arrays = arrayLength
+                // * 1 slot per element). Walk the prefix-sum until we
+                // hit the bound source field name.
+                const EffectNode* srcNode = graph.FindNode(srcId);
+                if (!srcNode || !srcNode->customEffect.has_value())
+                    continue;
+                uint32_t fieldIndex = 0;
+                bool fieldFound = false;
+                for (const auto& fd : srcNode->customEffect->analysisFields)
+                {
+                    if (fd.name == binding.sources[0]->sourceFieldName)
+                    {
+                        fieldIndex += binding.sources[0]->sourceIndex;
+                        fieldFound = true;
+                        break;
+                    }
+                    fieldIndex += fd.pixelCount();
+                }
+                if (!fieldFound)
+                    continue;
+
                 bindingPlan.push_back({
                     thisGpuIdx,
                     thisGpuIdx + 1u,
+                    fieldIndex,
+                    p.name,
                     std::move(srv) });
                 macroBitset |= (1u << thisGpuIdx);
                 // (telemetry already bumped by ResolveBindings; no
@@ -938,12 +968,34 @@ namespace ShaderLab::Rendering
                         if (varDesc.StartOffset < 8) continue; // skip Width/Height
 
                         std::wstring varName(varDesc.Name, varDesc.Name + strlen(varDesc.Name));
-                        auto propIt = node.properties.find(varName);
-                        if (propIt == node.properties.end()) continue;
-
                         UINT32 destOff = varDesc.StartOffset - 8;
                         if (destOff >= cbBytes.size()) continue;
                         UINT32 remaining = static_cast<UINT32>(cbBytes.size() - destOff);
+
+                        // Phase 8 GPU-binding index slot. Variant
+                        // bytecode declares a `uint _SLIdx_<paramName>;`
+                        // for each gpuBindable param routed via SRV.
+                        // The host packs the upstream's float4 index
+                        // here so the consumer's shader reads the right
+                        // slot via _SLBuf_<name>[_SLIdx_<name>].
+                        if (varName.starts_with(L"_SLIdx_"))
+                        {
+                            std::wstring paramName = varName.substr(7);
+                            for (const auto& e : bindingPlan)
+                            {
+                                if (e.paramName == paramName)
+                                {
+                                    uint32_t idx = e.fieldIndex;
+                                    if (remaining >= sizeof(uint32_t))
+                                        memcpy(cbBytes.data() + destOff, &idx, sizeof(uint32_t));
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+
+                        auto propIt = node.properties.find(varName);
+                        if (propIt == node.properties.end()) continue;
 
                         D3D11_SHADER_TYPE_DESC typeDesc{};
                         D3D_SHADER_VARIABLE_TYPE hlslType = D3D_SVT_FLOAT;

@@ -156,6 +156,7 @@ namespace ShaderLab::Rendering
         // CustomComputeBridgeEffect::Dispatch.
         void DispatchViaBridge(
             ID2D1DeviceContext5* dc,
+            const Graph::EffectGraph& graph,
             Graph::EffectNode& node,
             ID2D1Image* inputImage,
             ID2D1Bitmap1* preRenderedInput,
