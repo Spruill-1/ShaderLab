@@ -8,6 +8,7 @@
 #include "Effects/EffectRegistry.h"
 #include "Effects/ShaderCompiler.h"
 #include "Effects/BytecodeCache.h"
+#include "Effects/Performance.h"
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
 
@@ -786,6 +787,143 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
         }
     }
 
+    // ----- Phase 8: GPU-binding routing through the bridge -----------------
+    //
+    // Verifies the feature-flag-on path:
+    //   Gamut Source -> Luminance Statistics -> ICtCp Tone Map (D3D11
+    //   compute, post-migration) with TargetPeakNits bound to Mean.
+    // Asserts:
+    //   1. ICtCp produces a non-trivial output (> 0 pixels).
+    //   2. Performance::GpuBindingDetections() increments.
+    //   3. With the flag off, the same chain still works (CPU readback).
+    //   4. With the flag on but no upstream binding, ICtCp still works
+    //      (graceful baseline path).
+    void TestGpuBindingRouting()
+    {
+        printf("\n=== Phase 8: GPU-binding routing ===\n");
+        g_evaluator.ReleaseCache();
+
+        auto& registry = ShaderLab::Effects::ShaderLabEffects::Instance();
+        auto* srcDesc   = registry.FindByName(L"Gamut Source");
+        auto* statsDesc = registry.FindByName(L"Luminance Statistics");
+        auto* ictcpDesc = registry.FindByName(L"ICtCp Tone Map (HDR -> SDR)");
+        if (!srcDesc || !statsDesc || !ictcpDesc) {
+            TEST("GpuBinding_DescriptorsFound", false);
+            return;
+        }
+        TEST("GpuBinding_ICtCpIsD3D11Compute",
+             ictcpDesc->shaderType == ShaderLab::Graph::CustomShaderType::D3D11ComputeShader);
+
+        // ---- Sub-test 1: Feature flag ON, with binding ----
+        {
+            ShaderLab::Effects::SourceNodeFactory sf;
+            ShaderLab::Graph::EffectGraph g;
+            auto srcNode   = ShaderLab::Effects::ShaderLabEffects::CreateNode(*srcDesc);
+            auto statsNode = ShaderLab::Effects::ShaderLabEffects::CreateNode(*statsDesc);
+            auto ictcpNode = ShaderLab::Effects::ShaderLabEffects::CreateNode(*ictcpDesc);
+            auto srcId   = g.AddNode(std::move(srcNode));
+            auto statsId = g.AddNode(std::move(statsNode));
+            auto ictcpId = g.AddNode(std::move(ictcpNode));
+
+            g.Connect(srcId, 0, statsId, 0);
+            g.Connect(srcId, 0, ictcpId, 0);
+
+            // Bind ICtCp's TargetPeakNits to Luminance Statistics' Mean.
+            g.BindProperty(ictcpId, L"TargetPeakNits", statsId, L"Mean", 0);
+
+            ShaderLab::Performance::SetGpuBindingsEnabled(true);
+            uint64_t beforeDet = ShaderLab::Performance::GpuBindingDetections();
+
+            Evaluate(g, sf);
+            g_dc->SetTarget(nullptr);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+            // Run twice so the first-frame just-created delay clears.
+            Evaluate(g, sf);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+
+            uint64_t afterDet = ShaderLab::Performance::GpuBindingDetections();
+            TEST("GpuBinding_TelemetryIncremented", afterDet > beforeDet);
+
+            auto* n = g.FindNode(ictcpId);
+            TEST("GpuBinding_ICtCpHasOutput_FlagOn", n && n->cachedOutput != nullptr);
+            TEST("GpuBinding_ICtCpNoRuntimeError_FlagOn", n && n->runtimeError.empty());
+
+            ShaderLab::Performance::SetGpuBindingsEnabled(false);
+        }
+
+        // ---- Sub-test 2: Feature flag OFF, with binding ----
+        // CPU readback path. Should still work.
+        {
+            ShaderLab::Effects::SourceNodeFactory sf;
+            ShaderLab::Graph::EffectGraph g;
+            auto srcNode   = ShaderLab::Effects::ShaderLabEffects::CreateNode(*srcDesc);
+            auto statsNode = ShaderLab::Effects::ShaderLabEffects::CreateNode(*statsDesc);
+            auto ictcpNode = ShaderLab::Effects::ShaderLabEffects::CreateNode(*ictcpDesc);
+            auto srcId   = g.AddNode(std::move(srcNode));
+            auto statsId = g.AddNode(std::move(statsNode));
+            auto ictcpId = g.AddNode(std::move(ictcpNode));
+            g.Connect(srcId, 0, statsId, 0);
+            g.Connect(srcId, 0, ictcpId, 0);
+
+            ShaderLab::Graph::PropertyBinding pb;
+            ShaderLab::Graph::ComponentSource cs;
+            cs.sourceNodeId    = statsId;
+            cs.sourceFieldName = L"Mean";
+            cs.sourceComponent = 0;
+            pb.sources.push_back(cs);
+            g.BindProperty(ictcpId, L"TargetPeakNits", statsId, L"Mean", 0);
+
+            g_evaluator.ReleaseCache();
+            Evaluate(g, sf);
+            g_dc->SetTarget(nullptr);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+            Evaluate(g, sf);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+
+            auto* n = g.FindNode(ictcpId);
+            TEST("GpuBinding_ICtCpHasOutput_FlagOff", n && n->cachedOutput != nullptr);
+            TEST("GpuBinding_ICtCpNoRuntimeError_FlagOff", n && n->runtimeError.empty());
+        }
+
+        // ---- Sub-test 3: Feature flag ON, NO binding ----
+        // Baseline (cbuffer mode) path even with flag on.
+        {
+            ShaderLab::Effects::SourceNodeFactory sf;
+            ShaderLab::Graph::EffectGraph g;
+            auto srcNode   = ShaderLab::Effects::ShaderLabEffects::CreateNode(*srcDesc);
+            auto ictcpNode = ShaderLab::Effects::ShaderLabEffects::CreateNode(*ictcpDesc);
+            auto srcId   = g.AddNode(std::move(srcNode));
+            auto ictcpId = g.AddNode(std::move(ictcpNode));
+            g.Connect(srcId, 0, ictcpId, 0);
+
+            ShaderLab::Performance::SetGpuBindingsEnabled(true);
+            g_evaluator.ReleaseCache();
+            Evaluate(g, sf);
+            g_dc->SetTarget(nullptr);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+            Evaluate(g, sf);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+
+            auto* n = g.FindNode(ictcpId);
+            TEST("GpuBinding_ICtCpHasOutput_FlagOnNoBinding", n && n->cachedOutput != nullptr);
+            TEST("GpuBinding_ICtCpNoRuntimeError_FlagOnNoBinding", n && n->runtimeError.empty());
+
+            ShaderLab::Performance::SetGpuBindingsEnabled(false);
+        }
+    }
+
     // ----- Phase 7 spike: headless pixel readback ----------------------------
     //
     // The Phase 7 plan to move the MCP server engine-side and add a
@@ -967,6 +1105,7 @@ int main(int argc, char* argv[])
     TestBytecodeCache();
     TestEffectChain();
     TestLuminanceStatistics();
+    TestGpuBindingRouting();
     TestHeadlessReadback();
 
     // ---- Math test bench (Phase 2) -----------------------------------------

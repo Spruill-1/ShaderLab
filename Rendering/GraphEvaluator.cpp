@@ -760,6 +760,102 @@ namespace ShaderLab::Rendering
             }
         }
 
+        // -----------------------------------------------------------------
+        // Phase 8 GPU-binding plan
+        // -----------------------------------------------------------------
+        // Walk gpuBindable params in declaration order. For each one
+        // that has a binding from an upstream effect implementing
+        // IEngineComputeOutput, capture (paramIndex, slot, srv) and
+        // set the corresponding bit in macroBitset. Slot follows the
+        // convention: gpuBindable param at index i binds to t<i+1>
+        // (t0 is reserved for the input texture). HLSL authors using
+        // SHADERLAB_GPU_BUFFER must pick consistent slot numbers.
+        struct GpuBindingEntry {
+            uint32_t                                 gpuBindableIndex;
+            uint32_t                                 slot;
+            winrt::com_ptr<ID3D11ShaderResourceView> srv;
+        };
+        std::vector<GpuBindingEntry> bindingPlan;
+        uint32_t macroBitset = 0;
+        const std::vector<uint8_t>* reflectBytecode = &def.compiledBytecode;
+        std::vector<uint8_t> variantBytecode;
+
+        if (Performance::IsGpuBindingsEnabled())
+        {
+            uint32_t gpuBindableIdx = 0;
+            for (const auto& p : def.parameters)
+            {
+                if (!p.gpuBindable)
+                    continue;
+                const uint32_t thisGpuIdx = gpuBindableIdx++;
+
+                auto bIt = node.propertyBindings.find(p.name);
+                if (bIt == node.propertyBindings.end())
+                    continue;
+                const auto& binding = bIt->second;
+                if (binding.wholeArray ||
+                    binding.sources.empty() ||
+                    !binding.sources[0].has_value())
+                    continue;
+
+                uint32_t srcId = binding.sources[0]->sourceNodeId;
+                // Discover via m_bridgeImplCache (the bridge impl
+                // pointer captured at CreateEffect time). D2D's outer
+                // ID2D1Effect's QueryInterface doesn't delegate
+                // arbitrary IIDs to the impl, so we use the impl
+                // pointer directly. The bridge implements
+                // IEngineComputeOutput by delegation to its internal
+                // D3D11ComputeRunner.
+                auto bridgeIt = m_bridgeImplCache.find(srcId);
+                if (bridgeIt == m_bridgeImplCache.end() || !bridgeIt->second)
+                    continue;
+                winrt::com_ptr<Effects::IEngineComputeOutput> ieco;
+                if (FAILED(bridgeIt->second->QueryInterface(
+                    __uuidof(Effects::IEngineComputeOutput), ieco.put_void())))
+                    continue;
+
+                winrt::com_ptr<ID3D11ShaderResourceView> srv;
+                if (FAILED(ieco->GetAnalysisSrv(srv.put())) || !srv)
+                    continue;
+
+                bindingPlan.push_back({
+                    thisGpuIdx,
+                    thisGpuIdx + 1u,
+                    std::move(srv) });
+                macroBitset |= (1u << thisGpuIdx);
+                // (telemetry already bumped by ResolveBindings; no
+                // double-count here.)
+            }
+
+            // If we're routing any binding GPU-side, swap to the
+            // variant bytecode (compiled with _SLPARAM_<name>_GPU=1
+            // for the bits set). Eagerly precompiled at first encounter
+            // (commit 74eb9a5), so this is typically a cache hit.
+            if (macroBitset != 0)
+            {
+                auto gpuNames = ExtractGpuBindableNames(def);
+                auto variant = CompileViaCache(
+                    node.name, /*effectVersion*/ 1u,
+                    def.hlslSource, "cs_5_0", macroBitset, gpuNames);
+                if (variant.status == Effects::BytecodeStatus::Ready)
+                {
+                    variantBytecode  = std::move(variant.bytecode);
+                    reflectBytecode  = &variantBytecode;
+                    bridge->SetCompiledBytecode(
+                        variantBytecode.data(),
+                        static_cast<UINT32>(variantBytecode.size()));
+                }
+                else
+                {
+                    // Variant unavailable -- gracefully fall back to
+                    // baseline (cbuffer mode for all params; CPU
+                    // readback path stays as the source of truth).
+                    bindingPlan.clear();
+                    macroBitset = 0;
+                }
+            }
+        }
+
         // Analysis float4 count: sum over typed-field pixel counts.
         UINT32 analysisFloat4Count = 0;
         for (const auto& f : def.analysisFields)
@@ -816,12 +912,15 @@ namespace ShaderLab::Rendering
         // Width/Height). Use the typed PackPropertyToCBuffer helper
         // (Phase 3) so HLSL `uint`/`int`/`bool` slots receive the
         // correctly converted scalar instead of a float bit pattern.
+        // Reflection runs against the variant bytecode if we swapped;
+        // GPU-bound params simply have no cbuffer slot in the variant
+        // and PackPropertyToCBuffer skips them naturally.
         std::vector<BYTE> cbBytes;
-        if (!def.parameters.empty() && !def.compiledBytecode.empty())
+        if (!def.parameters.empty() && !reflectBytecode->empty())
         {
             winrt::com_ptr<ID3D11ShaderReflection> reflect;
             HRESULT hr = D3DReflect(
-                def.compiledBytecode.data(), def.compiledBytecode.size(),
+                reflectBytecode->data(), reflectBytecode->size(),
                 IID_ID3D11ShaderReflection, reinterpret_cast<void**>(reflect.put()));
             if (SUCCEEDED(hr) && reflect)
             {
@@ -873,6 +972,37 @@ namespace ShaderLab::Rendering
             ? static_cast<ID2D1Image*>(preRenderedInput)
             : inputImage;
 
+        // Phase 8 GPU bindings: register each upstream SRV with its
+        // declared t-slot. Bridge clears these at the end of Dispatch.
+        for (const auto& e : bindingPlan)
+            bridge->SetGpuBinding(e.slot, e.srv.get());
+
+        // Image-producing per-pixel computes need dispatch dims that
+        // cover the full output. analysis-only and "fixed-size loop"
+        // image producers (e.g. CIE Histogram) keep (1,1,1).
+        // Convention: when a customEffect declares image output AND
+        // its [numthreads] is per-pixel (threadGroupX*Y >= 4 typical),
+        // dispatch (ceil(W/tx), ceil(H/ty), 1).
+        if (hasImageOutput && imageOutW > 0 && imageOutH > 0 &&
+            def.threadGroupX > 0 && def.threadGroupY > 0)
+        {
+            // Heuristic: per-pixel compute = small thread group
+            // (8x8 typical). Fixed-size internal loops use larger
+            // 1D groups (numthreads(64,1,1) doing W*H iters
+            // internally). For now: dispatch (W/tx, H/ty, 1) when
+            // tx*ty >= 4 AND tx<=64 AND ty>=2 (i.e. genuine 2D
+            // tiling rather than a 1D iteration shader).
+            const bool perPixelTiling =
+                def.threadGroupX * def.threadGroupY >= 4 &&
+                def.threadGroupY >= 2;
+            if (perPixelTiling)
+            {
+                UINT32 dx = (imageOutW + def.threadGroupX - 1) / def.threadGroupX;
+                UINT32 dy = (imageOutH + def.threadGroupY - 1) / def.threadGroupY;
+                bridge->SetDispatchDims(dx, dy, 1);
+            }
+        }
+
         std::vector<float> analysisFloats;
         HRESULT hr = bridge->Dispatch(
             dc, dispatchInput,
@@ -881,6 +1011,19 @@ namespace ShaderLab::Rendering
             analysisFloat4Count,
             imageOutW, imageOutH,
             &analysisFloats);
+
+        // After dispatch, restore the baseline bytecode on the bridge
+        // so a subsequent dispatch with a different binding plan starts
+        // from a known state. Cheap since bridge keeps both blobs as
+        // bytecode pointers; CreateComputeShader is the only D3D cost
+        // and the cache returns the same bytes for the same key.
+        if (macroBitset != 0 && !def.compiledBytecode.empty())
+        {
+            bridge->SetCompiledBytecode(
+                def.compiledBytecode.data(),
+                static_cast<UINT32>(def.compiledBytecode.size()));
+        }
+
         if (FAILED(hr))
         {
             node.runtimeError = std::format(L"Bridge dispatch failed 0x{:08X}",
@@ -1422,13 +1565,21 @@ namespace ShaderLab::Rendering
             //   * the feature flag is on,
             //   * the consumer's parameter is flagged gpuBindable in
             //     its CustomEffectDefinition,
-            //   * the upstream effect publishes IEngineComputeOutput
-            //     (i.e. its cachedEffect QI's the interface).
+            //   * the upstream effect publishes IEngineComputeOutput.
             //
-            // For v1 we only INCREMENT a telemetry counter; the actual
-            // SRV-to-shader binding path is consumer-effect-specific
-            // and lands in a follow-up commit per migrated effect.
-            // The CPU readback below still runs as the safe fallback.
+            // Discovery uses m_bridgeImplCache directly: D2D's outer
+            // ID2D1Effect's QI does not delegate arbitrary IIDs to the
+            // inner impl, so a raw QI on the cached effect would always
+            // fail for IEngineComputeOutput. The bridge impl pointer
+            // we captured during CreateOrGetEffect (commit 2f69acd)
+            // is the canonical "is this upstream a GPU-output producer"
+            // signal -- the bridge always implements IEngineComputeOutput
+            // by delegation to its internal D3D11ComputeRunner.
+            //
+            // The actual SRV-to-t-slot routing happens in DispatchViaBridge
+            // for D3D11 compute consumers; this branch only bumps a
+            // detection telemetry counter so we can see how many
+            // bindings *could* be routed regardless of consumer kind.
             if (Performance::IsGpuBindingsEnabled() &&
                 node.customEffect.has_value() &&
                 !binding.wholeArray)
@@ -1442,18 +1593,10 @@ namespace ShaderLab::Rendering
                     binding.sources[0].has_value())
                 {
                     uint32_t srcId = binding.sources[0]->sourceNodeId;
-                    const EffectNode* srcNode = graph.FindNode(srcId);
-                    auto effIt = m_effectCache.find(srcId);
-                    if (srcNode && effIt != m_effectCache.end() && effIt->second)
+                    auto bridgeIt = m_bridgeImplCache.find(srcId);
+                    if (bridgeIt != m_bridgeImplCache.end() && bridgeIt->second)
                     {
-                        winrt::com_ptr<Effects::IEngineComputeOutput> ieco;
-                        if (SUCCEEDED(effIt->second->QueryInterface(
-                            __uuidof(Effects::IEngineComputeOutput), ieco.put_void())))
-                        {
-                            // Detected. Counter for diagnostics; actual
-                            // routing is per-consumer-effect future work.
-                            Performance::IncrementGpuBindingDetection();
-                        }
+                        Performance::IncrementGpuBindingDetection();
                     }
                 }
             }
