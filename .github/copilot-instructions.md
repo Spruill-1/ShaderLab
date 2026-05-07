@@ -22,23 +22,47 @@ ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, 
 
 ## Architecture
 
+The codebase is split between an engine DLL (`ShaderLabEngine.dll`, host-agnostic), a WinUI 3 app (`ShaderLab.exe`), a console host (`ShaderLabHeadless.exe`), and a test runner (`ShaderLabTests.exe`). The split is documented in detail in README's *Engine / Host Split* section.
+
 ```
-MainWindow (WinUI 3 XAML)
-  ├── RenderEngine        — D3D11 + D2D1 device stack, DXGI swap chain, BeginDraw/EndDraw/Present
-  ├── DisplayMonitor      — HDR/SDR detection, WM_DISPLAYCHANGE + adapter-change jthread
-  ├── GraphEvaluator      — Topological walk of EffectGraph, per-node D2D effect cache, dirty gating
-  ├── EffectGraph (DAG)   — Nodes, edges, Kahn's topo sort, JSON serialization (Windows.Data.Json)
-  ├── SourceNodeFactory   — WIC image loading (HDR/SDR format split) + Flood fill sources
-  ├── ShaderLabEffects    — 30+ built-in effects (analysis + source + tone mapping) with embedded HLSL + color math
-  ├── ShaderEditorCtrl    — Live HLSL compile (D3DCompile), D3DReflect auto-property generation
-  ├── NodeGraphController — D2D-rendered canvas: bezier edges, color-coded nodes, pan/zoom, hit-test
-  ├── PixelInspectorCtrl  — GPU readback (1×1 D2D1Bitmap1), scRGB→sRGB/PQ/luminance conversions
-  ├── PixelTraceCtrl      — Recursive per-node pixel readback through effect graph
-  ├── FalseColorOverlay   — False color rendering overlay
-  └── EffectDesignerWindow — Modal window for creating/editing custom pixel/compute shader effects
+ShaderLab.exe (WinUI 3 host)
+  ├── MainWindow (XAML)         — split across .xaml.cpp / .WorkingSpace.cpp / .GraphFileIo.cpp / .RenderTick.cpp / .McpRoutes.cpp
+  ├── RenderEngine              — D3D11 + D2D1 device stack, DXGI swap chain, BeginDraw/EndDraw/Present
+  ├── Controls/                 — NodeGraphController (canvas), OutputWindow (per-Output OS window),
+  │                               ShaderEditorController, PixelInspectorController, PixelTraceController
+  └── EffectDesignerWindow      — Modal for creating/editing custom pixel/compute shader effects
+
+ShaderLabEngine.dll (host-agnostic)
+  ├── Graph/                    — EffectGraph, EffectNode, EffectEdge, NodeType, PropertyValue
+  ├── Rendering/
+  │   ├── GraphEvaluator        — Topological walk + per-node D2D effect cache + ProcessDeferredCompute
+  │   ├── DisplayMonitor        — HDR/SDR detection, WM_DISPLAYCHANGE + adapter-changed jthread
+  │   ├── D3D11ComputeRunner    — Generic D3D11 compute dispatch (RWStructuredBuffer<float4>),
+  │   │                           also implements IEngineComputeOutput (Phase 8 GPU-binding interface)
+  │   ├── PixelReadback         — FP32 RGBA region readback helper
+  │   ├── CaptureNode           — D2D + WIC PNG encode of any node's output
+  │   ├── WorkingSpaceSync      — Working Space parameter node refresh
+  │   ├── IccProfileParser      — mscms.dll-based ICC reader
+  │   └── MathExpression        — ExprTk-backed expression evaluator (Numeric Expression node)
+  ├── Effects/
+  │   ├── ShaderLabEffects      — 35 ShaderLab effects (analysis/source/tone-map/parameter) with embedded HLSL
+  │   ├── ColorMath.cpp         — Shared HLSL color math library (BT.709/BT.2020/P3, PQ/HLG, ICtCp)
+  │   ├── EffectRegistry        — 40+ wrapped D2D effects across 9 categories
+  │   ├── ShaderCompiler        — D3DCompile + D3DReflect + ID3DInclude resolver for shaderlab_params.hlsli
+  │   ├── ShaderLabParamsHlsl   — Engine-embedded macro library for GPU-binding-aware parameters
+  │   ├── IEngineComputeOutput  — COM interface for upstream effects exposing GPU-resident analysis
+  │   ├── CustomPixelShaderEffect / CustomComputeShaderEffect — Custom-effect base classes
+  │   ├── SourceNodeFactory     — Image / video / Flood / DXGI Desktop Duplication / Windows Graphics Capture
+  │   └── DxgiDuplicationSourceProvider, WindowsGraphicsCaptureSourceProvider, VideoSourceProvider
+  └── Engine/Mcp/
+      ├── McpHttpServer         — Winsock2 TCP server, route registration, JSON-RPC dispatcher
+      └── EngineMcpRoutes       — 20 engine-pure routes + IEngineCommandSink + EngineContext
+
+ShaderLabHeadless.exe (console host, no WinUI dependency)
+  └── Main.cpp                  — PNG render / --pixels FP32 readback / --script JSON batch mode
 ```
 
-Render loop: `DispatcherQueueTimer` (refresh-rate-driven, 60–240 Hz) → `GraphEvaluator.Evaluate()` → `BeginDraw` → `DrawImage` → `EndDraw` → `Present`. There is no built-in tone-mapping pass in the render path — users build tone mappers as graph effects (the ICtCp suite is the preferred path).
+Render loop: `DispatcherQueueTimer` driven by the active monitor's refresh rate (clamped to 60–240 Hz, decision #50) → dirty-propagation BFS → `BeginDraw` → `GraphEvaluator.Evaluate()` → `ProcessDeferredCompute()` (D3D11 compute analysis nodes; **must** be inside the `BeginDraw`/`EndDraw` so the internal `dc->DrawImage` actually runs — decision #63) → `DrawImage(previewOutput)` → `EndDraw` → `Present`. There is no built-in tone-mapping pass — users build tone mappers as graph effects (the ICtCp suite is the preferred path).
 
 ## Namespace Convention
 
@@ -84,11 +108,11 @@ All code lives under `ShaderLab::` with sub-namespaces matching directories:
 ## Custom D2D Effect Pattern
 
 When creating new D2D effects (the core purpose of this tool):
-1. Implement `ID2D1EffectImpl` + `ID2D1DrawTransform` (pixel shader) or `ID2D1ComputeTransform` (compute shader)
+1. Implement `ID2D1EffectImpl` + `ID2D1DrawTransform` (pixel shader) or `ID2D1ComputeTransform` (D2D-tiled compute shader). For full-image reductions that need atomics / cross-tile groupshared, use `customEffect.shaderType == D3D11ComputeShader` instead — those run via `D3D11ComputeRunner` in the deferred-compute pass.
 2. Register with `ID2D1Factory1::RegisterEffectFromString()` using XML schema + `D2D1_VALUE_TYPE_BINDING` macros
 3. Keep only `InputCount` as a D2D-exposed property; manage shader bytecode and cbuffers host-side
 4. Use `ShaderCompiler` for `D3DCompile` (ps_5_0 / cs_5_0) + `D3DReflect` for cbuffer discovery
-5. Register effects in `MainWindow::RegisterCustomEffects()` at startup
+5. Register effects in `Effects::RegisterEngineD2DEffects()` at engine init (called from app + headless + tests)
 6. Follow `CustomPixelShaderEffect` / `CustomComputeShaderEffect` as templates
 
 ## Tone Mapping & Color Correction (Primary Development Focus)
@@ -108,10 +132,11 @@ Active development centers on **tone-mapping and color-correction effects author
 - **Display monitoring**: Dual path — `WM_DISPLAYCHANGE` via hidden message-only HWND + `IDXGIFactory7::RegisterAdaptersChangedEvent` on a jthread.
 - **Graph serialization**: `Windows.Data.Json` (zero extra dependencies). GUID fields use `StringFromGUID2`/`CLSIDFromString`.
 - **Effect registry**: Singleton with 40+ built-in D2D effects across 9 categories. Case-insensitive name lookup.
-- **ShaderLab effects library**: 20+ built-in effects in `Effects/ShaderLabEffects.h/.cpp` (Analysis + Color Processing + Source/Generator + Parameter / Clock / Numeric Expression). Embedded HLSL with shared color math. Auto-compiled at first use.
-- **MCP server**: 23-tool JSON-RPC 2.0 server on port 47808 for AI agent integration. Routes in `MainWindow.McpRoutes.cpp`.
-- **Versioning**: `Version.h` defines app version (1.2.7) and graph format version (2). Both stored in saved graphs. Forward compatibility check on load.
-- **Dirty-gated render loop**: `DispatcherQueueTimer` at 16ms (~60 FPS). Skips evaluate when no nodes changed. Analysis readback only on dirty frames.
+- **ShaderLab effects library**: 35 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map), Source / Generator, Composition (Split Comparison), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use.
+- **MCP server**: JSON-RPC 2.0 server on port 47808 (47809 for headless to avoid shared-machine conflicts). The server itself + 20 engine-pure routes live in `Engine/Mcp/{McpHttpServer,EngineMcpRoutes}.{h,cpp}`; 16 UI-coupled / host-specific routes stay in `MainWindow.McpRoutes.cpp`. Both hosts register the same engine-side route set through the same `IEngineCommandSink` interface (decision #58). Engine-side routes are uniform: pure mutation closures dispatched via `sink.Dispatch`, with 8 event hooks (`OnNodeAdded`, `OnNodeRemoved`, `OnNodeChanged`, `OnGraphCleared`, `OnGraphLoaded`, `OnGraphStructureChanged`, `OnCustomEffectRecompiled`, `OnDisplayProfileChanged`) the GUI overrides to keep its UI in sync.
+- **Versioning**: `Version.h` defines app version (currently **1.5.0**) and graph format version (2). Both are stored in saved graphs. Forward compatibility check on load. `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` is independent — bumped manually on engine ABI breaks; mismatch between header and DLL aborts startup with a friendly message-box.
+- **Refresh-rate-driven render loop**: `DispatcherQueueTimer` interval is set from the active monitor's refresh rate (clamped to 60–240 Hz). Dirty-gated: skips evaluate when no nodes changed. Re-applied on every display change so dragging the window across monitors picks up the new rate.
+- **`ProcessDeferredCompute` requires an active D2D draw session**: it calls `dc->DrawImage` internally to pre-render the upstream chain into an FP32 bitmap, and outside `BeginDraw`/`EndDraw` that DrawImage silently no-ops. The GUI's `RenderFrame`, the headless host's `runEval` / `RunRender`, and the test bench all wrap accordingly.
 - **Ctrl+Enter** compiles shader from the editor TextBox.
 
 ## Adding New Files
@@ -145,8 +170,15 @@ The built-in effects library lives in `Effects/ShaderLabEffects.h/.cpp`:
 - **Shared color math**: A common HLSL library (BT.709/BT.2020/P3 color matrices, PQ/HLG transfer functions, CIE XYZ↔xy conversions, luminance calculations) is prepended to each shader at compile time.
 - **Auto-compile**: Effects are compiled via `ShaderCompiler` at first use (when added to graph). Compiled bytecode is cached.
 - **Categories**:
-  - **Analysis** (4): Luminance Heatmap (PS), Out-of-Gamut Highlight (CS), CIE Chromaticity Plot (CS), Vectorscope (CS)
-  - **Source** (5): Gamut Source (PS), Color Checker (PS), Zone Plate (PS), Gradient Generator (PS), HDR Test Pattern (PS)
+  - **Analysis → Heatmaps** (PS): Luminance Heatmap, Gamut Highlight, Luminance Highlight, Nit Map, Delta E Comparator
+  - **Analysis → Scopes** (PS or CS): Vectorscope, Waveform Monitor, CIE Histogram (CS), CIE Chromaticity Plot
+  - **Analysis → Statistics** (D3D11 compute, data-only): Channel Statistics, Luminance Statistics, Chromaticity Statistics
+  - **Analysis → Tone Mapping** (PS, ICtCp suite): ICtCp Round-Trip Validator, ICtCp Tone Map, ICtCp Inverse Tone Map, ICtCp Saturation, ICtCp Highlight Desaturation
+  - **Analysis → Gamut**: Gamut Coverage (CS), ICtCp Boundary (PS)
+  - **Color Processing** (PS): Gamut Map, ICtCp Gamut Map
+  - **Source / Generator** (PS): Gamut Source, Color Checker, Zone Plate, Gradient Generator, HDR Test Pattern
+  - **Composition**: Split Comparison
+  - **Parameter / Data-only**: Float / Integer / Toggle / Gamut Parameter, Clock, Numeric Expression (ExprTk), Random, Working Space
 - No `_hidden` suffix convention. (Removed in Phase-0 cleanup. Sink-only properties — e.g., the Working Space node's `ActiveColorMode`, `SdrWhiteNits`, primaries — live in `ShaderLabEffectDescriptor::hiddenDefaults` without any `_hidden` suffix, and are kept off the UI by the customEffect declared-parameter filter. The Working Space node + property bindings is the only path for tracking the active display profile.)
 - **Analysis outputs**: Compute shader analysis effects declare `AnalysisFieldDef` entries that describe their output fields (name, type, count). These are read back to CPU via `GraphEvaluator` and can be bound to downstream properties.
 
