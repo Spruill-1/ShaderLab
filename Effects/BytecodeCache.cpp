@@ -50,12 +50,12 @@ namespace ShaderLab::Effects
         // Cache schema version: bump when the cache layout, key fields,
         // or any embedded include changes in a way that should invalidate
         // existing entries (in-memory and on disk).
-        // v2: SHADERLAB_PARAM(GPU mode) now declares a uint _SLIdx_<name>
-        //     cbuffer slot that the host packs with the upstream's field
-        //     index, instead of expanding to nothing. Old v1 variants
-        //     read SRV[0] regardless of which field was bound, producing
-        //     wrong values for any field other than the first.
-        constexpr uint32_t kCacheSchemaVersion = 2;
+        // v3: ShaderCompiler::CompileFromString now always optimizes
+        //     (D3DCOMPILE_OPTIMIZATION_LEVEL3) even in debug builds.
+        //     Old v2 cached entries used SKIP_OPTIMIZATION in debug
+        //     -- those bytecodes are 5-10x slower at runtime. Bump
+        //     so they fall out and re-compile at the new opt level.
+        constexpr uint32_t kCacheSchemaVersion = 3;
         const char* libPtr = GetShaderLabParamsHLSL();
         size_t libLen = libPtr ? GetShaderLabParamsHLSLLength() : 0;
         std::string buf;
