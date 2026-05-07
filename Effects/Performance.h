@@ -33,6 +33,35 @@ namespace ShaderLab::Performance
     SHADERLAB_API bool IsGpuBindingsEnabled();
     SHADERLAB_API void SetGpuBindingsEnabled(bool enabled);
 
+    // Phase 8c: skip-CPU-readback opt-in flag.
+    // ============================================
+    //
+    // When enabled, the evaluator skips the CPU `Map(D3D11_MAP_READ)` of
+    // each compute node's analysis structured buffer when no consumer
+    // needs the values on the CPU this frame. "Needs CPU" =
+    //   (1) any property binding that consumes this node's analysis is
+    //       NOT served via GPU SRV (covers pixel-shader consumers, multi-
+    //       component bindings, gpuBindable=false params, GpuBindings
+    //       feature flag off);
+    //   (2) the host explicitly hinted the node via
+    //       GraphEvaluator::SetCpuAnalysisInterest (UI selected node,
+    //       MCP read_analysis_output target, etc.).
+    //
+    // When skipping is in effect for a node, `EffectNode::analysisOutput.fields`
+    // retains the previous-frame values (or empty if never read). Callers
+    // that need fresh values must either include the node in the host
+    // hint set or disable the feature for that frame.
+    //
+    // Default OFF for safe rollout. Tests run with default off.
+    SHADERLAB_API bool IsSkipUnneededCpuReadbackEnabled();
+    SHADERLAB_API void SetSkipUnneededCpuReadbackEnabled(bool enabled);
+
+    // Telemetry: number of dispatches whose CPU readback was skipped
+    // since process start. Useful for confirming the optimization
+    // actually fires under workload.
+    SHADERLAB_API uint64_t SkippedCpuReadbacks();
+    SHADERLAB_API void IncrementSkippedCpuReadbacks();
+
     // Telemetry: count of bindings the evaluator detected as GPU-routable
     // since process start (whether or not actually routed).
     SHADERLAB_API uint64_t GpuBindingDetections();

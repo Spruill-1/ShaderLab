@@ -166,7 +166,8 @@ namespace ShaderLab::Rendering
         ID3D11Texture2D* imageOutputTexture,
         uint32_t dispatchX, uint32_t dispatchY, uint32_t dispatchZ,
         const std::vector<ID3D11ShaderResourceView*>& extraSrvs,
-        const std::vector<uint32_t>& extraSrvSlots)
+        const std::vector<uint32_t>& extraSrvSlots,
+        bool readbackToCpu)
     {
         std::vector<float> result;
         if (!m_shader || !m_context || !inputTexture)
@@ -274,8 +275,12 @@ namespace ShaderLab::Rendering
         m_context->CSSetShader(nullptr, nullptr, 0);
 
         // Readback (only if caller asked for analysis values; image
-        // output stays GPU-resident).
-        if (resultCount > 0)
+        // output stays GPU-resident). Phase 8c: also gated by
+        // `readbackToCpu` so the host can keep the result GPU-only when
+        // no CPU consumer needs the values this frame -- the SRV at
+        // `m_resultSRV` is unaffected and downstream GPU bindings still
+        // see the buffer's freshly-written contents.
+        if (resultCount > 0 && readbackToCpu)
         {
             m_context->CopyResource(m_stagingBuffer.get(), m_resultBuffer.get());
             hr = m_context->Map(m_stagingBuffer.get(), 0, D3D11_MAP_READ, 0, &mapped);

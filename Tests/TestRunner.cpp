@@ -931,7 +931,149 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
         }
     }
 
-    // ----- Phase 7 spike: headless pixel readback ----------------------------
+    // ----- Phase 8c: skip-CPU-readback when GPU-routed -----------------
+    //
+    // Verifies the Performance::IsSkipUnneededCpuReadbackEnabled() path:
+    //   Source -> LumStats -> ICtCp Tone Map (bound via TargetPeakNits = LumStats.Mean).
+    // With the skip flag ON and the GPU-binding flag ON, the LumStats
+    // dispatch's CPU Map() should be elided -- but ICtCp must still
+    // produce correct image output (because it reads LumStats's GPU SRV).
+    // With the host hint adding LumStats to interest set, readback runs
+    // again. With skip flag OFF, readback always runs (default behavior).
+    void TestSkipCpuReadback()
+    {
+        printf("\n=== Phase 8c: skip-CPU-readback ===\n");
+        g_evaluator.ReleaseCache();
+        g_evaluator.ClearCpuAnalysisInterest();
+
+        auto& registry = ShaderLab::Effects::ShaderLabEffects::Instance();
+        auto* srcDesc   = registry.FindByName(L"Gamut Source");
+        auto* statsDesc = registry.FindByName(L"Luminance Statistics");
+        auto* ictcpDesc = registry.FindByName(L"ICtCp Tone Map (HDR -> SDR)");
+        if (!srcDesc || !statsDesc || !ictcpDesc) {
+            TEST("SkipReadback_DescriptorsFound", false);
+            return;
+        }
+
+        auto buildGraph = [&](ShaderLab::Graph::EffectGraph& g,
+                              uint32_t& srcId, uint32_t& statsId, uint32_t& ictcpId) {
+            auto srcNode   = ShaderLab::Effects::ShaderLabEffects::CreateNode(*srcDesc);
+            auto statsNode = ShaderLab::Effects::ShaderLabEffects::CreateNode(*statsDesc);
+            auto ictcpNode = ShaderLab::Effects::ShaderLabEffects::CreateNode(*ictcpDesc);
+            srcId   = g.AddNode(std::move(srcNode));
+            statsId = g.AddNode(std::move(statsNode));
+            ictcpId = g.AddNode(std::move(ictcpNode));
+            g.Connect(srcId, 0, statsId, 0);
+            g.Connect(srcId, 0, ictcpId, 0);
+            g.BindProperty(ictcpId, L"TargetPeakNits", statsId, L"Mean", 0);
+        };
+
+        // ---- Sub-test 1: skip flag ON + GPU flag ON, no host hint -------
+        // LumStats.Mean is read by ICtCp via GPU SRV -> readback skipped.
+        {
+            ShaderLab::Effects::SourceNodeFactory sf;
+            ShaderLab::Graph::EffectGraph g;
+            uint32_t srcId, statsId, ictcpId;
+            buildGraph(g, srcId, statsId, ictcpId);
+
+            ShaderLab::Performance::SetGpuBindingsEnabled(true);
+            ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(true);
+            uint64_t beforeSkip = ShaderLab::Performance::SkippedCpuReadbacks();
+
+            // Two-pass: first creates effects, second produces output.
+            Evaluate(g, sf);
+            g_dc->SetTarget(nullptr);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+            Evaluate(g, sf);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+
+            uint64_t afterSkip = ShaderLab::Performance::SkippedCpuReadbacks();
+            TEST("SkipReadback_CounterIncrementsWhenSkipping",
+                 afterSkip > beforeSkip);
+
+            // ICtCp's image output must still be valid (it reads
+            // LumStats.Mean via the upstream SRV at t1).
+            auto* ictcp = g.FindNode(ictcpId);
+            TEST("SkipReadback_ICtCpHasOutput",
+                 ictcp && ictcp->cachedOutput != nullptr);
+
+            ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(false);
+            ShaderLab::Performance::SetGpuBindingsEnabled(false);
+        }
+
+        // ---- Sub-test 2: skip flag ON + host hint forces readback ------
+        // Adding LumStats to CpuAnalysisInterest re-engages readback so
+        // the Properties panel / MCP can read fresh values. Validates
+        // the host's escape hatch for any node that needs CPU values.
+        {
+            ShaderLab::Effects::SourceNodeFactory sf;
+            ShaderLab::Graph::EffectGraph g;
+            uint32_t srcId, statsId, ictcpId;
+            buildGraph(g, srcId, statsId, ictcpId);
+
+            ShaderLab::Performance::SetGpuBindingsEnabled(true);
+            ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(true);
+            g_evaluator.SetCpuAnalysisInterest({ statsId });
+
+            Evaluate(g, sf);
+            g_dc->SetTarget(nullptr);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+            Evaluate(g, sf);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+
+            auto* stats = g.FindNode(statsId);
+            float mean = 0.0f;
+            if (stats) {
+                for (const auto& f : stats->analysisOutput.fields)
+                    if (f.name == L"Mean") { mean = f.components[0]; break; }
+            }
+            TEST("SkipReadback_HostHintForcesReadback", mean > 0.0f);
+
+            g_evaluator.ClearCpuAnalysisInterest();
+            ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(false);
+            ShaderLab::Performance::SetGpuBindingsEnabled(false);
+        }
+
+        // ---- Sub-test 3: skip flag OFF preserves baseline ---------------
+        // Default behavior: every dispatch reads back regardless.
+        {
+            ShaderLab::Effects::SourceNodeFactory sf;
+            ShaderLab::Graph::EffectGraph g;
+            uint32_t srcId, statsId, ictcpId;
+            buildGraph(g, srcId, statsId, ictcpId);
+
+            ShaderLab::Performance::SetGpuBindingsEnabled(true);
+            ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(false);
+
+            Evaluate(g, sf);
+            g_dc->SetTarget(nullptr);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+            Evaluate(g, sf);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+
+            auto* stats = g.FindNode(statsId);
+            float mean = 0.0f;
+            if (stats) {
+                for (const auto& f : stats->analysisOutput.fields)
+                    if (f.name == L"Mean") { mean = f.components[0]; break; }
+            }
+            TEST("SkipReadback_FlagOffAlwaysReadsBack", mean > 0.0f);
+
+            ShaderLab::Performance::SetGpuBindingsEnabled(false);
+        }
+    }
     //
     // The Phase 7 plan to move the MCP server engine-side and add a
     // ShaderLabHeadless.exe console host depends on being able to render
@@ -1113,6 +1255,7 @@ int main(int argc, char* argv[])
     TestEffectChain();
     TestLuminanceStatistics();
     TestGpuBindingRouting();
+    TestSkipCpuReadback();
     TestHeadlessReadback();
 
     // ---- Math test bench (Phase 2) -----------------------------------------

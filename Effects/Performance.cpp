@@ -7,6 +7,9 @@ namespace ShaderLab::Performance
         // Phase 8 v1.6: GPU-binding fast path defaults ON.
         std::atomic<bool>     g_enabled{ true };
         std::atomic<uint64_t> g_detections{ 0 };
+        // Phase 8c: skip-readback opt-in defaults OFF.
+        std::atomic<bool>     g_skipReadback{ false };
+        std::atomic<uint64_t> g_skipped{ 0 };
     }
 
     bool IsGpuBindingsEnabled()
@@ -27,5 +30,25 @@ namespace ShaderLab::Performance
     void IncrementGpuBindingDetection()
     {
         g_detections.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    bool IsSkipUnneededCpuReadbackEnabled()
+    {
+        return g_skipReadback.load(std::memory_order_relaxed);
+    }
+
+    void SetSkipUnneededCpuReadbackEnabled(bool enabled)
+    {
+        g_skipReadback.store(enabled, std::memory_order_relaxed);
+    }
+
+    uint64_t SkippedCpuReadbacks()
+    {
+        return g_skipped.load(std::memory_order_relaxed);
+    }
+
+    void IncrementSkippedCpuReadbacks()
+    {
+        g_skipped.fetch_add(1, std::memory_order_relaxed);
     }
 }

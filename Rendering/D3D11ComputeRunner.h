@@ -91,7 +91,8 @@ namespace ShaderLab::Rendering
             ID3D11Texture2D* imageOutputTexture,
             uint32_t dispatchX = 1, uint32_t dispatchY = 1, uint32_t dispatchZ = 1,
             const std::vector<ID3D11ShaderResourceView*>& extraSrvs = {},
-            const std::vector<uint32_t>& extraSrvSlots = {});
+            const std::vector<uint32_t>& extraSrvSlots = {},
+            bool readbackToCpu = true);
 
         bool IsInitialized() const { return m_device != nullptr; }
         bool HasShader() const { return m_shader != nullptr; }

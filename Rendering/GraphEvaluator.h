@@ -58,6 +58,28 @@ namespace ShaderLab::Rendering
         // If the effect isn't cached yet, does nothing (next Evaluate will create it).
         void UpdateNodeShader(uint32_t nodeId, const Graph::EffectNode& node);
 
+        // Phase 8c: host hint set for which nodes need their analysis
+        // values on the CPU. UI integration: MainWindow updates this
+        // each frame with the currently-selected node id (so its
+        // Properties-panel display stays live) plus any node whose
+        // values an MCP route is about to read. Default empty: when
+        // empty AND the skip-readback flag is on, only nodes detected
+        // as feeding a non-GPU-served binding will get readback.
+        // When the skip-readback flag is off (the default), this set
+        // is ignored and every compute dispatch reads back to CPU.
+        void SetCpuAnalysisInterest(std::unordered_set<uint32_t> ids)
+        {
+            m_cpuAnalysisInterest = std::move(ids);
+        }
+        void AddCpuAnalysisInterest(uint32_t id)
+        {
+            m_cpuAnalysisInterest.insert(id);
+        }
+        void ClearCpuAnalysisInterest()
+        {
+            m_cpuAnalysisInterest.clear();
+        }
+
     private:
         // Create or retrieve the cached D2D effect for a built-in effect node.
         ID2D1Effect* GetOrCreateEffect(
@@ -160,7 +182,28 @@ namespace ShaderLab::Rendering
             Graph::EffectNode& node,
             ID2D1Image* inputImage,
             ID2D1Bitmap1* preRenderedInput,
-            Effects::CustomComputeBridgeEffect* bridge);
+            Effects::CustomComputeBridgeEffect* bridge,
+            bool readbackToCpu);
+
+        // Phase 8c skip-readback predicate. Returns true iff the binding
+        // (consumer node `consumer`, parameter `paramName`, source pin
+        // described by the binding's first ComponentSource) will be
+        // served entirely via the GPU SRV path during DispatchViaBridge.
+        // The predicate is conservative: anything that would cause the
+        // bindingPlan to be cleared inside DispatchViaBridge (variant
+        // bytecode missing, multi-component sources, gpuBindable=false,
+        // bridge missing, SRV unavailable) returns false here so the
+        // pre-pass falls back to "needs CPU readback" for the source.
+        bool CanServeBindingViaGpu(
+            const Graph::EffectNode&         consumer,
+            const std::wstring&              paramName,
+            const Graph::PropertyBinding&    binding,
+            const Graph::EffectGraph&        graph) const;
+
+        // Phase 8c host hint: nodes whose analysis values must be
+        // populated on the CPU this frame (currently-selected node, MCP
+        // targets, etc). Default empty.
+        std::unordered_set<uint32_t> m_cpuAnalysisInterest;
 
         // Phase 8 perf: per-input FP32 pre-render cache used by
         // ProcessDeferredCompute to amortize the source DrawImage

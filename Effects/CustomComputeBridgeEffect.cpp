@@ -411,13 +411,21 @@ float4 main(
         // parallel via a u1 binding the bridge sets up below. Phase 8
         // GPU bindings (m_gpuBindingSrvs / m_gpuBindingSlots) flow
         // through as extra SRVs at consumer-declared t-slots.
+        //
+        // Phase 8c: when caller passes outAnalysisFloats=nullptr it
+        // signals "no CPU consumer this frame" -- skip the runner's
+        // CopyResource + Map. The structured-buffer UAV is still sized
+        // and populated by the dispatch; only the readback round-trip
+        // is elided. Downstream GPU SRV consumers see the same buffer.
+        const bool readbackToCpu = (outAnalysisFloats != nullptr);
         auto floats = m_runner.DispatchWithImageOutput(
             inputTex.get(),
             cbBytes,
             analysisFloat4Count,
             m_imageOutputTex.get(),
             m_dispatchX, m_dispatchY, m_dispatchZ,
-            m_gpuBindingSrvs, m_gpuBindingSlots);
+            m_gpuBindingSrvs, m_gpuBindingSlots,
+            readbackToCpu);
 
         if (outAnalysisFloats)
             *outAnalysisFloats = std::move(floats);

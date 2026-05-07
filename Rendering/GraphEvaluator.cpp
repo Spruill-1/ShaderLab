@@ -653,6 +653,44 @@ namespace ShaderLab::Rendering
 
         bool imageComputeProduced = false;
 
+        // Phase 8c: build the per-frame "needs CPU readback" set. When
+        // the skip-readback feature flag is OFF, the set is treated as
+        // covering every node (preserves pre-Phase-8c behavior). When
+        // ON, a node lands in the set if either:
+        //   (1) it is hinted by the host via SetCpuAnalysisInterest
+        //       (UI selected node, MCP target, etc.), or
+        //   (2) at least one downstream property binding that consumes
+        //       this node's analysis output is NOT served via the GPU
+        //       SRV path (CanServeBindingViaGpu returned false).
+        // Nodes not in the set skip the CopyResource + Map round-trip;
+        // their `analysisOutput.fields` retains last-frame values.
+        const bool skipFlag = Performance::IsSkipUnneededCpuReadbackEnabled();
+        std::unordered_set<uint32_t> needsReadback;
+        if (skipFlag)
+        {
+            // Seed with host hints.
+            needsReadback = m_cpuAnalysisInterest;
+            // Add every source whose binding cannot be GPU-served.
+            for (const auto& consumerNode : graph.Nodes())
+            {
+                for (const auto& [propName, binding] : consumerNode.propertyBindings)
+                {
+                    bool gpuServed =
+                        CanServeBindingViaGpu(consumerNode, propName, binding, graph);
+                    if (gpuServed) continue;
+                    for (const auto& srcOpt : binding.sources)
+                    {
+                        if (srcOpt.has_value())
+                            needsReadback.insert(srcOpt->sourceNodeId);
+                    }
+                }
+            }
+        }
+        auto isReadbackNeeded = [&](uint32_t nodeId) -> bool
+        {
+            return !skipFlag || needsReadback.count(nodeId) > 0;
+        };
+
         // Phase 8 perf: pre-render each unique upstream input ONCE
         // per frame and share the FP32 bitmap across all deferred-
         // compute consumers that share it. Without this, a graph
@@ -747,7 +785,7 @@ namespace ShaderLab::Rendering
                 preRendered = preRenderShared(deferred.inputImage);
 
             DispatchViaBridge(dc, graph, *node, deferred.inputImage,
-                preRendered, bridge);
+                preRendered, bridge, isReadbackNeeded(node->id));
 
             bool hasImageOutput = !node->outputPins.empty();
             if (hasImageOutput && node->cachedOutput)
@@ -795,7 +833,8 @@ namespace ShaderLab::Rendering
         EffectNode& node,
         ID2D1Image* inputImage,
         ID2D1Bitmap1* preRenderedInput,
-        Effects::CustomComputeBridgeEffect* bridge)
+        Effects::CustomComputeBridgeEffect* bridge,
+        bool readbackToCpu)
     {
         if (!bridge) return;
         auto& def = node.customEffect.value();
@@ -1132,13 +1171,20 @@ namespace ShaderLab::Rendering
         }
 
         std::vector<float> analysisFloats;
+        // Phase 8c: pass nullptr for outAnalysisFloats when readback is
+        // not needed; the bridge interprets that as "skip the Map" and
+        // returns an empty `floats` vector. The structured-buffer SRV
+        // is still populated on the GPU side for downstream consumers.
         HRESULT hr = bridge->Dispatch(
             dc, dispatchInput,
             cbBytes.empty() ? nullptr : cbBytes.data(),
             static_cast<UINT32>(cbBytes.size()),
             analysisFloat4Count,
             imageOutW, imageOutH,
-            &analysisFloats);
+            readbackToCpu ? &analysisFloats : nullptr);
+
+        if (!readbackToCpu)
+            Performance::IncrementSkippedCpuReadbacks();
 
         // After dispatch, restore the baseline bytecode on the bridge
         // so a subsequent dispatch with a different binding plan starts
@@ -1160,8 +1206,13 @@ namespace ShaderLab::Rendering
         }
         node.runtimeError.clear();
 
-        // Unpack analysis floats into typed fields.
-        if (analysisFloat4Count > 0)
+        // Unpack analysis floats into typed fields. Phase 8c: only
+        // overwrite when readback actually ran -- skip-readback frames
+        // leave `node.analysisOutput.fields` at the previous-frame
+        // values (or empty if never populated). Hosts that need fresh
+        // values must include the node in
+        // `GraphEvaluator::SetCpuAnalysisInterest` (see Performance.h).
+        if (readbackToCpu && analysisFloat4Count > 0)
         {
             node.analysisOutput.type = AnalysisOutputType::Typed;
             node.analysisOutput.fields.clear();
@@ -1206,6 +1257,68 @@ namespace ShaderLab::Rendering
             node.cachedOutput = bridge->GetImageOutput();
         else
             node.cachedOutput = nullptr;
+    }
+
+    // Phase 8c: predicate matching the GPU-routability checks used inside
+    // DispatchViaBridge (see bindingPlan construction). Conservative:
+    // any condition that would cause DispatchViaBridge to skip GPU
+    // routing for the binding returns false here, so the pre-pass
+    // counts the source as needing CPU readback. Keep this in sync
+    // with the bindingPlan construction in DispatchViaBridge -- if a
+    // new GPU-routability requirement is added there, mirror it here.
+    bool GraphEvaluator::CanServeBindingViaGpu(
+        const EffectNode&         consumer,
+        const std::wstring&       paramName,
+        const Graph::PropertyBinding& binding,
+        const EffectGraph&        graph) const
+    {
+        if (!Performance::IsGpuBindingsEnabled())
+            return false;
+        // Consumer must be a D3D11 compute custom effect (only the
+        // CustomComputeBridgeEffect can wire upstream SRVs at t-slots).
+        // Pixel-shader / D2D-tiled / built-in D2D effects always go CPU.
+        if (!consumer.customEffect.has_value())
+            return false;
+        if (consumer.customEffect->shaderType != Graph::CustomShaderType::D3D11ComputeShader)
+            return false;
+        // Single-component bindings only -- multi-source per-component
+        // packing always goes CPU.
+        if (binding.wholeArray ||
+            binding.sources.empty() ||
+            binding.sources.size() > 1 ||
+            !binding.sources[0].has_value())
+            return false;
+        // Target parameter must be flagged gpuBindable.
+        const auto& def = consumer.customEffect.value();
+        const Graph::ParameterDefinition* paramDef = nullptr;
+        for (const auto& p : def.parameters)
+        {
+            if (p.name == paramName) { paramDef = &p; break; }
+        }
+        if (!paramDef || !paramDef->gpuBindable)
+            return false;
+        // Source bridge must exist and expose IEngineComputeOutput. We
+        // don't actually call GetAnalysisSrv here (it can fail before
+        // first dispatch); presence of the bridge in m_bridgeImplCache
+        // and a customEffect on the source is the predicate. The
+        // pre-pass runs before DispatchViaBridge during the same
+        // ProcessDeferredCompute, so by the time the consumer
+        // dispatches, the upstream's runner has produced its SRV.
+        const uint32_t srcId = binding.sources[0]->sourceNodeId;
+        auto bridgeIt = m_bridgeImplCache.find(srcId);
+        if (bridgeIt == m_bridgeImplCache.end() || !bridgeIt->second)
+            return false;
+        const EffectNode* srcNode = graph.FindNode(srcId);
+        if (!srcNode || !srcNode->customEffect.has_value())
+            return false;
+        // Source field must exist on the upstream's analysisFields.
+        const auto& srcFieldName = binding.sources[0]->sourceFieldName;
+        bool fieldFound = false;
+        for (const auto& fd : srcNode->customEffect->analysisFields)
+        {
+            if (fd.name == srcFieldName) { fieldFound = true; break; }
+        }
+        return fieldFound;
     }
 
     // -----------------------------------------------------------------------
