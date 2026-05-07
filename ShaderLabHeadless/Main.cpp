@@ -167,14 +167,15 @@ L"  --reap-shader-cache-stale-sec N\n"
 L"                           Threshold in seconds for --reap-shader-cache\n"
 L"                           (default: 7776000 = 90 days).\n"
 L"\n"
-L"GPU-binding fast path (Phase 8 feature flag):\n"
-L"  --enable-gpu-bindings    Enable Performance::IsGpuBindingsEnabled for\n"
-L"                           this run. The evaluator will detect bindings\n"
-L"                           routable upstream-effect SRV -> consumer t-slot\n"
-L"                           and bump GpuBindingDetections() telemetry.\n"
-L"                           Actual SRV routing requires consumer-effect\n"
-L"                           support (D3D11 compute via bridge today).\n"
-L"  --disable-gpu-bindings   Force GPU bindings off (default for v1.6).\n",
+L"GPU-binding fast path (Phase 8 feature flag, default ON in v1.6):\n"
+L"  --enable-gpu-bindings    Force GPU bindings on (default).\n"
+L"                           The evaluator routes upstream-effect SRVs\n"
+L"                           directly to D3D11 compute consumers'\n"
+L"                           t-slots; pixel shader consumers fall back\n"
+L"                           to CPU readback gracefully. Telemetry via\n"
+L"                           Performance::GpuBindingDetections().\n"
+L"  --disable-gpu-bindings   Force GPU bindings off; every binding goes\n"
+L"                           through CPU readback (the pre-v1.6 path).\n",
             exeName);
     }
 

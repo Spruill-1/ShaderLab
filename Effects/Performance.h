@@ -10,33 +10,25 @@ namespace ShaderLab::Performance
     //
     // When enabled, the evaluator's binding-resolution pass detects
     // upstream effects that publish IEngineComputeOutput AND consumer
-    // parameters flagged gpuBindable, and *attempts* to route them
-    // GPU-side instead of via Map() readback.
+    // parameters flagged gpuBindable, and routes them GPU-side via the
+    // CustomComputeBridgeEffect's SetGpuBinding entry instead of via
+    // Map() readback. v1.6 ships with this default ON.
     //
-    // For the v1.6 release this defaults OFF so behavior is unchanged
-    // for end users. CLI flag --enable-gpu-bindings / --disable-gpu-
-    // bindings flip it for headless. The status bar (future) will
-    // expose a checkbox once enough effects are migrated.
+    // CLI flag --enable-gpu-bindings / --disable-gpu-bindings flips it
+    // for headless. Tests can flip it via SetGpuBindingsEnabled to
+    // exercise both paths.
     //
-    // The actual GPU routing path is consumer-effect-specific:
-    //   - D3D11 compute consumers (via CustomComputeBridgeEffect): can
-    //     bind the upstream SRV to a t-slot via a future SetGpuBinding
-    //     entry on the bridge (added when the first consumer needs it).
-    //   - D2D pixel-shader consumers: cannot bind raw SRVs through
-    //     D2D's input mechanism; would need a ResourceTexture-update
-    //     path (deferred).
-    //
-    // When the flag is enabled but the consumer's effect class has no
-    // GPU-binding implementation yet, the evaluator falls back to CPU
-    // readback for that binding (no behavior change for that node).
-    //
-    // For v1.6, this scaffolding lets us:
-    //   1. Track how many graphs *would* benefit from GPU binding via
-    //      GpuBindingDetections() telemetry.
-    //   2. Validate the macro-wrapped HLSL compiles and runs identically
-    //      to today's path with the flag off.
-    //   3. Flip the flag once a future commit adds the actual SRV
-    //      routing for at least one consumer effect class.
+    // Routing behavior:
+    //   - D3D11 compute consumers (via CustomComputeBridgeEffect): bind
+    //     the upstream IEngineComputeOutput SRV at the consumer's
+    //     t-slot via the bridge's SetGpuBinding entry. Variant bytecode
+    //     (compiled with _SLPARAM_<name>_GPU=1 macros) comes from the
+    //     BytecodeCache (eager precompile fills the +N variants on
+    //     first encounter so the swap is a cache hit).
+    //   - D2D pixel-shader consumers (no bridge entry): the m_bridgeImplCache
+    //     miss naturally skips the GPU plan; CPU readback path runs as
+    //     graceful fallback. A compute upstream feeding a pixel shader
+    //     downstream still works -- just at today's cbuffer-pack speed.
 
     SHADERLAB_API bool IsGpuBindingsEnabled();
     SHADERLAB_API void SetGpuBindingsEnabled(bool enabled);
