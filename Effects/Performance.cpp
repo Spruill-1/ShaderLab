@@ -4,7 +4,13 @@
 namespace ShaderLab::Performance
 {
     namespace {
-        std::atomic<bool>     g_enabled{ false };
+        // Phase 8 v1.6: GPU-binding fast path defaults ON. The
+        // detection + routing pipeline is exercised by 149 tests +
+        // the headless smoke; pixel shader consumers fall back to
+        // CPU readback gracefully so a compute upstream feeding a
+        // pixel shader downstream still works (just at the older
+        // cbuffer-pack speed).
+        std::atomic<bool>     g_enabled{ true };
         std::atomic<uint64_t> g_detections{ 0 };
     }
 
