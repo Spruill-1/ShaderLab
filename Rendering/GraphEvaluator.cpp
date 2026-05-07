@@ -473,6 +473,22 @@ namespace ShaderLab::Rendering
                         def.compiledBytecode = std::move(cached.bytecode);
                         CoCreateGuid(&def.shaderGuid);
                         node->dirty = true;
+                        // Phase 8 eager precompile: kick off background
+                        // compiles for the +N gpu-binding variants so
+                        // they're warm if the user later wires a binding
+                        // to a gpuBindable param. Idempotent (the cache
+                        // dedupes by key); fires once per node per session
+                        // since this branch runs only on !isCompiled().
+                        if (!gpuNames.empty())
+                        {
+                            Effects::BytecodeCacheMetadata meta;
+                            meta.effectId = node->name;
+                            meta.version  = 1u;
+                            Effects::BytecodeCache::Instance().PrecompileCommonShapes(
+                                meta,
+                                Effects::CanonicalizeHlslSource(def.hlslSource),
+                                "main", target, gpuNames);
+                        }
                     }
                     else
                     {
@@ -728,6 +744,18 @@ namespace ShaderLab::Rendering
             bridge->SetCompiledBytecode(def.compiledBytecode.data(),
                 static_cast<UINT32>(def.compiledBytecode.size()));
             node.runtimeError.clear();
+            // Phase 8 eager precompile (mirror of the ShaderLab built-in
+            // case in EvaluateNode).
+            if (!gpuNames.empty())
+            {
+                Effects::BytecodeCacheMetadata meta;
+                meta.effectId = node.name;
+                meta.version  = 1u;
+                Effects::BytecodeCache::Instance().PrecompileCommonShapes(
+                    meta,
+                    Effects::CanonicalizeHlslSource(def.hlslSource),
+                    "main", "cs_5_0", gpuNames);
+            }
         }
 
         // Analysis float4 count: sum over typed-field pixel counts.
