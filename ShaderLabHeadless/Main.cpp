@@ -43,6 +43,7 @@
 #include "Effects/SourceNodeFactory.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/BytecodeCache.h"
+#include "Effects/Performance.h"
 #include "Rendering/PixelReadback.h"
 #include "Engine/Mcp/McpHttpServer.h"
 #include "Engine/Mcp/EngineMcpRoutes.h"
@@ -107,6 +108,11 @@ namespace
         bool          reapShaderCache{ false };
         bool          clearShaderCache{ false };
         uint64_t      reapStaleSec{ 90ull * 24 * 60 * 60 };  // 90 days default
+
+        // p8-feature-flag: opt in to the Phase 8 GPU-binding fast path
+        // for the duration of this run. Persists no state; affects only
+        // this process. Defaults to engine default (off for v1.6).
+        std::optional<bool> enableGpuBindings;
     };
 
     void PrintUsage(const wchar_t* exeName)
@@ -159,7 +165,16 @@ L"  --clear-shader-cache     Delete every cached shader bytecode entry.\n"
 L"                           Exits without loading a graph.\n"
 L"  --reap-shader-cache-stale-sec N\n"
 L"                           Threshold in seconds for --reap-shader-cache\n"
-L"                           (default: 7776000 = 90 days).\n",
+L"                           (default: 7776000 = 90 days).\n"
+L"\n"
+L"GPU-binding fast path (Phase 8 feature flag):\n"
+L"  --enable-gpu-bindings    Enable Performance::IsGpuBindingsEnabled for\n"
+L"                           this run. The evaluator will detect bindings\n"
+L"                           routable upstream-effect SRV -> consumer t-slot\n"
+L"                           and bump GpuBindingDetections() telemetry.\n"
+L"                           Actual SRV routing requires consumer-effect\n"
+L"                           support (D3D11 compute via bridge today).\n"
+L"  --disable-gpu-bindings   Force GPU bindings off (default for v1.6).\n",
             exeName);
     }
 
@@ -229,6 +244,8 @@ L"                           (default: 7776000 = 90 days).\n",
                 auto v = needNext(L"--reap-shader-cache-stale-sec"); if (!v) return false;
                 out.reapStaleSec = static_cast<uint64_t>(std::wcstoull(v, nullptr, 10));
             }
+            else if (a == L"--enable-gpu-bindings")  { out.enableGpuBindings = true;  }
+            else if (a == L"--disable-gpu-bindings") { out.enableGpuBindings = false; }
             else if (a == L"--help" || a == L"-h" || a == L"-?") { PrintUsage(argv[0]); return false; }
             else { std::wprintf(L"ERROR: unknown argument '%ls'\n", argv[i]); return false; }
         }
@@ -1124,6 +1141,12 @@ int wmain(int argc, wchar_t* argv[])
 
     winrt::init_apartment();
     ::MFStartup(MF_VERSION);
+
+    // p8-feature-flag: apply --enable-gpu-bindings / --disable-gpu-bindings
+    // before any engine work so the evaluator's binding-resolution pass
+    // sees the correct flag state. Engine default is OFF for v1.6.
+    if (args.enableGpuBindings.has_value())
+        ShaderLab::Performance::SetGpuBindingsEnabled(*args.enableGpuBindings);
 
     // Run all engine work inside an inner scope so the GraphEvaluator
     // and other engine objects destruct before MFShutdown / apartment
