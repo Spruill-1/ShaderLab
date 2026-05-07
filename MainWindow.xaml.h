@@ -405,7 +405,10 @@ namespace winrt::ShaderLab::implementation
 
         // MCP HTTP server for AI agent integration.
         std::unique_ptr<::ShaderLab::McpHttpServer> m_mcpServer;
-        bool m_autoStartMcp{ false };
+        // TEMP (Phase 8 perf debugging): default ON so the MCP-driven
+        // graph-building loop doesn't require a manual toggle every
+        // restart. Revert to false once the crash repro is sorted.
+        bool m_autoStartMcp{ true };
         ::ShaderLab::Rendering::DevicePreference m_devicePref{ ::ShaderLab::Rendering::DevicePreference::Default };
         std::wstring m_pendingOpenPath; // file path from Explorer FTA, loaded after init
         void SetupMcpRoutes();
