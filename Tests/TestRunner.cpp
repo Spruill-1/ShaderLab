@@ -555,6 +555,11 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
     void TestLuminanceStatistics()
     {
         printf("\n=== Luminance Statistics (D3D11 compute) ===\n");
+        // g_evaluator is a global; node IDs (1, 2, ...) collide with
+        // prior tests' graphs, so flush its caches before building a
+        // fresh graph or CreateOrGetEffect will cache-hit a stale
+        // effect from a different test.
+        g_evaluator.ReleaseCache();
         auto& registry = ShaderLab::Effects::ShaderLabEffects::Instance();
         auto* lumDesc = registry.FindByName(L"Luminance Statistics");
         if (!lumDesc) { TEST("LumStatsDescriptorFound", false); return; }

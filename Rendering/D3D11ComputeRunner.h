@@ -38,6 +38,16 @@ namespace ShaderLab::Rendering
         // can pack user properties at the correct offsets.
         bool CompileShader(const std::string& hlslSource);
 
+        // Install pre-compiled shader bytecode (Phase 8 bridge effect
+        // path). Bypasses D3DCompile -- used when the host already
+        // has the bytecode (e.g. after an MCP /effect/compile call).
+        // The runner stashes the bytecode blob and the live
+        // ID3D11ComputeShader; subsequent Dispatch calls use it like
+        // they would the CompileShader output.
+        void InstallPrecompiledShader(
+            const std::vector<uint8_t>& bytecode,
+            winrt::com_ptr<ID3D11ComputeShader> shader);
+
         // Get the last compile error message.
         const std::wstring& GetCompileError() const { return m_compileError; }
 
@@ -52,6 +62,19 @@ namespace ShaderLab::Rendering
             ID3D11Texture2D* inputTexture,
             const std::vector<BYTE>& cbufferData,
             uint32_t resultCount);
+
+        // Dispatch with an optional secondary image-output texture
+        // bound at u1 as `RWTexture2D<float4>`. Used by
+        // CustomComputeBridgeEffect: image-producing D3D11 compute
+        // effects (CIE Histogram et al.) write their image output
+        // here while still publishing analysis values to the
+        // structured buffer at u0. Pass nullptr for analysis-only.
+        // Same readback contract as the regular Dispatch.
+        std::vector<float> DispatchWithImageOutput(
+            ID3D11Texture2D* inputTexture,
+            const std::vector<BYTE>& cbufferData,
+            uint32_t resultCount,
+            ID3D11Texture2D* imageOutputTexture);
 
         bool IsInitialized() const { return m_device != nullptr; }
         bool HasShader() const { return m_shader != nullptr; }

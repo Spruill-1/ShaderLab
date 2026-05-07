@@ -137,21 +137,48 @@ namespace ShaderLab::Rendering
         m_device->CreateBuffer(&bufDesc, nullptr, m_cbuffer.put());
     }
 
+    void D3D11ComputeRunner::InstallPrecompiledShader(
+        const std::vector<uint8_t>& bytecode,
+        winrt::com_ptr<ID3D11ComputeShader> shader)
+    {
+        // Install pre-compiled bytecode + the live shader handle. Used
+        // by CustomComputeBridgeEffect to bypass the runtime D3DCompile
+        // path when the bytecode is already produced by the host (e.g.
+        // an MCP /effect/compile call). Subsequent Dispatch calls use
+        // the installed shader directly.
+        m_bytecode = bytecode;
+        m_shader = std::move(shader);
+        m_compileError.clear();
+    }
+
     std::vector<float> D3D11ComputeRunner::Dispatch(
         ID3D11Texture2D* inputTexture,
         const std::vector<BYTE>& cbufferData,
         uint32_t resultCount)
     {
+        return DispatchWithImageOutput(inputTexture, cbufferData, resultCount, nullptr);
+    }
+
+    std::vector<float> D3D11ComputeRunner::DispatchWithImageOutput(
+        ID3D11Texture2D* inputTexture,
+        const std::vector<BYTE>& cbufferData,
+        uint32_t resultCount,
+        ID3D11Texture2D* imageOutputTexture)
+    {
         std::vector<float> result;
-        if (!m_shader || !m_context || !inputTexture || resultCount == 0)
+        if (!m_shader || !m_context || !inputTexture)
             return result;
 
         // Get texture dimensions.
         D3D11_TEXTURE2D_DESC texDesc{};
         inputTexture->GetDesc(&texDesc);
 
-        // Ensure buffers are the right size.
-        EnsureBuffers(resultCount);
+        // Ensure buffers are the right size. Use 1 as the floor so
+        // analysis-only shaders that emit no analysis output (rare,
+        // but possible in the image-producing case) still get a valid
+        // SRV bound.
+        uint32_t bufferSlots = (resultCount > 0) ? resultCount : 1;
+        EnsureBuffers(bufferSlots);
         if (!m_resultBuffer || !m_resultUAV || !m_cbuffer) return result;
 
         // Create SRV for input.
@@ -162,6 +189,23 @@ namespace ShaderLab::Rendering
         srvDesc.Texture2D.MipLevels = 1;
         HRESULT hr = m_device->CreateShaderResourceView(inputTexture, &srvDesc, srv.put());
         if (FAILED(hr)) return result;
+
+        // Image-output UAV (optional).
+        winrt::com_ptr<ID3D11UnorderedAccessView> imageUAV;
+        if (imageOutputTexture)
+        {
+            D3D11_TEXTURE2D_DESC outDesc{};
+            imageOutputTexture->GetDesc(&outDesc);
+            D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+            uavDesc.Format = outDesc.Format;
+            uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+            hr = m_device->CreateUnorderedAccessView(imageOutputTexture, &uavDesc, imageUAV.put());
+            if (FAILED(hr)) return result;
+            // Clear the image-output UAV so previous-frame contents
+            // don't leak through when the shader writes selectively.
+            float clearF[4] = { 0, 0, 0, 0 };
+            m_context->ClearUnorderedAccessViewFloat(imageUAV.get(), clearF);
+        }
 
         // Pack cbuffer: Width, Height (8 bytes) + user data.
         D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -182,7 +226,7 @@ namespace ShaderLab::Rendering
             m_context->Unmap(m_cbuffer.get(), 0);
         }
 
-        // Clear result buffer.
+        // Clear analysis result buffer.
         uint32_t clearValues[4] = { 0, 0, 0, 0 };
         m_context->ClearUnorderedAccessViewUint(m_resultUAV.get(), clearValues);
 
@@ -190,8 +234,9 @@ namespace ShaderLab::Rendering
         m_context->CSSetShader(m_shader.get(), nullptr, 0);
         ID3D11ShaderResourceView* srvs[] = { srv.get() };
         m_context->CSSetShaderResources(0, 1, srvs);
-        ID3D11UnorderedAccessView* uavs[] = { m_resultUAV.get() };
-        m_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+        ID3D11UnorderedAccessView* uavs[2] = { m_resultUAV.get(), imageUAV.get() };
+        UINT uavCount = imageUAV ? 2u : 1u;
+        m_context->CSSetUnorderedAccessViews(0, uavCount, uavs, nullptr);
         ID3D11Buffer* cbs[] = { m_cbuffer.get() };
         m_context->CSSetConstantBuffers(0, 1, cbs);
 
@@ -200,18 +245,22 @@ namespace ShaderLab::Rendering
         // Clear shader state.
         ID3D11ShaderResourceView* nullSRV[] = { nullptr };
         m_context->CSSetShaderResources(0, 1, nullSRV);
-        ID3D11UnorderedAccessView* nullUAV[] = { nullptr };
-        m_context->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
+        ID3D11UnorderedAccessView* nullUAVs[2] = { nullptr, nullptr };
+        m_context->CSSetUnorderedAccessViews(0, uavCount, nullUAVs, nullptr);
         m_context->CSSetShader(nullptr, nullptr, 0);
 
-        // Readback.
-        m_context->CopyResource(m_stagingBuffer.get(), m_resultBuffer.get());
-        hr = m_context->Map(m_stagingBuffer.get(), 0, D3D11_MAP_READ, 0, &mapped);
-        if (SUCCEEDED(hr))
+        // Readback (only if caller asked for analysis values; image
+        // output stays GPU-resident).
+        if (resultCount > 0)
         {
-            const float* data = static_cast<const float*>(mapped.pData);
-            result.assign(data, data + resultCount * 4);
-            m_context->Unmap(m_stagingBuffer.get(), 0);
+            m_context->CopyResource(m_stagingBuffer.get(), m_resultBuffer.get());
+            hr = m_context->Map(m_stagingBuffer.get(), 0, D3D11_MAP_READ, 0, &mapped);
+            if (SUCCEEDED(hr))
+            {
+                const float* data = static_cast<const float*>(mapped.pData);
+                result.assign(data, data + resultCount * 4);
+                m_context->Unmap(m_stagingBuffer.get(), 0);
+            }
         }
 
         // Phase 8: bump the dispatch counter so downstream

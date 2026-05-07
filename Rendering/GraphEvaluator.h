@@ -5,6 +5,7 @@
 #include "../Graph/EffectGraph.h"
 #include "../Effects/CustomPixelShaderEffect.h"
 #include "../Effects/CustomComputeShaderEffect.h"
+#include "../Effects/CustomComputeBridgeEffect.h"
 #include "../Effects/ShaderCompiler.h"
 #include "D3D11ComputeRunner.h"
 
@@ -108,6 +109,14 @@ namespace ShaderLab::Rendering
         };
         std::unordered_map<uint32_t, CustomEffectEntry> m_customImplCache;
 
+        // Phase 8: per-node CustomComputeBridgeEffect impl cache.
+        // Populated when CreateOrGetEffect creates a bridge for a
+        // D3D11ComputeShader node. ProcessDeferredCompute looks up the
+        // bridge here and calls ICustomComputeBridge::Dispatch.
+        // Bridge lifetime is owned by m_effectCache (the ID2D1Effect
+        // outer); this raw pointer is valid as long as that entry is.
+        std::unordered_map<uint32_t, Effects::CustomComputeBridgeEffect*> m_bridgeImplCache;
+
         // Apply bytecode and cbuffer to a custom effect node.
         void ApplyCustomEffect(
             ID2D1Effect* effect,
@@ -141,26 +150,16 @@ namespace ShaderLab::Rendering
         winrt::com_ptr<ID2D1Bitmap1> m_dummySourceBitmap;
         void EnsureDummySourceBitmap(ID2D1DeviceContext5* dc);
 
-        // Per-node D3D11 compute runners for user-authored D3D11 compute effects.
-        std::unordered_map<uint32_t, std::unique_ptr<D3D11ComputeRunner>> m_d3d11RunnerCache;
-
-        // Cached output bitmaps for image-producing compute effects.
-        std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Bitmap1>> m_imageComputeCache;
-        std::unordered_map<uint32_t, winrt::com_ptr<ID3D11Texture2D>> m_imageComputeTexCache;
-
-        // Generic D3D11 compute dispatch for user-authored shaders (analysis-only).
-        void DispatchUserD3D11Compute(
-            ID2D1DeviceContext5* dc,
-            Graph::EffectNode& node,
-            ID2D1Image* inputImage);
-
-        // D3D11 compute dispatch that produces an image output (not analysis data).
-        // Creates an output texture, dispatches compute, wraps as D2D bitmap → cachedOutput.
-        void DispatchImageCompute(
+        // Phase 8 unified bridge dispatch. Replaces the pre-Phase-8
+        // DispatchUserD3D11Compute (analysis-only) and DispatchImageCompute
+        // (image-producing) paths -- both now route through
+        // CustomComputeBridgeEffect::Dispatch.
+        void DispatchViaBridge(
             ID2D1DeviceContext5* dc,
             Graph::EffectNode& node,
             ID2D1Image* inputImage,
-            ID2D1Bitmap1* preRenderedInput = nullptr);
+            ID2D1Bitmap1* preRenderedInput,
+            Effects::CustomComputeBridgeEffect* bridge);
 
         // Deferred D3D11 compute dispatches (node ID + upstream image).
         struct DeferredCompute {
