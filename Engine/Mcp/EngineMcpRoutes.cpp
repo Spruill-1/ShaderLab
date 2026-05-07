@@ -879,7 +879,14 @@ namespace ShaderLab::Mcp
                             ctx.graph->MarkAllDirty();
 
                             // Special-cased properties that mirror to dedicated node fields.
-                            if (key == L"isPlaying")
+                            // Match both casings: graph storage uses `IsPlaying`
+                            // (PascalCase, matching the Clock + Video effect
+                            // descriptors and graph_get_node output), but legacy
+                            // callers used lowercase. Without this mirror, the
+                            // runtime `node.isPlaying` bool stays false and
+                            // Clock/Video never tick (RenderTick gates on
+                            // `node.isPlaying`, not on the property map).
+                            if (key == L"isPlaying" || key == L"IsPlaying")
                             {
                                 if (auto* bv = std::get_if<bool>(&node->properties[key]))
                                     node->isPlaying = *bv;

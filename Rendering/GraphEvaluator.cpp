@@ -2051,27 +2051,76 @@ namespace ShaderLab::Rendering
             {
                 implIt->second.pixelImpl->SetConstantBufferData(cbData.data(), static_cast<UINT32>(cbData.size()));
 
-                // Update fixed output size for zero-input source effects.
-                if (node.customEffect->inputNames.empty())
+                // Fixed-output sizing.
+                //   - Source effects (no inputs): always size to a Size/PatchSize
+                //     param so D2D doesn't render a 0x0 or full-source-bounds
+                //     output.
+                //   - Effects with inputs: only fix the output size if the
+                //     descriptor *explicitly* declares a `DiagramSize`/`OutputSize`/
+                //     `PatchSize` parameter. Without this, an analysis-style
+                //     viewer like Gamut Coverage / Waveform Monitor (whose pixel
+                //     shader does an O(N) inner loop per output pixel) would
+                //     render at the full source resolution -- billions of
+                //     samples per frame at 4K, hanging the GPU. The shader
+                //     already uses `DiagramSize` to map output coords to its
+                //     visualization domain, so honoring it as the actual
+                //     output size keeps D2D in sync with shader intent.
+                bool hasFixedSizeParam = false;
+                UINT32 outW = 512, outH = 512;
                 {
-                    UINT32 outW = 512, outH = 512;
-                    for (const auto& [key, val] : effectiveProps)
-                    {
-                        if (key.find(L"Size") != std::wstring::npos ||
-                            key.find(L"size") != std::wstring::npos)
+                    auto pickFloat = [&](const std::wstring& key, UINT32* w, UINT32* h) -> bool {
+                        auto it = effectiveProps.find(key);
+                        if (it == effectiveProps.end()) return false;
+                        if (auto* f = std::get_if<float>(&it->second))
                         {
-                            if (auto* f = std::get_if<float>(&val))
-                            { outW = outH = static_cast<UINT32>(*f); break; }
+                            *w = static_cast<UINT32>(*f);
+                            *h = static_cast<UINT32>(*f);
+                            return true;
+                        }
+                        return false;
+                    };
+                    if (pickFloat(L"DiagramSize", &outW, &outH))      hasFixedSizeParam = true;
+                    else if (pickFloat(L"OutputSize", &outW, &outH))  hasFixedSizeParam = true;
+                    else
+                    {
+                        auto patchIt = effectiveProps.find(L"PatchSize");
+                        if (patchIt != effectiveProps.end())
+                        {
+                            if (auto* f = std::get_if<float>(&patchIt->second))
+                            {
+                                outW = static_cast<UINT32>(*f * 6);
+                                outH = static_cast<UINT32>(*f * 4);
+                                hasFixedSizeParam = true;
+                            }
                         }
                     }
-                    auto patchIt = effectiveProps.find(L"PatchSize");
-                    if (patchIt != effectiveProps.end())
+                    if (!hasFixedSizeParam)
                     {
-                        if (auto* f = std::get_if<float>(&patchIt->second))
-                        { outW = static_cast<UINT32>(*f * 6); outH = static_cast<UINT32>(*f * 4); }
+                        // Generic fallback for source effects: any param whose
+                        // name contains "Size" / "size".
+                        if (node.customEffect->inputNames.empty())
+                        {
+                            for (const auto& [key, val] : effectiveProps)
+                            {
+                                if (key.find(L"Size") != std::wstring::npos ||
+                                    key.find(L"size") != std::wstring::npos)
+                                {
+                                    if (auto* f = std::get_if<float>(&val))
+                                    {
+                                        outW = outH = static_cast<UINT32>(*f);
+                                        hasFixedSizeParam = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    implIt->second.pixelImpl->SetFixedOutputSize(outW, outH);
                 }
+                const bool applyFixedSize =
+                    hasFixedSizeParam ||
+                    node.customEffect->inputNames.empty();
+                if (applyFixedSize)
+                    implIt->second.pixelImpl->SetFixedOutputSize(outW, outH);
             }
             else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
                 implIt->second.computeImpl->SetConstantBufferData(cbData.data(), static_cast<UINT32>(cbData.size()));
