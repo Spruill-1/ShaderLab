@@ -3,6 +3,29 @@
 
 namespace ShaderLab::Rendering
 {
+    HRESULT __stdcall D3D11ComputeRunner::QueryInterface(REFIID iid, void** out) noexcept
+    {
+        if (!out) return E_POINTER;
+        if (iid == __uuidof(IUnknown) ||
+            iid == Effects::IID_IEngineComputeOutput)
+        {
+            *out = static_cast<Effects::IEngineComputeOutput*>(this);
+            // No-op AddRef -- runner lifetime owned by GraphEvaluator's cache.
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    HRESULT __stdcall D3D11ComputeRunner::GetAnalysisSrv(ID3D11ShaderResourceView** out)
+    {
+        if (!out) return E_POINTER;
+        if (!m_resultSRV) return E_NOT_VALID_STATE;
+        *out = m_resultSRV.get();
+        (*out)->AddRef();
+        return S_OK;
+    }
+
     void D3D11ComputeRunner::Initialize(ID3D11Device* device)
     {
         if (!device) return;
@@ -62,15 +85,19 @@ namespace ShaderLab::Rendering
         m_resultBuffer = nullptr;
         m_stagingBuffer = nullptr;
         m_resultUAV = nullptr;
+        m_resultSRV = nullptr;
         m_cbuffer = nullptr;
 
         uint32_t byteSize = (std::max)(resultCount * 16u, 16u); // 16 bytes per float4
 
-        // Structured buffer for results.
+        // Structured buffer for results. Phase 8: BindFlags also include
+        // SHADER_RESOURCE so a downstream consumer effect can read the
+        // analysis values directly off the GPU through an SRV (the
+        // IEngineComputeOutput path) without going through Map().
         D3D11_BUFFER_DESC bufDesc{};
         bufDesc.ByteWidth = byteSize;
         bufDesc.Usage = D3D11_USAGE_DEFAULT;
-        bufDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bufDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
         bufDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
         bufDesc.StructureByteStride = 16; // sizeof(float4)
         m_device->CreateBuffer(&bufDesc, nullptr, m_resultBuffer.put());
@@ -82,6 +109,16 @@ namespace ShaderLab::Rendering
         uavDesc.Buffer.FirstElement = 0;
         uavDesc.Buffer.NumElements = resultCount;
         m_device->CreateUnorderedAccessView(m_resultBuffer.get(), &uavDesc, m_resultUAV.put());
+
+        // SRV — same layout, read-only. Used by IEngineComputeOutput
+        // consumers; downstream effects bind this directly to a t-slot
+        // and Load() the analysis values without a CPU round-trip.
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        srvDesc.Buffer.FirstElement = 0;
+        srvDesc.Buffer.NumElements = resultCount;
+        m_device->CreateShaderResourceView(m_resultBuffer.get(), &srvDesc, m_resultSRV.put());
 
         // Staging buffer for readback.
         bufDesc.Usage = D3D11_USAGE_STAGING;
@@ -176,6 +213,10 @@ namespace ShaderLab::Rendering
             result.assign(data, data + resultCount * 4);
             m_context->Unmap(m_stagingBuffer.get(), 0);
         }
+
+        // Phase 8: bump the dispatch counter so downstream
+        // IEngineComputeOutput consumers can detect freshness.
+        ++m_lastEvaluatedFrame;
 
         return result;
     }

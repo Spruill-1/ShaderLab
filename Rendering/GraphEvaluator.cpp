@@ -1,7 +1,6 @@
 #include "pch_engine.h"
 #include "GraphEvaluator.h"
 #include "../Effects/ShaderCompiler.h"
-#include "../Effects/StatisticsEffect.h"
 #include "MathExpression.h"
 
 using namespace ShaderLab::Graph;
@@ -699,7 +698,6 @@ namespace ShaderLab::Rendering
             m_d3d11RunnerCache.erase(nodeId);
             return;
         }
-
         auto implIt = m_customImplCache.find(nodeId);
         if (implIt == m_customImplCache.end())
             return; // First compile — next Evaluate() will create the effect.
@@ -2075,116 +2073,6 @@ namespace ShaderLab::Rendering
     // -----------------------------------------------------------------------
     // GPU-accelerated image statistics
     // -----------------------------------------------------------------------
-
-    void GraphEvaluator::ComputeImageStatistics(
-        ID2D1DeviceContext5* dc,
-        EffectNode& node,
-        ID2D1Image* inputImage)
-    {
-        if (!dc || !inputImage) return;
-
-        // Use 96 DPI so GetImageLocalBounds returns pixel coordinates.
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
-
-        // Get input image bounds.
-        D2D1_RECT_F bounds{};
-        dc->GetImageLocalBounds(inputImage, &bounds);
-        uint32_t w = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
-        uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-        if (w == 0 || h == 0) { dc->SetDpi(oldDpiX, oldDpiY); return; }
-
-        // Render input to a D2D bitmap backed by a DXGI surface.
-        winrt::com_ptr<ID2D1Bitmap1> gpuTarget;
-        D2D1_BITMAP_PROPERTIES1 gpuProps = {};
-        gpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        gpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-        gpuProps.dpiX = 96.0f;
-        gpuProps.dpiY = 96.0f;
-        HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, gpuProps, gpuTarget.put());
-        if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return; }
-
-        winrt::com_ptr<ID2D1Image> prevTarget;
-        dc->GetTarget(prevTarget.put());
-
-        // Render the upstream D2D chain to our GPU bitmap.
-        dc->SetTarget(gpuTarget.get());
-        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-        dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
-        dc->SetTarget(prevTarget.get());
-
-        // Flush D2D command batch so the bitmap is populated before D3D11 reads it.
-        // Without this, D2D lazily defers the DrawImage until EndDraw/Flush,
-        // and the D3D11 compute dispatch reads zeros from the texture.
-        dc->Flush();
-        dc->SetDpi(oldDpiX, oldDpiY);
-
-        // Get the underlying D3D11 texture from the D2D bitmap.
-        winrt::com_ptr<IDXGISurface> surface;
-        hr = gpuTarget->GetSurface(surface.put());
-        if (FAILED(hr)) return;
-
-        winrt::com_ptr<ID3D11Texture2D> d3dTexture;
-        hr = surface->QueryInterface(d3dTexture.put());
-        if (FAILED(hr)) return;
-
-        // Initialize GPU reduction if needed.
-        if (!m_gpuReduction.IsInitialized())
-        {
-            winrt::com_ptr<ID3D11Device> device;
-            winrt::com_ptr<ID3D11DeviceContext> d3dCtx;
-            d3dTexture->GetDevice(device.put());
-            device->GetImmediateContext(d3dCtx.put());
-            m_gpuReduction.Initialize(device.get());
-        }
-
-        // Get D3D11 device context.
-        winrt::com_ptr<ID3D11Device> device;
-        d3dTexture->GetDevice(device.put());
-        winrt::com_ptr<ID3D11DeviceContext> d3dCtx;
-        device->GetImmediateContext(d3dCtx.put());
-
-        // Read channel/nonzero settings from properties.
-        uint32_t channel = 0;
-        {
-            auto it = node.properties.find(L"Channel");
-            if (it != node.properties.end())
-                if (auto* f = std::get_if<float>(&it->second)) channel = static_cast<uint32_t>(*f);
-        }
-        bool nonzeroOnly = true;
-        {
-            auto it = node.properties.find(L"NonzeroOnly");
-            if (it != node.properties.end())
-                if (auto* f = std::get_if<float>(&it->second)) nonzeroOnly = *f > 0.5f;
-        }
-
-        // Dispatch GPU reduction.
-        auto stats = m_gpuReduction.Reduce(d3dCtx.get(), d3dTexture.get(), channel, nonzeroOnly);
-
-        float vNonzero = (stats.totalPixels > 0)
-            ? static_cast<float>(stats.nonzeroPixels) / static_cast<float>(stats.totalPixels) : 0.0f;
-
-        // Populate analysis output.
-        node.analysisOutput.type = AnalysisOutputType::Typed;
-        node.analysisOutput.fields.clear();
-
-        auto addField = [&](const std::wstring& name, float value) {
-            AnalysisFieldValue fv;
-            fv.name = name;
-            fv.type = AnalysisFieldType::Float;
-            fv.components[0] = value;
-            node.analysisOutput.fields.push_back(std::move(fv));
-        };
-
-        addField(L"Min", stats.min);
-        addField(L"Max", stats.max);
-        addField(L"Mean", stats.mean);
-        addField(L"Median", stats.median);
-        addField(L"P95", stats.p95);
-        addField(L"Samples", static_cast<float>(stats.samples));
-        addField(L"Nonzero%", vNonzero);
-    }
 
     // -----------------------------------------------------------------------
     // Standalone (graph-mutation-free) image statistics for MCP queries.

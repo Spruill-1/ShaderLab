@@ -19,8 +19,8 @@
 // the COM boundary would only invite drift. This interface is narrow
 // on purpose: just the runtime resource handles, in stable POD shape.
 //
-// Implementations: `Effects::StatisticsEffect` and the D3D11-compute
-// path of `Effects::CustomComputeShaderEffect`. Pixel-shader effects
+// Implementations: the D2D effect wrapper for the D3D11-compute path
+// (Phase 8 -- still in progress as of this edit). Pixel-shader effects
 // and the D2D-tiled compute path do NOT implement this interface --
 // neither produces a structured-buffer SRV the evaluator could bind.
 

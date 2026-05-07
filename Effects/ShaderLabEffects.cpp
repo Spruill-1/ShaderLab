@@ -2,7 +2,6 @@
 #include "ShaderLabEffects.h"
 #include "CustomComputeShaderEffect.h"
 #include "CustomPixelShaderEffect.h"
-#include "StatisticsEffect.h"
 
 namespace ShaderLab::Effects
 {
@@ -11,7 +10,6 @@ namespace ShaderLab::Effects
         if (!factory) return;
         CustomPixelShaderEffect::RegisterEffect(factory);
         CustomComputeShaderEffect::RegisterEffect(factory);
-        StatisticsEffect::RegisterEffect(factory);
     }
 
     // Shared color-math HLSL extracted to Effects/ColorMath.cpp

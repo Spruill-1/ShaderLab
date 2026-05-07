@@ -132,7 +132,6 @@
     <ClInclude Include="Effects\DxgiDuplicationSourceProvider.h" />
     <ClInclude Include="Effects\WindowsGraphicsCaptureSourceProvider.h" />
     <ClInclude Include="Effects\SourceNodeFactory.h" />
-    <ClInclude Include="Effects\StatisticsEffect.h" />
     <ClInclude Include="Effects\VideoSourceProvider.h" />
   </ItemGroup>
   <ItemGroup>
@@ -166,7 +165,6 @@
     <ClCompile Include="Effects\DxgiDuplicationSourceProvider.cpp" />
     <ClCompile Include="Effects\WindowsGraphicsCaptureSourceProvider.cpp" />
     <ClCompile Include="Effects\SourceNodeFactory.cpp" />
-    <ClCompile Include="Effects\StatisticsEffect.cpp" />
     <ClCompile Include="Effects\VideoSourceProvider.cpp" />
     <ClCompile Include="Engine\Mcp\McpHttpServer.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>

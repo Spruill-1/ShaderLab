@@ -57,11 +57,9 @@
     <ClInclude Include="Rendering\GraphEvaluator.h" />
     <ClInclude Include="Rendering\GpuReduction.h" />
     <ClInclude Include="Rendering\D3D11ComputeRunner.h" />
-    <ClInclude Include="Effects\StatisticsEffect.h" />
     <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
     <ClInclude Include="Rendering\RenderEngine.h" />
-    <ClInclude Include="Rendering\ToneMapper.h" />
     <ClInclude Include="Rendering\FalseColorOverlay.h" />
     <ClInclude Include="Effects\DxgiDuplicationSourceProvider.h" />
     <ClInclude Include="Effects\WindowsGraphicsCaptureSourceProvider.h" />

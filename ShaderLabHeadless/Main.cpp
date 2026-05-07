@@ -352,7 +352,7 @@ int RunRender(const Args& args)
         reinterpret_cast<ID2D1DeviceContext**>(dc.put()));
 
     // Register custom effect classes with the D2D factory (CustomPixelShader,
-    // CustomComputeShader, StatisticsEffect). Without this, custom-effect
+    // CustomComputeShader). Without this, custom-effect
     // nodes in the graph fail to instantiate.
     winrt::com_ptr<ID2D1Factory1> factory1;
     d2dFactory->QueryInterface(factory1.put());

@@ -9,7 +9,6 @@
 #include "Rendering/EffectGraphFile.h"
 #include "Rendering/PixelReadback.h"
 #include "Effects/ShaderLabEffects.h"
-#include "Effects/StatisticsEffect.h"
 #include "Effects/DxgiDuplicationSourceProvider.h"
 #include "Version.h"
 #include "EngineExport.h"

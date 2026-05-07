@@ -8,7 +8,6 @@
 #include "MainWindow.xaml.h"
 
 #include "Rendering/PipelineFormat.h"
-#include "Effects/StatisticsEffect.h"
 
 namespace winrt::ShaderLab::implementation
 {
