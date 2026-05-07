@@ -162,6 +162,19 @@ namespace ShaderLab::Rendering
             ID2D1Bitmap1* preRenderedInput,
             Effects::CustomComputeBridgeEffect* bridge);
 
+        // Phase 8 perf: per-input FP32 pre-render cache used by
+        // ProcessDeferredCompute to amortize the source DrawImage
+        // across multiple deferred-compute consumers in the same
+        // frame. Bitmap is reused frame-to-frame when dimensions
+        // match; reallocated otherwise.
+        struct SharedPreRenderEntry
+        {
+            winrt::com_ptr<ID2D1Bitmap1> bitmap;
+            UINT32                       width{ 0 };
+            UINT32                       height{ 0 };
+        };
+        std::unordered_map<ID2D1Image*, SharedPreRenderEntry> m_sharedPreRenderCache;
+
         // Deferred D3D11 compute dispatches (node ID + upstream image).
         struct DeferredCompute {
             uint32_t nodeId;

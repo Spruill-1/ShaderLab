@@ -653,31 +653,106 @@ namespace ShaderLab::Rendering
 
         bool imageComputeProduced = false;
 
+        // Phase 8 perf: pre-render each unique upstream input ONCE
+        // per frame and share the FP32 bitmap across all deferred-
+        // compute consumers that share it. Without this, a graph
+        // like {Source -> 4 stats + ICtCp Tone Map} pays 5x the
+        // upstream-render cost (each bridge re-rendered the source
+        // into its own private FP32 bitmap).
+        //
+        // We do the SetTarget+Clear+DrawImage inline (NOT via
+        // PreRenderInputBitmap, which nests BeginDraw and breaks
+        // submission inside an outer draw session). dc->Flush() forces
+        // the commands out before the bridge's D3D11 compute reads.
+        // Cache key is the raw ID2D1Image pointer of the upstream's
+        // cachedOutput; cleared at end of ProcessDeferredCompute.
+        struct SharedFp32 {
+            winrt::com_ptr<ID2D1Bitmap1> bitmap;
+            UINT32 width{ 0 };
+            UINT32 height{ 0 };
+        };
+        std::unordered_map<ID2D1Image*, SharedFp32> sharedPreRender;
+
+        auto preRenderShared = [&](ID2D1Image* inputImage) -> ID2D1Bitmap1*
+        {
+            auto it = sharedPreRender.find(inputImage);
+            if (it != sharedPreRender.end()) return it->second.bitmap.get();
+
+            float oldDpiX = 0, oldDpiY = 0;
+            dc->GetDpi(&oldDpiX, &oldDpiY);
+            dc->SetDpi(96.0f, 96.0f);
+
+            D2D1_RECT_F bounds{};
+            dc->GetImageLocalBounds(inputImage, &bounds);
+            UINT32 w = static_cast<UINT32>((std::min)(bounds.right - bounds.left, 8192.0f));
+            UINT32 h = static_cast<UINT32>((std::min)(bounds.bottom - bounds.top, 8192.0f));
+            if (w == 0 || h == 0) { dc->SetDpi(oldDpiX, oldDpiY); return nullptr; }
+
+            // Reuse the previous frame's bitmap if dimensions match;
+            // otherwise allocate a new one.
+            auto& cacheBitmap = m_sharedPreRenderCache[inputImage];
+            if (!cacheBitmap.bitmap || cacheBitmap.width != w || cacheBitmap.height != h)
+            {
+                D2D1_BITMAP_PROPERTIES1 bp{};
+                bp.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+                bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+                bp.dpiX = 96.0f;
+                bp.dpiY = 96.0f;
+                winrt::com_ptr<ID2D1Bitmap1> newBmp;
+                HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bp, newBmp.put());
+                if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return nullptr; }
+                cacheBitmap.bitmap = std::move(newBmp);
+                cacheBitmap.width  = w;
+                cacheBitmap.height = h;
+            }
+
+            // Render upstream into the cached bitmap. Inline pattern
+            // (no nested BeginDraw); Flush forces submit before the
+            // bridge's D3D11 compute reads.
+            winrt::com_ptr<ID2D1Image> prevTarget;
+            dc->GetTarget(prevTarget.put());
+            dc->SetTarget(cacheBitmap.bitmap.get());
+            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+            dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
+            dc->SetTarget(prevTarget.get());
+            dc->Flush();
+            dc->SetDpi(oldDpiX, oldDpiY);
+
+            SharedFp32 s;
+            s.bitmap = cacheBitmap.bitmap;
+            s.width  = w;
+            s.height = h;
+            auto* ptr = s.bitmap.get();
+            sharedPreRender[inputImage] = std::move(s);
+            return ptr;
+        };
+
         for (auto& deferred : m_deferredCompute)
         {
             auto* node = graph.FindNode(deferred.nodeId);
             if (!node || !deferred.inputImage) continue;
             if (!node->customEffect.has_value()) continue;
 
-            // Phase 8: D3D11 compute custom effects (analysis-only and
-            // image-producing alike) route through the bridge effect
-            // captured during CreateOrGetEffect. The bridge is owned by
-            // m_effectCache; the impl pointer is stashed in
-            // m_bridgeImplCache.
             auto bit = m_bridgeImplCache.find(node->id);
             if (bit == m_bridgeImplCache.end() || !bit->second)
                 continue;
             auto* bridge = bit->second;
 
+            // Use the deferred entry's pre-rendered bitmap if it
+            // exists (image-producing computes pre-render in
+            // EvaluateNode while D2D effect properties are fresh).
+            // Otherwise share via the per-frame map.
+            ID2D1Bitmap1* preRendered = deferred.preRenderedInput.get();
+            if (!preRendered)
+                preRendered = preRenderShared(deferred.inputImage);
+
             DispatchViaBridge(dc, graph, *node, deferred.inputImage,
-                deferred.preRenderedInput.get(), bridge);
+                preRendered, bridge);
 
             bool hasImageOutput = !node->outputPins.empty();
             if (hasImageOutput && node->cachedOutput)
             {
                 imageComputeProduced = true;
-                // Mark all downstream nodes dirty so they re-evaluate
-                // on the next frame with the new image input.
                 std::vector<uint32_t> queue = { node->id };
                 for (size_t i = 0; i < queue.size(); ++i)
                 {

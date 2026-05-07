@@ -253,6 +253,14 @@ namespace ShaderLab::Effects
         UINT32                          m_imageOutputW{ 0 };
         UINT32                          m_imageOutputH{ 0 };
 
+        // Cached input bitmap. Without this the bridge allocated a
+        // fresh FP32 bitmap (132 MB at 4K!) on every dispatch, which
+        // dominated frame time (~30ms/frame on Intel Arc). Re-created
+        // only when the upstream's dimensions change.
+        winrt::com_ptr<ID2D1Bitmap1>    m_inputBitmap;
+        UINT32                          m_inputBitmapW{ 0 };
+        UINT32                          m_inputBitmapH{ 0 };
+
         UINT64 m_lastEvaluatedFrame{ 0 };
 
         // Phase 8 GPU-binding state, cleared at end of each Dispatch.

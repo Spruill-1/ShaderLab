@@ -271,25 +271,66 @@ float4 main(
         }
 
         winrt::com_ptr<ID2D1Bitmap1> inputBmp;
-        D2D1_BITMAP_PROPERTIES1 bp{};
-        bp.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-        bp.dpiX = 96.0f;
-        bp.dpiY = 96.0f;
-        HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bp, inputBmp.put());
-        if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return hr; }
+        // Fast path: if `inputImage` is already an FP32-RGBA D2D bitmap
+        // of the correct size (e.g. produced by GraphEvaluator's
+        // PreRenderInputBitmap and shared across all deferred-compute
+        // consumers in the same frame), we can grab its DXGI surface
+        // directly and skip the per-dispatch DrawImage round-trip.
+        // This is the dominant cost on multi-consumer graphs (4 stats +
+        // 1 tonemap = 5 dispatches all consuming the same Source ->
+        // 5 redundant DrawImage calls + 5 FP32 bitmap allocations
+        // before this fast path).
+        bool inputIsAlreadyFp32Bitmap = false;
+        {
+            winrt::com_ptr<ID2D1Bitmap1> asBitmap;
+            if (SUCCEEDED(inputImage->QueryInterface(asBitmap.put())) && asBitmap)
+            {
+                auto px = asBitmap->GetPixelFormat();
+                auto sz = asBitmap->GetPixelSize();
+                if (px.format == DXGI_FORMAT_R32G32B32A32_FLOAT &&
+                    sz.width == w && sz.height == h)
+                {
+                    inputBmp = asBitmap;
+                    inputIsAlreadyFp32Bitmap = true;
+                }
+            }
+        }
 
-        winrt::com_ptr<ID2D1Image> prevTarget;
-        dc->GetTarget(prevTarget.put());
-        dc->SetTarget(inputBmp.get());
-        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-        dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
-        dc->SetTarget(prevTarget.get());
-        dc->Flush();  // Required: D2D batches DrawImage until Flush/EndDraw.
+        if (!inputIsAlreadyFp32Bitmap)
+        {
+            if (m_inputBitmap && m_inputBitmapW == w && m_inputBitmapH == h)
+            {
+                inputBmp = m_inputBitmap;
+            }
+            else
+            {
+                D2D1_BITMAP_PROPERTIES1 bp{};
+                bp.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+                bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+                bp.dpiX = 96.0f;
+                bp.dpiY = 96.0f;
+                HRESULT hrAlloc = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bp, inputBmp.put());
+                if (FAILED(hrAlloc)) { dc->SetDpi(oldDpiX, oldDpiY); return hrAlloc; }
+                m_inputBitmap  = inputBmp;
+                m_inputBitmapW = w;
+                m_inputBitmapH = h;
+            }
+
+            // Render upstream chain into our cached bitmap. Necessary
+            // when inputImage is a D2D effect output (not already an
+            // FP32 bitmap) -- the format-convert happens via DrawImage.
+            winrt::com_ptr<ID2D1Image> prevTarget;
+            dc->GetTarget(prevTarget.put());
+            dc->SetTarget(inputBmp.get());
+            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+            dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
+            dc->SetTarget(prevTarget.get());
+            dc->Flush();  // D2D batches DrawImage until Flush/EndDraw.
+        }
         dc->SetDpi(oldDpiX, oldDpiY);
 
         winrt::com_ptr<IDXGISurface> surface;
-        hr = inputBmp->GetSurface(surface.put());
+        HRESULT hr = inputBmp->GetSurface(surface.put());
         if (FAILED(hr)) return hr;
         winrt::com_ptr<ID3D11Texture2D> inputTex;
         hr = surface->QueryInterface(inputTex.put());
