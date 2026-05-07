@@ -8,6 +8,7 @@
 
 #include "Rendering/EffectGraphFile.h"
 #include "Effects/ShaderLabEffects.h"
+#include "Effects/BytecodeCache.h"
 #include "Version.h"
 
 namespace winrt::ShaderLab::implementation
@@ -727,6 +728,154 @@ namespace winrt::ShaderLab::implementation
         std::error_code rmEc;
         for (const auto& d : stale)
             std::filesystem::remove_all(d, rmEc);
+    }
+
+    // ---- Status-bar broom (Phase 8 p8-status-bar-button) -------------------
+    //
+    // Single-click runs both reapers (graph-temp media dirs + shader
+    // bytecode cache) and reports freed bytes in ReaperStatusText.
+    // Runs on a background thread so the UI doesn't stall on a slow
+    // filesystem walk.
+
+    winrt::fire_and_forget MainWindow::OnReaperBroomClicked(
+        winrt::Windows::Foundation::IInspectable const& /*sender*/,
+        winrt::Microsoft::UI::Xaml::RoutedEventArgs const& /*args*/)
+    {
+        auto strong = get_strong();
+        auto dispatcher = DispatcherQueue();
+
+        // Disable the button + show "Sweeping…" while we work.
+        ReaperBroomButton().IsEnabled(false);
+        ReaperStatusText().Text(L"Sweeping…");
+
+        co_await winrt::resume_background();
+
+        // ---- Reap graph-temp media dirs --------------------------------
+        size_t graphDirsDeleted = 0;
+        size_t graphBytesFreed  = 0;
+        {
+            wchar_t tempBuf[MAX_PATH + 1]{};
+            DWORD len = ::GetTempPathW(MAX_PATH, tempBuf);
+            if (len > 0)
+            {
+                std::wstring tempRoot(tempBuf, len);
+                FILETIME nowFt{};
+                ::GetSystemTimeAsFileTime(&nowFt);
+                const uint64_t now = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
+                const uint64_t staleTicks = static_cast<uint64_t>(HeartbeatStaleSec) * 10'000'000ULL;
+
+                std::error_code ec;
+                std::vector<std::pair<std::wstring, uint64_t>> victims;
+                for (const auto& entry : std::filesystem::directory_iterator(tempRoot, ec))
+                {
+                    if (ec) break;
+                    if (!entry.is_directory(ec)) continue;
+                    const auto name = entry.path().filename().wstring();
+                    if (!name.starts_with(L"ShaderLab-")) continue;
+
+                    FILETIME ft{};
+                    std::wstring beat = entry.path().wstring() + L"\\.heartbeat";
+                    HANDLE h = ::CreateFileW(beat.c_str(),
+                        GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_HIDDEN, nullptr);
+                    if (h != INVALID_HANDLE_VALUE)
+                    {
+                        ::GetFileTime(h, nullptr, nullptr, &ft);
+                        ::CloseHandle(h);
+                    }
+                    else
+                    {
+                        WIN32_FILE_ATTRIBUTE_DATA fad{};
+                        if (::GetFileAttributesExW(entry.path().c_str(), GetFileExInfoStandard, &fad))
+                            ft = fad.ftLastWriteTime;
+                    }
+                    const uint64_t touched = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+                    if (touched == 0 || (now > touched && (now - touched) > staleTicks))
+                    {
+                        // Sum the dir's contents for the freed-bytes display.
+                        uint64_t bytes = 0;
+                        for (auto it = std::filesystem::recursive_directory_iterator(entry.path(), ec);
+                             it != std::filesystem::recursive_directory_iterator(); ++it)
+                        {
+                            if (ec) { ec.clear(); continue; }
+                            if (it->is_regular_file(ec))
+                                bytes += static_cast<uint64_t>(it->file_size(ec));
+                        }
+                        victims.emplace_back(entry.path().wstring(), bytes);
+                    }
+                }
+
+                std::error_code rmEc;
+                for (const auto& [path, bytes] : victims)
+                {
+                    std::filesystem::remove_all(path, rmEc);
+                    if (!rmEc)
+                    {
+                        ++graphDirsDeleted;
+                        graphBytesFreed += bytes;
+                    }
+                    rmEc.clear();
+                }
+            }
+        }
+
+        // ---- Reap shader bytecode cache --------------------------------
+        // Use a 7-day threshold for the broom (less aggressive than
+        // ClearDisk; preserves recently-used compiles). Engine
+        // already configured the disk root via ConfigureBytecodeCache
+        // at startup.
+        constexpr uint64_t kBroomShaderStaleSec = 7ull * 24 * 60 * 60;
+        auto shaderStats = ::ShaderLab::Effects::BytecodeCache::Instance()
+            .ReapDisk(kBroomShaderStaleSec);
+
+        // ---- Format status string + return to UI thread ---------------
+        const uint64_t totalBytes = graphBytesFreed + shaderStats.bytesFreed;
+        std::wstring summary;
+        if (totalBytes == 0 && graphDirsDeleted == 0 && shaderStats.filesDeleted == 0)
+        {
+            summary = L"Cache clean";
+        }
+        else
+        {
+            // Format bytes as "1.2 MB" or "534 KB".
+            wchar_t bytesBuf[64]{};
+            if (totalBytes >= 1024ull * 1024)
+                swprintf_s(bytesBuf, L"%.1f MB", totalBytes / (1024.0 * 1024.0));
+            else if (totalBytes >= 1024)
+                swprintf_s(bytesBuf, L"%.1f KB", totalBytes / 1024.0);
+            else
+                swprintf_s(bytesBuf, L"%llu B", static_cast<unsigned long long>(totalBytes));
+            summary = std::format(
+                L"Freed {} \u00B7 {} graph dir{}, {} shader variant{}",
+                bytesBuf,
+                graphDirsDeleted, graphDirsDeleted == 1 ? L"" : L"s",
+                shaderStats.filesDeleted, shaderStats.filesDeleted == 1 ? L"" : L"s");
+        }
+
+        // UI update via TryEnqueue (WinUI 3's DispatcherQueue isn't
+        // compatible with winrt::resume_foreground, which targets
+        // Windows.System.DispatcherQueue from the Windows SDK).
+        winrt::hstring summaryH(summary);
+        winrt::hstring tooltipH = winrt::hstring(L"Last sweep: " + summary +
+            L"\n(Click to sweep again. Default thresholds: 150s heartbeat for graph temps, 7 days for shader cache.)");
+        dispatcher.TryEnqueue([strong, summaryH, tooltipH]()
+        {
+            strong->ReaperStatusText().Text(summaryH);
+            strong->ReaperBroomButton().IsEnabled(true);
+            winrt::Microsoft::UI::Xaml::Controls::ToolTipService::SetToolTip(
+                strong->ReaperBroomButton(), winrt::box_value(tooltipH));
+        });
+
+        // Auto-clear the inline label after 5 seconds (the tooltip
+        // keeps the result for as long as the user wants it).
+        co_await winrt::resume_after(std::chrono::seconds(5));
+        dispatcher.TryEnqueue([strong]()
+        {
+            // Only clear if the user hasn't kicked off another sweep in
+            // the meantime (button enabled = no in-flight work).
+            if (strong->ReaperBroomButton().IsEnabled())
+                strong->ReaperStatusText().Text(L"");
+        });
     }
 
     void MainWindow::ResetAfterGraphLoad(bool reopenOutputWindows)

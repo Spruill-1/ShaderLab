@@ -50,6 +50,11 @@ namespace winrt::ShaderLab::implementation
         void OnGpuInfoTapped(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::TappedRoutedEventArgs const& args);
+
+        // Status-bar broom button (Phase 8 p8-status-bar-button).
+        winrt::fire_and_forget OnReaperBroomClicked(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
         void OnNodeGraphDragOver(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::DragEventArgs const& args);
