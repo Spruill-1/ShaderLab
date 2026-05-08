@@ -492,14 +492,20 @@ namespace winrt::ShaderLab::implementation
             double fps = (t.totalUs > 0) ? 1000000.0 / t.totalUs : 0;
             return { 200, std::format(
                 "{{\"fps\":{:.1f},\"totalMs\":{:.2f},"
+                "\"videoTickMs\":{:.2f},"
                 "\"sourcesPrepMs\":{:.2f},\"evaluateMs\":{:.2f},"
                 "\"deferredComputeMs\":{:.2f},\"drawMs\":{:.2f},"
-                "\"presentMs\":{:.2f},\"computeDispatches\":{},"
+                "\"presentMs\":{:.2f},"
+                "\"nodeGraphMs\":{:.2f},\"outputWindowsMs\":{:.2f},\"traceMs\":{:.2f},"
+                "\"computeDispatches\":{},"
                 "\"framesSampled\":{}}}",
                 fps, t.totalUs / 1000.0,
+                t.videoTickUs / 1000.0,
                 t.sourcesPrepUs / 1000.0, t.evaluateUs / 1000.0,
                 t.deferredComputeUs / 1000.0, t.drawUs / 1000.0,
-                t.presentUs / 1000.0, t.computeDispatches,
+                t.presentUs / 1000.0,
+                t.nodeGraphUs / 1000.0, t.outputWindowsUs / 1000.0, t.traceUs / 1000.0,
+                t.computeDispatches,
                 t.framesSampled) };
         });
 

@@ -1408,134 +1408,196 @@ float4 main(
         // ---- Waveform Monitor ----
         {
             static const std::string waveformHLSL = R"HLSL(
-// Waveform Monitor - RGB parade or luminance waveform
-// For each output pixel (x, y), samples the source column x and counts
-// how many source pixels have a value near the level represented by y.
+// Waveform Monitor - RGB parade or luminance waveform.
+// Migrated to D3D11 compute (Phase 8c perf): each thread group scatters all
+// source pixels into a per-channel hit grid in groupshared, then renders
+// the OutputWidth x OutputHeight result by reading the hit grid. Was a
+// per-output-pixel column scan in the previous pixel-shader implementation,
+// O(srcW * srcH * outH * outW) at the worst (with the inner sample cap
+// thats ~1B ops at 4K). Compute version is O(srcW * srcH + outW * outH).
+//
+// Output layout:
+//   Mode 0 (Luma):       outW x outH grayscale waveform.
+//   Mode 1 (RGB Parade): outW x outH split into 3 columns; left=R, mid=G, right=B.
+//   Mode 2 (RGB Overlay): outW x outH with R/G/B overlapped.
 
-cbuffer Constants : register(b0)
-{
-    float WaveformSize;  // Output height in pixels
-    uint Mode;          // 0 = Luma, 1 = RGB Parade, 2 = RGB Overlay
-    float Gain;          // Brightness gain for the waveform traces
-    float MaxNits;       // Max nits for the Y axis (default 1000)
+Texture2D<float4>    Source : register(t0);
+RWTexture2D<float4>  Output : register(u1);
+
+cbuffer Constants : register(b0) {
+    uint  Width;            // auto-injected by bridge
+    uint  Height;
+    float OutputWidth;      // waveform width (default 1024; 3-column parade keeps overall width)
+    float OutputHeight;     // waveform height
+    float Mode;             // 0=Luma, 1=RGB Parade, 2=RGB Overlay (declared float per ShaderLab convention)
+    float Gain;             // brightness gain
+    float MaxNits;          // y-axis ceiling in nits
 };
 
-Texture2D InputTexture : register(t0);
-SamplerState InputSampler : register(s0);
+// 4-channel hit grid: R, G, B, Luma. Each is COL_BINS x ROW_BINS.
+// Using compact bins so groupshared stays under 32 KB:
+//   COL_BINS=128, ROW_BINS=64 -> 128*64*4 channels*4 bytes = 128 KB.
+//   Reduce to: COL_BINS=64, ROW_BINS=64, 4 channels -> 64 KB. Still over.
+//   Final: COL_BINS=64, ROW_BINS=32, 4 channels = 32 KB. Tight but works.
+#define WCOL_BINS 64
+#define WROW_BINS 32
+groupshared uint gs_R[WCOL_BINS * WROW_BINS];
+groupshared uint gs_G[WCOL_BINS * WROW_BINS];
+groupshared uint gs_B[WCOL_BINS * WROW_BINS];
+groupshared uint gs_L[WCOL_BINS * WROW_BINS];
 
-float4 main(
-    float4 pos      : SV_POSITION,
-    float4 posScene : SCENE_POSITION,
-    float4 uv0      : TEXCOORD0
-) : SV_Target
+[numthreads(32, 32, 1)]
+void main(uint3 GTid : SV_GroupThreadID)
 {
-    float2 dims;
-    InputTexture.GetDimensions(dims.x, dims.y);
-    if (dims.x < 1 || dims.y < 1)
-        return float4(0, 0, 0, 1);
+    uint tid = GTid.x + GTid.y * 32;
+    const uint totalThreads = 1024;
 
-    float outW, outH;
-    uint mode = Mode;
+    uint outW = max((uint)OutputWidth,  64u);
+    uint outH = max((uint)OutputHeight, 64u);
+    uint mode = (uint)Mode;
+    float gain = Gain;
+    float maxNits = max(MaxNits, 1.0);
 
-    // Output size: width matches source, height = WaveformSize
-    outW = dims.x;
-    if (mode == 1) outW = dims.x * 3.0; // RGB parade: 3x width
-    outH = WaveformSize;
-
-    // Current pixel in output space
-    float px = uv0.x * outW;
-    float py = uv0.y * outH;
-
-    // Y axis: 0 at bottom, maxNits at top
-    float level = (1.0 - py / outH);  // 0 at bottom, 1 at top
-
-    // Determine which source column and channel(s) to sample
-    float srcCol;
-    int channelMask = 7; // all RGB
-    if (mode == 1) {
-        // RGB Parade: left third = R, middle = G, right = B
-        float third = outW / 3.0;
-        if (px < third)      { srcCol = px; channelMask = 1; }
-        else if (px < 2*third) { srcCol = px - third; channelMask = 2; }
-        else                  { srcCol = px - 2*third; channelMask = 4; }
-    } else {
-        srcCol = px;
-    }
-
-    float u = (srcCol + 0.5) / dims.x;
-
-    // Sample source column and accumulate hits
-    float hitR = 0, hitG = 0, hitB = 0, hitL = 0;
-    float binSize = MaxNits / outH * 2.0; // Tolerance per bin (2 pixels)
-
-    uint samples = min((uint)dims.y, 512); // Cap for performance
-    float step = dims.y / (float)samples;
-
-    for (uint i = 0; i < samples; i++)
+    // Phase 1: zero groupshared.
+    for (uint c = tid; c < WCOL_BINS * WROW_BINS; c += totalThreads)
     {
-        float v = ((float)i * step + 0.5) / dims.y;
-        float4 s = InputTexture.SampleLevel(InputSampler, float2(u, v), 0);
+        gs_R[c] = 0; gs_G[c] = 0; gs_B[c] = 0; gs_L[c] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
 
-        float nitsR = max(0, s.r) * 80.0;
-        float nitsG = max(0, s.g) * 80.0;
-        float nitsB = max(0, s.b) * 80.0;
+    // Phase 2: scatter every source pixel into (column-bin, value-bin)
+    // per channel.
+    uint totalPixels = Width * Height;
+    for (uint pi = tid; pi < totalPixels; pi += totalThreads)
+    {
+        uint px = pi % Width;
+        uint py = pi / Width;
+        float4 s = Source[int2(px, py)];
+        if (s.a < 0.001) continue;
+
+        // Column bin: source x mapped uniformly to [0, WCOL_BINS).
+        uint bx = min((uint)(((float)px / (float)Width) * WCOL_BINS), WCOL_BINS - 1);
+
+        // Value-bin per channel (in nits, [0, maxNits]).
+        float nitsR = max(0.0, s.r) * 80.0;
+        float nitsG = max(0.0, s.g) * 80.0;
+        float nitsB = max(0.0, s.b) * 80.0;
         float nitsL = ScRGBLuminanceNits(s.rgb);
 
-        float targetNits = level * MaxNits;
-
-        if (mode == 0) { // Luma
-            if (abs(nitsL - targetNits) < binSize) hitL += 1.0;
-        } else { // RGB
-            if (abs(nitsR - targetNits) < binSize) hitR += 1.0;
-            if (abs(nitsG - targetNits) < binSize) hitG += 1.0;
-            if (abs(nitsB - targetNits) < binSize) hitB += 1.0;
+        if (nitsR > 0)
+        {
+            uint by = (uint)(saturate(nitsR / maxNits) * (WROW_BINS - 1));
+            InterlockedAdd(gs_R[by * WCOL_BINS + bx], 1u);
+        }
+        if (nitsG > 0)
+        {
+            uint by = (uint)(saturate(nitsG / maxNits) * (WROW_BINS - 1));
+            InterlockedAdd(gs_G[by * WCOL_BINS + bx], 1u);
+        }
+        if (nitsB > 0)
+        {
+            uint by = (uint)(saturate(nitsB / maxNits) * (WROW_BINS - 1));
+            InterlockedAdd(gs_B[by * WCOL_BINS + bx], 1u);
+        }
+        if (nitsL > 0)
+        {
+            uint by = (uint)(saturate(nitsL / maxNits) * (WROW_BINS - 1));
+            InterlockedAdd(gs_L[by * WCOL_BINS + bx], 1u);
         }
     }
+    GroupMemoryBarrierWithGroupSync();
 
-    float scale = Gain / (float)samples * 40.0;
-    float3 color;
+    // Phase 3: render the waveform output.
+    // Density scaling: at any source column, total pixels mapping there =
+    // ~totalPixels/WCOL_BINS. "Fully bright" should correspond to ~1% of
+    // that column landing in a single value-bin (very flat-luma scene).
+    // densityNorm of `gain / max(pixelsPerCol * 0.01, 100.0)` keeps a
+    // wide range of densities visible without immediate saturation.
+    float pixelsPerCol = (float)totalPixels / (float)WCOL_BINS;
+    float densityNorm = gain / max(pixelsPerCol * 0.01, 100.0);
 
-    if (mode == 0) {
-        float lum = hitL * scale;
-        color = float3(lum, lum, lum);
-    } else if (mode == 1) {
-        // Parade: show only the relevant channel
-        if (channelMask == 1)      color = float3(hitR * scale, 0, 0);
-        else if (channelMask == 2) color = float3(0, hitG * scale, 0);
-        else                       color = float3(0, 0, hitB * scale);
-    } else {
-        // Overlay: all channels on top of each other
-        color = float3(hitR * scale, hitG * scale, hitB * scale);
+    for (uint oi = tid; oi < outW * outH; oi += totalThreads)
+    {
+        uint ox = oi % outW;
+        uint oy = oi / outW;
+
+        // py: 0 at top, outH at bottom. Level: 0 at bottom, 1 at top.
+        float level = 1.0 - ((float)oy + 0.5) / (float)outH;
+        float nitsAtY = level * maxNits;
+
+        // Determine which source-column / channel(s) this output pixel reads.
+        float u = ((float)ox + 0.5) / (float)outW;
+        uint bx;
+        int channel = -1;  // -1 = all (overlay), 0=R, 1=G, 2=B, 3=Luma
+
+        if (mode == 0u) // Luma
+        {
+            bx = min((uint)(u * WCOL_BINS), WCOL_BINS - 1);
+            channel = 3;
+        }
+        else if (mode == 1u) // Parade
+        {
+            // 3 stripes; remap u within each stripe to [0,1].
+            float third = 1.0 / 3.0;
+            if (u < third)            { bx = min((uint)((u / third) * WCOL_BINS), WCOL_BINS - 1); channel = 0; }
+            else if (u < 2.0 * third) { bx = min((uint)(((u - third) / third) * WCOL_BINS), WCOL_BINS - 1); channel = 1; }
+            else                      { bx = min((uint)(((u - 2.0 * third) / third) * WCOL_BINS), WCOL_BINS - 1); channel = 2; }
+        }
+        else // Overlay
+        {
+            bx = min((uint)(u * WCOL_BINS), WCOL_BINS - 1);
+            channel = -1;
+        }
+
+        // Vertical: convert nitsAtY to a row bin.
+        uint by = (uint)(saturate(nitsAtY / maxNits) * (WROW_BINS - 1));
+        uint binIdx = by * WCOL_BINS + bx;
+
+        float3 color = float3(0, 0, 0);
+        if (channel == 3) // luma
+        {
+            float lum = saturate((float)gs_L[binIdx] * densityNorm);
+            color = float3(lum, lum, lum);
+        }
+        else if (channel == 0) color = float3(saturate((float)gs_R[binIdx] * densityNorm), 0, 0);
+        else if (channel == 1) color = float3(0, saturate((float)gs_G[binIdx] * densityNorm), 0);
+        else if (channel == 2) color = float3(0, 0, saturate((float)gs_B[binIdx] * densityNorm));
+        else // overlay
+        {
+            color.r = saturate((float)gs_R[binIdx] * densityNorm);
+            color.g = saturate((float)gs_G[binIdx] * densityNorm);
+            color.b = saturate((float)gs_B[binIdx] * densityNorm);
+        }
+
+        // Reference lines at key nit levels.
+        float lineThick = maxNits / (float)outH * 0.5;
+        if (abs(nitsAtY - 80.0)   < lineThick) color += 0.15;
+        if (abs(nitsAtY - 203.0)  < lineThick) color += 0.15;
+        if (abs(nitsAtY - 1000.0) < lineThick) color += 0.15;
+
+        // Dark background floor.
+        color = max(color, float3(0.02, 0.02, 0.02));
+
+        Output[int2(ox, oy)] = float4(color, 1.0);
     }
-
-    // Draw horizontal reference lines at key nit levels
-    float lineAlpha = 0.0;
-    float nitsAtY = level * MaxNits;
-    float lineThick = MaxNits / outH * 0.5;
-    if (abs(nitsAtY - 80.0) < lineThick)   lineAlpha = 0.15; // SDR white
-    if (abs(nitsAtY - 203.0) < lineThick)  lineAlpha = 0.15; // HDR reference
-    if (abs(nitsAtY - 1000.0) < lineThick) lineAlpha = 0.15; // 1000 nits
-
-    color += float3(lineAlpha, lineAlpha, lineAlpha);
-
-    // Dark background
-    float bg = 0.02;
-    color = max(color, float3(bg, bg, bg));
-
-    return float4(color, 1.0);
 }
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Waveform Monitor";
             desc.subcategory = L"Scopes";
-            desc.effectId = L"Waveform Monitor"; desc.effectVersion = 2;
+            desc.effectId = L"Waveform Monitor"; desc.effectVersion = 3;
             desc.category = L"Analysis";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 32;
+            desc.threadGroupY = 32;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + waveformHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"WaveformSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
+                { L"OutputWidth",  L"float", 1024.0f, 256.0f, 4096.0f, 64.0f },
+                { L"OutputHeight", L"float",  256.0f, 128.0f, 1024.0f, 32.0f },
                 { L"Mode",     L"float", 1.0f, 0.0f, 2.0f, 1.0f, { L"Luminance", L"RGB Parade", L"RGB Overlay" } },
                 { L"Gain",     L"float", 1.0f, 0.1f, 10.0f, 0.1f },
                 { L"MaxNits",  L"float", 1000.0f, 80.0f, 10000.0f, 100.0f },

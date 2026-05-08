@@ -27,6 +27,13 @@ namespace winrt::ShaderLab::implementation
         // Compute frame delta time.
         auto now = std::chrono::steady_clock::now();
         double deltaSec = std::chrono::duration<double>(now - m_lastRenderTick).count();
+        // tTickStart marks the start of this entire timer-tick processing so
+        // we can attribute time to phases that arent inside RenderFrame
+        // (video decode + upload, dirty propagation, node-graph editor
+        // redraw, output-window present, pixel-trace updates). The frames
+        // wall-clock interval is the gap between consecutive m_lastRenderTick
+        // captures (= deltaSec).
+        auto tTickStart = now;
         m_lastRenderTick = now;
         // Clamp to avoid huge jumps (e.g., after breakpoint or sleep).
         if (deltaSec > 0.1) deltaSec = 0.016;
@@ -174,6 +181,9 @@ namespace winrt::ShaderLab::implementation
         bool hasDirty = m_graph.HasDirtyNodes();
         bool hasOutputWindows = !m_outputWindows.empty();
         bool needsEval = hasDirty || m_needsFitPreview || m_forceRender || hasOutputWindows;
+        // Mark the boundary between "video tick / dirty propagation" and
+        // "render frame" so we can attribute time to each.
+        auto tVideoTickEnd = std::chrono::high_resolution_clock::now();
         if (needsEval)
         {
             RenderFrame(deltaSec);
@@ -184,8 +194,29 @@ namespace winrt::ShaderLab::implementation
             if (wasForceRender)
                 m_nodeGraphController.RebuildLayout();
         }
+        auto tRenderFrameEnd = std::chrono::high_resolution_clock::now();
 
         RenderNodeGraph();
+        auto tNodeGraphEnd = std::chrono::high_resolution_clock::now();
+
+        // Accumulate per-tick wall-clock + tick-only phases. `totalUs` is
+        // tick-to-tick wall clock so it matches the displayed FPS exactly:
+        // sub-phase counters below sum to <= totalUs and the difference
+        // is dispatcher idle / message-pump / OS overhead between ticks.
+        {
+            auto usec = [](auto a, auto b) {
+                return std::chrono::duration<double, std::micro>(b - a).count();
+            };
+            const double a = 0.1;
+            auto& t = m_frameTiming;
+            t.totalUs       = t.totalUs * (1-a) + (deltaSec * 1'000'000.0) * a;
+            t.videoTickUs   = t.videoTickUs * (1-a) + usec(tTickStart, tVideoTickEnd) * a;
+            t.nodeGraphUs   = t.nodeGraphUs * (1-a) + usec(tRenderFrameEnd, tNodeGraphEnd) * a;
+            t.framesSampled++;
+            // Snapshot every 30 frames for MCP reads.
+            if (t.framesSampled % 30 == 0)
+                m_lastFrameTiming = t;
+        }
 
         // Update video seek slider and position label while playing.
         if (m_videoSeekSlider && m_videoSeekNodeId != 0)
@@ -238,16 +269,30 @@ namespace winrt::ShaderLab::implementation
 
             if (videoFps > 0.1f)
             {
-                FpsText().Text(std::format(L"{:.0f} FPS | {:.1f}ms (eval {:.1f} + compute {:.1f} + draw {:.1f}) | video {:.0f} fps",
-                    fps, ft.totalUs / 1000.0, ft.evaluateUs / 1000.0,
-                    ft.deferredComputeUs / 1000.0, ft.drawUs / 1000.0 + ft.presentUs / 1000.0,
+                FpsText().Text(std::format(
+                    L"{:.0f} FPS | {:.1f}ms total = vid {:.1f} + eval {:.1f} + compute {:.1f} + draw {:.1f} + graph {:.1f} + outwins {:.1f} + trace {:.1f} | video {:.0f} fps",
+                    fps, ft.totalUs / 1000.0,
+                    ft.videoTickUs / 1000.0,
+                    ft.sourcesPrepUs / 1000.0 + ft.evaluateUs / 1000.0,
+                    ft.deferredComputeUs / 1000.0,
+                    ft.drawUs / 1000.0 + ft.presentUs / 1000.0,
+                    ft.nodeGraphUs / 1000.0,
+                    ft.outputWindowsUs / 1000.0,
+                    ft.traceUs / 1000.0,
                     videoFps));
             }
             else
             {
-                FpsText().Text(std::format(L"{:.0f} FPS | {:.1f}ms (eval {:.1f} + compute {:.1f} + draw {:.1f})",
-                    fps, ft.totalUs / 1000.0, ft.evaluateUs / 1000.0,
-                    ft.deferredComputeUs / 1000.0, ft.drawUs / 1000.0 + ft.presentUs / 1000.0));
+                FpsText().Text(std::format(
+                    L"{:.0f} FPS | {:.1f}ms total = vid {:.1f} + eval {:.1f} + compute {:.1f} + draw {:.1f} + graph {:.1f} + outwins {:.1f} + trace {:.1f}",
+                    fps, ft.totalUs / 1000.0,
+                    ft.videoTickUs / 1000.0,
+                    ft.sourcesPrepUs / 1000.0 + ft.evaluateUs / 1000.0,
+                    ft.deferredComputeUs / 1000.0,
+                    ft.drawUs / 1000.0 + ft.presentUs / 1000.0,
+                    ft.nodeGraphUs / 1000.0,
+                    ft.outputWindowsUs / 1000.0,
+                    ft.traceUs / 1000.0));
             }
             m_frameCount = 0;
             m_fpsTimePoint = fpsNow;
@@ -537,6 +582,9 @@ namespace winrt::ShaderLab::implementation
         auto tPresentEnd = std::chrono::high_resolution_clock::now();
 
         // Accumulate per-frame timing (exponential moving average, alpha=0.1).
+        // Note: `totalUs` is set by OnRenderTick to the wall-clock tick-to-tick
+        // interval -- thats the only number that matches the displayed FPS.
+        // Everything below is a sub-phase of that interval.
         {
             auto usec = [](auto a, auto b) {
                 return std::chrono::duration<double, std::micro>(b - a).count();
@@ -548,16 +596,13 @@ namespace winrt::ShaderLab::implementation
             t.deferredComputeUs = t.deferredComputeUs * (1-a) + usec(tEvalEnd, tComputeEnd) * a;
             t.drawUs         = t.drawUs * (1-a) + usec(tComputeEnd, tDrawEnd) * a;
             t.presentUs      = t.presentUs * (1-a) + usec(tDrawEnd, tPresentEnd) * a;
-            t.totalUs        = t.totalUs * (1-a) + usec(tFrameStart, tPresentEnd) * a;
             t.computeDispatches = computeCount;
-            t.framesSampled++;
-            // Snapshot every 30 frames for MCP reads.
-            if (t.framesSampled % 30 == 0)
-                m_lastFrameTiming = t;
         }
 
+        auto tOutWinsStart = std::chrono::high_resolution_clock::now();
         // Present to any open output windows.
         PresentOutputWindows();
+        auto tOutWinsEnd = std::chrono::high_resolution_clock::now();
 
         // Refresh pixel trace after graph evaluation (before next frame).
         if (m_traceActive)
@@ -565,8 +610,19 @@ namespace winrt::ShaderLab::implementation
             PopulatePixelTraceTree();
             RenderTraceSwatches();
         }
+        auto tTraceEnd = std::chrono::high_resolution_clock::now();
         // Update crosshair position each frame (tracks with pan/zoom).
         UpdateCrosshairOverlay();
+
+        {
+            auto usec = [](auto a, auto b) {
+                return std::chrono::duration<double, std::micro>(b - a).count();
+            };
+            const double a = 0.1;
+            auto& t = m_frameTiming;
+            t.outputWindowsUs = t.outputWindowsUs * (1-a) + usec(tOutWinsStart, tOutWinsEnd) * a;
+            t.traceUs         = t.traceUs * (1-a) + usec(tOutWinsEnd, tTraceEnd) * a;
+        }
     }
 
 }

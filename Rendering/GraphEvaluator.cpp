@@ -1050,25 +1050,56 @@ namespace ShaderLab::Rendering
         for (const auto& f : def.analysisFields)
             analysisFloat4Count += f.pixelCount();
 
-        // Image-output dimensions: DiagramSize / OutputSize, fallback
-        // to upstream bounds. 0 / 0 = analysis-only (no u1 binding).
+        // Image-output dimensions: DiagramSize / OutputSize for square
+        // viewers, or OutputWidth + OutputHeight for non-square viewers
+        // like Waveform Monitor (output is srcW-ish x WaveformSize),
+        // fallback to upstream input bounds. 0/0 = analysis-only (no
+        // u1 binding).
         UINT32 imageOutW = 0, imageOutH = 0;
         bool hasImageOutput = !node.outputPins.empty();
         if (hasImageOutput)
         {
-            for (const auto& p : def.parameters)
+            // Pass 1: explicit OutputWidth + OutputHeight (non-square).
+            UINT32 explicitW = 0, explicitH = 0;
+            for (const auto& [key, val] : node.properties)
             {
-                if (p.name == L"DiagramSize" || p.name == L"OutputSize")
+                if (key == L"OutputWidth")
                 {
-                    auto it = node.properties.find(p.name);
-                    if (it != node.properties.end())
+                    if (auto* f = std::get_if<float>(&val))
+                        explicitW = static_cast<UINT32>((std::max)(*f, 64.0f));
+                    else if (auto* u = std::get_if<uint32_t>(&val))
+                        explicitW = (std::max)(*u, 64u);
+                }
+                else if (key == L"OutputHeight")
+                {
+                    if (auto* f = std::get_if<float>(&val))
+                        explicitH = static_cast<UINT32>((std::max)(*f, 64.0f));
+                    else if (auto* u = std::get_if<uint32_t>(&val))
+                        explicitH = (std::max)(*u, 64u);
+                }
+            }
+            if (explicitW > 0 && explicitH > 0)
+            {
+                imageOutW = explicitW;
+                imageOutH = explicitH;
+            }
+            // Pass 2: square sizing via DiagramSize / OutputSize.
+            if (imageOutW == 0)
+            {
+                for (const auto& p : def.parameters)
+                {
+                    if (p.name == L"DiagramSize" || p.name == L"OutputSize")
                     {
-                        if (auto* f = std::get_if<float>(&it->second))
-                            imageOutW = imageOutH = static_cast<UINT32>((std::max)(*f, 64.0f));
-                        else if (auto* u = std::get_if<uint32_t>(&it->second))
-                            imageOutW = imageOutH = (std::max)(*u, 64u);
+                        auto it = node.properties.find(p.name);
+                        if (it != node.properties.end())
+                        {
+                            if (auto* f = std::get_if<float>(&it->second))
+                                imageOutW = imageOutH = static_cast<UINT32>((std::max)(*f, 64.0f));
+                            else if (auto* u = std::get_if<uint32_t>(&it->second))
+                                imageOutW = imageOutH = (std::max)(*u, 64u);
+                        }
+                        break;
                     }
-                    break;
                 }
             }
             if (imageOutW == 0)
@@ -1212,9 +1243,11 @@ namespace ShaderLab::Rendering
             bool isFixedSizeViewer = false;
             for (const auto& p : def.parameters)
             {
-                if (p.name == L"DiagramSize" ||
-                    p.name == L"OutputSize"  ||
-                    p.name == L"ScopeSize"   ||
+                if (p.name == L"DiagramSize"  ||
+                    p.name == L"OutputSize"   ||
+                    p.name == L"OutputWidth"  ||
+                    p.name == L"OutputHeight" ||
+                    p.name == L"ScopeSize"    ||
                     p.name == L"WaveformSize")
                 {
                     isFixedSizeViewer = true;

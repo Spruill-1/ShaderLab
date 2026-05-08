@@ -258,12 +258,16 @@ namespace winrt::ShaderLab::implementation
 
         // Per-frame performance timings (microseconds, rolling averages).
         struct FrameTimings {
-            double totalUs{};
-            double sourcesPrepUs{};
-            double evaluateUs{};
-            double deferredComputeUs{};
-            double drawUs{};
-            double presentUs{};
+            double totalUs{};            // wall-clock between consecutive timer ticks (true frame interval)
+            double videoTickUs{};        // TickAndUploadLiveCaptures + TickAndUploadVideos + dirty propagation
+            double sourcesPrepUs{};      // PrepareSourceNode loop inside RenderFrame
+            double evaluateUs{};         // GraphEvaluator::Evaluate (passes 1 + 2)
+            double deferredComputeUs{};  // ProcessDeferredCompute (D3D11 compute dispatches) + post-PDC eval
+            double drawUs{};             // swap-chain DrawImage (CPU command queueing)
+            double presentUs{};          // RenderEngine::Present (back-buffer swap, blocks on VSync/GPU)
+            double nodeGraphUs{};        // RenderNodeGraph + overlays (canvas redraw)
+            double outputWindowsUs{};    // PresentOutputWindows (peeled-off output panes)
+            double traceUs{};            // PopulatePixelTraceTree + RenderTraceSwatches
             uint32_t computeDispatches{};
             uint32_t framesSampled{};
         };
