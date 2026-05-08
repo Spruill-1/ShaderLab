@@ -39,6 +39,15 @@ namespace ShaderLab::Rendering
         bool ProcessDeferredCompute(Graph::EffectGraph& graph, ID2D1DeviceContext5* dc);
         size_t DeferredComputeCount() const { return m_deferredCompute.size(); }
 
+        // Phase 8c: when set true, EvaluateNode for D3D11 compute effects
+        // skips appending to `m_deferredCompute`. The host sets this before
+        // the post-PDC re-evaluate pass (which exists only to re-apply
+        // properties on D2D effects downstream of just-dispatched compute
+        // bridges) so leftover compute entries don't leak into the next
+        // frame's PDC and cause a duplicate dispatch with stale source.
+        // Reset to false before pass 1 of each frame.
+        void SetDeferredComputeFrozen(bool frozen) { m_deferredComputeFrozen = frozen; }
+
         // Resolve property bindings for Source nodes only (lightweight, no D2D).
         // Call before TickAndUploadVideos so video nodes see updated Time values.
         void ResolveSourceBindings(Graph::EffectGraph& graph);
@@ -255,6 +264,7 @@ namespace ShaderLab::Rendering
             winrt::com_ptr<ID2D1Bitmap1> preRenderedInput;  // owning, pre-rendered bitmap (optional)
         };
         std::vector<DeferredCompute> m_deferredCompute;
+        bool m_deferredComputeFrozen{ false };
 
         // Pre-render a D2D image to an FP32 bitmap at 96 DPI.
         winrt::com_ptr<ID2D1Bitmap1> PreRenderInputBitmap(

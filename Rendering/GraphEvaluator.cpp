@@ -263,7 +263,7 @@ namespace ShaderLab::Rendering
                         skipReadbackForcesRedispatch ||
                         (hasImageOutput && !node->cachedOutput) ||
                         (!hasImageOutput && node->analysisOutput.fields.empty());
-                    if (inputImage && needsCompute)
+                    if (inputImage && needsCompute && !m_deferredComputeFrozen)
                     {
                         // Phase 8: ensure the bridge effect exists for this
                         // node so ProcessDeferredCompute can drive it via

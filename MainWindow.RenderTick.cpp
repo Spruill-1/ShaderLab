@@ -422,7 +422,20 @@ namespace winrt::ShaderLab::implementation
         {
             m_nodeGraphController.SetNeedsRedraw();
             if (m_graph.HasDirtyNodes())
+            {
+                // Post-PDC re-evaluate: re-apply properties on D2D effects
+                // downstream of the just-dispatched compute bridges so
+                // their internal intermediate caches invalidate. We do
+                // NOT want compute nodes to re-add themselves to
+                // m_deferredCompute here -- those entries would leak
+                // into next frame's PDC and cause a duplicate dispatch
+                // (stale-source then current-source overwriting the
+                // same UAV in alternation, which manifests as visible
+                // two-frame flicker).
+                m_graphEvaluator.SetDeferredComputeFrozen(true);
                 m_graphEvaluator.Evaluate(m_graph, drawDc);
+                m_graphEvaluator.SetDeferredComputeFrozen(false);
+            }
         }
 
         auto tComputeEnd = std::chrono::high_resolution_clock::now();
