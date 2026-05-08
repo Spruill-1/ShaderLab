@@ -244,6 +244,8 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer m_renderTimer{ nullptr };
         uint32_t m_frameCount{ 0 };
         uint64_t m_lastVideoUploadCount{ 0 };
+        float    m_lastFps{ 0.0f };
+        float    m_lastVideoFps{ 0.0f };
         std::chrono::steady_clock::time_point m_fpsTimePoint;
         std::chrono::steady_clock::time_point m_lastRenderTick;
 
@@ -463,6 +465,7 @@ namespace winrt::ShaderLab::implementation
         std::set<std::string> m_mcpKnownPeers;  // distinct peer addresses seen since server start
         void UpdateMcpActivityIndicator();
         void ResetMcpActivityState();
+        void UpdateFpsTooltip();
 
         // Column splitter drag state.
         bool m_isDraggingSplitter{ false };

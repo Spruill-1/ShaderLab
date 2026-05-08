@@ -256,44 +256,27 @@ namespace winrt::ShaderLab::implementation
             // Refresh MCP activity indicator (dot color fade + tooltip "Xs ago"
             // counter).  Cheap when no activity has occurred.
             UpdateMcpActivityIndicator();
+
+            // Refresh the FPS tooltip's breakdown at 250 ms cadence so that
+            // hovering the FPS counter shows live phase costs without
+            // waiting for the once-per-second FPS-text update. The TextBlock
+            // inside the ToolTip is data-bound so updating its Text
+            // refreshes the open tooltip in place.
+            UpdateFpsTooltip();
         }
         if (elapsed >= 1000)
         {
             float fps = static_cast<float>(m_frameCount) * 1000.0f / static_cast<float>(elapsed);
-            auto& ft = m_frameTiming;
 
-            // Video decode FPS.
+            // Video decode FPS (kept for tooltip).
             uint64_t currentVideoUploads = m_sourceFactory.TotalVideoUploads();
             float videoFps = static_cast<float>(currentVideoUploads - m_lastVideoUploadCount) * 1000.0f / static_cast<float>(elapsed);
             m_lastVideoUploadCount = currentVideoUploads;
+            m_lastVideoFps = videoFps;
+            m_lastFps = fps;
 
-            if (videoFps > 0.1f)
-            {
-                FpsText().Text(std::format(
-                    L"{:.0f} FPS | {:.1f}ms total = vid {:.1f} + eval {:.1f} + compute {:.1f} + draw {:.1f} + graph {:.1f} + outwins {:.1f} + trace {:.1f} | video {:.0f} fps",
-                    fps, ft.totalUs / 1000.0,
-                    ft.videoTickUs / 1000.0,
-                    ft.sourcesPrepUs / 1000.0 + ft.evaluateUs / 1000.0,
-                    ft.deferredComputeUs / 1000.0,
-                    ft.drawUs / 1000.0 + ft.presentUs / 1000.0,
-                    ft.nodeGraphUs / 1000.0,
-                    ft.outputWindowsUs / 1000.0,
-                    ft.traceUs / 1000.0,
-                    videoFps));
-            }
-            else
-            {
-                FpsText().Text(std::format(
-                    L"{:.0f} FPS | {:.1f}ms total = vid {:.1f} + eval {:.1f} + compute {:.1f} + draw {:.1f} + graph {:.1f} + outwins {:.1f} + trace {:.1f}",
-                    fps, ft.totalUs / 1000.0,
-                    ft.videoTickUs / 1000.0,
-                    ft.sourcesPrepUs / 1000.0 + ft.evaluateUs / 1000.0,
-                    ft.deferredComputeUs / 1000.0,
-                    ft.drawUs / 1000.0 + ft.presentUs / 1000.0,
-                    ft.nodeGraphUs / 1000.0,
-                    ft.outputWindowsUs / 1000.0,
-                    ft.traceUs / 1000.0));
-            }
+            FpsText().Text(std::format(L"FPS: {:.0f}", fps));
+            UpdateFpsTooltip();
             m_frameCount = 0;
             m_fpsTimePoint = fpsNow;
         }

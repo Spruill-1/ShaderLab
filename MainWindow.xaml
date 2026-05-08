@@ -324,7 +324,16 @@
             <TextBlock x:Name="FpsText" Grid.Column="6"
                        Text="FPS: --"
                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                       Style="{StaticResource CaptionTextBlockStyle}" />
+                       Style="{StaticResource CaptionTextBlockStyle}">
+                <ToolTipService.ToolTip>
+                    <ToolTip x:Name="FpsTooltip">
+                        <TextBlock x:Name="FpsTooltipText"
+                                   FontFamily="Cascadia Mono, Consolas, Courier New"
+                                   FontSize="11"
+                                   Text="(no data yet)" />
+                    </ToolTip>
+                </ToolTipService.ToolTip>
+            </TextBlock>
             <TextBlock x:Name="AppVersionText" Grid.Column="7"
                        Visibility="Collapsed" />
         </Grid>

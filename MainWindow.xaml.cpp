@@ -5428,4 +5428,61 @@ namespace winrt::ShaderLab::implementation
                 w->Update(it->second);
         }
     }
+
+    void MainWindow::UpdateFpsTooltip()
+    {
+        // Refresh the TextBlock inside the FPS counter's tooltip with a
+        // fresh per-phase breakdown. The TextBlock's Text property is
+        // observable, so updating it while the tooltip is open re-renders
+        // in place -- giving the user a real-time view of where each
+        // millisecond is going. Sub-phases sum to <= totalUs (= 1000/fps);
+        // the remainder is dispatcher idle / OS overhead between ticks.
+        if (!FpsTooltipText()) return;
+        const auto& ft = m_frameTiming;
+        double fps = m_lastFps;
+        double total = ft.totalUs / 1000.0;
+        double sumPhases =
+            ft.videoTickUs / 1000.0 +
+            ft.sourcesPrepUs / 1000.0 + ft.evaluateUs / 1000.0 +
+            ft.deferredComputeUs / 1000.0 +
+            ft.drawUs / 1000.0 + ft.presentUs / 1000.0 +
+            ft.nodeGraphUs / 1000.0 +
+            ft.outputWindowsUs / 1000.0 +
+            ft.traceUs / 1000.0;
+        double idle = (std::max)(0.0, total - sumPhases);
+
+        std::wstring text = std::format(
+            L"{:.0f} FPS  ({:.1f} ms total)\n"
+            L"\n"
+            L"  video tick    {:>6.2f} ms\n"
+            L"  sources prep  {:>6.2f} ms\n"
+            L"  eval          {:>6.2f} ms\n"
+            L"  compute       {:>6.2f} ms  ({} dispatch{})\n"
+            L"  draw          {:>6.2f} ms\n"
+            L"  present       {:>6.2f} ms\n"
+            L"  node graph    {:>6.2f} ms\n"
+            L"  output wins   {:>6.2f} ms\n"
+            L"  pixel trace   {:>6.2f} ms\n"
+            L"  --------------------------\n"
+            L"  sum           {:>6.2f} ms\n"
+            L"  idle / sched  {:>6.2f} ms",
+            fps, total,
+            ft.videoTickUs / 1000.0,
+            ft.sourcesPrepUs / 1000.0,
+            ft.evaluateUs / 1000.0,
+            ft.deferredComputeUs / 1000.0, ft.computeDispatches,
+                (ft.computeDispatches == 1 ? L"" : L"es"),
+            ft.drawUs / 1000.0,
+            ft.presentUs / 1000.0,
+            ft.nodeGraphUs / 1000.0,
+            ft.outputWindowsUs / 1000.0,
+            ft.traceUs / 1000.0,
+            sumPhases,
+            idle);
+
+        if (m_lastVideoFps > 0.1f)
+            text += std::format(L"\n\n  video decode  {:>6.0f} fps", m_lastVideoFps);
+
+        FpsTooltipText().Text(winrt::hstring(text));
+    }
 }
