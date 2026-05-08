@@ -2644,6 +2644,31 @@ namespace winrt::ShaderLab::implementation
         args.Handled(true);
     }
 
+    bool MainWindow::IsPropertiesPanelInteracting()
+    {
+        // Walks the focused element's parent chain looking for the
+        // PropertiesPanel StackPanel. If found, the user is mid-edit on
+        // some control inside the panel and a Clear() + recreate would
+        // destroy their in-progress input. Used by the 4 Hz binding-value
+        // refresh on Clock-driven graphs.
+        try
+        {
+            auto root = this->Content().XamlRoot();
+            if (!root) return false;
+            auto focused = winrt::Microsoft::UI::Xaml::Input::FocusManager::GetFocusedElement(root);
+            auto cur = focused.try_as<winrt::Microsoft::UI::Xaml::DependencyObject>();
+            auto target = PropertiesPanel().try_as<winrt::Microsoft::UI::Xaml::DependencyObject>();
+            if (!cur || !target) return false;
+            for (int hops = 0; hops < 64 && cur; ++hops)
+            {
+                if (cur == target) return true;
+                cur = winrt::Microsoft::UI::Xaml::Media::VisualTreeHelper::GetParent(cur);
+            }
+        }
+        catch (...) {}
+        return false;
+    }
+
     void MainWindow::UpdatePropertiesPanel()
     {
         namespace Controls = winrt::Microsoft::UI::Xaml::Controls;

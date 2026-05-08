@@ -247,10 +247,18 @@ namespace winrt::ShaderLab::implementation
             // every frame) caused a 4 Hz rebuild of the entire properties
             // panel -- visibly jittering Slider/NumberBox widths as auto-sized
             // controls re-laid out.
+            //
+            // Additional guard: skip the rebuild when any descendant of the
+            // PropertiesPanel currently has keyboard focus (i.e. the user
+            // is mid-edit in a TextBox / NumberBox / dropdown). The clear()
+            // + recreate cycle was destroying the focused control on every
+            // 250 ms tick, making any property whose owner has a bound
+            // sibling effectively un-editable in a Clock-driven graph.
             if (m_selectedNodeId != 0 && m_graph.HasDirtyNodes())
             {
                 auto* selNode = m_graph.FindNode(m_selectedNodeId);
-                if (selNode && !selNode->propertyBindings.empty())
+                if (selNode && !selNode->propertyBindings.empty() &&
+                    !IsPropertiesPanelInteracting())
                     UpdatePropertiesPanel();
             }
             // Refresh MCP activity indicator (dot color fade + tooltip "Xs ago"

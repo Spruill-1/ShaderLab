@@ -342,6 +342,11 @@ namespace winrt::ShaderLab::implementation
         D2D1_POINT_2F m_graphPanStart{};
         D2D1_POINT_2F m_graphPanOrigin{};
         void UpdatePropertiesPanel();
+        // True when any descendant of PropertiesPanel currently has keyboard
+        // focus (TextBox cursor, NumberBox edit, dropdown open). Used by the
+        // 4 Hz binding-value refresh path to avoid clobbering an in-progress
+        // edit by Clear() + recreate on the panel.
+        bool IsPropertiesPanelInteracting();
         void ShowCurveEditorDialog(uint32_t nodeId, const std::wstring& propertyKey, std::function<void()> markDirty);
         void AddMathExpressionInput(uint32_t nodeId);
         void RemoveMathExpressionInput(uint32_t nodeId, const std::wstring& paramName);
