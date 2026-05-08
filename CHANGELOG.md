@@ -5,7 +5,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-### Added
+## [1.6.0] - 2026-05-08
+
+The "Phase 8 GPU-binding" release. Compute outputs now route directly to downstream compute consumers as SRVs (no CPU readback round-trip), with a per-frame skip-readback policy that avoids `Map()` calls when no consumer needs CPU values. Disk-persistent bytecode cache, eager precompile of GPU-binding variants, and a new `CustomComputeBridgeEffect` D2D wrapper unify the discovery channel for D3D11 compute custom effects. Two slow analysis viewers (Gamut Coverage at 4K, plus Vectorscope/Waveform Monitor when present) migrated to single-group D3D11 compute scatter. Plus a flurry of bug fixes from real-world heavy-graph testing.
+
+### Added (since 1.5.0)
 
 - **Phase 8 GPU-binding rollout (decisions #62, #63 in README; v1.6 work-in-progress).** The full Phase 8 stack is now in place:
   - `Effects/IEngineComputeOutput.h` — engine-internal COM interface (IID `831B9291-CCAB-40A2-B0BA-E847F5B9FA6C`) with `GetAnalysisSrv` + `GetLastEvaluatedFrame`. Pure POD ABI, no STL across the COM boundary. Field layout stays in the graph data model on `EffectNode::analysisOutput.fields` so the metadata isn't duplicated.
@@ -32,6 +36,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ### Fixed
 
 - **D3D11 compute analysis nodes silently produced zero stats in headless contexts.** `DispatchUserD3D11Compute`'s internal `dc->DrawImage` requires an active D2D draw session; without one, the compute shader read a black input texture and emitted Min/Max/Mean = 0 with the histogram floor at bin 0. Caught by the new `TestLuminanceStatistics` unit test and fixed by wrapping the headless host's `runEval` / `RunRender` and the test bench's `Evaluate` shim in `dc->BeginDraw/EndDraw`. The latent bug had probably been there since the D3D11 hybrid compute landed in v1.4-era; it never manifested because the GUI's `RenderFrame` always wraps correctly and the GUI was the only host running stats analysis.
+- **Split Comparison pivot off-center on multi-branch graphs.** D2D atlas-pads pixel-shader input intermediates to 4096×4096 when an upstream effect has multiple downstream consumers, so HLSL `Texture2D::GetDimensions()` returns the atlas size, not the output rect. The shader's `uv0 - (W*0.5, H*0.5)` recentering was pivoting at (2048, 2048) on a 3840×2160 video, putting the seam at the bottom edge. Fix: added `OutputW`/`OutputH` hidden cbuffer fields populated by the host from `GetImageLocalBounds(srcNode->cachedOutput)`. Generic mechanism — any pixel shader declaring `OutputW`/`OutputH` parameters gets host-injected dimensions.
+- **`D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING` now passed on every `CustomPixelShaderEffect::SetPixelShader` call.** Disables D2D's intermediate-atlas allocation so `uv0`/`SV_POSITION` report true output coordinates. Contract: every ShaderLab pixel shader reads inputs at the same coord as the output (cross-texel sampling effects belong on the compute path).
+- **CIE Histogram produced an empty image output.** The shader declared `RWTexture2D<float4> Output : register(u0)`, but the runner binds the analysis structured buffer at `u0` and the image output at `u1`. Histogram writes were silently going to the (unused) analysis buffer. Fixed: `register(u0)` → `register(u1)`. Downstream CIE Chromaticity Plot now correctly shows the histogram scatter overlay.
+- **Properties panel was un-editable on Clock-driven graphs.** The 4 Hz binding-value refresh was unconditionally calling `UpdatePropertiesPanel()` (which `Clear()`s the entire control tree) whenever the selected node had any property binding and any graph node was dirty — both true continuously while a Clock plays. Mid-edit clicks lost focus on every 250 ms tick. Fix: walk the focused element's parent chain via `VisualTreeHelper::GetParent` and skip the periodic rebuild while any descendant of `PropertiesPanel` holds keyboard focus. User-driven rebuild paths (selection change, explicit property mutation) still rebuild immediately.
+- **Vectorscope and Waveform Monitor analysis viewers removed.** No clear use case after the migration to compute scatter; 318 lines net.
+- **Gamut Coverage GPU lockup at 4K.** Pixel-shader path was 65K-iter inner loop × full source resolution = ~543B ops on a 4K HDR source. Migrated to single-group D3D11 compute scatter (numthreads(32,32,1), dispatch (1,1,1)) — ~46× speedup.
+- **D2D HDR Tone Map post-PDC eval pass leaked compute dispatches into the next frame.** Caused two-frame flicker on tone-mapper output. Fixed via `SetDeferredComputeFrozen(bool)` flag gated around pass 3.
+- **Skip-readback compute consumers stopped re-dispatching when bindings hadn't changed.** Broadened force-redispatch condition: when the skip-readback flag is on, ALL compute nodes redispatch every frame regardless of dirty state (bindings can be CPU-throttled while keeping image-output texture fresh).
+- **`MapInputRectsToOutputRect` clamps to 4096×4096** so single-input pixel shaders with a hidden 1×1 dummy bitmap don't degenerate to a zero-size output rect.
 
 ## [1.5.0] - 2026-05-06
 
