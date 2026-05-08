@@ -397,7 +397,7 @@ float4 main(
 // Output R: log-scaled density, G: avg luminance / 10000, A: 1 if hit.
 
 Texture2D<float4> Source : register(t0);
-RWTexture2D<float4> Output : register(u0);
+RWTexture2D<float4> Output : register(u1);
 
 cbuffer Constants : register(b0) {
     uint Width;
@@ -503,7 +503,7 @@ void main(uint3 GTid : SV_GroupThreadID) {
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"CIE Histogram";
-            desc.effectId = L"CIE Histogram"; desc.effectVersion = 1;
+            desc.effectId = L"CIE Histogram"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.subcategory = L"Scopes";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;

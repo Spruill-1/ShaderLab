@@ -154,7 +154,8 @@ namespace ShaderLab::Effects
                 static_cast<UINT32>(m_shaderBytecode.size()));
 
             if (SUCCEEDED(hr))
-                hr = m_drawInfo->SetPixelShader(m_shaderGuid);
+                hr = m_drawInfo->SetPixelShader(m_shaderGuid,
+                    D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING);
 
             if (FAILED(hr))
                 return hr;
