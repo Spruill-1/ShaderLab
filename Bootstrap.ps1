@@ -34,7 +34,7 @@ try {
 
     # 2. ExprTk single-header download (Numeric Expression node).
     Write-Host "[2/4] Ensuring third_party/exprtk/exprtk.hpp..."
-    & "$Repo\scripts\EnsureExprTk.ps1"
+    & "$Repo\scripts\EnsureExprTk.ps1" -TargetDir "$Repo\third_party\exprtk"
 
     # 3. NuGet restore (packages.config style).
     Write-Host "[3/4] Restoring NuGet packages..."

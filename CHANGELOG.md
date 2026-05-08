@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-05-08
+
+### Fixed
+
+- **CI Bootstrap.ps1 smoke job: missing `TargetDir` arg on `EnsureExprTk.ps1`.** Same shape as the 1.6.1 cert fix — `EnsureExprTk.ps1` declares `TargetDir` as a mandatory parameter; the vcxproj target supplies `$(ProjectDir)third_party\exprtk` but Bootstrap.ps1 was calling it bare. Now matches the vcxproj invocation.
+
 ## [1.6.1] - 2026-05-08
 
 ### Fixed
