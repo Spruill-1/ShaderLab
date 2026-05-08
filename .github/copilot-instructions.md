@@ -7,7 +7,7 @@ ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, 
 ## Hard Rules
 
 - **C++/WinRT only** — never generate C# code. Direct COM access to `ID2D1EffectImpl`, `ID2D1DrawTransform`, `ID2D1ComputeTransform` is the reason this project exists.
-- **README.md is a living architecture doc** — update it with Mermaid diagrams and a decision log entry whenever a significant architectural decision is made.
+- **`docs/` is the living architecture documentation tree.** Update the relevant file under `docs/architecture/`, `docs/effects/`, etc. when a significant architectural change lands. Append a new entry to [`docs/history/decision-log.md`](../docs/history/decision-log.md) with a Mermaid diagram for any choice that future contributors will need to understand the *why* of. The repo-root `README.md` is intentionally slim — install + build + a pointer to `docs/` — and should not be expanded with technical detail.
 - **All new `.cpp` files must `#include "pch.h"` as the first include** — precompiled header is mandatory (`pch.h` aggregates WinRT, D2D, D3D, Win2D, DXGI, WIC, and STL headers).
 
 ## Build

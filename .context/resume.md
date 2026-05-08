@@ -11,7 +11,7 @@
 - **Language**: C++/WinRT — direct COM access to `ID2D1EffectImpl`, `ID2D1DrawTransform`, `ID2D1ComputeTransform`.
 - **Branch / repo state**: `main`, tagged `v1.5.0`. Working tree clean; the 4 stacked commits are Phase 8 prep + cleanup, not yet pushed.
 
-> Authoritative sources of truth: `README.md` (architecture + decision log, **63 entries**), `CHANGELOG.md` (per-version diffs, including `[Unreleased]` for the post-1.5 work), `Version.h` (numeric version), `.github/copilot-instructions.md` (AI agent rules). This file is a fast-orientation summary; it can drift — re-check the README before relying on details.
+> Authoritative sources of truth: [`docs/`](../docs/README.md) (architecture tree + per-file references) and especially [`docs/history/decision-log.md`](../docs/history/decision-log.md) (**63 entries**), `CHANGELOG.md` (per-version diffs, including `[Unreleased]` for the post-1.5 work), `Version.h` (numeric version), `.github/copilot-instructions.md` (AI agent rules). This file is a fast-orientation summary; it can drift — re-check the docs tree before relying on details.
 
 ---
 
@@ -199,9 +199,10 @@ ShaderLab\
 ├── app.manifest                    # DPI awareness, heap type
 ├── EngineExport.h / .cpp           # SHADERLAB_API + ABI version + ShaderLab_GetAbiVersion C export
 ├── Version.h                       # App 1.5.0, graph format 2
-├── README.md                       # Living architecture doc + decision log (63 entries)
+├── README.md                       # Slim repo intro + pointer to docs/
+├── docs/                           # Architecture tree (architecture / effects / ui-ux / hosts / development / history)
+├── docs/effects/new-effect-defaults.md  # D2D effect default-property reference
 ├── CHANGELOG.md                    # Version history
-├── NewEffectDefaults.md            # D2D effect default-property reference
 ├── Bootstrap.ps1                   # One-command fresh-clone setup
 │
 ├── pch.h / pch.cpp                 # App PCH
