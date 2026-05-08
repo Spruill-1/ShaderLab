@@ -1064,69 +1064,114 @@ float4 main(
         // ---- Vectorscope (Analysis) ----
         {
             static const std::string vectorscopeHLSL = R"HLSL(
-// Vectorscope - chrominance distribution on a circular plot
-Texture2D Source : register(t0);
+// Vectorscope - chrominance distribution on a circular plot.
+// Migrated to D3D11 compute (Phase 8c perf): each thread group scatters all
+// source pixels into a 64x64 Cb/Cr histogram in groupshared, then renders
+// the 512x512 output (circle border + crosshairs + scatter bins) by reading
+// the histogram. O(srcW*srcH + outW*outH) instead of the previous O(samples
+// * outW*outH).
 
-cbuffer constants : register(b0) {
-    float ScopeSize;    // pixels (default 256)
-    float Intensity;    // dot brightness (default 1.0)
+Texture2D<float4>    Source : register(t0);
+RWTexture2D<float4>  Output : register(u1);
+
+cbuffer Constants : register(b0) {
+    uint  Width;            // auto-injected by bridge
+    uint  Height;
+    float ScopeSize;        // pixels (default 512)
+    float Intensity;        // dot brightness (default 1.0)
 };
 
-float4 main(
-    float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+#define VBINS 64
+groupshared uint gs_hits[VBINS * VBINS];
+
+[numthreads(32, 32, 1)]
+void main(uint3 GTid : SV_GroupThreadID)
 {
-    float size = max(ScopeSize, 64.0);
-    float2 center = float2(size * 0.5, size * 0.5);
-    float2 p = (uv0.xy - center) / (size * 0.5); // -1 to 1
+    uint tid = GTid.x + GTid.y * 32;
+    const uint totalThreads = 1024;
 
-    float4 result = float4(0.15, 0.15, 0.15, 1.0);
+    uint outSize = max((uint)ScopeSize, 64u);
+    float intensity = Intensity;
 
-    // Draw circular border
-    float r = length(p);
-    if (abs(r - 1.0) < 0.01)
-        result.rgb = float3(0.3, 0.3, 0.3);
+    // Phase 1: zero groupshared.
+    for (uint c = tid; c < VBINS * VBINS; c += totalThreads)
+        gs_hits[c] = 0;
+    GroupMemoryBarrierWithGroupSync();
 
-    // Cross-hairs
-    if ((abs(p.x) < 0.003 || abs(p.y) < 0.003) && r < 1.0)
-        result.rgb = float3(0.2, 0.2, 0.2);
+    // Phase 2: scatter source pixels into Cb/Cr bins.
+    uint totalPixels = Width * Height;
+    for (uint pi = tid; pi < totalPixels; pi += totalThreads)
+    {
+        uint px = pi % Width;
+        uint py = pi / Width;
+        float4 s = Source[int2(px, py)];
+        if (s.a < 0.001) continue;
 
-    // Scatter source pixels: use Cb/Cr as position
-    uint srcW, srcH;
-    Source.GetDimensions(srcW, srcH);
-    if (srcW > 0 && srcH > 0) {
-        float bestDist = 1e10;
-        uint stepX = max(1, srcW / 64);
-        uint stepY = max(1, srcH / 64);
-        for (uint sy = 0; sy < srcH; sy += stepY) {
-            for (uint sx = 0; sx < srcW; sx += stepX) {
-                float4 pix = Source.Load(int3(sx, sy, 0));
-                if (pix.a < 0.001) continue;
-                // YCbCr: Cb = B-Y, Cr = R-Y (simplified)
-                float Y = dot(pix.rgb, float3(0.2126, 0.7152, 0.0722));
-                float Cb = (pix.b - Y) * 0.9;
-                float Cr = (pix.r - Y) * 0.9;
-                float2 sPos = float2(Cr, -Cb); // map to scope space
-                float d = length(sPos - p);
-                bestDist = min(bestDist, d);
+        // Simplified BT.709-ish Y, Cb, Cr.
+        float Y  = dot(s.rgb, float3(0.2126, 0.7152, 0.0722));
+        float Cb = (s.b - Y) * 0.9;
+        float Cr = (s.r - Y) * 0.9;
+
+        // Scope-space position: x=Cr, y=-Cb, mapped to [0,1].
+        float2 sPos = float2(Cr, -Cb);
+        float u = sPos.x * 0.5 + 0.5;
+        float v = sPos.y * 0.5 + 0.5;
+        if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
+
+        uint bx = min((uint)(u * VBINS), VBINS - 1);
+        uint by = min((uint)(v * VBINS), VBINS - 1);
+        InterlockedAdd(gs_hits[by * VBINS + bx], 1u);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Phase 3: render the circular plot.
+    float halfSz = float(outSize) * 0.5;
+    for (uint oi = tid; oi < outSize * outSize; oi += totalThreads)
+    {
+        uint ox = oi % outSize;
+        uint oy = oi / outSize;
+        float2 p = (float2(ox, oy) + 0.5 - halfSz) / halfSz; // -1..1
+
+        float4 result = float4(0.15, 0.15, 0.15, 1.0);
+        float r = length(p);
+
+        // Border
+        if (abs(r - 1.0) < 0.01)
+            result.rgb = float3(0.3, 0.3, 0.3);
+        // Cross-hairs (only inside the circle)
+        if ((abs(p.x) < 0.003 || abs(p.y) < 0.003) && r < 1.0)
+            result.rgb = float3(0.2, 0.2, 0.2);
+
+        // Look up the scope-space bin.
+        float u = p.x * 0.5 + 0.5;
+        float v = p.y * 0.5 + 0.5;
+        if (u >= 0 && u < 1 && v >= 0 && v < 1)
+        {
+            uint bx = min((uint)(u * VBINS), VBINS - 1);
+            uint by = min((uint)(v * VBINS), VBINS - 1);
+            uint hits = gs_hits[by * VBINS + bx];
+            if (hits > 0)
+            {
+                float density = saturate(float(hits) * intensity * 0.05);
+                result.rgb += density * float3(0.8, 0.8, 0.8);
             }
         }
-        if (bestDist < 0.02) {
-            float hit = saturate(1.0 - bestDist / 0.02) * Intensity;
-            result.rgb += hit * float3(0.8, 0.8, 0.8);
-        }
-    }
 
-    return result;
+        Output[int2(ox, oy)] = result;
+    }
 }
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Vectorscope";
-            desc.effectId = L"Vectorscope"; desc.effectVersion = 1;
+            desc.effectId = L"Vectorscope"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.subcategory = L"Scopes";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 32;
+            desc.threadGroupY = 32;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + vectorscopeHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
