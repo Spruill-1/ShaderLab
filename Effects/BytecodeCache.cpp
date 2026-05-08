@@ -55,7 +55,7 @@ namespace ShaderLab::Effects
         //     Old v2 cached entries used SKIP_OPTIMIZATION in debug
         //     -- those bytecodes are 5-10x slower at runtime. Bump
         //     so they fall out and re-compile at the new opt level.
-        constexpr uint32_t kCacheSchemaVersion = 3;
+        constexpr uint32_t kCacheSchemaVersion = 4;
         const char* libPtr = GetShaderLabParamsHLSL();
         size_t libLen = libPtr ? GetShaderLabParamsHLSLLength() : 0;
         std::string buf;

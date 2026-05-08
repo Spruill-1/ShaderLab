@@ -183,10 +183,26 @@ namespace
     {
         printf("\n=== Analysis Effects ===\n");
         auto& registry = ShaderLab::Effects::ShaderLabEffects::Instance();
+        // Wave Monitor + similar viewers migrated to D3D11 compute (Phase
+        // 8c) need the BeginDraw + ProcessDeferredCompute + double-eval
+        // dance to actually produce output. Apply it uniformly so this
+        // test works for both pixel-shader and compute-bridge effects.
+        auto runTwoPass = [&](ShaderLab::Graph::EffectGraph& g,
+                              ShaderLab::Effects::SourceNodeFactory& sf) {
+            g_evaluator.ReleaseCache();
+            Evaluate(g, sf);
+            g_dc->SetTarget(nullptr);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+            Evaluate(g, sf);
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(g, g_dc.get());
+            g_dc->EndDraw();
+        };
 
         const wchar_t* names[] = {
-            L"Luminance Heatmap", L"Gamut Highlight", L"Nit Map",
-            L"Waveform Monitor"
+            L"Luminance Heatmap", L"Gamut Highlight", L"Nit Map"
         };
         for (const auto* name : names)
         {
@@ -201,7 +217,7 @@ namespace
             auto srcId = g.AddNode(std::move(srcNode));
             auto fxId = g.AddNode(std::move(fxNode));
             g.Connect(srcId, 0, fxId, 0);
-            Evaluate(g, sf);
+            runTwoPass(g, sf);
 
             auto* n = g.FindNode(fxId);
             bool ok = n && HasOutput(*n) && n->runtimeError.empty();
@@ -226,7 +242,7 @@ namespace
             auto fxId = g.AddNode(std::move(fxNode));
             g.Connect(src1Id, 0, fxId, 0);
             g.Connect(src2Id, 0, fxId, 1);
-            Evaluate(g, sf);
+            runTwoPass(g, sf);
 
             auto* n = g.FindNode(fxId);
             TEST("Analysis_Split Comparison", n && HasOutput(*n) && n->runtimeError.empty());

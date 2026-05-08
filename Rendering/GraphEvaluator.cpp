@@ -1051,8 +1051,7 @@ namespace ShaderLab::Rendering
             analysisFloat4Count += f.pixelCount();
 
         // Image-output dimensions: DiagramSize / OutputSize for square
-        // viewers, or OutputWidth + OutputHeight for non-square viewers
-        // like Waveform Monitor (output is srcW-ish x WaveformSize),
+        // viewers, or OutputWidth + OutputHeight for non-square viewers,
         // fallback to upstream input bounds. 0/0 = analysis-only (no
         // u1 binding).
         UINT32 imageOutW = 0, imageOutH = 0;
@@ -1246,9 +1245,7 @@ namespace ShaderLab::Rendering
                 if (p.name == L"DiagramSize"  ||
                     p.name == L"OutputSize"   ||
                     p.name == L"OutputWidth"  ||
-                    p.name == L"OutputHeight" ||
-                    p.name == L"ScopeSize"    ||
-                    p.name == L"WaveformSize")
+                    p.name == L"OutputHeight")
                 {
                     isFixedSizeViewer = true;
                     break;
@@ -1658,7 +1655,7 @@ namespace ShaderLab::Rendering
             if (node.customEffect.has_value() && node.customEffect->inputNames.empty())
             {
                 UINT32 outW = 512, outH = 512;
-                // Look for OutputSize/DiagramSize/PlateSize/GradSize/PatternSize/PatchSize/ScopeSize property.
+                // Look for OutputSize/DiagramSize/PlateSize/GradSize/PatternSize/PatchSize property.
                 for (const auto& [key, val] : node.properties)
                 {
                     if (key.find(L"Size") != std::wstring::npos ||

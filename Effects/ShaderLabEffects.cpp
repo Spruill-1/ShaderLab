@@ -1061,125 +1061,6 @@ float4 main(
             m_effects.push_back(std::move(desc));
         }
 
-        // ---- Vectorscope (Analysis) ----
-        {
-            static const std::string vectorscopeHLSL = R"HLSL(
-// Vectorscope - chrominance distribution on a circular plot.
-// Migrated to D3D11 compute (Phase 8c perf): each thread group scatters all
-// source pixels into a 64x64 Cb/Cr histogram in groupshared, then renders
-// the 512x512 output (circle border + crosshairs + scatter bins) by reading
-// the histogram. O(srcW*srcH + outW*outH) instead of the previous O(samples
-// * outW*outH).
-
-Texture2D<float4>    Source : register(t0);
-RWTexture2D<float4>  Output : register(u1);
-
-cbuffer Constants : register(b0) {
-    uint  Width;            // auto-injected by bridge
-    uint  Height;
-    float ScopeSize;        // pixels (default 512)
-    float Intensity;        // dot brightness (default 1.0)
-};
-
-#define VBINS 64
-groupshared uint gs_hits[VBINS * VBINS];
-
-[numthreads(32, 32, 1)]
-void main(uint3 GTid : SV_GroupThreadID)
-{
-    uint tid = GTid.x + GTid.y * 32;
-    const uint totalThreads = 1024;
-
-    uint outSize = max((uint)ScopeSize, 64u);
-    float intensity = Intensity;
-
-    // Phase 1: zero groupshared.
-    for (uint c = tid; c < VBINS * VBINS; c += totalThreads)
-        gs_hits[c] = 0;
-    GroupMemoryBarrierWithGroupSync();
-
-    // Phase 2: scatter source pixels into Cb/Cr bins.
-    uint totalPixels = Width * Height;
-    for (uint pi = tid; pi < totalPixels; pi += totalThreads)
-    {
-        uint px = pi % Width;
-        uint py = pi / Width;
-        float4 s = Source[int2(px, py)];
-        if (s.a < 0.001) continue;
-
-        // Simplified BT.709-ish Y, Cb, Cr.
-        float Y  = dot(s.rgb, float3(0.2126, 0.7152, 0.0722));
-        float Cb = (s.b - Y) * 0.9;
-        float Cr = (s.r - Y) * 0.9;
-
-        // Scope-space position: x=Cr, y=-Cb, mapped to [0,1].
-        float2 sPos = float2(Cr, -Cb);
-        float u = sPos.x * 0.5 + 0.5;
-        float v = sPos.y * 0.5 + 0.5;
-        if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
-
-        uint bx = min((uint)(u * VBINS), VBINS - 1);
-        uint by = min((uint)(v * VBINS), VBINS - 1);
-        InterlockedAdd(gs_hits[by * VBINS + bx], 1u);
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    // Phase 3: render the circular plot.
-    float halfSz = float(outSize) * 0.5;
-    for (uint oi = tid; oi < outSize * outSize; oi += totalThreads)
-    {
-        uint ox = oi % outSize;
-        uint oy = oi / outSize;
-        float2 p = (float2(ox, oy) + 0.5 - halfSz) / halfSz; // -1..1
-
-        float4 result = float4(0.15, 0.15, 0.15, 1.0);
-        float r = length(p);
-
-        // Border
-        if (abs(r - 1.0) < 0.01)
-            result.rgb = float3(0.3, 0.3, 0.3);
-        // Cross-hairs (only inside the circle)
-        if ((abs(p.x) < 0.003 || abs(p.y) < 0.003) && r < 1.0)
-            result.rgb = float3(0.2, 0.2, 0.2);
-
-        // Look up the scope-space bin.
-        float u = p.x * 0.5 + 0.5;
-        float v = p.y * 0.5 + 0.5;
-        if (u >= 0 && u < 1 && v >= 0 && v < 1)
-        {
-            uint bx = min((uint)(u * VBINS), VBINS - 1);
-            uint by = min((uint)(v * VBINS), VBINS - 1);
-            uint hits = gs_hits[by * VBINS + bx];
-            if (hits > 0)
-            {
-                float density = saturate(float(hits) * intensity * 0.05);
-                result.rgb += density * float3(0.8, 0.8, 0.8);
-            }
-        }
-
-        Output[int2(ox, oy)] = result;
-    }
-}
-)HLSL";
-
-            ShaderLabEffectDescriptor desc;
-            desc.name = L"Vectorscope";
-            desc.effectId = L"Vectorscope"; desc.effectVersion = 2;
-            desc.category = L"Analysis";
-            desc.subcategory = L"Scopes";
-            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
-            desc.hasImageOutput = true;
-            desc.threadGroupX = 32;
-            desc.threadGroupY = 32;
-            desc.threadGroupZ = 1;
-            desc.hlslSource = colorMath + vectorscopeHLSL;
-            desc.inputNames = { L"Source" };
-            desc.parameters = {
-                { L"ScopeSize",  L"float", 512.0f, 64.0f, 2048.0f, 32.0f },
-                { L"Intensity",  L"float", 1.0f,   0.1f, 5.0f, 0.1f },
-            };
-            m_effects.push_back(std::move(desc));
-        }
 
         // ---- Delta E Comparator ----
         {
@@ -1405,205 +1286,6 @@ float4 main(
             m_effects.push_back(std::move(desc));
         }
 
-        // ---- Waveform Monitor ----
-        {
-            static const std::string waveformHLSL = R"HLSL(
-// Waveform Monitor - RGB parade or luminance waveform.
-// Migrated to D3D11 compute (Phase 8c perf): each thread group scatters all
-// source pixels into a per-channel hit grid in groupshared, then renders
-// the OutputWidth x OutputHeight result by reading the hit grid. Was a
-// per-output-pixel column scan in the previous pixel-shader implementation,
-// O(srcW * srcH * outH * outW) at the worst (with the inner sample cap
-// thats ~1B ops at 4K). Compute version is O(srcW * srcH + outW * outH).
-//
-// Output layout:
-//   Mode 0 (Luma):       outW x outH grayscale waveform.
-//   Mode 1 (RGB Parade): outW x outH split into 3 columns; left=R, mid=G, right=B.
-//   Mode 2 (RGB Overlay): outW x outH with R/G/B overlapped.
-
-Texture2D<float4>    Source : register(t0);
-RWTexture2D<float4>  Output : register(u1);
-
-cbuffer Constants : register(b0) {
-    uint  Width;            // auto-injected by bridge
-    uint  Height;
-    float OutputWidth;      // waveform width (default 1024; 3-column parade keeps overall width)
-    float OutputHeight;     // waveform height
-    float Mode;             // 0=Luma, 1=RGB Parade, 2=RGB Overlay (declared float per ShaderLab convention)
-    float Gain;             // brightness gain
-    float MaxNits;          // y-axis ceiling in nits
-};
-
-// 4-channel hit grid: R, G, B, Luma. Each is COL_BINS x ROW_BINS.
-// Using compact bins so groupshared stays under 32 KB:
-//   COL_BINS=128, ROW_BINS=64 -> 128*64*4 channels*4 bytes = 128 KB.
-//   Reduce to: COL_BINS=64, ROW_BINS=64, 4 channels -> 64 KB. Still over.
-//   Final: COL_BINS=64, ROW_BINS=32, 4 channels = 32 KB. Tight but works.
-#define WCOL_BINS 64
-#define WROW_BINS 32
-groupshared uint gs_R[WCOL_BINS * WROW_BINS];
-groupshared uint gs_G[WCOL_BINS * WROW_BINS];
-groupshared uint gs_B[WCOL_BINS * WROW_BINS];
-groupshared uint gs_L[WCOL_BINS * WROW_BINS];
-
-[numthreads(32, 32, 1)]
-void main(uint3 GTid : SV_GroupThreadID)
-{
-    uint tid = GTid.x + GTid.y * 32;
-    const uint totalThreads = 1024;
-
-    uint outW = max((uint)OutputWidth,  64u);
-    uint outH = max((uint)OutputHeight, 64u);
-    uint mode = (uint)Mode;
-    float gain = Gain;
-    float maxNits = max(MaxNits, 1.0);
-
-    // Phase 1: zero groupshared.
-    for (uint c = tid; c < WCOL_BINS * WROW_BINS; c += totalThreads)
-    {
-        gs_R[c] = 0; gs_G[c] = 0; gs_B[c] = 0; gs_L[c] = 0;
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    // Phase 2: scatter every source pixel into (column-bin, value-bin)
-    // per channel.
-    uint totalPixels = Width * Height;
-    for (uint pi = tid; pi < totalPixels; pi += totalThreads)
-    {
-        uint px = pi % Width;
-        uint py = pi / Width;
-        float4 s = Source[int2(px, py)];
-        if (s.a < 0.001) continue;
-
-        // Column bin: source x mapped uniformly to [0, WCOL_BINS).
-        uint bx = min((uint)(((float)px / (float)Width) * WCOL_BINS), WCOL_BINS - 1);
-
-        // Value-bin per channel (in nits, [0, maxNits]).
-        float nitsR = max(0.0, s.r) * 80.0;
-        float nitsG = max(0.0, s.g) * 80.0;
-        float nitsB = max(0.0, s.b) * 80.0;
-        float nitsL = ScRGBLuminanceNits(s.rgb);
-
-        if (nitsR > 0)
-        {
-            uint by = (uint)(saturate(nitsR / maxNits) * (WROW_BINS - 1));
-            InterlockedAdd(gs_R[by * WCOL_BINS + bx], 1u);
-        }
-        if (nitsG > 0)
-        {
-            uint by = (uint)(saturate(nitsG / maxNits) * (WROW_BINS - 1));
-            InterlockedAdd(gs_G[by * WCOL_BINS + bx], 1u);
-        }
-        if (nitsB > 0)
-        {
-            uint by = (uint)(saturate(nitsB / maxNits) * (WROW_BINS - 1));
-            InterlockedAdd(gs_B[by * WCOL_BINS + bx], 1u);
-        }
-        if (nitsL > 0)
-        {
-            uint by = (uint)(saturate(nitsL / maxNits) * (WROW_BINS - 1));
-            InterlockedAdd(gs_L[by * WCOL_BINS + bx], 1u);
-        }
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    // Phase 3: render the waveform output.
-    // Density scaling: at any source column, total pixels mapping there =
-    // ~totalPixels/WCOL_BINS. "Fully bright" should correspond to ~1% of
-    // that column landing in a single value-bin (very flat-luma scene).
-    // densityNorm of `gain / max(pixelsPerCol * 0.01, 100.0)` keeps a
-    // wide range of densities visible without immediate saturation.
-    float pixelsPerCol = (float)totalPixels / (float)WCOL_BINS;
-    float densityNorm = gain / max(pixelsPerCol * 0.01, 100.0);
-
-    for (uint oi = tid; oi < outW * outH; oi += totalThreads)
-    {
-        uint ox = oi % outW;
-        uint oy = oi / outW;
-
-        // py: 0 at top, outH at bottom. Level: 0 at bottom, 1 at top.
-        float level = 1.0 - ((float)oy + 0.5) / (float)outH;
-        float nitsAtY = level * maxNits;
-
-        // Determine which source-column / channel(s) this output pixel reads.
-        float u = ((float)ox + 0.5) / (float)outW;
-        uint bx;
-        int channel = -1;  // -1 = all (overlay), 0=R, 1=G, 2=B, 3=Luma
-
-        if (mode == 0u) // Luma
-        {
-            bx = min((uint)(u * WCOL_BINS), WCOL_BINS - 1);
-            channel = 3;
-        }
-        else if (mode == 1u) // Parade
-        {
-            // 3 stripes; remap u within each stripe to [0,1].
-            float third = 1.0 / 3.0;
-            if (u < third)            { bx = min((uint)((u / third) * WCOL_BINS), WCOL_BINS - 1); channel = 0; }
-            else if (u < 2.0 * third) { bx = min((uint)(((u - third) / third) * WCOL_BINS), WCOL_BINS - 1); channel = 1; }
-            else                      { bx = min((uint)(((u - 2.0 * third) / third) * WCOL_BINS), WCOL_BINS - 1); channel = 2; }
-        }
-        else // Overlay
-        {
-            bx = min((uint)(u * WCOL_BINS), WCOL_BINS - 1);
-            channel = -1;
-        }
-
-        // Vertical: convert nitsAtY to a row bin.
-        uint by = (uint)(saturate(nitsAtY / maxNits) * (WROW_BINS - 1));
-        uint binIdx = by * WCOL_BINS + bx;
-
-        float3 color = float3(0, 0, 0);
-        if (channel == 3) // luma
-        {
-            float lum = saturate((float)gs_L[binIdx] * densityNorm);
-            color = float3(lum, lum, lum);
-        }
-        else if (channel == 0) color = float3(saturate((float)gs_R[binIdx] * densityNorm), 0, 0);
-        else if (channel == 1) color = float3(0, saturate((float)gs_G[binIdx] * densityNorm), 0);
-        else if (channel == 2) color = float3(0, 0, saturate((float)gs_B[binIdx] * densityNorm));
-        else // overlay
-        {
-            color.r = saturate((float)gs_R[binIdx] * densityNorm);
-            color.g = saturate((float)gs_G[binIdx] * densityNorm);
-            color.b = saturate((float)gs_B[binIdx] * densityNorm);
-        }
-
-        // Reference lines at key nit levels.
-        float lineThick = maxNits / (float)outH * 0.5;
-        if (abs(nitsAtY - 80.0)   < lineThick) color += 0.15;
-        if (abs(nitsAtY - 203.0)  < lineThick) color += 0.15;
-        if (abs(nitsAtY - 1000.0) < lineThick) color += 0.15;
-
-        // Dark background floor.
-        color = max(color, float3(0.02, 0.02, 0.02));
-
-        Output[int2(ox, oy)] = float4(color, 1.0);
-    }
-}
-)HLSL";
-
-            ShaderLabEffectDescriptor desc;
-            desc.name = L"Waveform Monitor";
-            desc.subcategory = L"Scopes";
-            desc.effectId = L"Waveform Monitor"; desc.effectVersion = 3;
-            desc.category = L"Analysis";
-            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
-            desc.hasImageOutput = true;
-            desc.threadGroupX = 32;
-            desc.threadGroupY = 32;
-            desc.threadGroupZ = 1;
-            desc.hlslSource = colorMath + waveformHLSL;
-            desc.inputNames = { L"Source" };
-            desc.parameters = {
-                { L"OutputWidth",  L"float", 1024.0f, 256.0f, 4096.0f, 64.0f },
-                { L"OutputHeight", L"float",  256.0f, 128.0f, 1024.0f, 32.0f },
-                { L"Mode",     L"float", 1.0f, 0.0f, 2.0f, 1.0f, { L"Luminance", L"RGB Parade", L"RGB Overlay" } },
-                { L"Gain",     L"float", 1.0f, 0.1f, 10.0f, 0.1f },
-                { L"MaxNits",  L"float", 1000.0f, 80.0f, 10000.0f, 100.0f },
-            };
-            m_effects.push_back(std::move(desc));
-        }
 
         // ---- Gamut Volume Coverage ----
         {
@@ -2683,18 +2365,33 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
         // ---- Split Comparison ----
         {
             static const std::string splitCompareHLSL = R"HLSL(
-// Split Comparison — side-by-side wipe between two inputs.
-// SplitPosition [0..1]: 0 = full Image B, 1 = full Image A.
-// A thin dividing line is drawn at the split boundary.
+// Split Comparison - oriented wipe between two inputs.
+// Works with arbitrary `Angle` (degrees) and `SplitPosition` (0..1).
+//
+// The wipe boundary is a line through the image perpendicular to the
+// direction (cos(Angle), sin(Angle)). SplitPosition sweeps the line
+// across the image: 0 = entire image is B, 1 = entire image is A.
+// At 0.5 the line passes through the image center.
+//
+// Coordinates are normalized so that "1.0" of travel corresponds to
+// the full extent of the image *along the wipe direction* -- i.e.
+// |cos(Angle)| * W + |sin(Angle)| * H. This makes the wipe sweep the
+// entire image regardless of angle: at SplitPosition=0 nothing of A
+// shows; at 1 nothing of B shows; in between you get a clean
+// diagonal line.
+//
+// LineWidth controls the dividing line thickness in pixels.
 
 Texture2D ImageA : register(t0);
 Texture2D ImageB : register(t1);
 
 cbuffer Constants : register(b0)
 {
-    float SplitPosition;
-    float LineWidth;
-    float Orientation;
+    float SplitPosition;   // 0..1 sweep along wipe direction
+    float LineWidth;       // dividing line thickness in pixels
+    float Angle;           // degrees; 0 = horizontal wipe (vertical line),
+                           // 90 = vertical wipe (horizontal line),
+                           // 45 = top-left-to-bottom-right diagonal
 };
 
 float4 main(
@@ -2706,25 +2403,35 @@ float4 main(
 
     uint w, h;
     ImageA.GetDimensions(w, h);
+    float W = float(w);
+    float H = float(h);
 
-    float coord = uv0.x;
-    float size = float(w);
-    if (Orientation > 0.5)
-    {
-        coord = uv0.y;
-        size = float(h);
-    }
+    // Direction vector along which we project pixel positions.
+    float radians = Angle * 3.14159265 / 180.0;
+    float2 dir = float2(cos(radians), sin(radians));
 
-    float splitPx = SplitPosition * size;
-    float dist = abs(coord - splitPx);
+    // Project the pixel coord onto `dir` and onto the image bounds
+    // along `dir`. The denominator |cos|*W + |sin|*H is the maximum
+    // projection any image-corner can have onto the dir vector --
+    // i.e. the full sweep extent. Normalizing by it lets SplitPosition
+    // = 0..1 cover the whole image regardless of angle.
+    float projPx  = dot(uv0.xy, dir);
+    float projMax = abs(dir.x) * W + abs(dir.y) * H;
+    float projMin = min(0.0, dir.x) * W + min(0.0, dir.y) * H;
+    // projPx ranges over [projMin, projMin + projMax] across the image.
+    float projNorm = (projPx - projMin) / max(projMax, 1.0);  // 0..1
+
+    // SplitPosition is the threshold the projection is compared against.
+    float threshold = SplitPosition;
+    float dist = abs(projNorm - threshold) * projMax;  // px-space distance
 
     // Dividing line.
     float halfLine = max(LineWidth * 0.5, 0.5);
     if (dist < halfLine)
         return float4(1, 1, 1, 1);
 
-    // Left/top = Image A, right/bottom = Image B.
-    if (coord < splitPx)
+    // Below threshold = Image A, above = Image B.
+    if (projNorm < threshold)
         return a;
     return b;
 }
@@ -2732,16 +2439,16 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Split Comparison";
-            desc.effectId = L"Split Comparison"; desc.effectVersion = 1;
+            desc.effectId = L"Split Comparison"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + splitCompareHLSL;
             desc.inputNames = { L"ImageA", L"ImageB" };
             desc.parameters = {
-                { L"SplitPosition", L"float", 0.5f, 0.0f, 1.0f, 0.01f },
-                { L"LineWidth",     L"float", 2.0f, 0.0f, 10.0f, 0.5f },
-                { L"Orientation",   L"float", 0.0f, 0.0f, 1.0f, 1.0f, { L"Horizontal", L"Vertical" } },
+                { L"SplitPosition", L"float",   0.5f,    0.0f,   1.0f,  0.01f },
+                { L"LineWidth",     L"float",   2.0f,    0.0f,  10.0f,  0.5f },
+                { L"Angle",         L"float",   0.0f, -360.0f, 360.0f,  1.0f },
             };
             m_effects.push_back(std::move(desc));
         }

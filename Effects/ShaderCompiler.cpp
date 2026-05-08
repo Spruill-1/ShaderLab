@@ -113,15 +113,18 @@ namespace ShaderLab::Effects
 
         // Always optimize: SKIP_OPTIMIZATION makes 4K compute shaders
         // 5-10x slower in debug, which makes perf measurements
-        // meaningless and the GUI app unusably slow during dev. Keep
-        // D3DCOMPILE_DEBUG in debug builds so PIX / RenderDoc captures
-        // still have HLSL source mapping, but pair it with full
-        // optimization. Bump cache schema below if we ever want to
-        // distinguish debug-symbols-with-opts vs no-symbols-with-opts.
+        // meaningless and the GUI app unusably slow during dev.
+        //
+        // We previously added D3DCOMPILE_DEBUG in debug builds for PIX /
+        // RenderDoc HLSL source mapping, but the FXC compiler's PDB
+        // stream overflows on large shaders -- e.g. ICtCp Gamut Map +
+        // the prepended colorMath library produces a "pdb append
+        // failed: debug info byte count too large" internal error.
+        // We don't actually rely on PIX HLSL mapping in this codebase
+        // (debugging is via the Effect Designer + Pixel Trace tab),
+        // so just drop the flag. Bump cache schema below if PIX
+        // mapping becomes a need again.
         UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
-#ifdef _DEBUG
-        flags |= D3DCOMPILE_DEBUG;
-#endif
 
         // Convert MacroDef list to D3DCompile's null-terminated form.
         // Names/definitions must outlive the call; the caller-owned
