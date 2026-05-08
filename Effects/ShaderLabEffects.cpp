@@ -2410,32 +2410,31 @@ float4 main(
     float radians = Angle * 3.14159265 / 180.0;
     float2 dir = float2(cos(radians), sin(radians));
 
-    // Use SV_POSITION (`pos.xy`) for the output pixel coord. uv0
-    // (TEXCOORD0) is supplied by D2D's default vertex shader and gets
-    // biased by the input rect when an effect has inputs, so dividing
-    // uv0 by W/H doesn't land in [0,1] reliably -- same gotcha that
-    // tripped up Gamut Coverage. SV_POSITION is the rasterizer-output
-    // pixel center, always 0..outputW × 0..outputH.
+    // For an effect with inputs (Split has 2), `uv0` (TEXCOORD0) is the
+    // scene/pixel-space position the inputs are sampled at, so it
+    // matches the output rect 1:1. SV_POSITION isnt reliable here --
+    // for some D2D draw configurations its in clip space, not pixel
+    // space, and recentering on (W*0.5, H*0.5) lands the pivot in
+    // the wrong place. (Source-like effects without inputs *can* use
+    // SV_POSITION reliably, but thats a separate code path.)
     //
-    // Project the pixel coord onto the dir vector, normalized so that
-    // SplitPosition = 0..1 sweeps the wipe from one side of the image
-    // to the other along that direction. The pivot at SplitPosition =
-    // 0.5 is the center of the image regardless of angle.
-    float2 p = pos.xy - float2(W * 0.5, H * 0.5);  // re-center on image midpoint
+    // Project the pixel coord (relative to image center) onto dir.
+    // SplitPosition = 0..1 sweeps the wipe across the full extent of
+    // the image *along* the dir vector, with 0.5 always pivoting on
+    // the geometric image center regardless of angle.
+    float2 p = uv0.xy - float2(W * 0.5, H * 0.5);
     float projPx  = dot(p, dir);
     float halfMax = 0.5 * (abs(dir.x) * W + abs(dir.y) * H);
-    // projPx now ranges [-halfMax, +halfMax] across the image.
     float projNorm = saturate(projPx / max(halfMax * 2.0, 1.0) + 0.5);
 
     float threshold = SplitPosition;
-    float dist = abs(projNorm - threshold) * (halfMax * 2.0);  // px-space
+    float dist = abs(projNorm - threshold) * (halfMax * 2.0);
 
     // Dividing line.
     float halfLine = max(LineWidth * 0.5, 0.5);
     if (dist < halfLine)
         return float4(1, 1, 1, 1);
 
-    // Below threshold = Image A, above = Image B.
     if (projNorm < threshold)
         return a;
     return b;
@@ -2444,7 +2443,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Split Comparison";
-            desc.effectId = L"Split Comparison"; desc.effectVersion = 3;
+            desc.effectId = L"Split Comparison"; desc.effectVersion = 4;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
