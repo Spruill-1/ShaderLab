@@ -36,15 +36,34 @@ try {
     Write-Host "[2/4] Ensuring third_party/exprtk/exprtk.hpp..."
     & "$Repo\scripts\EnsureExprTk.ps1" -TargetDir "$Repo\third_party\exprtk"
 
-    # 3. NuGet restore (packages.config style).
+    # 3. NuGet restore.
+    #    The repo uses packages.config (NOT PackageReference). MSBuild's
+    #    /t:Restore target on a .slnx silently no-ops on packages.config
+    #    style ("Nothing to do. None of the projects specified contain
+    #    packages to restore.") even though the manifest is right there.
+    #    Use nuget.exe directly against the root packages.config -- that
+    #    path explicitly supports packages.config and is what NuGet
+    #    documents for this scenario. Falls back to msbuild if nuget.exe
+    #    isn't on PATH.
     Write-Host "[3/4] Restoring NuGet packages..."
     $msbuild = "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"
     if (-not (Test-Path $msbuild)) {
         $msbuild = 'msbuild'  # fall back to PATH
     }
-    & $msbuild ShaderLab.slnx /t:Restore /p:Configuration=$Configuration /p:Platform=$Platform /v:minimal /m /nologo
-    if ($LASTEXITCODE -ne 0) {
-        throw "NuGet restore failed (exit $LASTEXITCODE)"
+
+    $nuget = Get-Command nuget.exe -ErrorAction SilentlyContinue
+    if ($nuget) {
+        & $nuget.Source restore "$Repo\packages.config" -PackagesDirectory "$Repo\packages" -NonInteractive
+        if ($LASTEXITCODE -ne 0) {
+            throw "NuGet restore failed (exit $LASTEXITCODE)"
+        }
+    } else {
+        # MSBuild fallback path. Requires VS to be configured with the
+        # NuGet packages.config restore feature; not the default in CI.
+        & $msbuild ShaderLab.slnx /t:Restore /p:RestorePackagesConfig=true /p:Configuration=$Configuration /p:Platform=$Platform /v:minimal /m /nologo
+        if ($LASTEXITCODE -ne 0) {
+            throw "NuGet restore failed (exit $LASTEXITCODE)"
+        }
     }
 
     # 4. Smoke build (optional, off by default).

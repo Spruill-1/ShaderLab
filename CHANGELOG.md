@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.6.3] - 2026-05-08
+
+### Fixed
+
+- **CI Bootstrap.ps1: package restore was a silent no-op on packages.config.** `msbuild /t:Restore` against `ShaderLab.slnx` reports "Nothing to do. None of the projects specified contain packages to restore." for packages.config-style references — it only handles PackageReference by default. The downstream build then failed because `Microsoft.Windows.CppWinRT.props` (from a missing package) couldn't be imported. Switched Bootstrap.ps1 to call `nuget.exe restore <packages.config> -PackagesDirectory packages` directly when nuget.exe is on PATH (which it is in the CI smoke job after `Setup NuGet`); falls back to `msbuild /t:Restore /p:RestorePackagesConfig=true` when not. Also fixes the same shape of bug on `EnsureExprTk.ps1`'s missing `TargetDir` arg (folded into 1.6.2 conceptually but only manifested after the cert fix unblocked CI past step 1).
+
 ## [1.6.2] - 2026-05-08
 
 ### Fixed
