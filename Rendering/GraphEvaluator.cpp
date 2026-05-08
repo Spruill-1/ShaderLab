@@ -241,21 +241,26 @@ namespace ShaderLab::Rendering
                     // Image-producing compute: recompute when dirty or no cached output.
                     // Analysis-only compute: also recompute if no analysis fields yet.
                     //
-                    // Phase 8c regression fix: when skip-readback is on AND this
-                    // compute consumer has any property binding, the CPU-side
-                    // binding-change detection (ResolveBindings) can't see
-                    // upstream changes -- the upstream skipped its Map() and
-                    // its `analysisOutput.fields` retain stale values. Without
-                    // this override the consumer's `dirty` flag never flips,
-                    // it never re-dispatches, and downstream rendering shows
-                    // a stale image even though the GPU SRV is fresh. Force
-                    // dispatch in that case so the consumer reads the latest
-                    // upstream SRV every frame.
-                    const bool skipReadbackBypassesDirty =
-                        Performance::IsSkipUnneededCpuReadbackEnabled() &&
-                        !node->propertyBindings.empty();
+                    // Phase 8c regression fix: when skip-readback is on, ALL
+                    // compute nodes must redispatch every frame regardless
+                    // of dirty state. Pre-skip-readback the per-frame
+                    // upstream dirty-propagation in OnRenderTick lit up
+                    // compute consumers via image edges, but inside this
+                    // EvaluateNode the upstream's `dirty` has already been
+                    // cleared (Source case clears it before downstream eval
+                    // runs) so we can't use it here. The host's upstream
+                    // propagation does set node->dirty for us when Source
+                    // ticks, but ResolveBindings on the consumer of an
+                    // analysis source (e.g. ICtCp <- LumStats.Mean) only
+                    // dirties the consumer when CPU value changes -- which
+                    // never happens when LumStats's Map() was throttled.
+                    // Force redispatch for every compute node so the GPU
+                    // dispatch fires and the structured-buffer / image-
+                    // output texture are kept fresh.
+                    const bool skipReadbackForcesRedispatch =
+                        Performance::IsSkipUnneededCpuReadbackEnabled();
                     bool needsCompute = node->dirty ||
-                        skipReadbackBypassesDirty ||
+                        skipReadbackForcesRedispatch ||
                         (hasImageOutput && !node->cachedOutput) ||
                         (!hasImageOutput && node->analysisOutput.fields.empty());
                     if (inputImage && needsCompute)

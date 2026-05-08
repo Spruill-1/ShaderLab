@@ -1534,10 +1534,13 @@ float4 main(
     InputTexture.GetDimensions(dims.x, dims.y);
 
     float size = max(DiagramSize, 256.0);
-    float2 uv = uv0.xy * size;
+    // D2D TEXCOORD is pixel/scene space, NOT normalized [0,1]. With
+    // SetFixedOutputSize the output is `size x size` pixels, so divide
+    // to get a normalized 0..1 coordinate before mapping to CIE xy.
+    float2 uvNorm = saturate(uv0.xy / size);
 
     // CIE xy mapping: x=[0,0.8], y=[0,0.9] (same as CIE plot)
-    float2 cie_xy = float2(uv.x / size * 0.8, (1.0 - uv.y / size) * 0.9);
+    float2 cie_xy = float2(uvNorm.x * 0.8, (1.0 - uvNorm.y) * 0.9);
 
     float3 bg = float3(0.05, 0.05, 0.05);
 
