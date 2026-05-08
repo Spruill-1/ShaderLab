@@ -882,6 +882,127 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
+        // GET /gpu/list  — Enumerate GPU adapters + identify the active one
+        // =====================================================================
+        m_mcpServer->AddRoute(L"GET", L"/gpu/list", [this](const std::wstring&, const std::string&)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                auto adapters = ::ShaderLab::Rendering::RenderEngine::EnumerateAdapters();
+                std::string json = "{\"active\":{";
+                json += "\"name\":\"" + ToUtf8(m_renderEngine.AdapterName()) + "\"";
+                json += ",\"isWarp\":" + std::string(m_renderEngine.IsWarp() ? "true" : "false");
+                json += "},\"adapters\":[";
+                for (size_t i = 0; i < adapters.size(); ++i)
+                {
+                    if (i > 0) json += ",";
+                    const auto& a = adapters[i];
+                    json += "{";
+                    json += "\"name\":\"" + ToUtf8(a.name) + "\"";
+                    json += ",\"vendorId\":" + std::to_string(a.vendorId);
+                    json += ",\"deviceId\":" + std::to_string(a.deviceId);
+                    json += ",\"dedicatedVideoMemoryMB\":" + std::to_string(a.dedicatedVideoMemoryMB);
+                    json += ",\"isWarp\":" + std::string(a.isWarp ? "true" : "false");
+                    json += ",\"luid\":{";
+                    json += "\"low\":" + std::to_string(static_cast<uint32_t>(a.luid.LowPart));
+                    json += ",\"high\":" + std::to_string(static_cast<int32_t>(a.luid.HighPart));
+                    json += "}";
+                    json += ",\"isActive\":" + std::string(
+                        (a.name == m_renderEngine.AdapterName() ||
+                         (a.isWarp && m_renderEngine.IsWarp())) ? "true" : "false");
+                    json += "}";
+                }
+                json += "]}";
+                return { 200, json };
+            });
+        });
+
+        // =====================================================================
+        // POST /gpu/switch  — Switch the active GPU adapter
+        // Body: one of
+        //   {"mode":"warp"}            -> WARP software adapter
+        //   {"mode":"default"}         -> let driver pick (typical: integrated)
+        //   {"mode":"adapter","name":"NVIDIA GeForce ..."}
+        //   {"mode":"adapter","luid":{"low":NUMBER,"high":NUMBER}}
+        // Returns the new active adapter (or falls back to default if the
+        // requested one fails to initialize). Triggers full
+        // SwitchAdapter sequence: graph save -> device teardown -> new
+        // device init -> graph reload.
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/gpu/switch", [this](const std::wstring&, const std::string& body)
+            -> ::ShaderLab::McpHttpServer::Response
+        {
+            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                using namespace ::ShaderLab::Rendering;
+                namespace WDJ = winrt::Windows::Data::Json;
+                WDJ::JsonObject jobj{ nullptr };
+                if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jobj))
+                    return { 400, R"({"error":"Invalid JSON body"})" };
+
+                std::wstring mode = jobj.HasKey(L"mode")
+                    ? std::wstring(jobj.GetNamedString(L"mode")) : L"default";
+
+                LUID luid{};
+                DevicePreference pref = DevicePreference::Default;
+
+                if (mode == L"warp")
+                {
+                    pref = DevicePreference::Warp;
+                }
+                else if (mode == L"default")
+                {
+                    pref = DevicePreference::Default;
+                }
+                else if (mode == L"adapter")
+                {
+                    pref = DevicePreference::Adapter;
+                    if (jobj.HasKey(L"luid"))
+                    {
+                        auto luidObj = jobj.GetNamedObject(L"luid");
+                        luid.LowPart  = static_cast<DWORD>(luidObj.GetNamedNumber(L"low"));
+                        luid.HighPart = static_cast<LONG>(luidObj.GetNamedNumber(L"high"));
+                    }
+                    else if (jobj.HasKey(L"name"))
+                    {
+                        auto wantedName = std::wstring(jobj.GetNamedString(L"name"));
+                        auto adapters = RenderEngine::EnumerateAdapters();
+                        bool found = false;
+                        for (const auto& a : adapters)
+                        {
+                            // Case-insensitive substring match so the
+                            // caller doesnt have to know exact GPU naming.
+                            auto lower = a.name;
+                            std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+                            auto wantedLower = wantedName;
+                            std::transform(wantedLower.begin(), wantedLower.end(), wantedLower.begin(), ::towlower);
+                            if (lower.find(wantedLower) != std::wstring::npos)
+                            { luid = a.luid; found = true; break; }
+                        }
+                        if (!found)
+                            return { 404, R"({"error":"No adapter matches the supplied name"})" };
+                    }
+                    else
+                    {
+                        return { 400, R"({"error":"adapter mode requires luid or name"})" };
+                    }
+                }
+                else
+                {
+                    return { 400, R"({"error":"mode must be 'warp', 'default', or 'adapter'"})" };
+                }
+
+                SwitchAdapter(pref, luid);
+
+                std::string json = "{\"ok\":true";
+                json += ",\"active\":{";
+                json += "\"name\":\"" + ToUtf8(m_renderEngine.AdapterName()) + "\"";
+                json += ",\"isWarp\":" + std::string(m_renderEngine.IsWarp() ? "true" : "false");
+                json += "}}";
+                return { 200, json };
+            });
+        });
+
+        // =====================================================================
         // /display/profiles, /display/profile, /display/profile/clear
         // -- moved to Engine/Mcp/EngineMcpRoutes.cpp (Phase 7).
         //    Uses Rendering::UpdateWorkingSpaceNodes engine helper and
@@ -1103,7 +1224,9 @@ namespace winrt::ShaderLab::implementation
 {"name":"preview_fit_view","description":"Fit the preview image to the preview viewport (auto zoom + center).","inputSchema":{"type":"object","properties":{}}},
 {"name":"image_stats","description":"GPU-accelerated per-channel image statistics (min/max/mean/median/p95/sum + nonzero counts). Forces a render frame first so the target node is fresh. Channels default to luminance+R+G+B+A; pass channels:[\"luminance\"] to skip the others. nonzeroOnly excludes zero pixels from min/max/mean/sum.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"nonzeroOnly":{"type":"boolean"},"channels":{"type":"array","items":{"type":"string","enum":["luminance","r","g","b","a"]}}},"required":["nodeId"]}},
 {"name":"read_pixel_region","description":"Read a small w x h region of FP32 RGBA pixels from a node's output (scRGB linear-light). Region is capped at 32x32 (1024 pixels) and per-axis at 64. Pixels are returned row-major as a flat float array (RGBARGBA...).","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"x":{"type":"number"},"y":{"type":"number"},"w":{"type":"number"},"h":{"type":"number"}},"required":["nodeId","x","y","w","h"]}},
-{"name":"effect_get_hlsl","description":"Read a node's custom-effect HLSL source, parameter list, compile state, and last runtime error. For non-custom nodes returns hasCustomEffect=false (200, not 404). For ShaderLab library effects, also includes isLibraryEffect=true + shaderLabEffectId/Version.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}}
+{"name":"effect_get_hlsl","description":"Read a node's custom-effect HLSL source, parameter list, compile state, and last runtime error. For non-custom nodes returns hasCustomEffect=false (200, not 404). For ShaderLab library effects, also includes isLibraryEffect=true + shaderLabEffectId/Version.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
+{"name":"list_gpus","description":"Enumerate available GPU adapters (DXGI). Returns the active adapter and a list of all installed adapters with name, vendorId, deviceId, dedicated VRAM (MB), LUID, and isWarp flag.","inputSchema":{"type":"object","properties":{}}},
+{"name":"switch_gpu","description":"Switch the active GPU adapter. Triggers a full graph-save, device-teardown, and graph-reload cycle. Use mode='warp' for the WARP software adapter, 'default' to let the driver pick, or 'adapter' with either {luid:{low,high}} or {name:'partial-match'}. Falls back to default if the requested adapter fails to initialize.","inputSchema":{"type":"object","properties":{"mode":{"type":"string","enum":["warp","default","adapter"]},"name":{"type":"string","description":"Substring match against adapter name (used when mode='adapter')"},"luid":{"type":"object","properties":{"low":{"type":"number"},"high":{"type":"number"}}}},"required":["mode"]}}
 ]})JSON";
                     return { 200, wrapResult(tools) };
                 }
@@ -1364,6 +1487,10 @@ namespace winrt::ShaderLab::implementation
                         restResp = m_mcpServer->RouteRequest(L"GET",
                             std::format(L"/effect/hlsl/{}", nodeId), "");
                     }
+                    else if (toolName == "list_gpus")
+                        restResp = m_mcpServer->RouteRequest(L"GET", L"/gpu/list", "");
+                    else if (toolName == "switch_gpu")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/gpu/switch", argsStr);
                     else if (toolName == "render_capture_node")
                     {
                         // Forward to REST handler; if inline=true was requested
