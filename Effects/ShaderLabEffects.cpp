@@ -2410,20 +2410,25 @@ float4 main(
     float radians = Angle * 3.14159265 / 180.0;
     float2 dir = float2(cos(radians), sin(radians));
 
-    // Project the pixel coord onto `dir` and onto the image bounds
-    // along `dir`. The denominator |cos|*W + |sin|*H is the maximum
-    // projection any image-corner can have onto the dir vector --
-    // i.e. the full sweep extent. Normalizing by it lets SplitPosition
-    // = 0..1 cover the whole image regardless of angle.
-    float projPx  = dot(uv0.xy, dir);
-    float projMax = abs(dir.x) * W + abs(dir.y) * H;
-    float projMin = min(0.0, dir.x) * W + min(0.0, dir.y) * H;
-    // projPx ranges over [projMin, projMin + projMax] across the image.
-    float projNorm = (projPx - projMin) / max(projMax, 1.0);  // 0..1
+    // Use SV_POSITION (`pos.xy`) for the output pixel coord. uv0
+    // (TEXCOORD0) is supplied by D2D's default vertex shader and gets
+    // biased by the input rect when an effect has inputs, so dividing
+    // uv0 by W/H doesn't land in [0,1] reliably -- same gotcha that
+    // tripped up Gamut Coverage. SV_POSITION is the rasterizer-output
+    // pixel center, always 0..outputW × 0..outputH.
+    //
+    // Project the pixel coord onto the dir vector, normalized so that
+    // SplitPosition = 0..1 sweeps the wipe from one side of the image
+    // to the other along that direction. The pivot at SplitPosition =
+    // 0.5 is the center of the image regardless of angle.
+    float2 p = pos.xy - float2(W * 0.5, H * 0.5);  // re-center on image midpoint
+    float projPx  = dot(p, dir);
+    float halfMax = 0.5 * (abs(dir.x) * W + abs(dir.y) * H);
+    // projPx now ranges [-halfMax, +halfMax] across the image.
+    float projNorm = saturate(projPx / max(halfMax * 2.0, 1.0) + 0.5);
 
-    // SplitPosition is the threshold the projection is compared against.
     float threshold = SplitPosition;
-    float dist = abs(projNorm - threshold) * projMax;  // px-space distance
+    float dist = abs(projNorm - threshold) * (halfMax * 2.0);  // px-space
 
     // Dividing line.
     float halfLine = max(LineWidth * 0.5, 0.5);
@@ -2439,7 +2444,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Split Comparison";
-            desc.effectId = L"Split Comparison"; desc.effectVersion = 2;
+            desc.effectId = L"Split Comparison"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
