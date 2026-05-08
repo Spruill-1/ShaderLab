@@ -275,7 +275,7 @@ namespace winrt::ShaderLab::implementation
             m_lastVideoFps = videoFps;
             m_lastFps = fps;
 
-            FpsText().Text(std::format(L"FPS: {:.0f}", fps));
+            FpsText().Text(std::format(L"{:.0f} fps | {:.1f} ms", fps, m_frameTiming.totalUs / 1000.0));
             UpdateFpsTooltip();
             m_frameCount = 0;
             m_fpsTimePoint = fpsNow;
