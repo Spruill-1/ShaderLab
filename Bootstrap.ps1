@@ -28,7 +28,9 @@ try {
 
     # 1. Dev cert (signed F5 deploy needs it; release builds don't).
     Write-Host "[1/4] Ensuring dev signing certificate..."
-    & "$Repo\scripts\EnsureDevCert.ps1"
+    & "$Repo\scripts\EnsureDevCert.ps1" `
+        -PfxPath "$Repo\ShaderLab_TemporaryKey.pfx" `
+        -Password "shaderlab"
 
     # 2. ExprTk single-header download (Numeric Expression node).
     Write-Host "[2/4] Ensuring third_party/exprtk/exprtk.hpp..."
