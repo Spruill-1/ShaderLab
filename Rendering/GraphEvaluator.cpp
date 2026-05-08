@@ -538,6 +538,59 @@ namespace ShaderLab::Rendering
                     bool bindingsChanged = ResolveBindings(*node, graph, effectiveProps);
                     bool wasDirty = node->dirty || bindingsChanged;
 
+                    // Inject host-driven output dimensions for shaders that
+                    // declare OutputW / OutputH cbuffer fields. D2D pads input
+                    // textures to atlas allocation sizes (typically 4096x4096),
+                    // so HLSL `Texture2D::GetDimensions()` is unreliable for
+                    // anything that needs the true output rect (e.g. Split
+                    // Comparisons center-of-image pivot). The shader uses
+                    // these values instead.
+                    bool declaresOutputDims = false;
+                    if (node->customEffect->shaderType == Graph::CustomShaderType::PixelShader)
+                    {
+                        for (const auto& p : node->customEffect->parameters)
+                        {
+                            if (p.name == L"OutputW" || p.name == L"OutputH")
+                            { declaresOutputDims = true; break; }
+                        }
+                    }
+                    if (declaresOutputDims)
+                    {
+                        auto inputs = graph.GetInputEdges(nodeId);
+                        if (!inputs.empty())
+                        {
+                            auto* srcNode = graph.FindNode(inputs[0]->sourceNodeId);
+                            if (srcNode && srcNode->cachedOutput && dc)
+                            {
+                                float oldDpiX = 0, oldDpiY = 0;
+                                dc->GetDpi(&oldDpiX, &oldDpiY);
+                                dc->SetDpi(96.0f, 96.0f);
+                                D2D1_RECT_F bounds{};
+                                dc->GetImageLocalBounds(srcNode->cachedOutput, &bounds);
+                                dc->SetDpi(oldDpiX, oldDpiY);
+                                float w = bounds.right - bounds.left;
+                                float h = bounds.bottom - bounds.top;
+                                if (w > 0 && h > 0)
+                                {
+                                    auto wIt = effectiveProps.find(L"OutputW");
+                                    auto hIt = effectiveProps.find(L"OutputH");
+                                    bool changed =
+                                        (wIt == effectiveProps.end() ||
+                                         !std::holds_alternative<float>(wIt->second) ||
+                                         std::get<float>(wIt->second) != w) ||
+                                        (hIt == effectiveProps.end() ||
+                                         !std::holds_alternative<float>(hIt->second) ||
+                                         std::get<float>(hIt->second) != h);
+                                    effectiveProps[L"OutputW"] = w;
+                                    effectiveProps[L"OutputH"] = h;
+                                    node->properties[L"OutputW"] = w;
+                                    node->properties[L"OutputH"] = h;
+                                    if (changed) wasDirty = true;
+                                }
+                            }
+                        }
+                    }
+
                     // Write resolved binding values back to node properties
                     // so the node graph UI shows live bound values.
                     if (bindingsChanged)

@@ -2392,6 +2392,11 @@ cbuffer Constants : register(b0)
     float Angle;           // degrees; 0 = horizontal wipe (vertical line),
                            // 90 = vertical wipe (horizontal line),
                            // 45 = top-left-to-bottom-right diagonal
+    float OutputW;         // host-injected: actual output rect width in
+                           // pixels. Cant use Texture2D::GetDimensions()
+                           // because D2D pads intermediates to atlas
+                           // allocation sizes (typically 4096x4096).
+    float OutputH;         // host-injected: actual output rect height.
 };
 
 float4 main(
@@ -2401,23 +2406,18 @@ float4 main(
     float4 a = ImageA.Load(int3(uv0.xy, 0));
     float4 b = ImageB.Load(int3(uv0.xy, 0));
 
-    uint w, h;
-    ImageA.GetDimensions(w, h);
-    float W = float(w);
-    float H = float(h);
+    // Use the host-supplied output dimensions, not GetDimensions(), since
+    // D2D pads input textures to atlas allocation sizes (e.g. 4096x4096
+    // when the actual output rect is 3840x2160). uv0 is in true pixel
+    // coords thanks to D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING; we just need
+    // the matching output-rect dimensions to recenter on.
+    float W = max(OutputW, 1.0);
+    float H = max(OutputH, 1.0);
 
     // Direction vector along which we project pixel positions.
     float radians = Angle * 3.14159265 / 180.0;
     float2 dir = float2(cos(radians), sin(radians));
 
-    // For an effect with inputs (Split has 2), `uv0` (TEXCOORD0) is the
-    // scene/pixel-space position the inputs are sampled at, so it
-    // matches the output rect 1:1. SV_POSITION isnt reliable here --
-    // for some D2D draw configurations its in clip space, not pixel
-    // space, and recentering on (W*0.5, H*0.5) lands the pivot in
-    // the wrong place. (Source-like effects without inputs *can* use
-    // SV_POSITION reliably, but thats a separate code path.)
-    //
     // Project the pixel coord (relative to image center) onto dir.
     // SplitPosition = 0..1 sweeps the wipe across the full extent of
     // the image *along* the dir vector, with 0.5 always pivoting on
@@ -2443,7 +2443,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Split Comparison";
-            desc.effectId = L"Split Comparison"; desc.effectVersion = 4;
+            desc.effectId = L"Split Comparison"; desc.effectVersion = 5;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2453,6 +2453,10 @@ float4 main(
                 { L"SplitPosition", L"float",   0.5f,    0.0f,   1.0f,  0.01f },
                 { L"LineWidth",     L"float",   2.0f,    0.0f,  10.0f,  0.5f },
                 { L"Angle",         L"float",   0.0f, -360.0f, 360.0f,  1.0f },
+                // Hidden: host writes actual output-rect dimensions
+                // each frame (see GraphEvaluator's pixel-shader eval).
+                Graph::ParameterDefinition{ L"OutputW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"OutputH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
             };
             m_effects.push_back(std::move(desc));
         }

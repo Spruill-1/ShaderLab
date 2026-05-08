@@ -1138,6 +1138,40 @@ namespace ShaderLab::Mcp
                     });
                 });
         }
+        // ---- POST /render/image-bounds — return raw GetImageLocalBounds -----
+        // Body: { nodeId }. Returns { width, height } at 96 DPI in pixels.
+        // Useful for diagnosing rect-bloat issues that the capture-node
+        // route hides via its maxDim clamp.
+        void RegisterImageBounds(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/render/image-bounds",
+                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                        WDJ::JsonObject jo{ nullptr };
+                        if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
+                            return Json(400, R"({"error":"Invalid JSON body"})");
+                        if (!jo.HasKey(L"nodeId"))
+                            return Json(400, R"({"error":"'nodeId' is required"})");
+                        uint32_t nodeId = static_cast<uint32_t>(jo.GetNamedNumber(L"nodeId"));
+                        if (ctx.renderFrame) ctx.renderFrame();
+                        auto* node = ctx.graph->FindNode(nodeId);
+                        if (!node || !node->cachedOutput)
+                            return Json(404, R"({"error":"Node not ready"})");
+                        float oldDpiX = 0, oldDpiY = 0;
+                        ctx.dc->GetDpi(&oldDpiX, &oldDpiY);
+                        ctx.dc->SetDpi(96.0f, 96.0f);
+                        D2D1_RECT_F bounds{};
+                        ctx.dc->GetImageLocalBounds(node->cachedOutput, &bounds);
+                        ctx.dc->SetDpi(oldDpiX, oldDpiY);
+                        return Json(200, std::format(
+                            R"({{"left":{},"top":{},"right":{},"bottom":{},"width":{},"height":{}}})",
+                            bounds.left, bounds.top, bounds.right, bounds.bottom,
+                            bounds.right - bounds.left, bounds.bottom - bounds.top));
+                    });
+                });
+        }
+
         // ---- POST /render/capture-node — render any node to PNG ------------
         // Body: { nodeId, inline?:bool }. Saves PNG to %TEMP%; returns
         // path + size. If inline=true, also returns a base64 PNG payload.
@@ -1599,6 +1633,7 @@ namespace ShaderLab::Mcp
         RegisterGetGraph(server, sink);
         RegisterCustomEffects(server, sink);
         RegisterAnalysisOutput(server, sink);
+        RegisterImageBounds(server, sink);
         RegisterCaptureNode(server, sink);
         RegisterCompileEffect(server, sink);
         RegisterGetDisplayProfiles(server, sink);
