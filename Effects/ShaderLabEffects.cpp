@@ -1501,22 +1501,29 @@ float4 main(
         // ---- Gamut Volume Coverage ----
         {
             static const std::string gamutCoverageHLSL = R"HLSL(
-// Gamut Volume Coverage - visualizes which gamut regions are occupied
-// Shows a CIE xy diagram with dots for occupied chromaticities
+// Gamut Volume Coverage - visualizes which gamut regions the source occupies.
+// Migrated to D3D11 compute (Phase 8c perf): each thread group scatters all
+// source pixels into a 64x64 chromaticity histogram in groupshared, then
+// renders the 512x512 output diagram + triangle outline by reading the
+// histogram. Total cost is O(srcW*srcH + outW*outH) -- ~8M ops on a 4K
+// source -- vs the previous pixel-shader gather's O(srcSamples * outW*outH)
+// which was ~17B ops at the same input.
+
+Texture2D<float4>    Source : register(t0);
+RWTexture2D<float4>  Output : register(u1);
 
 cbuffer Constants : register(b0)
 {
-    float DiagramSize; // output size in pixels
-    uint TargetGamut; // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
+    uint  Width;            // auto-injected by bridge
+    uint  Height;
+    float DiagramSize;      // output side length in pixels
+    uint  TargetGamut;      // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
     float2 RedPrimary;
     float2 GreenPrimary;
     float2 BluePrimary;
 };
 
-Texture2D InputTexture : register(t0);
-SamplerState InputSampler : register(s0);
-
-// Draw triangle outline
+// Triangle-edge antialiased line: returns 1 inside the line band, 0 outside.
 float TriangleEdge(float2 p, float2 a, float2 b, float lineW) {
     float2 ab = b - a;
     float t = saturate(dot(p - a, ab) / dot(ab, ab));
@@ -1524,95 +1531,115 @@ float TriangleEdge(float2 p, float2 a, float2 b, float lineW) {
     return smoothstep(lineW, 0.0, d);
 }
 
-float4 main(
-    float4 pos      : SV_POSITION,
-    float4 posScene : SCENE_POSITION,
-    float4 uv0      : TEXCOORD0
-) : SV_Target
+// 64x64 chromaticity histogram. 4096 bins x 4 bytes x 2 buffers = 32 KB.
+#define BINS 64
+groupshared uint gs_inGamut[BINS * BINS];
+groupshared uint gs_outGamut[BINS * BINS];
+
+[numthreads(32, 32, 1)]
+void main(uint3 GTid : SV_GroupThreadID)
 {
-    float2 dims;
-    InputTexture.GetDimensions(dims.x, dims.y);
+    uint tid = GTid.x + GTid.y * 32;
+    const uint totalThreads = 1024;
 
-    float size = max(DiagramSize, 256.0);
-    // SV_POSITION is the pixel center in output pixel coords (always
-    // 0.5, 1.5, ... regardless of D2D effect-graph scene transforms),
-    // which is the only coordinate guaranteed to be in [0, outputW)
-    // here. uv0 (TEXCOORD0) is supplied by D2Ds default vertex shader
-    // and may be offset by the input rect for a non-source effect,
-    // so dividing it by the output size doesnt always land in [0,1].
-    float2 uvNorm = saturate(pos.xy / size);
+    uint outSize = max((uint)DiagramSize, 64u);
 
-    // CIE xy mapping: x=[0,0.8], y=[0,0.9] (same as CIE plot)
-    float2 cie_xy = float2(uvNorm.x * 0.8, (1.0 - uvNorm.y) * 0.9);
-
-    float3 bg = float3(0.05, 0.05, 0.05);
-
-    // Read all cbuffer vars at top so DXC keeps them resident.
+    // Read cbuffer (keep all GPU-resident on every code path so DXC
+    // doesnt eliminate the slot).
     float gamutF = TargetGamut;
     float2 cR = RedPrimary;
     float2 cG = GreenPrimary;
     float2 cB = BluePrimary;
 
-    // Draw target gamut triangle
+    // Resolve target gamut vertices once per group.
     float2 tR, tG, tB;
     uint gamut = (uint)gamutF;
-    if (gamut == 1)      { tR = GAMUT_P3_R; tG = GAMUT_P3_G; tB = GAMUT_P3_B; }
+    if (gamut == 1)      { tR = GAMUT_P3_R;   tG = GAMUT_P3_G;   tB = GAMUT_P3_B; }
     else if (gamut == 2) { tR = GAMUT_2020_R; tG = GAMUT_2020_G; tB = GAMUT_2020_B; }
-    else if (gamut == 3) { tR = cR; tG = cG; tB = cB; }
-    else                 { tR = GAMUT_709_R; tG = GAMUT_709_G; tB = GAMUT_709_B; }
+    else if (gamut == 3) { tR = cR;           tG = cG;           tB = cB; }
+    else                 { tR = GAMUT_709_R;  tG = GAMUT_709_G;  tB = GAMUT_709_B; }
 
-    float lineW = 0.003;
-    float edge = TriangleEdge(cie_xy, tR, tG, lineW)
-               + TriangleEdge(cie_xy, tG, tB, lineW)
-               + TriangleEdge(cie_xy, tB, tR, lineW);
-    bg += float3(0.3, 0.3, 0.3) * saturate(edge);
-
-    // Sample source image and scatter chromaticities
-    float hitInGamut = 0;
-    float hitOutGamut = 0;
-    uint sampleCount = min((uint)(dims.x * dims.y), 65536u);
-    uint sqrtSamples = (uint)ceil(sqrt((float)sampleCount));
-    float stepX = dims.x / (float)sqrtSamples;
-    float stepY = dims.y / (float)sqrtSamples;
-
-    float dotRadius = 0.004;
-
-    for (uint sy = 0; sy < sqrtSamples; sy++)
+    // Phase 1: zero groupshared.
+    for (uint c = tid; c < BINS * BINS; c += totalThreads)
     {
-        for (uint sx = 0; sx < sqrtSamples; sx++)
-        {
-            float2 suv = float2((sx * stepX + 0.5) / dims.x, (sy * stepY + 0.5) / dims.y);
-            float4 s = InputTexture.SampleLevel(InputSampler, suv, 0);
-            float3 xyz = ScRGBToXYZ(max(s.rgb, 0.0));
-            float sum = xyz.x + xyz.y + xyz.z;
-            if (sum < 1e-6) continue;
-            float2 sxy = float2(xyz.x / sum, xyz.y / sum);
-
-            float d = length(cie_xy - sxy);
-            if (d < dotRadius)
-            {
-                bool inGamut = PointInTriangle(sxy, tR, tG, tB);
-                if (inGamut) hitInGamut += 1.0;
-                else hitOutGamut += 1.0;
-            }
-        }
+        gs_inGamut[c]  = 0;
+        gs_outGamut[c] = 0;
     }
+    GroupMemoryBarrierWithGroupSync();
 
-    float3 color = bg;
-    if (hitInGamut > 0)
-        color += float3(0.0, 0.8, 0.0) * min(hitInGamut * 0.5, 1.0);
-    if (hitOutGamut > 0)
-        color += float3(1.0, 0.2, 0.0) * min(hitOutGamut * 0.5, 1.0);
+    // Phase 2: scatter every source pixel into chromaticity bins.
+    uint totalPixels = Width * Height;
+    for (uint pi = tid; pi < totalPixels; pi += totalThreads)
+    {
+        uint px = pi % Width;
+        uint py = pi / Width;
+        float4 s = Source[int2(px, py)];
+        if (s.a < 0.001) continue;
+        float3 xyz = ScRGBToXYZ(max(s.rgb, 0.0));
+        float sum = xyz.x + xyz.y + xyz.z;
+        if (sum < 1e-6) continue;
+        float cieX = xyz.x / sum;
+        float cieY = xyz.y / sum;
 
-    return float4(color, 1.0);
+        // Map to bin coords matching the diagrams CIE x=[0,0.8], y=[0,0.9].
+        float u = cieX / 0.8;
+        float v = 1.0 - cieY / 0.9;
+        if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
+
+        uint bx = min((uint)(u * BINS), BINS - 1);
+        uint by = min((uint)(v * BINS), BINS - 1);
+        uint binIdx = by * BINS + bx;
+
+        bool inGamut = PointInTriangle(float2(cieX, cieY), tR, tG, tB);
+        if (inGamut) InterlockedAdd(gs_inGamut[binIdx],  1u);
+        else         InterlockedAdd(gs_outGamut[binIdx], 1u);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Phase 3: render the 2D diagram. Each thread strides through output
+    // pixels, writing bg + triangle outline + colored coverage dots.
+    float lineW = 0.003;
+    float dotIntensityScale = 0.05; // softens hot spots so a few hits dont saturate
+
+    for (uint oi = tid; oi < outSize * outSize; oi += totalThreads)
+    {
+        uint ox = oi % outSize;
+        uint oy = oi / outSize;
+        float2 uvNorm = float2((ox + 0.5) / (float)outSize, (oy + 0.5) / (float)outSize);
+        float2 cie_xy = float2(uvNorm.x * 0.8, (1.0 - uvNorm.y) * 0.9);
+
+        float3 color = float3(0.05, 0.05, 0.05);
+        float edge = TriangleEdge(cie_xy, tR, tG, lineW)
+                   + TriangleEdge(cie_xy, tG, tB, lineW)
+                   + TriangleEdge(cie_xy, tB, tR, lineW);
+        color += float3(0.3, 0.3, 0.3) * saturate(edge);
+
+        // Look up the bin this output pixel maps to.
+        uint bx = min((uint)(uvNorm.x * BINS), BINS - 1);
+        uint by = min((uint)(uvNorm.y * BINS), BINS - 1);
+        uint binIdx = by * BINS + bx;
+        uint inHits  = gs_inGamut[binIdx];
+        uint outHits = gs_outGamut[binIdx];
+
+        if (inHits > 0)
+            color += float3(0.0, 0.8, 0.0) * saturate(float(inHits) * dotIntensityScale);
+        if (outHits > 0)
+            color += float3(1.0, 0.2, 0.0) * saturate(float(outHits) * dotIntensityScale);
+
+        Output[int2(ox, oy)] = float4(color, 1.0);
+    }
 }
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Coverage";
-            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 5;
+            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 6;
             desc.category = L"Analysis";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 32;
+            desc.threadGroupY = 32;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + gamutCoverageHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
