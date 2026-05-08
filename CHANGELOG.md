@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-05-08
+
+### Fixed
+
+- **CI Bootstrap.ps1 smoke job failed on clean clone.** `Bootstrap.ps1` invoked `scripts\EnsureDevCert.ps1` without arguments, but that script declares `PfxPath` and `Password` as mandatory parameters. The local F5 path worked because the vcxproj's `EnsureDevSigningCertificate` MSBuild target supplies them via `$(MSBuildProjectDirectory)\$(PackageCertificateKeyFile)` and `$(PackageCertificatePassword)`; the bootstrap smoke job (which calls Bootstrap.ps1 directly on a fresh clone) didn't. Matched the vcxproj invocation: PFX at `$Repo\ShaderLab_TemporaryKey.pfx` + the public default password `shaderlab`.
+
 ## [1.6.0] - 2026-05-08
 
 The "Phase 8 GPU-binding" release. Compute outputs now route directly to downstream compute consumers as SRVs (no CPU readback round-trip), with a per-frame skip-readback policy that avoids `Map()` calls when no consumer needs CPU values. Disk-persistent bytecode cache, eager precompile of GPU-binding variants, and a new `CustomComputeBridgeEffect` D2D wrapper unify the discovery channel for D3D11 compute custom effects. Two slow analysis viewers (Gamut Coverage at 4K, plus Vectorscope/Waveform Monitor when present) migrated to single-group D3D11 compute scatter. Plus a flurry of bug fixes from real-world heavy-graph testing.
