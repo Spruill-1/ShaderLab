@@ -1534,10 +1534,13 @@ float4 main(
     InputTexture.GetDimensions(dims.x, dims.y);
 
     float size = max(DiagramSize, 256.0);
-    // D2D TEXCOORD is pixel/scene space, NOT normalized [0,1]. With
-    // SetFixedOutputSize the output is `size x size` pixels, so divide
-    // to get a normalized 0..1 coordinate before mapping to CIE xy.
-    float2 uvNorm = saturate(uv0.xy / size);
+    // SV_POSITION is the pixel center in output pixel coords (always
+    // 0.5, 1.5, ... regardless of D2D effect-graph scene transforms),
+    // which is the only coordinate guaranteed to be in [0, outputW)
+    // here. uv0 (TEXCOORD0) is supplied by D2Ds default vertex shader
+    // and may be offset by the input rect for a non-source effect,
+    // so dividing it by the output size doesnt always land in [0,1].
+    float2 uvNorm = saturate(pos.xy / size);
 
     // CIE xy mapping: x=[0,0.8], y=[0,0.9] (same as CIE plot)
     float2 cie_xy = float2(uvNorm.x * 0.8, (1.0 - uvNorm.y) * 0.9);
@@ -1607,7 +1610,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Coverage";
-            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 4;
+            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 5;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutCoverageHLSL;
