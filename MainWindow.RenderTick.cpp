@@ -380,14 +380,40 @@ namespace winrt::ShaderLab::implementation
         // draw session, where all effect chains are fully materialized.
         // Phase 8c: install the per-frame CPU-analysis interest set so
         // ProcessDeferredCompute knows which compute nodes need to read
-        // their structured buffer back to CPU. Currently just the
-        // selected node so the Properties panel + canvas value labels
-        // stay live for the user's focus. Every other compute node
-        // whose downstream consumers are entirely GPU-routed will skip
-        // its CopyResource + Map round-trip.
+        // their structured buffer back to CPU. Currently:
+        //   * the selected node so the Properties panel + canvas value
+        //     labels stay live for the user's focus;
+        //   * every upstream source that the selected node is bound to,
+        //     so the selected node's bound *parameter* values (not just
+        //     its analysis fields) stay live in the Properties panel
+        //     for nodes that consume an upstream stats output (e.g.
+        //     ICtCp Tone Map showing TargetPeakNits = LumStats.Mean
+        //     should display the changing Mean even though TargetPeakNits
+        //     is served via the GPU SRV).
+        // Every other compute node whose downstream consumers are
+        // entirely GPU-routed will skip its CopyResource + Map round-trip.
+        // Throttling at Performance::CpuAnalysisHintThrottleMs (default
+        // 2 s = 0.5 Hz) keeps the readback rate human-readable while
+        // playing video.
         {
             std::unordered_set<uint32_t> interest;
-            if (m_selectedNodeId != 0) interest.insert(m_selectedNodeId);
+            if (m_selectedNodeId != 0)
+            {
+                interest.insert(m_selectedNodeId);
+                if (auto* sel = m_graph.FindNode(m_selectedNodeId))
+                {
+                    for (const auto& [propName, binding] : sel->propertyBindings)
+                    {
+                        if (binding.wholeArray)
+                            interest.insert(binding.wholeArraySourceNodeId);
+                        for (const auto& srcOpt : binding.sources)
+                        {
+                            if (srcOpt.has_value())
+                                interest.insert(srcOpt->sourceNodeId);
+                        }
+                    }
+                }
+            }
             m_graphEvaluator.SetCpuAnalysisInterest(std::move(interest));
         }
         uint32_t computeCount = static_cast<uint32_t>(m_graphEvaluator.DeferredComputeCount());
