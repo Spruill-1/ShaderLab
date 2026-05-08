@@ -2064,29 +2064,11 @@ namespace winrt::ShaderLab::implementation
         }
 
         auto point = args.GetCurrentPoint(PreviewPanel());
-        auto scale = PreviewPanel().CompositionScaleX();
-        uint32_t px = static_cast<uint32_t>(point.Position().X * scale);
-        uint32_t py = static_cast<uint32_t>(point.Position().Y * scale);
-
-        // Single-pixel readback at cursor position from the previewed node.
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) return;
-
-        auto* previewImage = GetPreviewImage();
-        if (!previewImage)
-        {
-            CursorReadoutText().Text(L"");
-            return;
-        }
-
-        // Lightweight readback: inspect the previewed node at cursor position.
-        if (m_pixelInspector.InspectPixel(dc, m_graph, m_previewNodeId, px, py))
-        {
-            const auto& p = m_pixelInspector.LastPixel();
-            CursorReadoutText().Text(std::format(
-                L"({},{}) R:{:.3f} G:{:.3f} B:{:.3f} \u00B7 {:.0f} nits",
-                px, py, p.scR, p.scG, p.scB, p.luminanceNits));
-        }
+        // Status-bar pixel-readout was removed (it forced a per-mouse-move
+        // GPU readback for a single-pixel display that crowded out the FPS
+        // counter at low frame rates). The Pixel Trace tab is the
+        // canonical place for cursor-coordinate inspection now.
+        (void)point;
     }
 
     // -----------------------------------------------------------------------

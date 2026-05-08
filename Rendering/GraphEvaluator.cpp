@@ -1185,20 +1185,39 @@ namespace ShaderLab::Rendering
 
         // Image-producing per-pixel computes need dispatch dims that
         // cover the full output. analysis-only and "fixed-size loop"
-        // image producers (e.g. CIE Histogram) keep (1,1,1).
-        // Convention: when a customEffect declares image output AND
-        // its [numthreads] is per-pixel (threadGroupX*Y >= 4 typical),
-        // dispatch (ceil(W/tx), ceil(H/ty), 1).
+        // image producers (e.g. CIE Histogram, Vectorscope) keep (1,1,1)
+        // because their shader does its own internal iteration over the
+        // source pixels into groupshared accumulators.
+        //
+        // Heuristic for "single group" vs "per-pixel tile":
+        //   * Effects whose descriptor declares a `DiagramSize` /
+        //     `OutputSize` parameter are visualization viewers that
+        //     compute their output independently of the source resolution.
+        //     Their shader assumes ONE thread group covers the whole
+        //     output. Tiling them across the output (W/tx, H/ty)
+        //     dispatches the same redundant histogram-of-the-whole-image
+        //     N times -- on a 4K source feeding a 512x512 CIE Histogram
+        //     that's a 256x amplification of an already heavy inner
+        //     loop. Keep dispatch at (1,1,1) for these.
+        //   * Otherwise tile per-pixel (the ICtCp Tone Map style: each
+        //     thread group covers a [numthreads] tile of the output).
         if (hasImageOutput && imageOutW > 0 && imageOutH > 0 &&
             def.threadGroupX > 0 && def.threadGroupY > 0)
         {
-            // Heuristic: per-pixel compute = small thread group
-            // (8x8 typical). Fixed-size internal loops use larger
-            // 1D groups (numthreads(64,1,1) doing W*H iters
-            // internally). For now: dispatch (W/tx, H/ty, 1) when
-            // tx*ty >= 4 AND tx<=64 AND ty>=2 (i.e. genuine 2D
-            // tiling rather than a 1D iteration shader).
+            bool isFixedSizeViewer = false;
+            for (const auto& p : def.parameters)
+            {
+                if (p.name == L"DiagramSize" ||
+                    p.name == L"OutputSize"  ||
+                    p.name == L"ScopeSize"   ||
+                    p.name == L"WaveformSize")
+                {
+                    isFixedSizeViewer = true;
+                    break;
+                }
+            }
             const bool perPixelTiling =
+                !isFixedSizeViewer &&
                 def.threadGroupX * def.threadGroupY >= 4 &&
                 def.threadGroupY >= 2;
             if (perPixelTiling)
