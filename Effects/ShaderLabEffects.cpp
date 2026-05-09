@@ -3174,6 +3174,238 @@ void main(uint3 GTid : SV_GroupThreadID)
             m_effects.push_back(std::move(desc));
         }
 
+        // ---- ShaderLab Scale (Resampling) ----
+        // D3D11 compute scale effect with filter algorithms beyond what D2D's
+        // CLSID_D2D1Scale natively offers (Lanczos-3, Mitchell-Netravali,
+        // Catmull-Rom, Box / area, Gaussian). Useful as a hand-inserted
+        // resolution cap in heavy graphs: insert between Source and the
+        // visual branch and the entire downstream chain renders at the
+        // smaller resolution.
+        //
+        // Output dimensions are explicitly OutputWidth + OutputHeight. To
+        // drive them from source dimensions, add an Image Info node on the
+        // same input and route ImageInfo.Width / .Height through Numeric
+        // Expression nodes (e.g. expr "A * 0.5") into Scale.OutputWidth /
+        // .OutputHeight.
+        //
+        // OutputWidth = 0 or OutputHeight = 0 falls back to the source's
+        // bounds (no scaling).
+        {
+            static const std::string scaleHLSL = R"HLSL(
+// ShaderLab Scale -- D3D11 compute resampler with multi-tap filters.
+// Output pixel (x,y) reads a windowed neighborhood around the corresponding
+// source location and combines the samples with the chosen kernel.
+
+Texture2D<float4>   Source      : register(t0);
+RWTexture2D<float4> ImageOutput : register(u1);
+
+cbuffer constants : register(b0) {
+    uint  Width;          // source dims (auto-injected from input #0)
+    uint  Height;
+    uint  OutputWidth;    // 0 = pass-through (= source Width)
+    uint  OutputHeight;   // 0 = pass-through (= source Height)
+    uint  FilterMode;     // 0=Bilinear 1=CatmullRom 2=Mitchell 3=Lanczos3 4=Box 5=Gaussian
+};
+
+// ---- Filter kernels (1D weights; separable for 2D) ---------------------
+
+float W_bilinear(float t) { return max(0.0, 1.0 - abs(t)); }
+
+float W_catmullrom(float t) {
+    t = abs(t);
+    if (t < 1.0) return  1.5*t*t*t - 2.5*t*t + 1.0;
+    if (t < 2.0) return -0.5*t*t*t + 2.5*t*t - 4.0*t + 2.0;
+    return 0.0;
+}
+
+// Mitchell-Netravali B=1/3, C=1/3 -- balanced sharpness/ringing default.
+float W_mitchell(float t) {
+    t = abs(t);
+    const float B = 1.0/3.0, C = 1.0/3.0;
+    if (t < 1.0) {
+        return ((12.0 - 9.0*B - 6.0*C)*t*t*t
+              + (-18.0 + 12.0*B + 6.0*C)*t*t
+              + (6.0 - 2.0*B)) / 6.0;
+    }
+    if (t < 2.0) {
+        return ((-B - 6.0*C)*t*t*t
+              + (6.0*B + 30.0*C)*t*t
+              + (-12.0*B - 48.0*C)*t
+              + (8.0*B + 24.0*C)) / 6.0;
+    }
+    return 0.0;
+}
+
+float W_lanczos3(float t) {
+    t = abs(t);
+    if (t < 1e-5) return 1.0;
+    if (t >= 3.0) return 0.0;
+    float pt = 3.14159265 * t;
+    return 3.0 * sin(pt) * sin(pt / 3.0) / (pt * pt);
+}
+
+float W_box(float t, float halfWidth) {
+    return abs(t) <= halfWidth ? 1.0 : 0.0;
+}
+
+float W_gauss(float t) {
+    // sigma = 0.5 -- tight kernel. Effective radius widens with downscale
+    // ratio via the support multiplier in main().
+    return exp(-(t*t) * 2.0);   // = exp(-t^2 / (2*0.5^2))
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
+{
+    // Pass-through when OutputWidth/Height not set: act as identity.
+    uint outW = (OutputWidth  > 0) ? OutputWidth  : Width;
+    uint outH = (OutputHeight > 0) ? OutputHeight : Height;
+    if (dtid.x >= outW || dtid.y >= outH) return;
+
+    // Output pixel center -> source-pixel-center coords.
+    float2 outCenter = float2(dtid.xy) + 0.5;
+    float2 outSize   = float2(outW, outH);
+    float2 srcSize   = float2(Width, Height);
+    float2 ratio     = srcSize / outSize;             // src per dst pixel
+    float2 srcCenter = outCenter * ratio - 0.5;
+
+    // For downscale (ratio > 1) we widen the kernel by the ratio so the
+    // filter integrates over the *destination footprint* in source pixels;
+    // otherwise samples alias. For upscale (ratio < 1) we keep support = 1.
+    float2 support = max(ratio, float2(1.0, 1.0));
+
+    // Per-mode base radius in kernel domain (half-width of the kernel).
+    uint mode = FilterMode;
+    float baseRadius = 1.0;
+    if      (mode == 1) baseRadius = 2.0;   // Catmull-Rom
+    else if (mode == 2) baseRadius = 2.0;   // Mitchell
+    else if (mode == 3) baseRadius = 3.0;   // Lanczos-3
+    else if (mode == 4) baseRadius = 0.5;   // Box (half-width)
+    else if (mode == 5) baseRadius = 2.0;   // Gaussian (truncated)
+
+    // Effective radius in source pixels after widening for downscale.
+    float2 effR = baseRadius * support;
+    int2   r    = int2(ceil(effR));
+    r = clamp(r, int2(1, 1), int2(12, 12));   // safety cap
+
+    int2 ic = int2(floor(srcCenter));
+
+    float4 sum  = float4(0, 0, 0, 0);
+    float  wsum = 0.0;
+
+    [loop]
+    for (int dy = -r.y; dy <= r.y; ++dy)
+    {
+        [loop]
+        for (int dx = -r.x; dx <= r.x; ++dx)
+        {
+            int2 sxy = clamp(ic + int2(dx, dy),
+                             int2(0, 0),
+                             int2(int(Width) - 1, int(Height) - 1));
+            float2 t = (float2(sxy) + 0.5 - srcCenter) / support;
+
+            float wx, wy;
+            if      (mode == 0) { wx = W_bilinear(t.x);   wy = W_bilinear(t.y); }
+            else if (mode == 1) { wx = W_catmullrom(t.x); wy = W_catmullrom(t.y); }
+            else if (mode == 2) { wx = W_mitchell(t.x);   wy = W_mitchell(t.y); }
+            else if (mode == 3) { wx = W_lanczos3(t.x);   wy = W_lanczos3(t.y); }
+            else if (mode == 4) { wx = W_box(t.x, 0.5);   wy = W_box(t.y, 0.5); }
+            else                { wx = W_gauss(t.x);      wy = W_gauss(t.y); }
+
+            float w = wx * wy;
+            sum  += Source.Load(int3(sxy, 0)) * w;
+            wsum += w;
+        }
+    }
+
+    ImageOutput[dtid.xy] = (wsum > 1e-6) ? (sum / wsum) : float4(0, 0, 0, 0);
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Scale";
+            desc.effectId = L"ShaderLab Scale"; desc.effectVersion = 1;
+            desc.category = L"Color";
+            desc.subcategory = L"Resampling";
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
+            desc.hlslSource = scaleHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                // OutputWidth / OutputHeight are the primary controls.
+                // 0 means "pass through at source dims". To drive them
+                // from source dimensions, bind from an Image Info node
+                // (see catalog) through a Numeric Expression.
+                { L"OutputWidth",  L"uint", 0.0f, 0.0f, 16384.0f, 1.0f },
+                { L"OutputHeight", L"uint", 0.0f, 0.0f, 16384.0f, 1.0f },
+                { L"FilterMode",   L"float", 3.0f, 0.0f, 5.0f, 1.0f,
+                    { L"Bilinear", L"Catmull-Rom Bicubic", L"Mitchell-Netravali",
+                      L"Lanczos-3", L"Box (Area)", L"Gaussian" } },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Image Info ----
+        // Analysis-only compute that exposes its source's dimensions and a
+        // few derived quantities as typed analysis fields. The runner
+        // auto-injects Width / Height into the cbuffer based on the input
+        // texture; this shader just copies them into the result buffer
+        // alongside two convenience derivations.
+        //
+        // Composes naturally with Numeric Expression to drive parameters
+        // that should track the source -- e.g. ImageInfo.Width through
+        // "A * 0.5" into Scale.OutputWidth for a half-resolution pass.
+        {
+            static const std::string imageInfoHLSL = R"HLSL(
+// Image Info -- D3D11 compute, exposes source dims as analysis fields.
+
+Texture2D<float4>          Source : register(t0);
+RWStructuredBuffer<float4> Result : register(u0);
+
+cbuffer constants : register(b0) {
+    uint Width;
+    uint Height;
+};
+
+[numthreads(1, 1, 1)]
+void main()
+{
+    float w = float(Width);
+    float h = float(Height);
+    float aspect = (h > 0.5) ? (w / h) : 0.0;
+    float pixels = w * h;
+    // Each analysis field maps to its own Result[i].x slot.
+    Result[0] = float4(w,      0, 0, 0);   // Width
+    Result[1] = float4(h,      0, 0, 0);   // Height
+    Result[2] = float4(aspect, 0, 0, 0);   // AspectRatio
+    Result[3] = float4(pixels, 0, 0, 0);   // PixelCount
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Image Info";
+            desc.effectId = L"Image Info"; desc.effectVersion = 1;
+            desc.category = L"Analysis";
+            desc.subcategory = L"Statistics";
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.dataOnly = true;
+            desc.hasImageOutput = false;
+            desc.threadGroupX = 1;
+            desc.threadGroupY = 1;
+            desc.threadGroupZ = 1;
+            desc.hlslSource = imageInfoHLSL;
+            desc.inputNames = { L"Source" };
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                { L"Width",       Graph::AnalysisFieldType::Float },
+                { L"Height",      Graph::AnalysisFieldType::Float },
+                { L"AspectRatio", Graph::AnalysisFieldType::Float },
+                { L"PixelCount",  Graph::AnalysisFieldType::Float },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
         // ---- Working Space Parameter Node ----
         // A first-class, host-driven parameter node that mirrors the active
         // display profile (live or simulated) as 14 typed analysis output
