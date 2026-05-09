@@ -2224,49 +2224,66 @@ void main(uint3 dtid : SV_DispatchThreadID)
         // ---- ICtCp Inverse Tone Map (SDR -> HDR) ----
         // Inverse Reinhard on I; expands SDR-anchored content into the
         // HDR peak. Mirror of ICtCp Tone Map; Ct/Cp unchanged.
+        // D3D11 compute -- SourcePeakNits + TargetPeakNits gpuBindable.
         {
             static const std::string ictcpInverseToneMapHLSL = R"HLSL(
-// ICtCp Inverse Tone Map (SDR -> HDR), I-channel inverse Reinhard
-Texture2D Source : register(t0);
-SamplerState Sampler : register(s0);
+// ICtCp Inverse Tone Map (SDR -> HDR) -- D3D11 compute, I-channel inverse Reinhard.
+#include "shaderlab_params.hlsli"
+
+Texture2D<float4>        Source      : register(t0);
+RWTexture2D<float4>      ImageOutput : register(u1);
+
+SHADERLAB_GPU_BUFFER(SourcePeakNits, t1)
+SHADERLAB_GPU_BUFFER(TargetPeakNits, t2)
 
 cbuffer constants : register(b0) {
-    float SourcePeakNits;        // SDR source peak (e.g. 80, 203)
-    float TargetPeakNits;        // typical 1000-10000
-    float Strength;              // 0..1 lerp from identity to expanded
+    uint   Width;
+    uint   Height;
+    SHADERLAB_PARAM(float, SourcePeakNits)        // SDR source peak (e.g. 80, 203)
+    SHADERLAB_PARAM(float, TargetPeakNits)        // typical 1000-10000
+    float  Strength;                              // 0..1 lerp from identity to expanded
 };
 
-float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
 {
-    float4 color = Source.Load(int3(uv, 0));
+    if (dtid.x >= Width || dtid.y >= Height) return;
+
+    SHADERLAB_LOAD_PARAM(float, SourcePeakNits)
+    SHADERLAB_LOAD_PARAM(float, TargetPeakNits)
+
+    float4 color = Source.Load(int3(dtid.xy, 0));
     float3 ictcp = ScRGBToICtCp(color.rgb);
 
     // Inverse of ReinhardCompressI(x, peakIn=HDR, peakOut=SDR):
     // for SDR -> HDR expansion we feed the *compressed* (SDR) range as
-    // peakOut and the *expanded* (HDR) range as peakIn. The input I lives
-    // in [0, peakOut_I] (SDR range) and the helper returns an I in
-    // [0, peakIn_I] (HDR range).
+    // peakOut and the *expanded* (HDR) range as peakIn. Input I lives in
+    // [0, sdrI] (SDR range); the helper returns I in [0, hdrI] (HDR).
     float sdrI = NitsToI(SourcePeakNits);
     float hdrI = NitsToI(TargetPeakNits);
     float expanded = ReinhardExpandI(ictcp.x, hdrI, sdrI);
     ictcp.x = lerp(ictcp.x, expanded, saturate(Strength));
 
     float3 outRgb = ICtCpToScRGB(ictcp);
-    return float4(outRgb, color.a);
+    ImageOutput[dtid.xy] = float4(outRgb, color.a);
 }
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Inverse Tone Map (SDR -> HDR)";
-            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 10;
+            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 11;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + ictcpInverseToneMapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"SourcePeakNits", L"float", 203.0f, 80.0f, 500.0f, 1.0f },
-                { L"TargetPeakNits", L"float", 1000.0f, 100.0f, 10000.0f, 50.0f },
-                { L"Strength",       L"float", 1.0f, 0.0f, 1.0f, 0.05f },
+                Graph::ParameterDefinition{ L"SourcePeakNits", L"float",  203.0f,   80.0f,   500.0f,  1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"TargetPeakNits", L"float", 1000.0f,  100.0f, 10000.0f, 50.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"Strength",       L"float",    1.0f,    0.0f,     1.0f, 0.05f },
             };
             m_effects.push_back(std::move(desc));
         }
