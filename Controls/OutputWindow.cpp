@@ -25,7 +25,6 @@ namespace ShaderLab::Controls
         m_dxgiFactory = dxgiFactory;
         m_nodeId = nodeId;
         m_format = format;
-        m_fpsTime = std::chrono::steady_clock::now();
 
         try
         {
@@ -58,7 +57,7 @@ namespace ShaderLab::Controls
             MUXC::Grid::SetRow(statusBar, 1);
 
             m_fpsText = MUXC::TextBlock();
-            m_fpsText.Text(L"0 FPS");
+            m_fpsText.Text(L"-- fps");
             m_fpsText.Foreground(MUX::Media::SolidColorBrush(
                 winrt::Windows::UI::Color{ 255, 180, 180, 180 }));
             m_fpsText.FontSize(11);
@@ -310,20 +309,11 @@ namespace ShaderLab::Controls
             dc->SetDpi(oldDpiX, oldDpiY);
             dc->SetTransform(&oldTransform);
 
-            // Update FPS counter.
-            m_frameCount++;
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration<double>(now - m_fpsTime).count();
-            if (elapsed >= 1.0)
-            {
-                uint32_t fps = static_cast<uint32_t>(m_frameCount / elapsed);
-                if (m_timingText.empty())
-                    m_fpsText.Text(std::to_wstring(fps) + L" FPS");
-                else
-                    m_fpsText.Text(std::format(L"{} FPS | {}", fps, m_timingText));
-                m_frameCount = 0;
-                m_fpsTime = now;
-            }
+            // FPS / timing display is driven by SetStatusText from the main
+            // window so all windows show the same numbers in the same
+            // format. No per-window counter -- every render tick presents
+            // to all output windows synchronously, so per-window FPS would
+            // be redundant.
         }
         catch (const winrt::hresult_error& ex)
         {
@@ -362,9 +352,23 @@ namespace ShaderLab::Controls
             m_window.Title(winrt::hstring(title));
     }
 
-    void OutputWindow::SetTimingText(const std::wstring& text)
+    void OutputWindow::SetStatusText(const std::wstring& text)
     {
-        m_timingText = text;
+        if (m_fpsText)
+            m_fpsText.Text(winrt::hstring(text));
+    }
+
+    void OutputWindow::SetStatusTooltip(const std::wstring& tooltip)
+    {
+        if (!m_fpsText) return;
+        // Wrap the tooltip text in a monospace TextBlock for readability.
+        namespace MUX = winrt::Microsoft::UI::Xaml;
+        namespace MUXC = winrt::Microsoft::UI::Xaml::Controls;
+        auto tb = MUXC::TextBlock();
+        tb.FontFamily(MUX::Media::FontFamily(L"Cascadia Mono, Consolas, Courier New"));
+        tb.FontSize(11);
+        tb.Text(winrt::hstring(tooltip));
+        MUXC::ToolTipService::SetToolTip(m_fpsText, tb);
     }
 
     void OutputWindow::CreateSwapChain()

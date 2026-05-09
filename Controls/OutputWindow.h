@@ -31,7 +31,15 @@ namespace ShaderLab::Controls
         bool IsReady() const { return m_swapChain != nullptr; }
         uint32_t NodeId() const { return m_nodeId; }
         void SetTitle(const std::wstring& title);
-        void SetTimingText(const std::wstring& text);
+        // Push the canonical "NN fps | NN.N ms" status string from the main
+        // window. Each render tick presents to all output windows
+        // synchronously, so the main window's FPS *is* this window's FPS --
+        // no point recomputing it per-window.
+        void SetStatusText(const std::wstring& text);
+        // Push the multi-line per-phase breakdown the main window shows in
+        // its FPS-tooltip flyout. Used as the hover tooltip on this
+        // window's status bar.
+        void SetStatusTooltip(const std::wstring& tooltip);
 
     private:
         void CreateSwapChain();
@@ -78,10 +86,9 @@ namespace ShaderLab::Controls
         float m_panOriginX{ 0.0f };
         float m_panOriginY{ 0.0f };
 
-        // FPS counter.
-        uint32_t m_frameCount{ 0 };
-        std::chrono::steady_clock::time_point m_fpsTime;
-        std::wstring m_timingText;
+        // FPS counter -- driven by main window via SetStatusText/SetStatusTooltip.
+        // No per-window state; every render tick presents to all output windows
+        // synchronously so the main window's FPS *is* this window's FPS.
 
         // Event tokens for cleanup.
         winrt::event_token m_sizeChangedToken{};

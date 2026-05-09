@@ -5393,10 +5393,11 @@ namespace winrt::ShaderLab::implementation
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) return;
 
-        auto& ft = m_frameTiming;
-        std::wstring timingStr = std::format(L"{:.1f}ms (eval {:.1f} + compute {:.1f} + draw {:.1f})",
-            ft.totalUs / 1000.0, ft.evaluateUs / 1000.0,
-            ft.deferredComputeUs / 1000.0, ft.drawUs / 1000.0 + ft.presentUs / 1000.0);
+        // Canonical status string + tooltip pushed to every output window so
+        // they all show identical numbers in identical formatting to the main
+        // window's FPS counter.
+        std::wstring statusText  = BuildFpsStatusText();
+        std::wstring tooltipText = BuildFpsTooltipText();
 
         for (auto& window : m_outputWindows)
         {
@@ -5407,7 +5408,8 @@ namespace winrt::ShaderLab::implementation
             auto* node = m_graph.FindNode(window->NodeId());
             if (node)
                 window->SetTitle(node->name);
-            window->SetTimingText(timingStr);
+            window->SetStatusText(statusText);
+            window->SetStatusTooltip(tooltipText);
 
             auto* image = ResolveDisplayImage(window->NodeId());
             window->Present(dc, image);
@@ -5454,15 +5456,11 @@ namespace winrt::ShaderLab::implementation
         }
     }
 
-    void MainWindow::UpdateFpsTooltip()
+    std::wstring MainWindow::BuildFpsTooltipText() const
     {
-        // Refresh the TextBlock inside the FPS counter's tooltip with a
-        // fresh per-phase breakdown. The TextBlock's Text property is
-        // observable, so updating it while the tooltip is open re-renders
-        // in place -- giving the user a real-time view of where each
-        // millisecond is going. Sub-phases sum to <= totalUs (= 1000/fps);
-        // the remainder is dispatcher idle / OS overhead between ticks.
-        if (!FpsTooltipText()) return;
+        // Builds the multi-line per-phase breakdown shown in the FPS tooltip
+        // / flyout. Used by the main window's FPS counter and by every
+        // output window's status-bar hover tooltip so they all stay in sync.
         const auto& ft = m_frameTiming;
         double fps = m_lastFps;
         double total = ft.totalUs / 1000.0;
@@ -5508,6 +5506,26 @@ namespace winrt::ShaderLab::implementation
         if (m_lastVideoFps > 0.1f)
             text += std::format(L"\n\n  video decode  {:>6.0f} fps", m_lastVideoFps);
 
-        FpsTooltipText().Text(winrt::hstring(text));
+        return text;
+    }
+
+    std::wstring MainWindow::BuildFpsStatusText() const
+    {
+        // Single-line "60 fps | 16.5 ms" canonical status string. Shared by
+        // the main FPS counter and every output window's status bar.
+        return std::format(L"{:.0f} fps | {:.1f} ms",
+            m_lastFps, m_frameTiming.totalUs / 1000.0);
+    }
+
+    void MainWindow::UpdateFpsTooltip()
+    {
+        // Refresh the TextBlock inside the FPS counter's tooltip with a
+        // fresh per-phase breakdown. The TextBlock's Text property is
+        // observable, so updating it while the tooltip is open re-renders
+        // in place -- giving the user a real-time view of where each
+        // millisecond is going. Sub-phases sum to <= totalUs (= 1000/fps);
+        // the remainder is dispatcher idle / OS overhead between ticks.
+        if (!FpsTooltipText()) return;
+        FpsTooltipText().Text(winrt::hstring(BuildFpsTooltipText()));
     }
 }

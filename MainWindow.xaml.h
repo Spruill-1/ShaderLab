@@ -471,6 +471,10 @@ namespace winrt::ShaderLab::implementation
         void UpdateMcpActivityIndicator();
         void ResetMcpActivityState();
         void UpdateFpsTooltip();
+        // Canonical FPS / timing strings shared by the main status bar and
+        // every output window. Single source of truth.
+        std::wstring BuildFpsStatusText() const;
+        std::wstring BuildFpsTooltipText() const;
 
         // Column splitter drag state.
         bool m_isDraggingSplitter{ false };
