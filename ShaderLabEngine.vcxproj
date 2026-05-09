@@ -116,6 +116,7 @@
     <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\MathExpression.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
+    <ClInclude Include="Rendering\RenderThreadDispatcher.h" />
     <ClInclude Include="Rendering\CaptureNode.h" />
     <ClInclude Include="Effects\ShaderLabParamsHlsl.h" />
     <ClInclude Include="Effects\IEngineComputeOutput.h" />

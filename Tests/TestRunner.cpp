@@ -11,6 +11,10 @@
 #include "Effects/Performance.h"
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
+#include "Rendering/RenderThreadDispatcher.h"
+
+#include <atomic>
+#include <thread>
 
 #include <cstdio>
 #include <cmath>
@@ -1262,6 +1266,122 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
 
         std::printf("    pixel = (%.4f, %.4f, %.4f, %.4f)\n", r, green, b, a);
     }
+
+    void TestRenderThreadDispatcher()
+    {
+        printf("\n=== RenderThreadDispatcher ===\n");
+
+        // ---- Synchronous mode runs inline, no threading. ------------------
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d{ /*synchronous=*/true };
+            int counter = 0;
+            d.DispatchAsync([&]{ counter++; });
+            TEST("synchronous mode runs DispatchAsync inline",
+                 counter == 1);
+
+            int sum = d.DispatchSync([]{ return 7 + 35; });
+            TEST("synchronous mode DispatchSync returns value", sum == 42);
+
+            // Re-entry from inside a closure runs inline.
+            int reentry = 0;
+            d.DispatchSync([&]{
+                d.DispatchSync([&]{ reentry = 99; });
+            });
+            TEST("synchronous mode allows re-entrant DispatchSync",
+                 reentry == 99);
+        }
+
+        // ---- Async-with-consumer-thread happy path. -----------------------
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d;
+            std::atomic<bool> stop{ false };
+            std::thread consumer([&]{
+                d.RegisterConsumer();
+                while (!stop.load(std::memory_order_acquire))
+                {
+                    d.WaitFor(std::chrono::milliseconds(50));
+                    d.Drain();
+                }
+                d.Drain();
+            });
+
+            std::atomic<int> hits{ 0 };
+            for (int i = 0; i < 100; ++i)
+                d.DispatchAsync([&]{ hits.fetch_add(1, std::memory_order_relaxed); });
+
+            // DispatchSync from a non-consumer thread blocks until done.
+            int v = d.DispatchSync([&]{
+                return hits.load(std::memory_order_relaxed);
+            });
+            TEST("async drain ran all enqueued closures (>=100)", v >= 100);
+            TEST("async DispatchSync returned a value seen on consumer",
+                 v == 100);
+
+            stop.store(true, std::memory_order_release);
+            d.Wake();
+            consumer.join();
+        }
+
+        // ---- Re-entrant DispatchSync from inside a closure runs inline. ---
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d;
+            std::atomic<bool> stop{ false };
+            std::thread consumer([&]{
+                d.RegisterConsumer();
+                while (!stop.load(std::memory_order_acquire))
+                {
+                    d.WaitFor(std::chrono::milliseconds(50));
+                    d.Drain();
+                }
+                d.Drain();
+            });
+
+            int outer = 0, inner = 0;
+            d.DispatchSync([&]{
+                outer = 1;
+                // From inside a closure (= consumer thread), DispatchSync
+                // must NOT requeue and self-deadlock; it must run inline.
+                d.DispatchSync([&]{ inner = 2; });
+            });
+            TEST("re-entrant DispatchSync did not deadlock",
+                 outer == 1 && inner == 2);
+
+            stop.store(true, std::memory_order_release);
+            d.Wake();
+            consumer.join();
+        }
+
+        // ---- Closure exception propagates back through DispatchSync. ------
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d{ /*synchronous=*/true };
+            bool threw = false;
+            try
+            {
+                d.DispatchSync([]() -> int {
+                    throw std::runtime_error("expected test failure");
+                });
+            }
+            catch (const std::exception&) { threw = true; }
+            TEST("DispatchSync re-throws closure exception", threw);
+        }
+
+        // ---- Shutdown cancels pending closures and unblocks waiters. ------
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d;
+            std::atomic<bool> consumerRan{ false };
+            std::thread consumer([&]{
+                d.RegisterConsumer();
+                d.Wait();          // returns when shutdown signaled
+                consumerRan.store(true, std::memory_order_release);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            d.Shutdown();
+            consumer.join();
+            TEST("Shutdown wakes Wait()", consumerRan.load());
+            TEST("Shutdown clears queue", d.QueueDepth() == 0);
+            TEST("IsShuttingDown reflects state", d.IsShuttingDown());
+        }
+    }
 }
 
 int main(int argc, char* argv[])
@@ -1337,6 +1457,7 @@ int main(int argc, char* argv[])
     TestGpuBindingRouting();
     TestSkipCpuReadback();
     TestHeadlessReadback();
+    TestRenderThreadDispatcher();
 
     // ---- Math test bench (Phase 2) -----------------------------------------
     {
