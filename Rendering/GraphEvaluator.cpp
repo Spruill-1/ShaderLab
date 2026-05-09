@@ -1150,16 +1150,16 @@ namespace ShaderLab::Rendering
                 if (key == L"OutputWidth")
                 {
                     if (auto* f = std::get_if<float>(&val))
-                        explicitW = static_cast<UINT32>((std::max)(*f, 64.0f));
+                        explicitW = (*f >= 1.0f) ? static_cast<UINT32>(*f) : 0;
                     else if (auto* u = std::get_if<uint32_t>(&val))
-                        explicitW = (std::max)(*u, 64u);
+                        explicitW = *u;
                 }
                 else if (key == L"OutputHeight")
                 {
                     if (auto* f = std::get_if<float>(&val))
-                        explicitH = static_cast<UINT32>((std::max)(*f, 64.0f));
+                        explicitH = (*f >= 1.0f) ? static_cast<UINT32>(*f) : 0;
                     else if (auto* u = std::get_if<uint32_t>(&val))
-                        explicitH = (std::max)(*u, 64u);
+                        explicitH = *u;
                 }
             }
             if (explicitW > 0 && explicitH > 0)
@@ -1336,13 +1336,22 @@ namespace ShaderLab::Rendering
         if (hasImageOutput && imageOutW > 0 && imageOutH > 0 &&
             def.threadGroupX > 0 && def.threadGroupY > 0)
         {
-            bool isFixedSizeViewer = false;
+            // Discriminator: single-group scatter shaders use a large
+            // thread group (commonly 32x32 = 1024) and dispatch (1,1,1);
+            // per-pixel-tile shaders use a small group (commonly 8x8 = 64)
+            // and dispatch (W/tx, H/ty, 1). Threshold at 256 cleanly
+            // separates the two conventions in the current catalog.
+            //
+            // The DiagramSize / OutputSize parameter names ALSO mark fixed-
+            // output viewers (CIE Histogram, etc.) that pre-date the
+            // generic threshold; keep that check for descriptors that use
+            // an 8x8 group but still want single-group dispatch (none
+            // exist today, but the check is cheap and safe).
+            const bool largeGroup = (def.threadGroupX * def.threadGroupY) >= 256;
+            bool isFixedSizeViewer = largeGroup;
             for (const auto& p : def.parameters)
             {
-                if (p.name == L"DiagramSize"  ||
-                    p.name == L"OutputSize"   ||
-                    p.name == L"OutputWidth"  ||
-                    p.name == L"OutputHeight")
+                if (p.name == L"DiagramSize" || p.name == L"OutputSize")
                 {
                     isFixedSizeViewer = true;
                     break;
