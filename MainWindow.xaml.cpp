@@ -842,6 +842,10 @@ namespace winrt::ShaderLab::implementation
         m_graphGridBrush = nullptr;
         m_traceSwatchTarget = nullptr;
         m_traceSwapChain = nullptr;
+        // The UI-side D2D context is bound to the previous D3D device via
+        // its dxgiDevice. Release before tearing down RenderEngine so it
+        // can be rebuilt against the new adapter.
+        ReleaseUiD2dContext();
         for (auto& w : m_outputWindows) w->Close();
         m_outputWindows.clear();
         for (auto& w : m_logWindows) w->Close();
@@ -2075,10 +2079,71 @@ namespace winrt::ShaderLab::implementation
     // Node graph editor rendering
     // -----------------------------------------------------------------------
 
+    void MainWindow::EnsureUiD2dContext()
+    {
+        if (m_uiD2dContext) return;
+        auto* d3dDevice = m_renderEngine.D3DDevice();
+        if (!d3dDevice) return;
+
+        // Separate D2D factory/device/context owned by the UI thread. Single-
+        // threaded factory is fine because the UI thread is the only consumer
+        // of these objects (editor canvas + pixel-trace swatch panel).
+        D2D1_FACTORY_OPTIONS factoryOpts{};
+        if (FAILED(D2D1CreateFactory(
+                D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                __uuidof(ID2D1Factory7),
+                &factoryOpts,
+                m_uiD2dFactory.put_void())))
+        {
+            m_uiD2dFactory = nullptr;
+            return;
+        }
+
+        winrt::com_ptr<IDXGIDevice> dxgiDevice;
+        if (FAILED(d3dDevice->QueryInterface(IID_PPV_ARGS(dxgiDevice.put()))))
+        {
+            m_uiD2dFactory = nullptr;
+            return;
+        }
+
+        if (FAILED(m_uiD2dFactory->CreateDevice(dxgiDevice.get(), m_uiD2dDevice.put())))
+        {
+            m_uiD2dDevice = nullptr;
+            m_uiD2dFactory = nullptr;
+            return;
+        }
+
+        if (FAILED(m_uiD2dDevice->CreateDeviceContext(
+                D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                m_uiD2dContext.put())))
+        {
+            m_uiD2dContext = nullptr;
+            m_uiD2dDevice = nullptr;
+            m_uiD2dFactory = nullptr;
+            return;
+        }
+    }
+
+    void MainWindow::ReleaseUiD2dContext()
+    {
+        // Brushes and bitmap targets are device-context-bound. When the UI
+        // context goes away (e.g. adapter switch) they have to be released
+        // before recreating the context against the new device.
+        m_graphGridBrush = nullptr;
+        m_graphRenderTarget = nullptr;
+        m_traceSwatchTarget = nullptr;
+        m_uiD2dContext = nullptr;
+        m_uiD2dDevice = nullptr;
+        m_uiD2dFactory = nullptr;
+    }
+
     void MainWindow::InitializeGraphPanel()
     {
         if (!m_renderEngine.DXGIFactory() || !m_renderEngine.D3DDevice())
             return;
+
+        EnsureUiD2dContext();
+        if (!m_uiD2dContext) return;
 
         auto panel = NodeGraphPanel();
         m_graphPanelDipsWidth = (std::max)(1.0f, static_cast<float>(panel.ActualWidth()));
@@ -2117,8 +2182,11 @@ namespace winrt::ShaderLab::implementation
         panelNative->SetSwapChain(m_graphSwapChain.get());
         UpdateGraphPanelScale();
 
-        // Create render target.
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        // Create render target on the UI-side D2D context (NOT the render
+        // engine's). Once the render thread (Phase 7) owns the engine
+        // context exclusively, this swap-chain target keeps drawing on the
+        // UI thread without crossing the multithread fence.
+        auto* dc = m_uiD2dContext.get();
         winrt::com_ptr<IDXGISurface> surface;
         m_graphSwapChain->GetBuffer(0, IID_PPV_ARGS(surface.put()));
 
@@ -2157,7 +2225,7 @@ namespace winrt::ShaderLab::implementation
         m_graphRenderTarget = nullptr;
         m_graphSwapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        auto* dc = m_uiD2dContext.get();
         if (!dc) return;
 
         winrt::com_ptr<IDXGISurface> surface;
@@ -2192,8 +2260,12 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::InitializeTraceSwatchPanel()
     {
-        if (m_traceSwapChain || !m_renderEngine.DXGIFactory() || !m_renderEngine.D3DDevice())
+        if (m_traceSwapChain) return;
+        if (!m_renderEngine.DXGIFactory() || !m_renderEngine.D3DDevice())
             return;
+
+        EnsureUiD2dContext();
+        if (!m_uiD2dContext) return;
 
         DXGI_SWAP_CHAIN_DESC1 desc{};
         desc.Width = 28;
@@ -2223,7 +2295,7 @@ namespace winrt::ShaderLab::implementation
 
         m_traceSwatchHeight = 600;
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        auto* dc = m_uiD2dContext.get();
         winrt::com_ptr<IDXGISurface> surface;
         m_traceSwapChain->GetBuffer(0, IID_PPV_ARGS(surface.put()));
 
@@ -2243,16 +2315,14 @@ namespace winrt::ShaderLab::implementation
         if (!m_traceSwapChain || !m_traceSwatchTarget)
             return;
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        // Use the UI-side D2D context -- editor / trace canvas drawing must
+        // not share state with the render engine's evaluator context.
+        auto* dc = m_uiD2dContext.get();
         if (!dc) return;
 
-        winrt::com_ptr<ID2D1Image> oldTarget;
-        dc->GetTarget(oldTarget.put());
-
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
+        // Save/restore not needed -- this context is owned by UI-thread
+        // editor drawing only.
         dc->SetDpi(96.0f, 96.0f);
-
         dc->SetTarget(m_traceSwatchTarget.get());
         dc->BeginDraw();
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
@@ -2289,8 +2359,7 @@ namespace winrt::ShaderLab::implementation
         drawSwatches(m_pixelTrace.Root(), 0);
 
         dc->EndDraw();
-        dc->SetTarget(oldTarget.get());
-        dc->SetDpi(oldDpiX, oldDpiY);
+        dc->SetTarget(nullptr);
 
         m_traceSwapChain->Present(0, 0);
     }
@@ -2335,14 +2404,11 @@ namespace winrt::ShaderLab::implementation
         if (!m_nodeGraphController.NeedsRedraw())
             return;
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        // UI-side D2D context: editor canvas is rendered entirely on the UI
+        // thread, separately from the render thread's evaluator context.
+        auto* dc = m_uiD2dContext.get();
         if (!dc) return;
 
-        winrt::com_ptr<ID2D1Image> oldTarget;
-        dc->GetTarget(oldTarget.put());
-
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
         float graphDpiX = 96.0f * (std::max)(1.0f, static_cast<float>(NodeGraphPanel().CompositionScaleX()));
         float graphDpiY = 96.0f * (std::max)(1.0f, static_cast<float>(NodeGraphPanel().CompositionScaleY()));
         dc->SetDpi(graphDpiX, graphDpiY);
@@ -2354,9 +2420,7 @@ namespace winrt::ShaderLab::implementation
         RenderGraphScene(dc, viewSize);
 
         dc->EndDraw();
-        dc->SetTarget(oldTarget.get());
-
-        dc->SetDpi(oldDpiX, oldDpiY);
+        dc->SetTarget(nullptr);
 
         m_graphSwapChain->Present(0, 0);
     }
@@ -4969,7 +5033,10 @@ namespace winrt::ShaderLab::implementation
 
     std::vector<uint8_t> MainWindow::CaptureGraphAsPng()
     {
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        // Use the UI-side D2D context -- this draws the editor canvas and
+        // produces a CPU-readable bitmap purely on the UI thread, with no
+        // dependency on the render-engine D2D context.
+        auto* dc = m_uiD2dContext.get();
         if (!dc) return {};
 
         // Layout may be stale (e.g., after MCP set-property) — rebuild before

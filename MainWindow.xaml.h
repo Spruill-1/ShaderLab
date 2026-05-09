@@ -217,6 +217,16 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Rendering::DisplayMonitor     m_displayMonitor;
         ::ShaderLab::Rendering::GraphEvaluator     m_graphEvaluator;
 
+        // UI-side D2D stack -- separate D2D factory + device + immediate
+        // context for drawing the node-graph editor canvas and pixel-trace
+        // swatch panel. Shares the D3D11 device with the render engine but
+        // never touches its D2D resources. Once the render thread (Phase 7)
+        // owns the engine D2D context exclusively, the editor canvas keeps
+        // working on the UI thread without crossing the multithread fence.
+        winrt::com_ptr<ID2D1Factory7>          m_uiD2dFactory;
+        winrt::com_ptr<ID2D1Device6>           m_uiD2dDevice;
+        winrt::com_ptr<ID2D1DeviceContext5>    m_uiD2dContext;
+
         // Effect graph.
         ::ShaderLab::Graph::EffectGraph         m_graph;
         ::ShaderLab::Effects::SourceNodeFactory m_sourceFactory;
@@ -320,6 +330,8 @@ namespace winrt::ShaderLab::implementation
         float m_graphPanelDipsHeight{ 0.0f };
 
         void InitializeGraphPanel();
+        void EnsureUiD2dContext();
+        void ReleaseUiD2dContext();
         void ResizeGraphPanel(float widthDips, float heightDips);
         void UpdateGraphPanelScale();
         void RenderNodeGraph();
