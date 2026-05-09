@@ -256,12 +256,27 @@ namespace ShaderLab::Effects
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const
     {
-        // Return the FULL clamped output rect (not the clipped viewport).
-        // This ensures the intermediate textures match the output rect,
-        // so TEXCOORD maps 1:1 with GetDimensions() normalization.
+        // Pass the queried output sub-rect through as the input demand. With
+        // D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING set, our shaders read input
+        // pixel (x,y) for output pixel (x,y) -- so the input rect needed is
+        // exactly the output rect being requested.
+        //
+        // Honoring the sub-rect (rather than returning m_lastOutputRect for
+        // every input) is the linchpin of D2Ds lazy-evaluation propagation:
+        // if a downstream consumer (e.g. the swap-chain present at a small
+        // canvas size) requests only a sub-rect of our output, that demand
+        // cascades upward and every upstream effect renders only what's
+        // actually needed. For preview-resolution scaling on heavy 4K HDR
+        // graphs this can reduce upstream pixel-shader work by 4x or more.
+        //
+        // Split Comparison and other effects that need the full output rect
+        // for math (pivot recentering, etc.) read the full dimensions from
+        // host-injected OutputW/OutputH cbuffer fields, not from the per-
+        // dispatch rect -- so this change is transparent to them.
+        const D2D1_RECT_L safe = outputRect ? *outputRect : m_lastOutputRect;
         for (UINT32 i = 0; i < inputRectCount; ++i)
         {
-            inputRects[i] = m_lastOutputRect;
+            inputRects[i] = safe;
         }
         return S_OK;
     }
