@@ -583,19 +583,43 @@ namespace ShaderLab::Rendering
                     if (declaresOutputDims)
                     {
                         auto inputs = graph.GetInputEdges(nodeId);
-                        if (!inputs.empty())
+                        if (!inputs.empty() && dc)
                         {
-                            auto* srcNode = graph.FindNode(inputs[0]->sourceNodeId);
-                            if (srcNode && srcNode->cachedOutput && dc)
+                            // Compute the *union* of all input bounds, mirroring
+                            // CustomPixelShaderEffect::MapInputRectsToOutputRect
+                            // (which produces the actual D2D output rect this
+                            // shader runs over). Using only inputs[0] would
+                            // misreport OutputW/H whenever inputs have different
+                            // bounds (e.g. Split Comparison fed a 4K and a 2K
+                            // input), causing the shader's coordinate math --
+                            // including UV normalization -- to use a smaller
+                            // virtual canvas than the actual output rect.
+                            float oldDpiX = 0, oldDpiY = 0;
+                            dc->GetDpi(&oldDpiX, &oldDpiY);
+                            dc->SetDpi(96.0f, 96.0f);
+                            float unionLeft = (std::numeric_limits<float>::max)();
+                            float unionTop = (std::numeric_limits<float>::max)();
+                            float unionRight = -(std::numeric_limits<float>::max)();
+                            float unionBottom = -(std::numeric_limits<float>::max)();
+                            bool anyValid = false;
+                            for (const auto& edge : inputs)
                             {
-                                float oldDpiX = 0, oldDpiY = 0;
-                                dc->GetDpi(&oldDpiX, &oldDpiY);
-                                dc->SetDpi(96.0f, 96.0f);
-                                D2D1_RECT_F bounds{};
-                                dc->GetImageLocalBounds(srcNode->cachedOutput, &bounds);
-                                dc->SetDpi(oldDpiX, oldDpiY);
-                                float w = bounds.right - bounds.left;
-                                float h = bounds.bottom - bounds.top;
+                                auto* srcNode = graph.FindNode(edge->sourceNodeId);
+                                if (!srcNode || !srcNode->cachedOutput) continue;
+                                D2D1_RECT_F b{};
+                                if (FAILED(dc->GetImageLocalBounds(srcNode->cachedOutput, &b))) continue;
+                                if (b.right <= b.left || b.bottom <= b.top) continue;
+                                unionLeft   = (std::min)(unionLeft,   b.left);
+                                unionTop    = (std::min)(unionTop,    b.top);
+                                unionRight  = (std::max)(unionRight,  b.right);
+                                unionBottom = (std::max)(unionBottom, b.bottom);
+                                anyValid = true;
+                            }
+                            dc->SetDpi(oldDpiX, oldDpiY);
+                            if (anyValid)
+                            {
+                                float w = unionRight - unionLeft;
+                                float h = unionBottom - unionTop;
                                 if (w > 0 && h > 0)
                                 {
                                     auto wIt = effectiveProps.find(L"OutputW");
