@@ -388,12 +388,23 @@ namespace ShaderLab::Effects
             .category = L"Transform",
             .inputPins = SINGLE_INPUT,
             .defaultProperties = {
-                { L"Scale", Numerics::float2{ 1.0f, 1.0f } },
-                { L"CenterPoint", Numerics::float2{ 0.0f, 0.0f } },
+                { L"Scale",             Numerics::float2{ 1.0f, 1.0f } },
+                { L"CenterPoint",       Numerics::float2{ 0.0f, 0.0f } },
+                // D2D1_SCALE_INTERPOLATION_MODE: 0=NearestNeighbor, 1=Linear,
+                // 2=Cubic, 3=MultiSampleLinear, 4=Anisotropic, 5=HighQualityCubic.
+                // Default to HighQualityCubic (Catmull-Rom): sharp at non-integer
+                // ratios with controlled mild ringing, HDR-safe in scRGB FP16.
+                { L"InterpolationMode", static_cast<uint32_t>(5) },
+                // D2D1_BORDER_MODE: 0=Soft (transparent edges), 1=Hard (clamp).
+                { L"BorderMode",        static_cast<uint32_t>(0) },
+                { L"Sharpness",         0.0f },
             },
             .propertyMetadata = {
-                { L"Scale", { .uiHint = PropertyUIHint::VectorEditor, .minValue = 0.01f, .maxValue = 10.0f, .step = 0.01f, .componentLabels = { L"X", L"Y" } } },
-                { L"CenterPoint", { .uiHint = PropertyUIHint::VectorEditor, .step = 1.0f, .componentLabels = { L"X", L"Y" } } },
+                { L"Scale",             { .uiHint = PropertyUIHint::VectorEditor, .minValue = 0.01f, .maxValue = 10.0f, .step = 0.01f, .componentLabels = { L"X", L"Y" } } },
+                { L"CenterPoint",       { .uiHint = PropertyUIHint::VectorEditor, .step = 1.0f, .componentLabels = { L"X", L"Y" } } },
+                { L"InterpolationMode", { .uiHint = PropertyUIHint::ComboBox, .enumLabels = { L"Nearest Neighbor", L"Bilinear", L"Bicubic", L"Multi-Sample Linear", L"Anisotropic", L"High Quality Bicubic" } } },
+                { L"BorderMode",        { .uiHint = PropertyUIHint::ComboBox, .enumLabels = { L"Soft (transparent)", L"Hard (clamp)" } } },
+                { L"Sharpness",         { .uiHint = PropertyUIHint::Slider, .minValue = 0.0f, .maxValue = 1.0f, .step = 0.05f } },
             },
         });
 
