@@ -103,6 +103,7 @@
     <ClInclude Include="Engine\Mcp\EngineMcpRoutes.h" />
     <ClInclude Include="Graph\EffectEdge.h" />
     <ClInclude Include="Graph\EffectGraph.h" />
+    <ClInclude Include="Graph\GraphUiSnapshot.h" />
     <ClInclude Include="Graph\EffectNode.h" />
     <ClInclude Include="Graph\NodeType.h" />
     <ClInclude Include="Graph\PropertyValue.h" />
@@ -143,6 +144,7 @@
     </ClCompile>
     <ClCompile Include="EngineExport.cpp" />
     <ClCompile Include="Graph\EffectGraph.cpp" />
+    <ClCompile Include="Graph\GraphUiSnapshot.cpp" />
     <ClCompile Include="Rendering\D3D11ComputeRunner.cpp" />
     <ClCompile Include="Rendering\DisplayMonitor.cpp" />
     <ClCompile Include="Rendering\FalseColorOverlay.cpp" />

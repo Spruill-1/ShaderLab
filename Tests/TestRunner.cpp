@@ -12,6 +12,7 @@
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
 #include "Rendering/RenderThreadDispatcher.h"
+#include "Graph/GraphUiSnapshot.h"
 
 #include <atomic>
 #include <thread>
@@ -1267,6 +1268,51 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
         std::printf("    pixel = (%.4f, %.4f, %.4f, %.4f)\n", r, green, b, a);
     }
 
+    void TestSnapshot()
+    {
+        printf("\n=== GraphUiSnapshot ===\n");
+        auto& registry = ShaderLab::Effects::ShaderLabEffects::Instance();
+        ShaderLab::Graph::EffectGraph g;
+        auto srcDesc = registry.FindByName(L"Gamut Source");
+        auto dstDesc = registry.FindByName(L"Gamut Source");
+        auto srcId = g.AddNode(ShaderLab::Effects::ShaderLabEffects::CreateNode(*srcDesc));
+        auto dstId = g.AddNode(ShaderLab::Effects::ShaderLabEffects::CreateNode(*dstDesc));
+        g.Connect(srcId, 0, dstId, 0);
+
+        // Stash a fake cachedOutput on a node to confirm the snapshot strips
+        // it (raw ID2D1Image* must never escape into UI code).
+        auto* live = g.FindNode(srcId);
+        live->cachedOutput = reinterpret_cast<ID2D1Image*>(static_cast<uintptr_t>(0xDEADBEEFu));
+        live->runtimeError = L"oops";
+        live->dirty = true;
+
+        auto snap = ShaderLab::Graph::BuildGraphUiSnapshot(
+            g, /*previewId*/ dstId, /*graphGen*/ 7, /*frameGen*/ 99);
+        TEST("BuildSnapshot returns non-null",        snap != nullptr);
+        TEST("Snapshot graphGeneration",              snap->graphGeneration == 7);
+        TEST("Snapshot frameGeneration",              snap->frameGeneration == 99);
+        TEST("Snapshot previewNodeId",                snap->previewNodeId == dstId);
+        TEST("Snapshot node count matches live",      snap->nodes.size() == 2);
+        TEST("Snapshot edge count matches live",      snap->edges.size() == 1);
+        TEST("Snapshot lookup by id works",           snap->FindNode(srcId) != nullptr);
+        TEST("Snapshot lookup unknown id is null",    snap->FindNode(99999u) == nullptr);
+        TEST("Snapshot strips cachedOutput",          snap->FindNode(srcId)->cachedOutput == nullptr);
+        TEST("Snapshot preserves runtimeError",       snap->FindNode(srcId)->runtimeError == L"oops");
+        TEST("Snapshot preserves dirty flag",         snap->FindNode(srcId)->dirty);
+        TEST("Snapshot edge mirrors connection",
+             snap->edges[0].sourceNodeId == srcId && snap->edges[0].destNodeId == dstId);
+
+        // Mutating the live graph after snapshot must not affect the snap.
+        g.RemoveNode(srcId);
+        TEST("Live mutation does not affect snapshot",
+             snap->nodes.size() == 2 && snap->FindNode(srcId) != nullptr);
+
+        // atomic<shared_ptr> publication round-trip.
+        std::atomic<std::shared_ptr<const ShaderLab::Graph::GraphUiSnapshot>> latest{ snap };
+        auto loaded = latest.load();
+        TEST("atomic<shared_ptr> publication round-trips", loaded == snap);
+    }
+
     void TestRenderThreadDispatcher()
     {
         printf("\n=== RenderThreadDispatcher ===\n");
@@ -1457,6 +1503,7 @@ int main(int argc, char* argv[])
     TestGpuBindingRouting();
     TestSkipCpuReadback();
     TestHeadlessReadback();
+    TestSnapshot();
     TestRenderThreadDispatcher();
 
     // ---- Math test bench (Phase 2) -----------------------------------------
