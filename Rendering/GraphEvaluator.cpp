@@ -594,6 +594,13 @@ namespace ShaderLab::Rendering
                             // input), causing the shader's coordinate math --
                             // including UV normalization -- to use a smaller
                             // virtual canvas than the actual output rect.
+                            //
+                            // Per-input bounds (ImageAW/H, ImageBW/H ...) are
+                            // also captured so the shader can compensate for
+                            // D2D's atlas padding -- a D2D pixel-shader output
+                            // bitmap may live inside e.g. a 4096x4096 atlas
+                            // even when its content rect is only 1920x1080.
+                            // Sampling [0,1] would otherwise read the padding.
                             float oldDpiX = 0, oldDpiY = 0;
                             dc->GetDpi(&oldDpiX, &oldDpiY);
                             dc->SetDpi(96.0f, 96.0f);
@@ -602,18 +609,29 @@ namespace ShaderLab::Rendering
                             float unionRight = -(std::numeric_limits<float>::max)();
                             float unionBottom = -(std::numeric_limits<float>::max)();
                             bool anyValid = false;
+                            // Per-input content widths/heights, indexed by
+                            // destination pin (so input #0 = ImageA, #1 = ImageB,
+                            // ...). graph.GetInputEdges() returns edges in
+                            // arbitrary order, so we have to scatter into a
+                            // pin-indexed vector explicitly.
+                            std::vector<std::pair<float, float>> perInputWH(4, { 0.0f, 0.0f });
                             for (const auto& edge : inputs)
                             {
                                 auto* srcNode = graph.FindNode(edge->sourceNodeId);
                                 if (!srcNode || !srcNode->cachedOutput) continue;
                                 D2D1_RECT_F b{};
-                                if (FAILED(dc->GetImageLocalBounds(srcNode->cachedOutput, &b))) continue;
-                                if (b.right <= b.left || b.bottom <= b.top) continue;
+                                if (FAILED(dc->GetImageLocalBounds(srcNode->cachedOutput, &b)))
+                                    continue;
+                                float bw = b.right - b.left;
+                                float bh = b.bottom - b.top;
+                                if (bw <= 0 || bh <= 0) continue;
                                 unionLeft   = (std::min)(unionLeft,   b.left);
                                 unionTop    = (std::min)(unionTop,    b.top);
                                 unionRight  = (std::max)(unionRight,  b.right);
                                 unionBottom = (std::max)(unionBottom, b.bottom);
                                 anyValid = true;
+                                if (edge->destPin < perInputWH.size())
+                                    perInputWH[edge->destPin] = { bw, bh };
                             }
                             dc->SetDpi(oldDpiX, oldDpiY);
                             if (anyValid)
@@ -635,6 +653,52 @@ namespace ShaderLab::Rendering
                                     effectiveProps[L"OutputH"] = h;
                                     node->properties[L"OutputW"] = w;
                                     node->properties[L"OutputH"] = h;
+
+                                    // Write per-input ImageAW/H / ImageBW/H /
+                                    // ImageCW/H / ImageDW/H -- but only if the
+                                    // shader actually declares those params.
+                                    static const wchar_t* kSlots[][2] = {
+                                        { L"ImageAW", L"ImageAH" },
+                                        { L"ImageBW", L"ImageBH" },
+                                        { L"ImageCW", L"ImageCH" },
+                                        { L"ImageDW", L"ImageDH" },
+                                    };
+                                    auto declaresParam = [&](const std::wstring& name) {
+                                        for (const auto& p : node->customEffect->parameters)
+                                            if (p.name == name) return true;
+                                        return false;
+                                    };
+                                    for (size_t i = 0; i < perInputWH.size() && i < std::size(kSlots); ++i)
+                                    {
+                                        const wchar_t* nW = kSlots[i][0];
+                                        const wchar_t* nH = kSlots[i][1];
+                                        if (!declaresParam(nW) || !declaresParam(nH)) continue;
+                                        // Fall back to the union dimensions when the input's
+                                        // cachedOutput is briefly nullptr (e.g. first frame
+                                        // after a compute branch is wired in -- deferred
+                                        // compute hasn't populated the wrapper bitmap yet).
+                                        // The shader's content/atlas math then degenerates
+                                        // to "atlas == content" which is correct for compute
+                                        // outputs (the typical case for null cachedOutput).
+                                        float iw = perInputWH[i].first;
+                                        float ih = perInputWH[i].second;
+                                        if (iw <= 0 || ih <= 0) { iw = w; ih = h; }
+                                        auto iwIt = effectiveProps.find(nW);
+                                        auto ihIt = effectiveProps.find(nH);
+                                        bool slotChanged =
+                                            (iwIt == effectiveProps.end() ||
+                                             !std::holds_alternative<float>(iwIt->second) ||
+                                             std::get<float>(iwIt->second) != iw) ||
+                                            (ihIt == effectiveProps.end() ||
+                                             !std::holds_alternative<float>(ihIt->second) ||
+                                             std::get<float>(ihIt->second) != ih);
+                                        effectiveProps[nW] = iw;
+                                        effectiveProps[nH] = ih;
+                                        node->properties[nW] = iw;
+                                        node->properties[nH] = ih;
+                                        if (slotChanged) changed = true;
+                                    }
+
                                     if (changed) wasDirty = true;
                                 }
                             }

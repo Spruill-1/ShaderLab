@@ -2473,8 +2473,17 @@ cbuffer Constants : register(b0)
     float Angle;           // degrees; 0 = horizontal wipe (vertical line),
                            // 90 = vertical wipe (horizontal line),
                            // 45 = top-left-to-bottom-right diagonal
-    float OutputW;         // host-injected: actual output rect width
-    float OutputH;         // host-injected: actual output rect height
+    float OutputW;         // host-injected: union of input *content* widths
+    float OutputH;         // host-injected: union of input *content* heights
+    // Per-input content dimensions. D2D pixel-shader inputs live inside
+    // atlas allocations that are larger than the actual content rect (e.g.
+    // 1920x1080 content in a 4096x4096 atlas). [0,1] UV with Sample() maps
+    // to the full atlas, so we have to scale by content/atlas to land on
+    // the content sub-rect.
+    float ImageAW;
+    float ImageAH;
+    float ImageBW;
+    float ImageBH;
 };
 
 float4 main(
@@ -2488,14 +2497,28 @@ float4 main(
     float W = max(OutputW, 1.0);
     float H = max(OutputH, 1.0);
 
-    // Sample each input via *normalized* UV so inputs of mismatched
-    // dimensions are stretched to fit the union output rect. Sample()
-    // with a linear sampler gives us bilinear filtering; D2D maps the
-    // [0,1] UV to the input texture's actual extent regardless of
-    // atlas allocation.
-    float2 uvNorm = uv0.xy / float2(W, H);
-    float4 a = ImageA.Sample(LinearSampler, uvNorm);
-    float4 b = ImageB.Sample(LinearSampler, uvNorm);
+    // Sample each input through its own atlas-aware UV. Logic:
+    //   uvNormOutput = uv0 / (W,H)              -> [0,1] across the wipe canvas
+    //   contentUV    = uvNormOutput * contentSize  -> pixel coords within
+    //                                                 the input's content rect
+    //   atlasUV      = contentUV / atlasSize    -> [0..content/atlas] within
+    //                                                 the actual D2D texture
+    // For exactly-sized inputs (compute outputs) atlas == content so atlasUV
+    // is the simple [0,1] mapping. For atlas-padded inputs (D2D pixel-shader
+    // outputs), atlas > content so atlasUV is < 1 and stays within content.
+    float2 atlasA, atlasB;
+    ImageA.GetDimensions(atlasA.x, atlasA.y);
+    ImageB.GetDimensions(atlasB.x, atlasB.y);
+    atlasA = max(atlasA, float2(1.0, 1.0));
+    atlasB = max(atlasB, float2(1.0, 1.0));
+
+    float2 uvA = uv0.xy * float2(max(ImageAW, 1.0), max(ImageAH, 1.0))
+               / (float2(W, H) * atlasA);
+    float2 uvB = uv0.xy * float2(max(ImageBW, 1.0), max(ImageBH, 1.0))
+               / (float2(W, H) * atlasB);
+
+    float4 a = ImageA.Sample(LinearSampler, uvA);
+    float4 b = ImageB.Sample(LinearSampler, uvB);
 
     // Direction vector along which we project pixel positions.
     float radians = Angle * 3.14159265 / 180.0;
@@ -2526,7 +2549,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Split Comparison";
-            desc.effectId = L"Split Comparison"; desc.effectVersion = 5;
+            desc.effectId = L"Split Comparison"; desc.effectVersion = 6;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2536,10 +2559,15 @@ float4 main(
                 { L"SplitPosition", L"float",   0.5f,    0.0f,   1.0f,  0.01f },
                 { L"LineWidth",     L"float",   2.0f,    0.0f,  10.0f,  0.5f },
                 { L"Angle",         L"float",   0.0f, -360.0f, 360.0f,  1.0f },
-                // Hidden: host writes actual output-rect dimensions
-                // each frame (see GraphEvaluator's pixel-shader eval).
+                // Hidden: host writes actual output-rect dimensions and
+                // per-input content dimensions every frame (see
+                // GraphEvaluator's pixel-shader eval).
                 Graph::ParameterDefinition{ L"OutputW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
                 Graph::ParameterDefinition{ L"OutputH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"ImageAW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"ImageAH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"ImageBW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"ImageBH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
             };
             m_effects.push_back(std::move(desc));
         }
