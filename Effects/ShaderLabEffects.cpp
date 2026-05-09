@@ -37,26 +37,41 @@ namespace ShaderLab::Effects
     // -----------------------------------------------------------------------
 
     static const std::string s_luminanceHeatmapHLSL = R"HLSL(
-// Luminance Heatmap - false-color visualization of luminance
-Texture2D Source : register(t0);
+// Luminance Heatmap -- D3D11 compute, false-color luminance visualization.
+// MinNits / MaxNits are gpuBindable so a Luminance Statistics .Min / .Max
+// can drive the heatmap range automatically per source-distribution
+// without a CPU readback round-trip.
+#include "shaderlab_params.hlsli"
+
+Texture2D<float4>        Source      : register(t0);
+RWTexture2D<float4>      ImageOutput : register(u1);
+
+SHADERLAB_GPU_BUFFER(MinNits, t1)
+SHADERLAB_GPU_BUFFER(MaxNits, t2)
 
 cbuffer constants : register(b0) {
-    float MinNits;     // default 0.0
-    float MaxNits;     // default 10000.0
-    uint ColormapMode; // 0=Turbo, 1=Inferno
+    uint  Width;
+    uint  Height;
+    SHADERLAB_PARAM(float, MinNits)     // default 0.0
+    SHADERLAB_PARAM(float, MaxNits)     // default 10000.0
+    uint  ColormapMode;                 // 0=Turbo, 1=Inferno
 };
 
-float4 main(
-    float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
 {
-    float4 color = Source.Load(int3(uv0.xy, 0));
+    if (dtid.x >= Width || dtid.y >= Height) return;
+
+    SHADERLAB_LOAD_PARAM(float, MinNits)
+    SHADERLAB_LOAD_PARAM(float, MaxNits)
+
+    float4 color = Source.Load(int3(dtid.xy, 0));
     float nits = ScRGBLuminanceNits(color.rgb);
     float t = saturate((nits - MinNits) / max(MaxNits - MinNits, 0.001));
     float3 mapped = TurboColormap(t);
-    // Turbo colormap outputs perceptual 0-1 values.
-    // Keep as-is in scRGB (1.0 = 80 nits SDR white) for visible display.
-    return float4(mapped, color.a);
+    // Turbo colormap outputs perceptual 0-1 values; keep in scRGB
+    // (1.0 = 80 nits SDR white) for visible display.
+    ImageOutput[dtid.xy] = float4(mapped, color.a);
 }
 )HLSL";
 
@@ -137,10 +152,13 @@ float4 main(
 )HLSL";
 
     static const std::string s_luminanceHighlightHLSL = R"HLSL(
-// Luminance Highlight
-// Mirrors Gamut Highlight: pixels whose luminance falls outside the
-// active nit range (or inside, depending on Mode) are tinted with an
-// overlay color.
+// Luminance Highlight -- D3D11 compute, mirrors Gamut Highlight but on
+// luminance. Pixels whose luminance falls outside (or inside, per Mode)
+// the active nit range are tinted with an overlay color.
+//
+// MinNits / MaxNits are gpuBindable so a Luminance Statistics .Min / .Max
+// (or Working Space.MinNits / .PeakNits) can drive the range
+// automatically without a CPU readback round-trip.
 //
 // TargetRange selects the [min,max] nit window:
 //   0 = SDR              (0 .. 80 nits)
@@ -148,28 +166,38 @@ float4 main(
 //   2 = HDR 1000         (0 .. 1000 nits)
 //   3 = HDR 4000         (0 .. 4000 nits)
 //   4 = HDR 10000        (0 .. 10000 nits)
-//   5 = Custom           (use MinNits / MaxNits sliders directly; bind
-//                         to `Working Space.MinNits/PeakNits` for
-//                         monitor-matched analysis.)
-Texture2D Source : register(t0);
+//   5 = Custom           (use MinNits / MaxNits sliders directly)
+#include "shaderlab_params.hlsli"
+
+Texture2D<float4>        Source      : register(t0);
+RWTexture2D<float4>      ImageOutput : register(u1);
+
+SHADERLAB_GPU_BUFFER(MinNits, t1)
+SHADERLAB_GPU_BUFFER(MaxNits, t2)
 
 cbuffer constants : register(b0) {
-    uint TargetRange;
-    float MinNits;
-    float MaxNits;
+    uint  Width;
+    uint  Height;
+    uint  TargetRange;
+    SHADERLAB_PARAM(float, MinNits)
+    SHADERLAB_PARAM(float, MaxNits)
     float OverlayR;
     float OverlayG;
     float OverlayB;
     float OverlayStrength;
-    uint Mode; // 0 = Out-of-Range, 1 = In-Range
+    uint  Mode;                  // 0 = Out-of-Range, 1 = In-Range
 };
 
-float4 main(
-    float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
 {
-    float4 color = Source.Load(int3(uv0.xy, 0));
-    if (color.a < 0.001) return color;
+    if (dtid.x >= Width || dtid.y >= Height) return;
+
+    SHADERLAB_LOAD_PARAM(float, MinNits)
+    SHADERLAB_LOAD_PARAM(float, MaxNits)
+
+    float4 color = Source.Load(int3(dtid.xy, 0));
+    if (color.a < 0.001) { ImageOutput[dtid.xy] = color; return; }
 
     // ScRGBLuminanceNits: scRGB luminance * 80 (1.0 = 80 nits SDR white).
     float nits = ScRGBLuminanceNits(color.rgb);
@@ -192,14 +220,13 @@ float4 main(
         effMax = MaxNits;
     }
 
-    // Defensive: degenerate range collapses to "everything out-of-range".
     bool outOfRange = (effMin >= effMax) || (nits < effMin) || (nits > effMax);
     bool highlight = (Mode > 0.5) ? !outOfRange : outOfRange;
     if (highlight) {
         float3 overlay = float3(OverlayR, OverlayG, OverlayB);
         color.rgb = lerp(color.rgb, overlay, OverlayStrength);
     }
-    return color;
+    ImageOutput[dtid.xy] = color;
 }
 )HLSL";
 
@@ -307,19 +334,24 @@ float4 main(
         const auto& colorMath = GetColorMathHLSL();
 
         // ---- Luminance Heatmap ----
+        // D3D11 compute -- MinNits / MaxNits gpuBindable.
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Luminance Heatmap";
-            desc.effectId = L"Luminance Heatmap"; desc.effectVersion = 2;
+            desc.effectId = L"Luminance Heatmap"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.subcategory = L"Highlights";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + s_luminanceHeatmapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"MinNits",      L"float", 0.0f,    0.0f, 10000.0f, 1.0f },
-                { L"MaxNits",      L"float", 10000.0f, 0.0f, 10000.0f, 100.0f },
-                { L"ColormapMode", L"float", 0.0f, 0.0f, 1.0f, 1.0f, { L"Turbo", L"Inferno" } },
+                Graph::ParameterDefinition{ L"MinNits",      L"float",     0.0f,    0.0f, 10000.0f,    1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"MaxNits",      L"float", 10000.0f,    0.0f, 10000.0f,  100.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"ColormapMode", L"float",     0.0f,    0.0f,     1.0f,    1.0f, { L"Turbo", L"Inferno" } },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -363,18 +395,22 @@ float4 main(
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Luminance Highlight";
-            desc.effectId = L"Luminance Highlight"; desc.effectVersion = 5;
+            desc.effectId = L"Luminance Highlight"; desc.effectVersion = 6;
             desc.category = L"Analysis";
             desc.subcategory = L"Highlights";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + s_luminanceHighlightHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"TargetRange",     L"float", 0.0f,   0.0f, 5.0f, 1.0f,
                     { L"SDR (0-80)", L"HDR 400", L"HDR 1000", L"HDR 4000",
                       L"HDR 10000", L"Custom" } },
-                { L"MinNits",         L"float", 0.0f,    0.0f, 10000.0f, 1.0f, {}, L"TargetRange == 5" },
-                { L"MaxNits",         L"float", 1000.0f, 0.0f, 10000.0f, 10.0f, {}, L"TargetRange == 5" },
+                Graph::ParameterDefinition{ L"MinNits",   L"float",    0.0f, 0.0f, 10000.0f,  1.0f, {}, L"TargetRange == 5", true },
+                Graph::ParameterDefinition{ L"MaxNits",   L"float", 1000.0f, 0.0f, 10000.0f, 10.0f, {}, L"TargetRange == 5", true },
                 { L"OverlayR",        L"float", 1.0f,   0.0f, 1.0f, 0.01f },
                 { L"OverlayG",        L"float", 0.0f,   0.0f, 1.0f, 0.01f },
                 { L"OverlayB",        L"float", 1.0f,   0.0f, 1.0f, 0.01f },
@@ -2334,25 +2370,40 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
         // multiplier ramps from 1 toward (1 - Amount); above PeakNits
         // the saturation is fully attenuated. Pairs naturally with
         // ICtCp Tone Map: tone-map first, then desat the highlights.
+        // D3D11 compute -- KneeNits + PeakNits gpuBindable (typical
+        // bindings: LumStats.P95 -> KneeNits, LumStats.Max -> PeakNits).
         {
             static const std::string ictcpHighlightDesatHLSL = R"HLSL(
-// ICtCp Highlight Desaturation — smooth Ct/Cp rolloff vs. I
-Texture2D Source : register(t0);
-SamplerState Sampler : register(s0);
+// ICtCp Highlight Desaturation -- D3D11 compute, smooth Ct/Cp rolloff vs. I.
+#include "shaderlab_params.hlsli"
+
+Texture2D<float4>        Source      : register(t0);
+RWTexture2D<float4>      ImageOutput : register(u1);
+
+SHADERLAB_GPU_BUFFER(KneeNits, t1)
+SHADERLAB_GPU_BUFFER(PeakNits, t2)
 
 cbuffer constants : register(b0) {
-    float KneeNits;     // start of the rolloff (e.g. 200)
-    float PeakNits;     // end of the rolloff       (e.g. 1000)
-    float Amount;       // [0..1], how far to desaturate at peak (1 = grayscale at peak)
+    uint  Width;
+    uint  Height;
+    SHADERLAB_PARAM(float, KneeNits)    // start of the rolloff (e.g. 200)
+    SHADERLAB_PARAM(float, PeakNits)    // end of the rolloff   (e.g. 1000)
+    float Amount;                       // [0..1] how far to desaturate at peak
 };
 
-float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
 {
-    float4 color = Source.Load(int3(uv, 0));
+    if (dtid.x >= Width || dtid.y >= Height) return;
+
+    SHADERLAB_LOAD_PARAM(float, KneeNits)
+    SHADERLAB_LOAD_PARAM(float, PeakNits)
+
+    float4 color = Source.Load(int3(dtid.xy, 0));
     float3 ictcp = ScRGBToICtCp(color.rgb);
 
-    // Map I (PQ) back to nits so the user's parameters mean what they say
-    // even though the I axis is non-linear.
+    // Map I (PQ) back to nits so the user's parameters mean what they
+    // say even though the I axis is non-linear.
     float nits = IToNits(ictcp.x);
     float t = saturate((nits - KneeNits) / max(PeakNits - KneeNits, 1e-3));
     float scale = 1.0 - saturate(Amount) * smoothstep(0.0, 1.0, t);
@@ -2360,21 +2411,25 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
     ictcp.y *= scale;
     ictcp.z *= scale;
     float3 outRgb = ICtCpToScRGB(ictcp);
-    return float4(outRgb, color.a);
+    ImageOutput[dtid.xy] = float4(outRgb, color.a);
 }
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Highlight Desaturation";
-            desc.effectId = L"ICtCp Highlight Desaturation"; desc.effectVersion = 3;
+            desc.effectId = L"ICtCp Highlight Desaturation"; desc.effectVersion = 4;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + ictcpHighlightDesatHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"KneeNits",       L"float", 200.0f,  10.0f, 5000.0f, 10.0f },
-                { L"PeakNits",       L"float", 1000.0f, 50.0f, 10000.0f, 50.0f },
-                { L"Amount",         L"float", 1.0f,    0.0f,  1.0f,    0.05f },
+                Graph::ParameterDefinition{ L"KneeNits", L"float",  200.0f, 10.0f,  5000.0f, 10.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"PeakNits", L"float", 1000.0f, 50.0f, 10000.0f, 50.0f, {}, L"", true },
+                { L"Amount",       L"float",    1.0f,  0.0f,     1.0f, 0.05f },
             };
             m_effects.push_back(std::move(desc));
         }
