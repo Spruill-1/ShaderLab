@@ -1101,20 +1101,22 @@ float4 main(
         // ---- Delta E Comparator ----
         {
             static const std::string deltaEHLSL = R"HLSL(
-// Delta E Comparator - per-pixel color difference between two inputs
-// Supports: CIE76, CIE94, CIEDE2000
+// Delta E Comparator -- D3D11 compute, per-pixel color difference between
+// two inputs (Reference at t0, Test at t1). Supports CIE76, CIE94, CIEDE2000.
+
+Texture2D<float4>   Reference   : register(t0);
+Texture2D<float4>   Test        : register(t1);
+RWTexture2D<float4> ImageOutput : register(u1);
 
 cbuffer Constants : register(b0)
 {
-    uint Method;     // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000
-    float Scale;      // Multiplier for visualization (higher = more sensitive)
-    float MaxDeltaE;  // Clamp for colormap (dE at this value = full red)
-    uint OutputMode; // 0 = Heatmap (Turbo colormap), 1 = Grayscale dE / MaxDeltaE
+    uint  Width;
+    uint  Height;
+    uint  Method;        // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000
+    float Scale;         // visualization multiplier
+    float MaxDeltaE;     // clamp for colormap (dE >= this = full red)
+    uint  OutputMode;    // 0 = Heatmap (Turbo), 1 = Grayscale dE / MaxDeltaE
 };
-
-Texture2D InputTexture : register(t0);   // Reference
-Texture2D InputTexture1 : register(t1);  // Test
-SamplerState InputSampler : register(s0);
 
 // CIE76: simple Euclidean distance in L*a*b*
 float DeltaE76(float3 lab1, float3 lab2) {
@@ -1212,15 +1214,13 @@ float DeltaE2000(float3 lab1, float3 lab2) {
     return sqrt(t1*t1 + t2*t2 + t3*t3 + RT * t2 * t3);
 }
 
-float4 main(
-    float4 pos      : SV_POSITION,
-    float4 posScene : SCENE_POSITION,
-    float4 uv0      : TEXCOORD0,
-    float4 uv1      : TEXCOORD1
-) : SV_Target
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
 {
-    float4 ref  = InputTexture.Sample(InputSampler, uv0.xy);
-    float4 test = InputTexture1.Sample(InputSampler, uv1.xy);
+    if (dtid.x >= Width || dtid.y >= Height) return;
+
+    float4 ref  = Reference.Load(int3(dtid.xy, 0));
+    float4 test = Test.Load(int3(dtid.xy, 0));
 
     float3 labRef  = ScRGBToLab(ref.rgb);
     float3 labTest = ScRGBToLab(test.rgb);
@@ -1232,34 +1232,36 @@ float4 main(
     else                  dE = DeltaE76(labRef, labTest);
 
     dE *= Scale;
-
-    // Always read OutputMode unconditionally so D3DCompile can't strip it
-    // (gotcha #2 in CLAUDE.md). Branch on the read value below.
     float mode = OutputMode;
-
-    // Map to colormap: 0 = black (exact match), MaxDeltaE = full red.
     float t = saturate(dE / max(MaxDeltaE, 0.01));
 
+    float4 outColor;
     if (mode > 0.5)
     {
-        // Grayscale dE: gray = saturate(dE / MaxDeltaE), output to RGB.
-        // This makes mean(R) directly readable as fractional dE — a
-        // downstream Luminance Statistics node yields live mean/p95/max
-        // dE values without needing CPU readback of every pixel.
-        return float4(t, t, t, 1.0);
+        // Grayscale dE: a downstream Luminance Statistics node yields
+        // live mean/p95/max dE values without needing CPU readback of
+        // every pixel.
+        outColor = float4(t, t, t, 1.0);
     }
-
-    float3 color = TurboColormap(t) * smoothstep(0.0, 0.02, t);
-    return float4(color, 1.0);
+    else
+    {
+        float3 color = TurboColormap(t) * smoothstep(0.0, 0.02, t);
+        outColor = float4(color, 1.0);
+    }
+    ImageOutput[dtid.xy] = outColor;
 }
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Delta E Comparator";
-            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 5;
+            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 6;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + deltaEHLSL;
             desc.inputNames = { L"Reference", L"Test" };
             desc.parameters = {

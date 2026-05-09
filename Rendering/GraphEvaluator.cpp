@@ -231,12 +231,32 @@ namespace ShaderLab::Rendering
                     }
 
                     auto inputs = graph.GetInputEdges(nodeId);
-                    ID2D1Image* inputImage = nullptr;
-                    if (!inputs.empty())
+                    // Collect all upstream input images, in pin-index order
+                    // (matching customEffect.inputNames). The bridge binds
+                    // them at t0..t(N-1).
+                    std::vector<ID2D1Image*> inputImages;
                     {
-                        auto* srcNode = graph.FindNode(inputs[0]->sourceNodeId);
-                        if (srcNode) inputImage = srcNode->cachedOutput;
+                        // Find max destPin so we can size by declared input
+                        // count. Slots not connected get nullptr (the bridge
+                        // returns E_INVALIDARG, surfaced as a runtime error).
+                        uint32_t maxPin = 0;
+                        for (const auto* e : inputs)
+                            if (e->destPin >= maxPin) maxPin = e->destPin + 1;
+                        // Also bound by declared input count if known.
+                        uint32_t declaredCount = node->customEffect.has_value()
+                            ? static_cast<uint32_t>(node->customEffect->inputNames.size())
+                            : 0;
+                        uint32_t totalSlots = (std::max)(maxPin, declaredCount);
+                        if (totalSlots == 0 && !inputs.empty()) totalSlots = 1;
+                        inputImages.assign(totalSlots, nullptr);
+                        for (const auto* e : inputs)
+                        {
+                            auto* srcNode = graph.FindNode(e->sourceNodeId);
+                            if (srcNode && e->destPin < inputImages.size())
+                                inputImages[e->destPin] = srcNode->cachedOutput;
+                        }
                     }
+                    ID2D1Image* primaryInput = inputImages.empty() ? nullptr : inputImages[0];
                     bool hasImageOutput = !node->outputPins.empty();
                     // Image-producing compute: recompute when dirty or no cached output.
                     // Analysis-only compute: also recompute if no analysis fields yet.
@@ -263,7 +283,7 @@ namespace ShaderLab::Rendering
                         skipReadbackForcesRedispatch ||
                         (hasImageOutput && !node->cachedOutput) ||
                         (!hasImageOutput && node->analysisOutput.fields.empty());
-                    if (inputImage && needsCompute && !m_deferredComputeFrozen)
+                    if (primaryInput && needsCompute && !m_deferredComputeFrozen)
                     {
                         // Phase 8: ensure the bridge effect exists for this
                         // node so ProcessDeferredCompute can drive it via
@@ -271,14 +291,20 @@ namespace ShaderLab::Rendering
                         // the impl into m_bridgeImplCache.
                         GetOrCreateEffect(dc, *node);
 
-                        // For image-producing compute, pre-render the upstream
-                        // D2D chain to a bitmap NOW while properties are fresh.
-                        // This avoids D2D GPU caching returning stale data when
-                        // ProcessDeferredCompute renders later inside BeginDraw.
-                        winrt::com_ptr<ID2D1Bitmap1> preRendered;
+                        // For image-producing compute, pre-render every upstream
+                        // input to its own FP32 bitmap NOW while properties are
+                        // fresh. This avoids D2D GPU caching returning stale data
+                        // when ProcessDeferredCompute renders later inside BeginDraw.
+                        std::vector<winrt::com_ptr<ID2D1Bitmap1>> preRendered(inputImages.size());
                         if (hasImageOutput)
-                            preRendered = PreRenderInputBitmap(dc, inputImage);
-                        m_deferredCompute.push_back({ nodeId, inputImage, preRendered });
+                        {
+                            for (size_t i = 0; i < inputImages.size(); ++i)
+                            {
+                                if (inputImages[i])
+                                    preRendered[i] = PreRenderInputBitmap(dc, inputImages[i]);
+                            }
+                        }
+                        m_deferredCompute.push_back({ nodeId, std::move(inputImages), std::move(preRendered) });
                     }
                     node->dirty = false;
                     if (!hasImageOutput)
@@ -856,7 +882,7 @@ namespace ShaderLab::Rendering
         for (auto& deferred : m_deferredCompute)
         {
             auto* node = graph.FindNode(deferred.nodeId);
-            if (!node || !deferred.inputImage) continue;
+            if (!node || deferred.inputImages.empty() || !deferred.inputImages[0]) continue;
             if (!node->customEffect.has_value()) continue;
 
             auto bit = m_bridgeImplCache.find(node->id);
@@ -864,16 +890,22 @@ namespace ShaderLab::Rendering
                 continue;
             auto* bridge = bit->second;
 
-            // Use the deferred entry's pre-rendered bitmap if it
-            // exists (image-producing computes pre-render in
+            // Use the deferred entry's pre-rendered bitmap per-input slot
+            // if it exists (image-producing computes pre-render in
             // EvaluateNode while D2D effect properties are fresh).
             // Otherwise share via the per-frame map.
-            ID2D1Bitmap1* preRendered = deferred.preRenderedInput.get();
-            if (!preRendered)
-                preRendered = preRenderShared(deferred.inputImage);
+            std::vector<ID2D1Bitmap1*> preRendered(deferred.inputImages.size(), nullptr);
+            for (size_t i = 0; i < deferred.inputImages.size(); ++i)
+            {
+                if (!deferred.inputImages[i]) continue;
+                if (i < deferred.preRenderedInputs.size() && deferred.preRenderedInputs[i])
+                    preRendered[i] = deferred.preRenderedInputs[i].get();
+                else
+                    preRendered[i] = preRenderShared(deferred.inputImages[i]);
+            }
 
             const bool readback = isReadbackNeeded(node->id);
-            DispatchViaBridge(dc, graph, *node, deferred.inputImage,
+            DispatchViaBridge(dc, graph, *node, deferred.inputImages,
                 preRendered, bridge, readback);
 
             // Phase 8c: record the timestamp for hinted nodes whose
@@ -928,8 +960,8 @@ namespace ShaderLab::Rendering
         ID2D1DeviceContext5* dc,
         const EffectGraph& graph,
         EffectNode& node,
-        ID2D1Image* inputImage,
-        ID2D1Bitmap1* preRenderedInput,
+        const std::vector<ID2D1Image*>& inputImages,
+        const std::vector<ID2D1Bitmap1*>& preRenderedInputs,
         Effects::CustomComputeBridgeEffect* bridge,
         bool readbackToCpu)
     {
@@ -1156,21 +1188,27 @@ namespace ShaderLab::Rendering
             }
             if (imageOutW == 0)
             {
-                // Fall back to upstream input dimensions (96 DPI bounds
+                // Fall back to upstream input #0 dimensions (96 DPI bounds
                 // from the pre-rendered bitmap, if any, else the input
-                // image's bounds).
-                if (preRenderedInput)
+                // image's bounds). For multi-input shaders we still drive
+                // dispatch sizing from t0 -- the contract is that all
+                // inputs match dimensions.
+                ID2D1Bitmap1* primaryPreRendered =
+                    preRenderedInputs.empty() ? nullptr : preRenderedInputs[0];
+                ID2D1Image* primaryInput =
+                    inputImages.empty() ? nullptr : inputImages[0];
+                if (primaryPreRendered)
                 {
-                    auto sz = preRenderedInput->GetPixelSize();
+                    auto sz = primaryPreRendered->GetPixelSize();
                     imageOutW = sz.width; imageOutH = sz.height;
                 }
-                else
+                else if (primaryInput)
                 {
                     float oldDpiX, oldDpiY;
                     dc->GetDpi(&oldDpiX, &oldDpiY);
                     dc->SetDpi(96.0f, 96.0f);
                     D2D1_RECT_F bounds{};
-                    dc->GetImageLocalBounds(inputImage, &bounds);
+                    dc->GetImageLocalBounds(primaryInput, &bounds);
                     imageOutW = static_cast<UINT32>((std::min)(bounds.right - bounds.left, 8192.0f));
                     imageOutH = static_cast<UINT32>((std::min)(bounds.bottom - bounds.top, 8192.0f));
                     dc->SetDpi(oldDpiX, oldDpiY);
@@ -1258,13 +1296,19 @@ namespace ShaderLab::Rendering
         }
 
         // Drive the dispatch through the bridge. The bridge handles
-        // pre-rendering internally; if we have a pre-rendered bitmap
-        // it's a cheap blit (same FP32 format). Use it directly when
+        // pre-rendering internally; if we have pre-rendered bitmaps
+        // it's a cheap blit (same FP32 format). Use them directly when
         // available so D2D doesn't re-evaluate upstream effects with
         // potentially-different cached state.
-        ID2D1Image* dispatchInput = preRenderedInput
-            ? static_cast<ID2D1Image*>(preRenderedInput)
-            : inputImage;
+        std::vector<ID2D1Image*> dispatchInputs(inputImages.size(), nullptr);
+        for (size_t i = 0; i < inputImages.size(); ++i)
+        {
+            ID2D1Bitmap1* preRendered = (i < preRenderedInputs.size())
+                ? preRenderedInputs[i] : nullptr;
+            dispatchInputs[i] = preRendered
+                ? static_cast<ID2D1Image*>(preRendered)
+                : inputImages[i];
+        }
 
         // Phase 8 GPU bindings: register each upstream SRV with its
         // declared t-slot. Bridge clears these at the end of Dispatch.
@@ -1322,7 +1366,9 @@ namespace ShaderLab::Rendering
         // returns an empty `floats` vector. The structured-buffer SRV
         // is still populated on the GPU side for downstream consumers.
         HRESULT hr = bridge->Dispatch(
-            dc, dispatchInput,
+            dc,
+            dispatchInputs.data(),
+            static_cast<UINT32>(dispatchInputs.size()),
             cbBytes.empty() ? nullptr : cbBytes.data(),
             static_cast<UINT32>(cbBytes.size()),
             analysisFloat4Count,
