@@ -2455,9 +2455,16 @@ void main(uint3 dtid : SV_DispatchThreadID)
 // diagonal line.
 //
 // LineWidth controls the dividing line thickness in pixels.
+//
+// Inputs of mismatched dimensions are stretched to the union output rect
+// via normalized-UV Sample() (linear-filtered) -- so feeding e.g. a
+// 4K source on ImageA and a 1080p tone-mapped result on ImageB still
+// fills both halves of the wipe, instead of returning black for any
+// out-of-bounds Load on the smaller input.
 
 Texture2D ImageA : register(t0);
 Texture2D ImageB : register(t1);
+SamplerState LinearSampler : register(s0);
 
 cbuffer Constants : register(b0)
 {
@@ -2466,27 +2473,29 @@ cbuffer Constants : register(b0)
     float Angle;           // degrees; 0 = horizontal wipe (vertical line),
                            // 90 = vertical wipe (horizontal line),
                            // 45 = top-left-to-bottom-right diagonal
-    float OutputW;         // host-injected: actual output rect width in
-                           // pixels. Cant use Texture2D::GetDimensions()
-                           // because D2D pads intermediates to atlas
-                           // allocation sizes (typically 4096x4096).
-    float OutputH;         // host-injected: actual output rect height.
+    float OutputW;         // host-injected: actual output rect width
+    float OutputH;         // host-injected: actual output rect height
 };
 
 float4 main(
     float4 pos : SV_POSITION,
     float4 uv0 : TEXCOORD0) : SV_TARGET
 {
-    float4 a = ImageA.Load(int3(uv0.xy, 0));
-    float4 b = ImageB.Load(int3(uv0.xy, 0));
-
     // Use the host-supplied output dimensions, not GetDimensions(), since
     // D2D pads input textures to atlas allocation sizes (e.g. 4096x4096
     // when the actual output rect is 3840x2160). uv0 is in true pixel
-    // coords thanks to D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING; we just need
-    // the matching output-rect dimensions to recenter on.
+    // coords thanks to D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING.
     float W = max(OutputW, 1.0);
     float H = max(OutputH, 1.0);
+
+    // Sample each input via *normalized* UV so inputs of mismatched
+    // dimensions are stretched to fit the union output rect. Sample()
+    // with a linear sampler gives us bilinear filtering; D2D maps the
+    // [0,1] UV to the input texture's actual extent regardless of
+    // atlas allocation.
+    float2 uvNorm = uv0.xy / float2(W, H);
+    float4 a = ImageA.Sample(LinearSampler, uvNorm);
+    float4 b = ImageB.Sample(LinearSampler, uvNorm);
 
     // Direction vector along which we project pixel positions.
     float radians = Angle * 3.14159265 / 180.0;
