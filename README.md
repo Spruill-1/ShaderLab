@@ -52,7 +52,7 @@ The deep technical reference lives under [docs/](docs/README.md), organized by a
 
 | Area | Highlights |
 |---|---|
-| [Architecture](docs/README.md#architecture) | System overview, pipeline format, effect graph model, D2D/D3D11 hybrid compute, engine/host split |
+| [Architecture](docs/README.md#architecture) | System overview, threading model (UI thread + render worker), pipeline format, effect graph model, D2D/D3D11 hybrid compute, engine/host split |
 | [Effects](docs/README.md#effects) | Built-in catalog, Effect Designer, parameter / numeric / property-binding mechanics, working space |
 | [UI / UX](docs/README.md#ui--ux) | Graph editor, multi-output windows, animation, conditional parameter visibility |
 | [Hosts](docs/README.md#hosts) | ShaderLabHeadless console host, MCP server for AI agent integration |

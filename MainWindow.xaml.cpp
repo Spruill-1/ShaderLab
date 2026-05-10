@@ -1050,41 +1050,51 @@ namespace winrt::ShaderLab::implementation
             co_return;
 
         auto items = co_await args.DataView().GetStorageItemsAsync();
-        auto* dc = m_renderEngine.D2DDeviceContext();
 
+        // P13 race-fix: AddNode + FindNode + PrepareSourceNode must run on
+        // the render thread so we don't push_back into m_graph.Nodes() while
+        // the worker is mid-iteration. PrepareSourceNode also wants the
+        // render-side D2D context (it creates D2D bitmaps that the
+        // evaluator will consume next tick).
+        std::vector<std::wstring> paths;
         for (const auto& item : items)
         {
-            auto file = item.try_as<winrt::Windows::Storage::StorageFile>();
-            if (!file) continue;
-
-            std::wstring path(file.Path());
-            bool isVideo = ::ShaderLab::Effects::SourceNodeFactory::IsVideoFile(path);
-
-            ::ShaderLab::Graph::EffectNode node;
-            if (isVideo)
-            {
-                node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(path);
-            }
-            else
-            {
-                node = ::ShaderLab::Effects::SourceNodeFactory::CreateImageSourceNode(path);
-            }
-
-            auto id = m_graph.AddNode(std::move(node));
-            m_nodeLogs[id].Info(std::format(L"Dropped: {}", std::filesystem::path(path).filename().wstring()));
-
-            // Prepare the source on the current device.
-            auto* addedNode = m_graph.FindNode(id);
-            if (addedNode && dc)
-            {
-                try {
-                    m_sourceFactory.PrepareSourceNode(*addedNode, dc, 0.0,
-                        m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-                } catch (...) {}
-            }
+            if (auto file = item.try_as<winrt::Windows::Storage::StorageFile>())
+                paths.emplace_back(std::wstring(file.Path()));
         }
+        if (paths.empty()) co_return;
 
-        m_graph.MarkAllDirty();
+        try {
+            m_renderDispatcher.DispatchSync([this, &paths] {
+                auto* dc = m_renderEngine.RenderD2DContext();
+                for (const auto& path : paths)
+                {
+                    bool isVideo = ::ShaderLab::Effects::SourceNodeFactory::IsVideoFile(path);
+                    ::ShaderLab::Graph::EffectNode node = isVideo
+                        ? ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(path)
+                        : ::ShaderLab::Effects::SourceNodeFactory::CreateImageSourceNode(path);
+
+                    auto id = m_graph.AddNode(std::move(node));
+                    m_nodeLogs[id].Info(std::format(L"Dropped: {}",
+                        std::filesystem::path(path).filename().wstring()));
+
+                    auto* addedNode = m_graph.FindNode(id);
+                    if (addedNode && dc)
+                    {
+                        try {
+                            m_sourceFactory.PrepareSourceNode(*addedNode, dc, 0.0,
+                                m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                        } catch (...) {}
+                    }
+                }
+                m_graph.MarkAllDirty();
+                return 0;
+            });
+        }
+        catch (...) {}
+
+        // AutoLayout + PopulatePreviewNodeSelector touch XAML and
+        // controller state -- UI thread.
         m_nodeGraphController.AutoLayout();
         PopulatePreviewNodeSelector();
         m_forceRender = true;
