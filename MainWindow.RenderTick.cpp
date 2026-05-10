@@ -1057,11 +1057,9 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::BlitOffscreenToSwapChain()
     {
-        // UI thread only. Reads the last published offscreen buffer and
-        // copies it into the SwapChainPanel-bound swap chain via the UI's
-        // own D2D context, then Presents. Idempotent when no new frame is
-        // available (re-presents the previous frame, which DXGI handles
-        // efficiently).
+        // UI thread only. Blits the latest published offscreen buffer to the
+        // SwapChainPanel-bound swap chain via a UI-side D2D context that shares
+        // the engine's multi-threaded D2D device.
         if (m_isShuttingDown) return;
         if (!m_renderEngine.IsInitialized()) return;
         if (!EnsureOffscreenUiWrappers()) return;
@@ -1074,27 +1072,25 @@ namespace winrt::ShaderLab::implementation
         auto* swap = m_renderEngine.SwapChain();
         if (!swap) return;
 
-        // Wrap the swap chain back buffer as a D2D bitmap on the UI context.
-        // We rewrap every frame for now -- cheap and avoids stale-buffer
-        // issues across resizes. (Could be cached + invalidated on resize.)
         winrt::com_ptr<IDXGISurface> backBuffer;
-        if (FAILED(swap->GetBuffer(0, IID_PPV_ARGS(backBuffer.put()))))
-            return;
+        HRESULT hr = swap->GetBuffer(0, IID_PPV_ARGS(backBuffer.put()));
+        if (FAILED(hr)) return;
+
         const auto& fmt = m_renderEngine.ActiveFormat();
         D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
             D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
             D2D1::PixelFormat(fmt.dxgiFormat, D2D1_ALPHA_MODE_PREMULTIPLIED),
             96.0f, 96.0f);
         winrt::com_ptr<ID2D1Bitmap1> backBufferBitmap;
-        if (FAILED(m_uiD2dContext->CreateBitmapFromDxgiSurface(
-                backBuffer.get(), bp, backBufferBitmap.put())))
-            return;
+        hr = m_uiD2dContext->CreateBitmapFromDxgiSurface(
+                backBuffer.get(), bp, backBufferBitmap.put());
+        if (FAILED(hr)) return;
 
         m_uiD2dContext->SetTarget(backBufferBitmap.get());
         m_uiD2dContext->BeginDraw();
         m_uiD2dContext->Clear(D2D1::ColorF(D2D1::ColorF::Black));
         m_uiD2dContext->DrawImage(sourceBitmap);
-        HRESULT hr = m_uiD2dContext->EndDraw();
+        hr = m_uiD2dContext->EndDraw();
         m_uiD2dContext->SetTarget(nullptr);
         if (FAILED(hr)) return;
 

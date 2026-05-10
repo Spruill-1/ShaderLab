@@ -2116,44 +2116,25 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::EnsureUiD2dContext()
     {
         if (m_uiD2dContext) return;
-        auto* d3dDevice = m_renderEngine.D3DDevice();
-        if (!d3dDevice) return;
+        if (!m_renderEngine.D2DDevice()) return;
 
-        // Separate D2D factory/device/context owned by the UI thread. Single-
-        // threaded factory is fine because the UI thread is the only consumer
-        // of these objects (editor canvas + pixel-trace swatch panel).
-        D2D1_FACTORY_OPTIONS factoryOpts{};
-        if (FAILED(D2D1CreateFactory(
-                D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                __uuidof(ID2D1Factory7),
-                &factoryOpts,
-                m_uiD2dFactory.put_void())))
-        {
-            m_uiD2dFactory = nullptr;
-            return;
-        }
-
-        winrt::com_ptr<IDXGIDevice> dxgiDevice;
-        if (FAILED(d3dDevice->QueryInterface(IID_PPV_ARGS(dxgiDevice.put()))))
-        {
-            m_uiD2dFactory = nullptr;
-            return;
-        }
-
-        if (FAILED(m_uiD2dFactory->CreateDevice(dxgiDevice.get(), m_uiD2dDevice.put())))
-        {
-            m_uiD2dDevice = nullptr;
-            m_uiD2dFactory = nullptr;
-            return;
-        }
-
+        // P7: create the UI-side D2D context from the SAME multi-threaded D2D
+        // device the render engine uses. Two contexts on the same device share
+        // resources without explicit sync, so the offscreen texture written
+        // by the render-thread context is immediately visible to the UI-thread
+        // context's DrawImage. Two SEPARATE D2D devices (the original P4
+        // approach) would need keyed-mutex / shared-handle sync to avoid
+        // sampling stale GPU writes -- which manifested as a black preview
+        // pane after the worker spawn (every published frame's pixels were
+        // still in flight on the render device).
+        m_uiD2dFactory = nullptr; // we won't own a factory anymore
+        m_uiD2dDevice.copy_from(m_renderEngine.D2DDevice());
         if (FAILED(m_uiD2dDevice->CreateDeviceContext(
                 D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
                 m_uiD2dContext.put())))
         {
             m_uiD2dContext = nullptr;
             m_uiD2dDevice = nullptr;
-            m_uiD2dFactory = nullptr;
             return;
         }
     }
