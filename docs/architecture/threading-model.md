@@ -5,21 +5,260 @@ layout, and composition, and a **render worker** (`std::jthread` running MTA) fo
 all D3D11/D2D graph evaluation. They communicate through a closure-based
 dispatcher and a double-buffered offscreen blit.
 
+## High-level component map
+
+Who owns what, and which thread accesses each piece. Solid arrows = ownership
+(allocation + lifetime), dotted arrows = access from the other side.
+
+```mermaid
+flowchart LR
+    subgraph UI["UI thread (XAML STA)"]
+        XAML[XAML tree<br/>Properties panel<br/>node-graph canvas<br/>FPS counter]
+        UICtx["m_uiD2dContext<br/>(ID2D1DeviceContext5)"]
+        SwapMain["m_swapChain<br/>bound to SwapChainPanel"]
+        OutWindows["OutputWindow[N]<br/>each with own SwapChainPanel<br/>+ swap chain"]
+        DispatchTimer["DispatcherQueueTimer<br/>(monitor refresh rate)"]
+    end
+
+    subgraph Shared["Shared (multi-threaded D2D + D3D11 MultithreadProtected)"]
+        D3DDev["ID3D11Device5"]
+        D2DDev["ID2D1Device<br/>(multi-threaded)"]
+        Offscreen["m_offscreenTextures[2]<br/>+ m_offscreenRenderTargets[2]"]
+        Sinks["OutputSinkRenderState[N]<br/>textures[2] + renderTargets[2]<br/>+ uiSources[2]"]
+        Dispatcher["RenderThreadDispatcher<br/>closure queue"]
+    end
+
+    subgraph Worker["Render worker (std::jthread, MTA)"]
+        WLoop[RenderWorkerLoop]
+        RenderCtx["m_renderD2dContext<br/>(ID2D1DeviceContext5)"]
+        Graph["m_graph<br/>EffectGraph"]
+        Eval["GraphEvaluator<br/>+ ProcessDeferredCompute"]
+    end
+
+    subgraph MCP["MCP server (Winsock thread pool)"]
+        Server["McpHttpServer<br/>port 47808"]
+        Routes["EngineMcpRoutes<br/>+ MainWindow.McpRoutes"]
+    end
+
+    DispatchTimer --> XAML
+    XAML --> UICtx
+    UICtx -.blit.-> SwapMain
+    UICtx -.blit.-> OutWindows
+    XAML --MCP request--> Routes
+    Routes --> Server
+
+    WLoop --> RenderCtx
+    WLoop --> Eval
+    Eval --> Graph
+    RenderCtx -.BeginDraw/EndDraw.-> Offscreen
+    Eval --> Sinks
+
+    UICtx -.wrap.-> Offscreen
+    OutWindows -.wrap uiSources.-> Sinks
+
+    Routes -- DispatchSync --> Dispatcher
+    XAML -- DispatchSync --> Dispatcher
+    Dispatcher -- drained by --> WLoop
+
+    UICtx -.shares device.-> D2DDev
+    RenderCtx -.shares device.-> D2DDev
+    D2DDev -.- D3DDev
+    Offscreen -.- D3DDev
+    Sinks -.- D3DDev
+```
+
+## Per-tick sequence (steady state)
+
+The "happy path" with no input, no MCP, no graph mutations — just the UI tick
+draining new frames the worker produced.
+
 ```mermaid
 sequenceDiagram
     participant UI as UI thread (STA)
     participant Disp as RenderThreadDispatcher
     participant W as Render worker (MTA)
-    participant Swap as SwapChainPanel back buffer
-    Note over UI: User interacts<br/>(timer tick, input, MCP route)
-    UI->>Disp: DispatchSync(closure)
-    Disp->>W: queue
-    W->>W: drain queue → run closure
-    W->>W: graph eval + BeginDraw/EndDraw → offscreen[N]
-    W->>Disp: signal published(idx, version)
-    UI->>UI: OnRenderTick: BlitOffscreenToSwapChain
-    UI->>Swap: DrawImage(offscreen[idx]) + Present1
+    participant Off as Offscreen[2]
+    participant Swap as SwapChainPanel
+
+    loop @ monitor refresh
+        UI->>UI: OnRenderTick fires<br/>(DispatcherQueueTimer)
+        UI->>UI: UpdateFpsText / status bar
+        UI->>UI: m_nodeGraphController.Render()<br/>(editor canvas, UI D2D ctx)
+        UI->>UI: BlitOffscreenToSwapChain():<br/>compare publishedVersion vs m_lastBlitted
+        alt new frame ready
+            UI->>Off: wrap textures[publishedIdx] on UI ctx
+            UI->>Swap: BeginDraw + DrawImage + EndDraw + Present1
+        else no new frame
+            Note over UI,Swap: skip Present;<br/>compositor keeps last frame
+        end
+        UI->>UI: PresentOutputWindows()<br/>(same blit pattern per Output)
+    end
+
+    loop @ monitor refresh
+        W->>Disp: Drain() any queued closures
+        W->>W: RenderFrameToOffscreen(dt):<br/>dirty BFS, pick idx = published ^ 1<br/>BeginDraw → Evaluate → ProcessDeferredCompute<br/>→ DrawImage → EndDraw
+        W->>Off: publishedIdx.store(idx)
+        W->>Off: publishedVersion.fetch_add(1)
+        W->>W: RenderOutputSinks()<br/>(per-sink double-buffer + bufferGen)
+    end
 ```
+
+The two loops are independent — the UI tick never blocks on the worker, and
+the worker never blocks on the UI. The handoff is two atomic stores per
+frame.
+
+## MCP mutation (e.g. `/graph/add-node`, `/graph/set-property`)
+
+The MCP server's Winsock thread receives the request, parses the JSON body,
+and asks `GuiEngineCommandSink::Dispatch` to marshal the work. The sink
+posts a closure to the dispatcher and blocks until the worker has run it.
+
+```mermaid
+sequenceDiagram
+    participant Net as MCP client
+    participant Srv as MCP server thread
+    participant Sink as GuiEngineCommandSink
+    participant Disp as RenderThreadDispatcher
+    participant W as Render worker
+    participant UI as UI thread (event hook)
+
+    Net->>Srv: POST /graph/add-node {effect:"..."}
+    Srv->>Sink: Dispatch(closure)
+    Sink->>Disp: DispatchSync<Response>(...)
+    Note over Srv: blocks here<br/>(returns response when worker is done)
+    Disp->>W: queue + Wake()
+    W->>W: drain → run closure on m_graph
+    W->>W: AddNode → returns nodeId
+    W-->>Disp: result(nodeId)
+    Disp-->>Sink: return value
+    Sink->>Sink: OnNodeAdded(nodeId)
+    Sink->>UI: DispatcherQueue().TryEnqueue(<br/>update XAML, AutoLayout, etc.)
+    Sink-->>Srv: Response{200, JSON body}
+    Srv-->>Net: HTTP 200 + body
+    UI->>UI: (later) rebuild Properties panel,<br/>repaint node-graph canvas
+```
+
+The closure runs on the worker thread while no eval iteration is in flight
+(the dispatcher drains the queue at the top of each loop). Re-entrant calls
+from inside a worker closure are detected and run inline so a hook that
+itself calls `DispatchSync` doesn't deadlock.
+
+## MCP readback (`/render/pixel-region`, `/render/capture-node`, `/render/pixel-trace`)
+
+Readback routes follow the same dispatch path but the closure body does the
+heavy lifting (force a render, then `Map()` the staging texture or walk the
+graph reading pixels).
+
+```mermaid
+sequenceDiagram
+    participant Net as MCP client
+    participant Sink as GuiEngineCommandSink
+    participant W as Render worker
+    participant DC as m_renderD2dContext
+    participant Graph as m_graph
+
+    Net->>Sink: POST /render/pixel-region {nodeId,x,y,w,h}
+    Sink->>W: DispatchSync(closure)
+    W->>Graph: ResolveDisplayImage(nodeId)
+    W->>W: force RenderFrameToOffscreen()<br/>so dirty nodes evaluate
+    W->>DC: PixelReadback::ReadRegion()<br/>(BeginDraw → DrawImage → EndDraw → Map)
+    DC-->>W: vector<float> RGBA pixels
+    W-->>Sink: Response{200, JSON pixel data}
+    Sink-->>Net: HTTP 200 + body
+```
+
+The `Map()` call inside `PixelReadback` is synchronous — it blocks the worker
+thread until the GPU finishes the copy. That's fine because the worker has
+nothing else to do; the UI thread keeps ticking independently.
+
+`/render/pixel-trace` follows the same shape but the closure body walks the
+graph (`PixelTraceController::BuildTrace`) reading 1×1 pixels from each
+node's cachedOutput in turn.
+
+## Output windows
+
+Each Output node owns a `shared_ptr<OutputSinkRenderState>`. The UI side
+(`OutputWindow`) writes view-state (panel size, pan/zoom, autoFit, closed)
+into the sink under a mutex. The render side reads view-state and writes
+into the sink's offscreen textures. A buffer-generation handshake lets the
+UI rebuild source-bitmap wrappers on its own context when the worker
+recreates the offscreen.
+
+```mermaid
+sequenceDiagram
+    participant UIPaint as UI: PresentOutputWindows
+    participant Sink as OutputSinkRenderState
+    participant W as Render worker
+    participant Panel as SwapChainPanel
+
+    par UI tick
+        UIPaint->>Sink: SyncSinkFromUi()<br/>(requestedW/H, scale, pan/zoom)
+        UIPaint->>Sink: BlitAndPresent(uiDc):<br/>load publishedIdx,<br/>rebuild uiSources if bufferGen changed
+        UIPaint->>Panel: DrawImage(uiSources[idx])<br/>+ Scale*Translate fit<br/>+ Present1
+    and Worker tick
+        W->>Sink: snapshot m_outputSinks
+        loop per sink
+            W->>Sink: read view-state under mutex
+            W->>W: alloc textures at image native size<br/>if dimensions changed → bump bufferGen
+            W->>W: BeginDraw on renderTargets[writeIdx]<br/>DrawImage(cachedOutput) → EndDraw
+            W->>Sink: publishedIdx.store(writeIdx)<br/>publishedVersion.fetch_add(1)
+        end
+    end
+```
+
+The render side renders at the **source image's native size** (stateless about
+panel display size or DPI). The UI side handles fit-to-panel on blit. This
+keeps the worker free of XAML-context queries and lets each window's
+`compositionScale` change without coordinating with the worker.
+
+## User input on UI thread that mutates the graph
+
+Drag-and-drop, Properties-panel slider edits, toolbar add-node, paste, etc.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant UI as UI handler
+    participant Disp as RenderThreadDispatcher
+    participant W as Render worker
+    participant Graph as m_graph
+
+    U->>UI: drop file on canvas
+    UI->>UI: collect file paths (UI thread)
+    UI->>Disp: DispatchSync(closure)
+    Note over UI: UI thread blocks here<br/>(short — single eval iteration)
+    Disp->>W: queue + Wake()
+    W->>Graph: AddNode + FindNode<br/>+ PrepareSourceNode<br/>(render-side D2D ctx)
+    W->>Graph: MarkAllDirty
+    W-->>Disp: complete
+    Disp-->>UI: return
+    UI->>UI: AutoLayout + PopulatePreviewNodeSelector<br/>(XAML, UI thread)
+    UI->>UI: m_forceRender = true
+```
+
+Anything XAML-touching (canvas layout, panel rebuild, selector populate)
+stays on the UI thread after the dispatcher returns. Anything touching
+`m_graph` or D3D11/D2D goes inside the closure.
+
+## Worker lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created: MainWindow ctor<br/>spawns jthread
+    Created --> Running: init_apartment(MTA)<br/>RegisterConsumer
+    Running --> Running: Drain → eval → publish<br/>(per tick)
+    Running --> Paused: SwitchAdapter starts
+    Paused --> Stopped: SwitchAdapter sets<br/>m_renderShouldStop<br/>+ joins worker
+    Stopped --> Running: SwitchAdapter recreates<br/>engine + respawns jthread
+    Running --> Stopping: MainWindow dtor sets<br/>m_isShuttingDown<br/>+ m_renderShouldStop
+    Stopping --> [*]: dispatcher.Shutdown()<br/>worker.join()<br/>release D2D/D3D
+```
+
+`Shutdown()` on the dispatcher cancels any pending `DispatchSync` waiters
+with `std::runtime_error` so the MCP server thread / UI handlers don't hang.
+The worker's outer loop checks `m_renderShouldStop` after each drain so a
+mutation queued during shutdown still runs but the next eval pass is
+skipped.
 
 ## Why two threads
 
