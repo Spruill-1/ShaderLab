@@ -5,11 +5,152 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-05-10
+
+The "render-engine worker thread" release. All D3D11/D2D graph evaluation moves
+off the UI dispatcher onto a dedicated worker; UI thread now just blits and
+Presents. Dropdown highlights, hover, and click latency stay sub-50 ms even
+under heavy 4K HDR ICtCp tone-map graphs running at 10 fps. Plus a handful of
+analysis-effect migrations to the D3D11 compute bridge path, a new bulk-edit
+MCP route, and a doc tree rewrite.
+
+### Added
+
+- **`/graph/apply` MCP route** — bulk graph construction: post a JSON body with
+  `nodes[]` (each `{ref, effect, ...}`) and `edges[]` (each `{from, to, ...}`)
+  and the server materializes the whole thing in one render-thread closure.
+  Accepts `effect="Output"` to round-trip Output nodes through the protocol.
+- **`OnNodeAdded` auto-spawns Output windows** — when an Output node lands in
+  the graph from any source (toolbar, MCP, file load), the GUI host opens the
+  associated `OutputWindow` automatically. Symmetric with `OnNodeRemoved`
+  closing it.
+- **`Scale` ShaderLab effect** — D3D11 compute resampler with selectable filter
+  (point / bilinear / box). Used to throttle preview-pane resolution on heavy
+  chains without losing analysis-branch fidelity (the analysis branch stays
+  at source resolution).
+- **`Image Info` ShaderLab effect** — data-only D3D11 compute node exposing
+  image metadata (width / height / format-derived nit assumptions) as analysis
+  fields for downstream binding.
+- **Concurrency tests** — `TestRenderThreadDispatcher` gains many-concurrent-
+  producers stress test (8 × 250 closures verifying single-consumer ordering)
+  and shutdown-with-pending-DispatchSync test. Total test count: 183 (from
+  178).
+- **`docs/architecture/threading-model.md`** — new architecture doc with seven
+  mermaid diagrams (component map, per-tick sequence, MCP mutation/readback
+  flow, output windows cross-thread sink, user-input mutation, worker
+  lifecycle).
+- **Decision log entry #68** documenting the worker-thread + offscreen-blit
+  architectural pivot.
+
 ### Changed
 
-- **Render engine moved to a dedicated worker thread.** All D3D11/D2D graph evaluation now runs on a `std::jthread` (MTA); the UI thread (XAML STA) only blits the latest published offscreen to the SwapChainPanel-bound swap chain and Presents. Heavy graph eval (4K HDR video → ICtCp tone-map chain → analysis effects) no longer starves UI input — dropdown highlights, hover, click latency stay sub-50ms even when graph eval runs at 10 fps. Architectural pivot from the original plan: `Present1` on a `SwapChainPanel`-bound chain is STA-bound (throws `RPC_E_WRONG_THREAD` from MTA); replaced with double-buffered offscreen render + UI-thread blit. See [Threading Model](docs/architecture/threading-model.md) and [decision-log #68](docs/history/decision-log.md).
-- **Output windows render on the worker thread.** Each Output node owns a cross-thread `OutputSinkRenderState`; render worker writes image-native-size offscreens, UI thread does the fit-to-panel transform on blit. MCP `/graph/apply effect=Output` round-trips Output nodes through the protocol; `OnNodeAdded` auto-spawns a window. Pan/zoom + auto-fit still on UI thread (driven by pointer events, applied at blit).
-- **Pixel trace + capture run on the render thread.** `PopulatePixelTraceTree` (UI tick) and `/render/pixel-trace` (MCP) now `m_renderDispatcher.DispatchSync` the pixel-readback walk against `m_graph`. Previously these read `m_graph` from UI thread, racing with worker mutations.
+- **Render engine moved to a dedicated worker thread.** All D3D11/D2D graph
+  evaluation now runs on a `std::jthread` (MTA); the UI thread (XAML STA) only
+  blits the latest published offscreen to the SwapChainPanel-bound swap chain
+  and Presents. **Architectural pivot from the original plan**: `Present1` on
+  a `SwapChainPanel`-bound chain throws `RPC_E_WRONG_THREAD` from a render-
+  thread MTA (XAML composition integration is STA-bound), so the worker
+  writes to one of two double-buffered offscreen `ID3D11Texture2D`s and the UI
+  thread blits the latest published buffer. UI Present cost is now a sub-ms
+  FP16 copy-blit + Present1, never blocked by eval. See
+  [Threading Model](docs/architecture/threading-model.md) and
+  [decision-log #68](docs/history/decision-log.md).
+- **MCP routing**: `GuiEngineCommandSink::Dispatch` marshals to the render
+  thread via `RenderThreadDispatcher::DispatchSync` instead of the UI thread.
+  `m_graph` is now single-writer / single-reader on the worker — the
+  dispatcher drains queued closures BEFORE each per-tick body so a mutation
+  runs while the worker is implicitly paused. Pixel trace, pixel region,
+  capture-node, image stats, pixel-region all use the same path. Re-entrant
+  `DispatchSync` from inside a worker closure runs inline (no deadlock).
+- **Output windows render on the worker thread.** Each Output node owns a
+  shared `OutputSinkRenderState`; render worker produces image-native-size
+  offscreens with a buffer-generation handshake, UI thread does the
+  fit-to-panel transform (`Scale(zoom) * Translation(pan)` with
+  `SetDpi(96 × compositionScale)`) on blit. Pan/zoom + auto-fit + save still
+  work; save now reads the wrapped offscreen instead of a stale `m_lastImage`.
+- **Drag-and-drop file handler** wraps `AddNode + FindNode + PrepareSourceNode`
+  in `m_renderDispatcher.DispatchSync` so the worker isn't mid-iteration on
+  `m_graph.Nodes()` when the vector relocates. XAML follow-up (AutoLayout,
+  selector populate) stays on UI thread after the dispatcher returns.
+- **`NodeGraphController` writes** routed through the dispatcher so canvas
+  drags / connection edits / property changes don't race the worker.
+- **Properties panel** reads runtime fields (`runtimeError`, `analysisOutput`)
+  from the published snapshot instead of touching `m_graph` directly.
+- **Split D2D context stack**: UI side gets `m_uiD2dContext` (editor canvas,
+  blit, trace-swatch draws); worker side gets `m_renderD2dContext` (graph eval
+  + ProcessDeferredCompute). Both share the same multi-threaded `ID2D1Device`
+  and the same `ID3D11Device5` (with `ID3D10Multithread::SetMultithreadProtected(TRUE)`).
+- **`GraphUiSnapshot`** introduced as the read path for UI controllers — an
+  immutable `shared_ptr` published by the worker each frame.
+- **Effect migrations to D3D11 compute via `CustomComputeBridgeEffect`**:
+  Luminance Heatmap, Luminance Highlight, ICtCp Highlight Desaturation,
+  ICtCp Inverse Tone Map, ICtCp Tone Map, Delta E Comparator (multi-input
+  bridge support added), Gamut Coverage. Now use the GPU-binding fast path
+  when bound parameters originate from compute analysis upstream.
+- **`Split Comparison`** accepts mismatched input sizes via normalized-UV
+  sampling; host injects `OutputW/H` from the union of input bounds; correctly
+  handles D2D's atlas-padded input bitmaps.
+- **D2D debug layer set to `D2D1_DEBUG_LEVEL_NONE` for all builds.** Removed
+  the prior `#ifdef _DEBUG` + "TEMP" framing — running with the debug layer
+  off in our supported configurations is now a deliberate choice.
+- **Adapter switch** coordinated: UI thread stops the worker, releases engine
+  resources, recreates engine on new GPU, respawns worker. MCP returns 503
+  while the dispatcher is shut down. Worker now actually restarts after a
+  `/gpu/switch` (previously the app appeared frozen — no clock ticks, no
+  video frames).
+- **Two-phase shutdown**: `m_isShuttingDown` guard, stop MCP server, stop UI
+  render timer, `m_renderDispatcher.Shutdown()` (cancels pending closures
+  with `std::runtime_error`), join worker, then release engine + output
+  windows + offscreen wrappers.
+- **`builtin-catalog.md` rewritten** to reflect the actual 33 effects in
+  `Effects/ShaderLabEffects.cpp` with accurate per-effect type labels
+  (PS / CS-Img / CS-Data / Host). Vectorscope and Waveform Monitor removed
+  (no longer ship); Luminance Highlight, ICtCp Saturation, ICtCp Highlight
+  Desaturation, Image Info, Scale, Random, Working Space added.
+- **`engine-host-split.md`** updated for post-P7 routing (sink dispatches to
+  render thread, not UI). **`topological-evaluation.md`** notes the evaluator
+  runs on the worker. **`multi-output-windows.md`** rewritten for the cross-
+  thread sink architecture. **`hosts/headless.md`** clarified the GUI vs
+  headless sink Dispatch difference. **`development/project-structure.md`**
+  fixed duplicates + added `RenderThreadDispatcher`, `OutputSinkRenderState`,
+  `CustomComputeBridgeEffect`, `BytecodeCache`, `IEngineComputeOutput`.
+- **`README.md`** and **`.github/copilot-instructions.md`** synced to the
+  current threading model, effect count (33), and version (1.7.0).
+
+### Fixed
+
+- **AV in `ProcessDeferredCompute` on complex graph after GPU switch.** The
+  first pass of `RenderFrameToOffscreen`'s double-Evaluate could rebuild an
+  upstream effect, releasing the output image, while `m_deferredCompute`
+  entries held non-owning raw `ID2D1Image*` pointers to it. Two fixes:
+  `m_deferredCompute.inputImages` is now `winrt::com_ptr<ID2D1Image>`
+  (owning); `Evaluate` clears the list at top-of-call so pass-2 doesn't
+  append onto pass-1's entries.
+- **`ProcessDeferredCompute` guarded against unready upstream sources.**
+  Returns gracefully when a video source hasn't produced its first frame
+  yet, instead of dispatching against a null input bitmap.
+- **40% `EndDraw` failure rate after GPU switch.** `RenderEngine::Shutdown`
+  now releases the offscreen pair + render-thread D2D context (was leaking
+  references to the old device; `EnsureOffscreenTargets` saw the bitmaps
+  still populated at the old size and skipped recreation).
+- **UI input lag during heavy graph eval.** `BlitOffscreenToSwapChain` now
+  skips when no new published frame since last UI tick (previously the UI
+  thread vsync-waited in `Present1(1, 0)` on every 16 ms tick even when the
+  worker was producing frames at 10 Hz). Worker tick is the sole consumer of
+  the dispatcher queue; UI's redundant `Drain()` removed.
+- **Canvas redraw on snapshot frame-generation change** — editor canvas now
+  repaints when the worker publishes new analysis output state.
+- **Race-safe `AutoLayout` / `RebuildLayout`** — these iterate
+  `m_graph.Nodes()` + each node's properties map. They now run through the
+  render dispatcher so the worker isn't concurrently mutating those maps.
+- **Per-phase frame timing** on the worker path; distinct `endDrawFlushUs`
+  and `uiTickUs` metrics (no more conflated `presentUs`); `endDrawFailed`
+  diagnostic counter.
+- **Output window FPS counter** now unified with main FPS panel (same numbers,
+  same format); click-persistent FPS flyout.
+- **`CustomPixelShaderEffect`** honors queried output sub-rects.
+- **`GraphEvaluator` dispatch heuristic** fixed; `0` for `OutputW/H` now means
+  passthrough.
 
 ## [1.6.3] - 2026-05-08
 
