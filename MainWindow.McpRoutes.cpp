@@ -1203,6 +1203,7 @@ namespace winrt::ShaderLab::implementation
 {"name":"graph_save_json","description":"Serialize graph to JSON","inputSchema":{"type":"object","properties":{}}},
 {"name":"graph_load_json","description":"Load graph from JSON string","inputSchema":{"type":"object","properties":{"json":{"type":"string"}},"required":["json"]}},
 {"name":"graph_clear","description":"Clear the graph","inputSchema":{"type":"object","properties":{}}},
+{"name":"graph_apply","description":"Apply a graph patch in one call: add nodes (using client refs), connect edges, set property bindings. Body: { clear?:bool, nodes:[{ref,effect,filePath?,properties?}], edges:[{from,to,fromPin?,toPin?}], bindings:[{node,property,from:'ref.field'|{node,field},component?}] }. 'from' and 'to' accept either a ref string or numeric nodeId. Returns refToId map + nodeIds in add order.","inputSchema":{"type":"object","properties":{"clear":{"type":"boolean"},"nodes":{"type":"array"},"edges":{"type":"array"},"bindings":{"type":"array"}}}},
 {"name":"effect_compile","description":"Compile HLSL for a custom effect node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"hlsl":{"type":"string"}},"required":["nodeId","hlsl"]}},
 {"name":"set_preview_node","description":"Set which node is previewed","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
 {"name":"render_capture","description":"Capture preview as PNG. Note: HDR values clipped to SDR.","inputSchema":{"type":"object","properties":{}}},
@@ -1272,6 +1273,8 @@ namespace winrt::ShaderLab::implementation
                     }
                     else if (toolName == "graph_clear")
                         restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/clear", "");
+                    else if (toolName == "graph_apply")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/apply", argsStr);
                     else if (toolName == "effect_compile")
                         restResp = m_mcpServer->RouteRequest(L"POST", L"/effect/compile", argsStr);
                     else if (toolName == "set_preview_node")
