@@ -932,14 +932,12 @@ namespace ShaderLab::Mcp
                         try { root = WDJ::JsonObject::Parse(winrt::to_hstring(body)); }
                         catch (...) { return Json(400, R"({"error":"Invalid JSON"})"); }
 
-                        if (root.HasKey(L"clear") &&
-                            root.GetNamedValue(L"clear").ValueType() == WDJ::JsonValueType::Boolean &&
-                            root.GetNamedBoolean(L"clear"))
-                        {
-                            ctx.evaluator->ReleaseCache();
-                            ctx.graph->Clear();
-                            sink.OnGraphCleared();
-                        }
+                        // Note: an in-patch `clear` flag was removed because
+                        // re-entering ctx.graph->Clear() from inside an
+                        // already-dispatched closure proved fragile (D2D
+                        // teardown races subsequent AddNode calls). Callers
+                        // wanting a fresh graph should call /graph/clear
+                        // first, then /graph/apply.
 
                         std::map<std::wstring, uint32_t> refToId;
                         std::vector<uint32_t> orderedIds;
