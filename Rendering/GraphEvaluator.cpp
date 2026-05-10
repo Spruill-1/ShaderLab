@@ -838,6 +838,25 @@ namespace ShaderLab::Rendering
     {
         if (m_deferredCompute.empty() || !dc) return false;
 
+        // P7 / first-frame safety: if any Source node still has a null
+        // cachedOutput, the chain isn't ready (e.g., video provider was
+        // just created but hasn't decoded its first frame; image source
+        // hasn't loaded; capture provider awaiting first frame). Walking
+        // a downstream effect's GetImageLocalBounds chain through a null
+        // upstream input AVs deep inside d2d1.dll. Skip this frame --
+        // the next worker iteration will retry once the source is
+        // populated. We DO clear m_deferredCompute so the entries (which
+        // hold raw ID2D1Image* pointers to potentially stale objects)
+        // don't pile up across frames.
+        for (const auto& n : graph.Nodes())
+        {
+            if (n.type == NodeType::Source && !n.cachedOutput)
+            {
+                m_deferredCompute.clear();
+                return false;
+            }
+        }
+
         bool imageComputeProduced = false;
 
         // Phase 8c: build the per-frame "needs CPU readback" set. When
@@ -923,7 +942,28 @@ namespace ShaderLab::Rendering
             dc->SetDpi(96.0f, 96.0f);
 
             D2D1_RECT_F bounds{};
-            dc->GetImageLocalBounds(inputImage, &bounds);
+            // GetImageLocalBounds walks the input image's effect chain back
+            // to its source bitmap. If any upstream effect has a null/stale
+            // input -- which can happen on the FIRST frame after a graph
+            // load or GPU switch when a video source provider hasn't
+            // decoded its first frame yet -- d2d1.dll AVs deep inside.
+            // Wrap defensively and treat any failure as "not yet ready"
+            // so the next frame can retry once upstream has its bitmap.
+            HRESULT bhr = E_FAIL;
+            try
+            {
+                bhr = dc->GetImageLocalBounds(inputImage, &bounds);
+            }
+            catch (...)
+            {
+                dc->SetDpi(oldDpiX, oldDpiY);
+                return nullptr;
+            }
+            if (FAILED(bhr))
+            {
+                dc->SetDpi(oldDpiX, oldDpiY);
+                return nullptr;
+            }
             UINT32 w = static_cast<UINT32>((std::min)(bounds.right - bounds.left, 8192.0f));
             UINT32 h = static_cast<UINT32>((std::min)(bounds.bottom - bounds.top, 8192.0f));
             if (w == 0 || h == 0) { dc->SetDpi(oldDpiX, oldDpiY); return nullptr; }
@@ -1623,6 +1663,14 @@ namespace ShaderLab::Rendering
         m_sharedPreRenderCache.clear();
         m_lastHintReadbackTime.clear();
         m_dummySourceBitmap = nullptr;
+
+        // P7: also drop any deferred-compute entries that the previous
+        // Evaluate left pending for ProcessDeferredCompute. They hold raw
+        // ID2D1Image* pointers to the cachedOutputs we just released; if
+        // we don't clear here, the next ProcessDeferredCompute call (from
+        // the post-SwitchAdapter worker, or any path that resets the
+        // device) deref's freed bitmaps and AVs in d2d1.dll.
+        m_deferredCompute.clear();
     }
 
     void GraphEvaluator::ReleaseCache(EffectGraph& graph)
