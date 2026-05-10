@@ -203,9 +203,34 @@ namespace winrt::ShaderLab::implementation
         });
     }
 
-    void MainWindow::GuiEngineCommandSink::OnNodeChanged(uint32_t /*nodeId*/)
+    void MainWindow::GuiEngineCommandSink::OnNodeChanged(uint32_t nodeId)
     {
         window->m_forceRender = true;
+
+        // If the changed node has any visibleWhen-conditional parameters,
+        // a property change might flip a pin's visibility. Rebuild the
+        // node-graph layout so new input pins materialize on the canvas.
+        //
+        // OnNodeChanged is already running inside a render-dispatcher
+        // closure (the /graph/set-property route DispatchSync's into the
+        // worker before invoking this hook), so it is safe to touch
+        // m_graph and m_nodeGraphController here directly -- the worker
+        // is paused for the duration. We just need to tell the controller
+        // to repaint via m_needsRedraw (set by RebuildLayout itself).
+        if (auto* n = window->m_graph.FindNode(nodeId))
+        {
+            if (n->customEffect.has_value())
+            {
+                for (const auto& p : n->customEffect->parameters)
+                {
+                    if (!p.visibleWhen.empty())
+                    {
+                        window->m_nodeGraphController.RebuildLayout();
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     void MainWindow::GuiEngineCommandSink::OnGraphCleared()

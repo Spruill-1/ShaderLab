@@ -3514,13 +3514,22 @@ namespace winrt::ShaderLab::implementation
                     if (hasVisibleWhen || isParameterNode || (n && n->effectClsid.has_value() &&
                         IsEqualGUID(n->effectClsid.value(), CLSID_D2D1Histogram)))
                     {
+                        // Normal priority (was Low) so the panel + node-graph
+                        // rebuild doesn't get starved behind the 60 Hz UI tick
+                        // when the user flips a visibleWhen trigger. With Low
+                        // priority the rebuild could sit in the queue
+                        // indefinitely on a busy render path -- the user sees
+                        // the Properties panel reflect their change but the
+                        // canvas pins don't materialize.
                         this->DispatcherQueue().TryEnqueue(
-                            winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low,
+                            winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Normal,
                             [this]() {
                                 if (!m_isShuttingDown)
                                 {
                                     UpdatePropertiesPanel();
                                     m_nodeGraphController.RebuildLayout();
+                                    m_nodeGraphController.SetNeedsRedraw();
+                                    m_forceRender = true;
                                 }
                             });
                     }

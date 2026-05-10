@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.7.3] - 2026-05-10
+
+### Fixed
+
+- **Clock node controls missing after loading a saved graph.** `EffectNode::isClock` is derived from the ShaderLab effect descriptor at node-creation time and is intentionally not serialized. `MainWindow::ResetAfterGraphLoad` was restoring the flag *after* `m_nodeGraphController.SetGraph(&m_graph)` triggered a layout pass, so `RebuildLayout` saw `isClock=false` for every freshly-deserialized Clock node and computed a regular-parameter-shaped visual without the play/pause button or progress bar. Move the restore loop to run *before* `SetGraph` so the layout sees the correct flag the first time.
+- **Conditionally-visible input pins (e.g. `TargetRedPrimary` on `ICtCp Gamut Map` when `TargetGamut == Custom`) didn't appear on the canvas after a Properties-panel dropdown change.** Two fixes: (1) the Properties-panel `markDirty` handler bumped its post-edit `RebuildLayout` enqueue from `DispatcherQueuePriority::Low` to `Normal` and explicitly calls `SetNeedsRedraw()` + sets `m_forceRender` so the canvas repaint follows the rebuild instead of being starved behind the 60 Hz render tick; (2) the engine `GuiEngineCommandSink::OnNodeChanged` hook now also rebuilds the layout when the changed node has any `visibleWhen`-conditional parameters, so MCP-driven `/graph/set-property` calls get the same node-extension behaviour as the Properties-panel dropdown. The hook is already running inside a render-dispatcher closure so it touches `m_nodeGraphController` directly without re-marshalling.
+
 ## [1.7.2] - 2026-05-10
 
 ### Removed
