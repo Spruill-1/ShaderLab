@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Render engine moved to a dedicated worker thread.** All D3D11/D2D graph evaluation now runs on a `std::jthread` (MTA); the UI thread (XAML STA) only blits the latest published offscreen to the SwapChainPanel-bound swap chain and Presents. Heavy graph eval (4K HDR video → ICtCp tone-map chain → analysis effects) no longer starves UI input — dropdown highlights, hover, click latency stay sub-50ms even when graph eval runs at 10 fps. Architectural pivot from the original plan: `Present1` on a `SwapChainPanel`-bound chain is STA-bound (throws `RPC_E_WRONG_THREAD` from MTA); replaced with double-buffered offscreen render + UI-thread blit. See [Threading Model](docs/architecture/threading-model.md) and [decision-log #68](docs/history/decision-log.md).
+- **Output windows render on the worker thread.** Each Output node owns a cross-thread `OutputSinkRenderState`; render worker writes image-native-size offscreens, UI thread does the fit-to-panel transform on blit. MCP `/graph/apply effect=Output` round-trips Output nodes through the protocol; `OnNodeAdded` auto-spawns a window. Pan/zoom + auto-fit still on UI thread (driven by pointer events, applied at blit).
+- **Pixel trace + capture run on the render thread.** `PopulatePixelTraceTree` (UI tick) and `/render/pixel-trace` (MCP) now `m_renderDispatcher.DispatchSync` the pixel-readback walk against `m_graph`. Previously these read `m_graph` from UI thread, racing with worker mutations.
+
 ## [1.6.3] - 2026-05-08
 
 ### Fixed
