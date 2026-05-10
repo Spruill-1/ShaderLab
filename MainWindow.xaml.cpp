@@ -395,11 +395,22 @@ namespace winrt::ShaderLab::implementation
             m_renderTimer = nullptr;
         }
 
+        // Two-phase shutdown of the render worker:
+        m_renderDispatcher.Shutdown();
+        if (m_renderWorker.joinable())
+        {
+            m_renderWorker.request_stop();
+            m_renderWorker.join();
+        }
+
         m_traceSwapChain = nullptr;
         m_traceSwatchTarget = nullptr;
 
         // Close all output windows.
         m_outputWindows.clear();
+
+        // Release UI-side offscreen wrappers before tearing down render engine.
+        for (auto& b : m_offscreenSourceBitmapUi) b = nullptr;
 
         m_graphEvaluator.ReleaseCache(m_graph);
         m_displayMonitor.Shutdown();
@@ -558,11 +569,15 @@ namespace winrt::ShaderLab::implementation
         UpdateRenderTimerInterval();
         m_renderTimer.Start();
 
-        // Note: the render-worker thread (m_renderWorker) is NOT yet spawned.
-        // Render work runs inline on the UI thread via the synchronous
-        // dispatcher mode. The worker spawn is deferred until the
-        // SwapChain/Present apartment-affinity issue is solved -- see
-        // MainWindow.RenderTick.cpp's RenderWorkerLoop comment.
+        // Spawn the render-worker thread (P7 offscreen-render path). Owns
+        // the engine D2D context and runs the graph + GPU loop independently
+        // of the UI thread, drawing into a double-buffered offscreen target.
+        // UI thread blits the latest published buffer into the SwapChainPanel-
+        // bound swap chain in OnRenderTick.
+        m_renderShouldStop.store(false, std::memory_order_release);
+        m_renderWorker = std::jthread([this](std::stop_token stop){
+            this->RenderWorkerLoop(stop);
+        });
 
         // Initialize the node graph editor panel.
         InitializeGraphPanel();
@@ -826,6 +841,16 @@ namespace winrt::ShaderLab::implementation
         // Stop UI render timer.
         if (m_renderTimer) m_renderTimer.Stop();
 
+        // Stop the render worker thread before tearing down GPU resources.
+        m_renderShouldStop.store(true, std::memory_order_release);
+        m_renderDispatcher.Wake();
+        if (m_renderWorker.joinable())
+        {
+            m_renderWorker.request_stop();
+            m_renderWorker.join();
+        }
+        m_renderDispatcher.ResetConsumer();
+
         // Save graph + view state.
         auto graphJson = m_graph.ToJson();
         uint32_t savedPreviewId = m_previewNodeId;
@@ -850,9 +875,10 @@ namespace winrt::ShaderLab::implementation
         m_graphGridBrush = nullptr;
         m_traceSwatchTarget = nullptr;
         m_traceSwapChain = nullptr;
-        // The UI-side D2D context is bound to the previous D3D device via
-        // its dxgiDevice. Release before tearing down RenderEngine so it
-        // can be rebuilt against the new adapter.
+        for (auto& b : m_offscreenSourceBitmapUi) b = nullptr;
+        m_offscreenWrapperWidth = 0;
+        m_offscreenWrapperHeight = 0;
+        m_offscreenPublishedIdx.store(-1, std::memory_order_release);
         ReleaseUiD2dContext();
         for (auto& w : m_outputWindows) w->Close();
         m_outputWindows.clear();

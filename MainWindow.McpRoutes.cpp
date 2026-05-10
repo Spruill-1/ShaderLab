@@ -104,53 +104,70 @@ namespace winrt::ShaderLab::implementation
         std::function<::ShaderLab::McpHttpServer::Response(
             ::ShaderLab::Mcp::EngineContext&)> closure)
     {
-        // Marshal the engine work to the UI thread for now -- once the render
-        // worker spawn lands (deferred from this turn pending the Present /
-        // SwapChainPanel apartment-affinity issue), this becomes
-        // m_renderDispatcher.DispatchSync. UI thread is currently the only
-        // safe writer to m_graph because the dispatcher runs synchronous.
-        return window->DispatchSync([this, &closure]() -> ::ShaderLab::McpHttpServer::Response {
-            ::ShaderLab::Mcp::EngineContext ctx{};
-            ctx.graph = &window->m_graph;
-            ctx.evaluator = &window->m_graphEvaluator;
-            ctx.displayMonitor = &window->m_displayMonitor;
-            ctx.sourceFactory = &window->m_sourceFactory;
-            ctx.dc = window->m_renderEngine.D2DDeviceContext();
-            ctx.d3dDevice = window->m_renderEngine.D3DDevice();
-            ctx.d3dContext = window->m_renderEngine.D3DContext();
-            ctx.renderFrame = [this]() { window->RenderFrame(); };
-            ctx.getPreviewNodeId = [this]() -> uint32_t { return window->m_previewNodeId; };
-            ctx.getLoadedIccProfile = [this]() -> std::optional<::ShaderLab::Rendering::DisplayProfile> {
-                return window->m_loadedIccProfile;
-            };
-            ctx.setLoadedIccProfile = [this](const ::ShaderLab::Rendering::DisplayProfile& p) {
-                window->m_loadedIccProfile = p;
-            };
-            return closure(ctx);
-        });
+        // Marshal the engine work to the render thread (single writer to
+        // m_graph). Re-entrant calls from inside the consumer thread run
+        // inline (RenderThreadDispatcher detects this).
+        ::ShaderLab::McpHttpServer::Response resp;
+        try
+        {
+            resp = window->m_renderDispatcher.DispatchSync(
+                [this, &closure]() -> ::ShaderLab::McpHttpServer::Response {
+                    ::ShaderLab::Mcp::EngineContext ctx{};
+                    ctx.graph = &window->m_graph;
+                    ctx.evaluator = &window->m_graphEvaluator;
+                    ctx.displayMonitor = &window->m_displayMonitor;
+                    ctx.sourceFactory = &window->m_sourceFactory;
+                    ctx.dc = window->m_renderEngine.D2DDeviceContext();
+                    ctx.d3dDevice = window->m_renderEngine.D3DDevice();
+                    ctx.d3dContext = window->m_renderEngine.D3DContext();
+                    ctx.renderFrame = [this]() { window->RenderFrameToOffscreen(0.0); };
+                    ctx.getPreviewNodeId = [this]() -> uint32_t { return window->m_previewNodeId; };
+                    ctx.getLoadedIccProfile = [this]() -> std::optional<::ShaderLab::Rendering::DisplayProfile> {
+                        return window->m_loadedIccProfile;
+                    };
+                    ctx.setLoadedIccProfile = [this](const ::ShaderLab::Rendering::DisplayProfile& p) {
+                        window->m_loadedIccProfile = p;
+                    };
+                    return closure(ctx);
+                });
+        }
+        catch (const std::exception& e)
+        {
+            ::ShaderLab::McpHttpServer::Response err;
+            err.statusCode = 500;
+            err.body = std::string(R"({"error":")") + e.what() + R"("})";
+            err.contentType = "application/json";
+            return err;
+        }
+        return resp;
     }
 
-    // Event hooks. All of these run on the UI thread (the engine route's
-    // Dispatch closure marshaled there). The implementations call the same
-    // UI methods MainWindow uses on native user interactions, so MCP-driven
-    // mutations take the same UI code path the user does.
+    // Event hooks fire from inside Dispatch closures, which run on the
+    // render thread. Anything that touches XAML or UI-thread-only controllers
+    // must be marshalled back to the UI thread via DispatcherQueue().TryEnqueue.
 
     void MainWindow::GuiEngineCommandSink::OnNodeAdded(uint32_t /*nodeId*/)
     {
         window->m_graph.MarkAllDirty();
-        window->m_nodeGraphController.AutoLayout();
-        window->PopulatePreviewNodeSelector();
         window->m_forceRender = true;
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w]{
+            w->m_nodeGraphController.AutoLayout();
+            w->PopulatePreviewNodeSelector();
+        });
     }
 
     void MainWindow::GuiEngineCommandSink::OnNodeRemoved(uint32_t nodeId)
     {
         window->m_graphEvaluator.InvalidateNode(nodeId);
-        window->CloseOutputWindow(nodeId);
         window->m_graph.MarkAllDirty();
-        window->m_nodeGraphController.AutoLayout();
-        window->PopulatePreviewNodeSelector();
         window->m_forceRender = true;
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w, nodeId]{
+            w->CloseOutputWindow(nodeId);
+            w->m_nodeGraphController.AutoLayout();
+            w->PopulatePreviewNodeSelector();
+        });
     }
 
     void MainWindow::GuiEngineCommandSink::OnNodeChanged(uint32_t /*nodeId*/)
@@ -161,39 +178,52 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::GuiEngineCommandSink::OnGraphCleared()
     {
         window->m_graphEvaluator.ReleaseCache();
-        window->m_outputWindows.clear();
         window->m_previewNodeId = 0;
         window->m_graph.MarkAllDirty();
-        window->m_nodeGraphController.AutoLayout();
-        window->PopulatePreviewNodeSelector();
         window->m_forceRender = true;
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w]{
+            w->m_outputWindows.clear();
+            w->m_nodeGraphController.AutoLayout();
+            w->PopulatePreviewNodeSelector();
+        });
     }
 
     void MainWindow::GuiEngineCommandSink::OnGraphLoaded()
     {
-        window->ResetAfterGraphLoad(/*reopenOutputWindows=*/true);
-        window->m_nodeGraphController.AutoLayout();
         window->m_forceRender = true;
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w]{
+            w->ResetAfterGraphLoad(/*reopenOutputWindows=*/true);
+            w->m_nodeGraphController.AutoLayout();
+        });
     }
 
     void MainWindow::GuiEngineCommandSink::OnGraphStructureChanged()
     {
-        window->m_nodeGraphController.AutoLayout();
         window->m_forceRender = true;
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w]{
+            w->m_nodeGraphController.AutoLayout();
+        });
     }
 
     void MainWindow::GuiEngineCommandSink::OnCustomEffectRecompiled(uint32_t /*nodeId*/)
     {
-        window->m_nodeGraphController.RebuildLayout();
-        window->PopulateAddNodeFlyout();
         window->m_forceRender = true;
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w]{
+            w->m_nodeGraphController.RebuildLayout();
+            w->PopulateAddNodeFlyout();
+        });
     }
 
     void MainWindow::GuiEngineCommandSink::OnDisplayProfileChanged()
     {
         window->m_graph.MarkAllDirty();
         window->m_forceRender = true;
-        window->UpdateStatusBar();
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w]{ w->UpdateStatusBar(); });
     }
 
     void MainWindow::SetupMcpRoutes()
@@ -436,10 +466,13 @@ namespace winrt::ShaderLab::implementation
         m_mcpServer->AddRoute(L"GET", L"/render/capture", [this](const std::wstring&, const std::string&)
             -> ::ShaderLab::McpHttpServer::Response
         {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                // Force a full re-evaluation so the capture reflects current state.
+            return m_renderDispatcher.DispatchSync(
+                [this]() -> ::ShaderLab::McpHttpServer::Response {
+                // Run on render thread (single writer to graph + owns the
+                // engine D2D context). Force a full re-evaluation so the
+                // capture reflects current state.
                 m_graph.MarkAllDirty();
-                RenderFrame();
+                RenderFrameToOffscreen(0.0);
                 auto pngData = CapturePreviewAsPng();
                 if (pngData.empty())
                     return { 404, R"({"error":"No output image"})" };

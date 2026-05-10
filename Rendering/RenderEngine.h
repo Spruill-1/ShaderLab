@@ -101,6 +101,32 @@ namespace ShaderLab::Rendering
         // Caller must release all device-dependent resources before calling.
         void Reinitialize(DevicePreference devicePref, LUID adapterLuid = {});
 
+        // ---- Offscreen render target (Phase 7 render-thread split) -------
+        //
+        // Render thread renders into a pair of double-buffered D2D bitmaps
+        // (each backed by its own D3D11 texture); UI thread blits the
+        // most-recently-published buffer into the SwapChainPanel-bound
+        // swap chain. This decouples graph evaluation from the XAML
+        // SwapChainPanel apartment-affinity rules.
+        //
+        // EnsureOffscreenTargets(w, h) (re)creates two textures + render-
+        // side D2D bitmap wrappers when the desired size differs from the
+        // current size. Caller (UI thread, on resize) is responsible for
+        // also recreating any UI-side D2D bitmap wrappers of the same
+        // textures via the OffscreenTextureForUi(idx) accessor.
+        bool EnsureOffscreenTargets(uint32_t width, uint32_t height);
+        ID3D11Texture2D* OffscreenTexture(uint32_t idx) const
+        {
+            return idx < 2 ? m_offscreenTexture[idx].get() : nullptr;
+        }
+        ID2D1Bitmap1* OffscreenRenderBitmap(uint32_t idx) const
+        {
+            return idx < 2 ? m_offscreenRenderBitmap[idx].get() : nullptr;
+        }
+        uint32_t OffscreenWidth()  const { return m_offscreenWidth; }
+        uint32_t OffscreenHeight() const { return m_offscreenHeight; }
+        void ReleaseOffscreenTargets();
+
     private:
         void CreateDeviceResources(DevicePreference devicePref);
         void CreateSwapChain(winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel const& panel);
@@ -119,6 +145,14 @@ namespace ShaderLab::Rendering
         // Swap chain
         winrt::com_ptr<IDXGISwapChain3>         m_swapChain;
         winrt::com_ptr<ID2D1Bitmap1>            m_renderTarget;
+
+        // Offscreen target pair (Phase 7). Render thread renders into one,
+        // UI thread blits the other into m_swapChain. Index swap is managed
+        // by MainWindow (atomic publish protocol).
+        winrt::com_ptr<ID3D11Texture2D>         m_offscreenTexture[2];
+        winrt::com_ptr<ID2D1Bitmap1>            m_offscreenRenderBitmap[2];
+        uint32_t                                m_offscreenWidth{ 0 };
+        uint32_t                                m_offscreenHeight{ 0 };
 
         // State
         PipelineFormat  m_format{ FormatScRgbFP16 };

@@ -380,6 +380,89 @@ namespace ShaderLab::Rendering
     }
 
     // -----------------------------------------------------------------------
+    // Offscreen target pair (Phase 7 -- render-thread split)
+    // -----------------------------------------------------------------------
+
+    bool RenderEngine::EnsureOffscreenTargets(uint32_t width, uint32_t height)
+    {
+        if (!m_d3dDevice || !m_d2dDeviceContext)
+            return false;
+
+        if (width == 0 || height == 0)
+            return false;
+
+        // Already at the right size?
+        if (m_offscreenWidth == width && m_offscreenHeight == height &&
+            m_offscreenTexture[0] && m_offscreenTexture[1] &&
+            m_offscreenRenderBitmap[0] && m_offscreenRenderBitmap[1])
+        {
+            return true;
+        }
+
+        ReleaseOffscreenTargets();
+
+        // Pipeline format matches the swap chain so there's no color-space
+        // conversion at the blit. scRGB FP16 by default.
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = width;
+        td.Height = height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = m_format.dxgiFormat; // matches swap chain
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            HRESULT hr = m_d3dDevice->CreateTexture2D(&td, nullptr,
+                m_offscreenTexture[i].put());
+            if (FAILED(hr))
+            {
+                ReleaseOffscreenTargets();
+                return false;
+            }
+
+            // Wrap as D2D bitmap on the *render-engine* D2D context. This is
+            // the bitmap the render thread sets as its draw target.
+            winrt::com_ptr<IDXGISurface> surface;
+            hr = m_offscreenTexture[i]->QueryInterface(IID_PPV_ARGS(surface.put()));
+            if (FAILED(hr))
+            {
+                ReleaseOffscreenTargets();
+                return false;
+            }
+
+            D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(m_format.dxgiFormat, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                96.0f, 96.0f);
+            hr = m_d2dDeviceContext->CreateBitmapFromDxgiSurface(
+                surface.get(), bp, m_offscreenRenderBitmap[i].put());
+            if (FAILED(hr))
+            {
+                ReleaseOffscreenTargets();
+                return false;
+            }
+        }
+
+        m_offscreenWidth = width;
+        m_offscreenHeight = height;
+        return true;
+    }
+
+    void RenderEngine::ReleaseOffscreenTargets()
+    {
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            m_offscreenRenderBitmap[i] = nullptr;
+            m_offscreenTexture[i] = nullptr;
+        }
+        m_offscreenWidth = 0;
+        m_offscreenHeight = 0;
+    }
+
+    // -----------------------------------------------------------------------
     // Adapter enumeration
     // -----------------------------------------------------------------------
 

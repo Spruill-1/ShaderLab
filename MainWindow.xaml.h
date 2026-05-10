@@ -218,6 +218,22 @@ namespace winrt::ShaderLab::implementation
         void RenderTickBody(double deltaSec);
         void RenderFrame(double deltaSeconds = 0.0);
 
+        // Render-thread frame body. Walks the graph, runs eval + deferred
+        // compute, draws the preview image into one of the offscreen
+        // targets, and publishes via m_offscreenPublishedIdx. NO swap-chain
+        // Present (UI thread does that in BlitOffscreenToSwapChain).
+        void RenderFrameToOffscreen(double deltaSec);
+
+        // UI-thread blit step. Reads m_offscreenPublishedIdx, copies the
+        // corresponding bitmap into the SwapChainPanel-bound swap chain,
+        // calls Present1. Idempotent when no new frame has been published.
+        void BlitOffscreenToSwapChain();
+
+        // Recreates the UI-side D2D wrapper bitmaps when the render engine's
+        // offscreen size changes. Must run on UI thread (m_uiD2dContext is
+        // UI-owned).
+        bool EnsureOffscreenUiWrappers();
+
         // Render-worker thread loop. Owns the render-engine D2D context. Drives
         // its own cadence (16ms wakeup) and drains m_renderDispatcher commands
         // each iteration. Spawned by InitializeRendering, joined in Shutdown.
@@ -233,13 +249,11 @@ namespace winrt::ShaderLab::implementation
         // rendering. Until the actual worker thread spawns (Phase 7), the
         // dispatcher runs in synchronous mode -- closures execute inline on
         // the calling thread, preserving today's single-thread behavior.
-        ::ShaderLab::Rendering::RenderThreadDispatcher m_renderDispatcher{ /*synchronous=*/true };
+        ::ShaderLab::Rendering::RenderThreadDispatcher m_renderDispatcher{ /*synchronous=*/false };
 
-        // Render-worker thread. Scaffolding for a future P7 spawn; not
-        // currently spawned because Present1 on a SwapChainPanel-bound chain
-        // throws RPC_E_WRONG_THREAD from a render-thread MTA. Until that
-        // apartment-affinity issue is resolved, render work runs on the UI
-        // thread (synchronous dispatcher mode).
+        // Render-worker thread. Spawned in InitializeRendering once the
+        // device is up; joined in Shutdown after m_isShuttingDown is set
+        // and the dispatcher is signalled. Runs RenderWorkerLoop.
         std::jthread m_renderWorker;
 
         // Latest published immutable snapshot of the graph + per-node runtime
@@ -248,6 +262,24 @@ namespace winrt::ShaderLab::implementation
         // the first render tick publishes.
         std::atomic<std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>>
             m_uiGraphSnapshot{ nullptr };
+
+        // Offscreen-render publish protocol (Phase 7). Render thread renders
+        // into m_renderEngine.OffscreenRenderBitmap(writeIdx); when done, it
+        // stores writeIdx into m_offscreenPublishedIdx (release). UI thread
+        // loads m_offscreenPublishedIdx (acquire) and blits the corresponding
+        // bitmap. Index -1 means no frame published yet.
+        //
+        // m_offscreenSourceBitmapUi[idx] are UI-side D2D bitmap wrappers of
+        // the same D3D11 textures as the render-side bitmaps -- created on
+        // m_uiD2dContext, used as DrawImage source. They get rebuilt in lock-
+        // step with EnsureOffscreenTargets when the offscreen size changes.
+        winrt::com_ptr<ID2D1Bitmap1>            m_offscreenSourceBitmapUi[2];
+        std::atomic<int32_t>                    m_offscreenPublishedIdx{ -1 };
+        std::atomic<uint64_t>                   m_offscreenPublishedVersion{ 0 };
+        // Tracks the size we last allocated UI-side wrappers for. When this
+        // doesn't match RenderEngine's offscreen size, UI thread rebuilds.
+        uint32_t                                m_offscreenWrapperWidth{ 0 };
+        uint32_t                                m_offscreenWrapperHeight{ 0 };
 
         // Generation counters. graphGeneration bumps every time the render
         // path observes a graph mutation (HasDirtyNodes etc.); frameGeneration

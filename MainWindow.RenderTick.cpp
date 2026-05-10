@@ -53,17 +53,13 @@ namespace winrt::ShaderLab::implementation
 
         auto tTickStart = std::chrono::high_resolution_clock::now();
 
-        // Drain pending dispatcher closures on UI thread (synchronous mode).
-        // Once the render thread is fully working (deferred from this turn --
-        // RenderFrame's IDXGISwapChain1::Present1 against a SwapChainPanel-
-        // bound chain throws RPC_E_WRONG_THREAD from a render-thread MTA),
-        // this becomes Drain on the worker side instead.
+        // Drain pending dispatcher closures on UI thread (synchronous mode
+        // closures only -- the worker drains its own queue).
         m_renderDispatcher.Drain();
 
-        // Render-tick body: graph + GPU work. Today still on UI thread; will
-        // move to render thread once the SwapChain/Present apartment-affinity
-        // issue is resolved (see RenderTickBody comment).
-        RenderTickBody(deltaSec);
+        // Blit the most recently published offscreen frame into the
+        // SwapChainPanel-bound swap chain and Present.
+        BlitOffscreenToSwapChain();
 
         if (m_forceRender || m_graph.HasDirtyNodes())
             m_frameCount.fetch_add(1, std::memory_order_relaxed);
@@ -149,11 +145,11 @@ namespace winrt::ShaderLab::implementation
     }
 
     // ---------------------------------------------------------------------
-    // RenderWorkerLoop -- render thread entry point. NOT YET SPAWNED -- the
-    // SwapChain/Present apartment-affinity issue (Present1 on a chain bound
-    // to a XAML SwapChainPanel throws RPC_E_WRONG_THREAD from a render-thread
-    // MTA, even with multi-threaded D2D and D3D11 multithread protection)
-    // needs more investigation. Kept as scaffolding for the next attempt.
+    // RenderWorkerLoop -- render thread entry point.
+    //
+    // Runs the offscreen render path: each iteration evaluates the graph
+    // and draws the preview image into a double-buffered offscreen target,
+    // then publishes the buffer index for UI thread to blit.
     // ---------------------------------------------------------------------
     void MainWindow::RenderWorkerLoop(std::stop_token stop)
     {
@@ -175,8 +171,145 @@ namespace winrt::ShaderLab::implementation
             last = now;
             if (dt > 0.1) dt = 0.016;
 
-            try { RenderTickBody(dt); }
-            catch (...) { /* see header note */ }
+            try
+            {
+                // Per-tick non-GPU work that previously lived in OnRenderTick:
+                // working space sync, capture/clock tick, video upload, dirty
+                // propagation. Then the offscreen render itself.
+                UpdateWorkingSpaceNodes();
+
+                if (auto* dc5 = static_cast<ID2D1DeviceContext5*>(m_renderEngine.D2DDeviceContext()))
+                {
+                    auto& nodes = const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes());
+                    if (m_sourceFactory.TickAndUploadLiveCaptures(nodes, dc5))
+                        m_forceRender = true;
+                }
+
+                // Tick clock nodes: advance time. (Same code as OnRenderTick's
+                // body uses; safe to call from render thread because m_graph
+                // is single-writer in this design.)
+                for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+                {
+                    if (!node.isClock) continue;
+                    auto getF = [&](const std::wstring& k, float def) {
+                        auto it = node.properties.find(k);
+                        if (it != node.properties.end())
+                            if (auto* f = std::get_if<float>(&it->second)) return *f;
+                        return def;
+                    };
+                    bool autoDuration = getF(L"AutoDuration", 1.0f) > 0.5f;
+                    if (autoDuration && node.propertyBindings.count(L"StopTime"))
+                    {
+                        autoDuration = false;
+                        node.properties[L"AutoDuration"] = 0.0f;
+                    }
+                    if (autoDuration)
+                    {
+                        float maxDur = 0.0f;
+                        for (const auto& other : m_graph.Nodes())
+                        {
+                            if (other.id == node.id) continue;
+                            bool boundToThisClock = false;
+                            for (const auto& [propName, binding] : other.propertyBindings)
+                            {
+                                for (const auto& src : binding.sources)
+                                {
+                                    if (src && src->sourceNodeId == node.id)
+                                    { boundToThisClock = true; break; }
+                                }
+                                if (boundToThisClock) break;
+                            }
+                            if (!boundToThisClock) continue;
+                            for (const auto& field : other.analysisOutput.fields)
+                            {
+                                if (field.name == L"Duration" && field.components[0] > 0.0f)
+                                    if (field.components[0] > maxDur) maxDur = field.components[0];
+                            }
+                        }
+                        if (maxDur > 0.0f)
+                            node.properties[L"StopTime"] = maxDur;
+                    }
+                    if (node.isPlaying)
+                    {
+                        float startTime = getF(L"StartTime", 0.0f);
+                        float stopTime = getF(L"StopTime", 10.0f);
+                        float speed = getF(L"Speed", 1.0f);
+                        bool loop = getF(L"Loop", 1.0f) > 0.5f;
+                        double duration = static_cast<double>(stopTime - startTime);
+                        if (duration <= 0.0) duration = 1.0;
+                        node.clockTime += dt * speed;
+                        if (loop)
+                        {
+                            while (node.clockTime >= duration) node.clockTime -= duration;
+                            while (node.clockTime < 0.0) node.clockTime += duration;
+                        }
+                        else
+                        {
+                            node.clockTime = std::clamp(node.clockTime, 0.0, duration);
+                            if (node.clockTime >= duration) node.isPlaying = false;
+                        }
+                        node.dirty = true;
+                    }
+                }
+
+                m_graphEvaluator.ResolveSourceBindings(m_graph);
+
+                if (auto* dc = m_renderEngine.D2DDeviceContext())
+                {
+                    try {
+                        m_sourceFactory.TickAndUploadVideos(
+                            const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()),
+                            dc, dt);
+                    } catch (...) {}
+                }
+
+                // Dirty propagation downstream.
+                {
+                    std::vector<uint32_t> queue;
+                    for (const auto& node : m_graph.Nodes())
+                        if (node.dirty) queue.push_back(node.id);
+                    for (size_t i = 0; i < queue.size(); ++i)
+                    {
+                        for (const auto* edge : m_graph.GetOutputEdges(queue[i]))
+                        {
+                            auto* dn = m_graph.FindNode(edge->destNodeId);
+                            if (dn && !dn->dirty)
+                            {
+                                dn->dirty = true;
+                                queue.push_back(edge->destNodeId);
+                            }
+                        }
+                    }
+                }
+
+                bool wasForceRender = m_forceRender;
+                bool hasDirty = m_graph.HasDirtyNodes();
+                bool needsEval = hasDirty || m_needsFitPreview || m_forceRender;
+                if (needsEval)
+                {
+                    RenderFrameToOffscreen(dt);
+                    m_forceRender = false;
+                    m_frameCount.fetch_add(1, std::memory_order_relaxed);
+                    if (hasDirty || wasForceRender)
+                        ++m_graphGeneration;
+                }
+
+                // Publish snapshot.
+                ++m_frameGeneration;
+                auto snap = ::ShaderLab::Graph::BuildGraphUiSnapshot(
+                    m_graph, m_previewNodeId, m_graphGeneration, m_frameGeneration);
+                std::atomic_store(&m_uiGraphSnapshot,
+                    std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>(snap));
+            }
+            catch (const winrt::hresult_error& ex)
+            {
+                OutputDebugStringW(std::format(L"[RenderWorker] hresult: 0x{:08X}\n",
+                    static_cast<uint32_t>(ex.code())).c_str());
+            }
+            catch (...)
+            {
+                OutputDebugStringW(L"[RenderWorker] tick exception\n");
+            }
         }
 
         m_renderDispatcher.Drain();
@@ -680,6 +813,270 @@ namespace winrt::ShaderLab::implementation
             t.outputWindowsUs = t.outputWindowsUs * (1-a) + usec(tOutWinsStart, tOutWinsEnd) * a;
             t.traceUs         = t.traceUs * (1-a) + usec(tOutWinsEnd, tTraceEnd) * a;
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // RenderFrameToOffscreen / BlitOffscreenToSwapChain
+    //
+    // Phase 7 split: render thread renders the preview image into a double-
+    // buffered offscreen D2D bitmap (no swap-chain Present); UI thread later
+    // blits the most recently published buffer into the SwapChainPanel-bound
+    // swap chain and Presents it.
+    //
+    // The two-buffer publish protocol uses m_offscreenPublishedIdx (atomic
+    // int32 with -1 = nothing published yet) and m_offscreenPublishedVersion
+    // (atomic uint64 monotonic). Render thread writes index N (where N is
+    // the buffer it just rendered to), then UI thread reads that index and
+    // blits. Render thread then writes the OTHER index next time.
+    // -------------------------------------------------------------------------
+
+    bool MainWindow::EnsureOffscreenUiWrappers()
+    {
+        // UI thread only: rebuild m_offscreenSourceBitmapUi[0,1] when the
+        // render engine's offscreen size changes (or when context is
+        // recreated, e.g. adapter switch).
+        EnsureUiD2dContext();
+        if (!m_uiD2dContext) return false;
+
+        uint32_t w = m_renderEngine.OffscreenWidth();
+        uint32_t h = m_renderEngine.OffscreenHeight();
+        if (w == 0 || h == 0) return false;
+
+        if (w == m_offscreenWrapperWidth && h == m_offscreenWrapperHeight &&
+            m_offscreenSourceBitmapUi[0] && m_offscreenSourceBitmapUi[1])
+        {
+            return true;
+        }
+
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            m_offscreenSourceBitmapUi[i] = nullptr;
+            auto* tex = m_renderEngine.OffscreenTexture(i);
+            if (!tex) return false;
+            winrt::com_ptr<IDXGISurface> surface;
+            if (FAILED(tex->QueryInterface(IID_PPV_ARGS(surface.put()))))
+                return false;
+
+            // Source-side wrapper: no TARGET option, no CANNOT_DRAW (UI uses
+            // it as DrawImage source). Format must match what RenderEngine
+            // created the textures with (scRGB FP16 by default).
+            const auto& fmt = m_renderEngine.ActiveFormat();
+            D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_NONE,
+                D2D1::PixelFormat(fmt.dxgiFormat, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                96.0f, 96.0f);
+            if (FAILED(m_uiD2dContext->CreateBitmapFromDxgiSurface(
+                    surface.get(), bp, m_offscreenSourceBitmapUi[i].put())))
+                return false;
+        }
+        m_offscreenWrapperWidth = w;
+        m_offscreenWrapperHeight = h;
+        return true;
+    }
+
+    void MainWindow::RenderFrameToOffscreen(double deltaSec)
+    {
+        // Runs on render thread once that path is enabled. Currently still
+        // safe to call from UI thread for the inline-fallback case (the
+        // synchronous dispatcher mode preserves today's behaviour).
+        if (m_isShuttingDown) return;
+        if (!m_renderEngine.IsInitialized()) return;
+
+        // Pick offscreen size = swap chain back buffer size for now.
+        uint32_t w = m_renderEngine.BackBufferWidth();
+        uint32_t h = m_renderEngine.BackBufferHeight();
+        if (w == 0 || h == 0) return;
+
+        if (!m_renderEngine.EnsureOffscreenTargets(w, h))
+            return;
+
+        // Pick the buffer to write to. We use the OPPOSITE of whatever was
+        // just published, so UI thread can keep reading the other one
+        // concurrently without contention.
+        int32_t lastPub = m_offscreenPublishedIdx.load(std::memory_order_acquire);
+        int32_t writeIdx = (lastPub == 0) ? 1 : 0;
+
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (!dc) return;
+        auto* targetBitmap = m_renderEngine.OffscreenRenderBitmap(writeIdx);
+        if (!targetBitmap) return;
+
+        // ---- Source preparation + graph evaluation (same as RenderFrame) ----
+        for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+        {
+            if (node.type == ::ShaderLab::Graph::NodeType::Source &&
+                (node.dirty || m_sourceFactory.GetVideoProvider(node.id)))
+            {
+                try {
+                    m_sourceFactory.PrepareSourceNode(node, dc, deltaSec,
+                        m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                } catch (...) {
+                    node.runtimeError = L"Source preparation failed";
+                    node.dirty = false;
+                }
+            }
+        }
+
+        // Compute which nodes are needed (mark roots + propagate upstream).
+        {
+            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+                node.needed = false;
+            std::vector<uint32_t> roots;
+            for (const auto& node : m_graph.Nodes())
+            {
+                if (node.type == ::ShaderLab::Graph::NodeType::Output)
+                    roots.push_back(node.id);
+                if (node.dirty && node.customEffect.has_value() &&
+                    node.customEffect->analysisOutputType == ::ShaderLab::Graph::AnalysisOutputType::Typed)
+                    roots.push_back(node.id);
+            }
+            if (m_previewNodeId != 0)
+                roots.push_back(m_previewNodeId);
+            for (const auto& window : m_outputWindows)
+                roots.push_back(window->NodeId());
+            std::unordered_set<uint32_t> visited;
+            std::vector<uint32_t> queue = roots;
+            while (!queue.empty())
+            {
+                uint32_t id = queue.back();
+                queue.pop_back();
+                if (visited.count(id)) continue;
+                visited.insert(id);
+                auto* node = m_graph.FindNode(id);
+                if (node) node->needed = true;
+                for (const auto* edge : m_graph.GetInputEdges(id))
+                    queue.push_back(edge->sourceNodeId);
+                if (node)
+                {
+                    for (const auto& [propName, binding] : node->propertyBindings)
+                    {
+                        if (binding.wholeArray)
+                            queue.push_back(binding.wholeArraySourceNodeId);
+                        for (const auto& src : binding.sources)
+                            if (src.has_value()) queue.push_back(src->sourceNodeId);
+                    }
+                }
+            }
+        }
+
+        m_graphEvaluator.Evaluate(m_graph, dc);
+        if (m_graph.HasDirtyNodes())
+            m_graphEvaluator.Evaluate(m_graph, dc); // second pass for new effects
+
+        // ---- BeginDraw on offscreen + ProcessDeferredCompute + draw preview --
+        winrt::com_ptr<ID2D1Image> oldTarget;
+        dc->GetTarget(oldTarget.put());
+        dc->SetTarget(targetBitmap);
+        dc->BeginDraw();
+
+        // CPU-analysis interest set (same as old RenderFrame).
+        {
+            std::unordered_set<uint32_t> interest;
+            if (m_selectedNodeId != 0)
+            {
+                interest.insert(m_selectedNodeId);
+                if (auto* sel = m_graph.FindNode(m_selectedNodeId))
+                {
+                    for (const auto& [propName, binding] : sel->propertyBindings)
+                    {
+                        if (binding.wholeArray)
+                            interest.insert(binding.wholeArraySourceNodeId);
+                        for (const auto& srcOpt : binding.sources)
+                            if (srcOpt.has_value())
+                                interest.insert(srcOpt->sourceNodeId);
+                    }
+                }
+            }
+            m_graphEvaluator.SetCpuAnalysisInterest(std::move(interest));
+        }
+
+        if (m_graphEvaluator.ProcessDeferredCompute(m_graph, dc))
+        {
+            m_nodeGraphController.SetNeedsRedraw();
+            if (m_graph.HasDirtyNodes())
+            {
+                m_graphEvaluator.SetDeferredComputeFrozen(true);
+                m_graphEvaluator.Evaluate(m_graph, dc);
+                m_graphEvaluator.SetDeferredComputeFrozen(false);
+            }
+        }
+
+        // Set DPI to 96 to match WinUI DIPs.
+        float oldDpiX, oldDpiY;
+        dc->GetDpi(&oldDpiX, &oldDpiY);
+        dc->SetDpi(96.0f, 96.0f);
+
+        dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
+
+        D2D1_MATRIX_3X2_F previewTransform =
+            D2D1::Matrix3x2F::Scale(m_previewZoom, m_previewZoom) *
+            D2D1::Matrix3x2F::Translation(m_previewPanX, m_previewPanY);
+        dc->SetTransform(previewTransform);
+
+        auto* previewImage = ResolveDisplayImage(m_previewNodeId);
+        if (previewImage)
+            dc->DrawImage(previewImage);
+
+        dc->SetTransform(D2D1::Matrix3x2F::Identity());
+        dc->SetDpi(oldDpiX, oldDpiY);
+
+        HRESULT hrEnd = dc->EndDraw();
+        dc->SetTarget(oldTarget.get());
+
+        if (FAILED(hrEnd))
+            return;
+
+        // Publish: store this buffer's index with release semantics so the
+        // UI thread sees a fully-rendered frame before reading.
+        m_offscreenPublishedIdx.store(writeIdx, std::memory_order_release);
+        m_offscreenPublishedVersion.fetch_add(1, std::memory_order_release);
+    }
+
+    void MainWindow::BlitOffscreenToSwapChain()
+    {
+        // UI thread only. Reads the last published offscreen buffer and
+        // copies it into the SwapChainPanel-bound swap chain via the UI's
+        // own D2D context, then Presents. Idempotent when no new frame is
+        // available (re-presents the previous frame, which DXGI handles
+        // efficiently).
+        if (m_isShuttingDown) return;
+        if (!m_renderEngine.IsInitialized()) return;
+        if (!EnsureOffscreenUiWrappers()) return;
+
+        int32_t idx = m_offscreenPublishedIdx.load(std::memory_order_acquire);
+        if (idx < 0 || idx > 1) return;
+        auto* sourceBitmap = m_offscreenSourceBitmapUi[idx].get();
+        if (!sourceBitmap) return;
+
+        auto* swap = m_renderEngine.SwapChain();
+        if (!swap) return;
+
+        // Wrap the swap chain back buffer as a D2D bitmap on the UI context.
+        // We rewrap every frame for now -- cheap and avoids stale-buffer
+        // issues across resizes. (Could be cached + invalidated on resize.)
+        winrt::com_ptr<IDXGISurface> backBuffer;
+        if (FAILED(swap->GetBuffer(0, IID_PPV_ARGS(backBuffer.put()))))
+            return;
+        const auto& fmt = m_renderEngine.ActiveFormat();
+        D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(fmt.dxgiFormat, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            96.0f, 96.0f);
+        winrt::com_ptr<ID2D1Bitmap1> backBufferBitmap;
+        if (FAILED(m_uiD2dContext->CreateBitmapFromDxgiSurface(
+                backBuffer.get(), bp, backBufferBitmap.put())))
+            return;
+
+        m_uiD2dContext->SetTarget(backBufferBitmap.get());
+        m_uiD2dContext->BeginDraw();
+        m_uiD2dContext->Clear(D2D1::ColorF(D2D1::ColorF::Black));
+        m_uiD2dContext->DrawImage(sourceBitmap);
+        HRESULT hr = m_uiD2dContext->EndDraw();
+        m_uiD2dContext->SetTarget(nullptr);
+        if (FAILED(hr)) return;
+
+        DXGI_PRESENT_PARAMETERS params{};
+        swap->Present1(1, 0, &params);
     }
 
 }
