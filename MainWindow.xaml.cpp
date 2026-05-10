@@ -521,6 +521,7 @@ namespace winrt::ShaderLab::implementation
         RefreshTitleBar();
 
         m_nodeGraphController.SetGraph(&m_graph);
+        m_nodeGraphController.SetDispatcher(&m_renderDispatcher);
         m_nodeGraphController.SetConnectionCallback(
             [this](uint32_t srcId, uint32_t srcPin, uint32_t dstId, uint32_t dstPin, bool isData) {
                 auto* srcNode = m_graph.FindNode(srcId);
