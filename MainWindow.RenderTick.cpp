@@ -53,9 +53,17 @@ namespace winrt::ShaderLab::implementation
 
         auto tTickStart = std::chrono::high_resolution_clock::now();
 
-        // Drain pending dispatcher closures on UI thread (synchronous mode
-        // closures only -- the worker drains its own queue).
-        m_renderDispatcher.Drain();
+        // Drain pending dispatcher closures: NO-OP from the UI side post-P7.
+        // The worker thread is the registered consumer and drains its own
+        // queue. UI thread reading the queue would race graph mutations and
+        // process closures slowly because OnRenderTick also does blit /
+        // canvas redraw / event handling. Leaving Drain() here is the
+        // primary cause of UI dropdown / hover input lag under load:
+        // long-running MCP closures end up running on the UI thread,
+        // blocking input event delivery for the duration. Worker calls
+        // m_renderDispatcher.Drain() in RenderWorkerLoop -- that's the only
+        // path closures should run on.
+        // m_renderDispatcher.Drain();   // <-- removed in 7fa7021+
 
         // Blit the most recently published offscreen frame into the
         // SwapChainPanel-bound swap chain and Present.
@@ -1095,6 +1103,19 @@ namespace winrt::ShaderLab::implementation
 
         int32_t idx = m_offscreenPublishedIdx.load(std::memory_order_acquire);
         if (idx < 0 || idx > 1) return;
+
+        // Skip blit when there's no new published frame since last UI tick.
+        // Without this the UI thread vsync-waits in Present1(1, 0) on EVERY
+        // 16 ms tick (60 Hz) even when the worker is producing frames at,
+        // say, 10 Hz. Each Present1 wait blocks input event delivery, so
+        // dropdowns / hover highlights get starved during heavy graph eval.
+        // The compositor keeps showing the last presented frame on its own;
+        // we only need to re-Present when the worker has actually published
+        // a new offscreen.
+        uint64_t version = m_offscreenPublishedVersion.load(std::memory_order_acquire);
+        if (version == m_lastBlittedVersion) return;
+        m_lastBlittedVersion = version;
+
         auto* sourceBitmap = m_offscreenSourceBitmapUi[idx].get();
         if (!sourceBitmap) return;
 

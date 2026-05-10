@@ -298,6 +298,15 @@ namespace winrt::ShaderLab::implementation
         // appear frozen even though the snapshot has fresh data.
         uint64_t m_lastSeenFrameGeneration{ 0 };
 
+        // UI-thread cached value of the last offscreen-publish version we
+        // blitted. The render worker bumps m_offscreenPublishedVersion
+        // every successful EndDraw. If it hasn't changed since our last
+        // tick, we skip the blit + Present1 -- otherwise the UI thread
+        // vsync-waits at 60 Hz even when the worker is only producing
+        // frames at 10 Hz, starving input event delivery during heavy
+        // graph eval (causing dropdown / hover input lag).
+        uint64_t m_lastBlittedVersion{ 0 };
+
         // UI-side D2D stack -- separate D2D factory + device + immediate
         // context for drawing the node-graph editor canvas and pixel-trace
         // swatch panel. Shares the D3D11 device with the render engine but
