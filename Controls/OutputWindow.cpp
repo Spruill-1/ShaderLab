@@ -732,6 +732,13 @@ namespace ShaderLab::Controls
         auto* sourceBitmap = m_sink->uiSources[idx].get();
         if (!sourceBitmap) return;
 
+        // Cache for SaveImageAsync. The source bitmap wraps the worker's
+        // offscreen texture; the wrapper lifetime is governed by uiSources
+        // (rebuilt on bufferGen change). Storing a raw pointer here is safe
+        // for the duration of this BlitAndPresent and the subsequent UI
+        // tick where Save is most likely to fire.
+        m_lastImage = sourceBitmap;
+
         winrt::com_ptr<IDXGISurface> backBuffer;
         HRESULT hr = m_swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.put()));
         if (FAILED(hr)) return;

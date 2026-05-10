@@ -665,11 +665,30 @@ namespace winrt::ShaderLab::implementation
                 float normX = static_cast<float>(jobj.GetNamedNumber(L"x"));
                 float normY = static_cast<float>(jobj.GetNamedNumber(L"y"));
 
-                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                    auto* dc = m_renderEngine.D2DDeviceContext();
+                return m_renderDispatcher.DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    // P13: pixel-trace runs on the render thread. m_graph is
+                    // single-writer there; the render-side D2D context shares
+                    // the engine's multi-threaded D2D device with the worker's
+                    // BeginDraw session. UI's PopulatePixelTraceTree also
+                    // routes its ReTrace through the render dispatcher, so
+                    // there's no concurrent access to m_pixelTrace state.
+                    auto* dc = m_renderEngine.RenderD2DContext();
                     if (!dc) return { 500, R"({"error":"No device context"})" };
 
-                    auto bounds = GetPreviewImageBounds();
+                    // Compute preview image bounds inline on render context
+                    // (can't call MainWindow::GetPreviewImageBounds, which
+                    // reads from the UI D2D context).
+                    auto* previewNode = m_graph.FindNode(m_previewNodeId);
+                    auto* previewImage = previewNode ? previewNode->cachedOutput : nullptr;
+                    if (!previewImage) return { 404, R"({"error":"No preview image"})" };
+                    float oldDpiX, oldDpiY;
+                    dc->GetDpi(&oldDpiX, &oldDpiY);
+                    dc->SetDpi(96.0f, 96.0f);
+                    D2D1_RECT_F bounds{};
+                    HRESULT bhr = dc->GetImageLocalBounds(previewImage, &bounds);
+                    dc->SetDpi(oldDpiX, oldDpiY);
+                    if (FAILED(bhr)) return { 500, R"({"error":"GetImageLocalBounds failed"})" };
+
                     uint32_t imageW = static_cast<uint32_t>(bounds.right - bounds.left);
                     uint32_t imageH = static_cast<uint32_t>(bounds.bottom - bounds.top);
                     if (imageW == 0 || imageH == 0)

@@ -1957,9 +1957,6 @@ namespace winrt::ShaderLab::implementation
     {
         if (!m_traceActive) return;
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) return;
-
         // Use actual image dimensions in context DIPs for pixel coordinate mapping.
         // DrawImage's sourceRectangle is in the same coordinate space as the D2D context.
         auto bounds = GetPreviewImageBounds();
@@ -1975,8 +1972,22 @@ namespace winrt::ShaderLab::implementation
         uint32_t traceH = static_cast<uint32_t>(imgH);
         if (traceW == 0 || traceH == 0) return;
 
-        if (!m_pixelTrace.ReTrace(dc, m_graph, m_previewNodeId, traceW, traceH))
-            return;
+        // P13: ReTrace walks m_graph + reads pixel values from each node's
+        // cachedOutput via DrawImage to a 1x1 staging texture. m_graph is
+        // single-writer/single-reader on the render thread; doing this on
+        // the UI thread races with the worker's evaluate. Dispatch to the
+        // render thread so the trace runs while m_graph is stable, then
+        // resume on the UI thread to update the XAML tree.
+        bool ok = false;
+        try {
+            ok = m_renderDispatcher.DispatchSync([this, traceW, traceH]() {
+                auto* renderDc = m_renderEngine.RenderD2DContext();
+                if (!renderDc) return false;
+                return m_pixelTrace.ReTrace(renderDc, m_graph, m_previewNodeId, traceW, traceH);
+            });
+        }
+        catch (...) { ok = false; }
+        if (!ok) return;
 
         auto topoHash = HashTraceTopology(m_pixelTrace.Root());
         if (topoHash == m_lastTraceTopologyHash)
