@@ -17,7 +17,7 @@ ShaderLab/
 ├── CHANGELOG.md                    # Version history
 ├── Bootstrap.ps1                   # One-command fresh-clone setup (cert + ExprTk + restore)
 │
-├── pch.h / pch.cpp                 # App PCH (WinRT, WinUI, D2D, D3D, Win2D, STL)
+├── pch.h / pch.cpp                 # App PCH (WinRT, WinUI, D2D, D3D, STL)
 ├── pch_engine.h / pch_engine.cpp   # Engine/Test/Headless PCH (WinRT base, D2D, D3D, MF, STL)
 ├── App.xaml / .h / .cpp            # Application entry point
 ├── MainWindow.xaml / .h / .cpp     # Main window layout + initialization (~4700 lines)

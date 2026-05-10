@@ -8,7 +8,7 @@ ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, 
 
 - **C++/WinRT only** — never generate C# code. Direct COM access to `ID2D1EffectImpl`, `ID2D1DrawTransform`, `ID2D1ComputeTransform` is the reason this project exists.
 - **`docs/` is the living architecture documentation tree.** Update the relevant file under `docs/architecture/`, `docs/effects/`, etc. when a significant architectural change lands. Append a new entry to [`docs/history/decision-log.md`](../docs/history/decision-log.md) with a Mermaid diagram for any choice that future contributors will need to understand the *why* of. The repo-root `README.md` is intentionally slim — install + build + a pointer to `docs/` — and should not be expanded with technical detail.
-- **All new `.cpp` files must `#include "pch.h"` as the first include** — precompiled header is mandatory (`pch.h` aggregates WinRT, D2D, D3D, Win2D, DXGI, WIC, and STL headers).
+- **All new `.cpp` files must `#include "pch.h"` as the first include** — precompiled header is mandatory (`pch.h` aggregates WinRT, D2D, D3D, DXGI, WIC, and STL headers).
 
 ## Build
 
@@ -16,7 +16,7 @@ ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, 
 - NuGet packages restore automatically (packages.config style, not PackageReference)
 - Build target: **Debug | x64** (also supports ARM64, Release)
 - No command-line build scripts exist; use MSBuild via VS or `msbuild ShaderLab.vcxproj /p:Configuration=Debug /p:Platform=x64`
-- Required: Windows App SDK 1.8, Windows 10 SDK 10.0.26100+, Win2D 1.3.0
+- Required: Windows App SDK 1.8, Windows 10 SDK 10.0.26100+
 - Linked native libs: `d3d11.lib`, `d2d1.lib`, `dxgi.lib`, `d3dcompiler.lib`, `dxguid.lib`, `windowscodecs.lib`
 - `/bigobj` is enabled; language standard is C++20 (VS 18+) or C++17 (VS 17)
 
@@ -134,7 +134,7 @@ Active development centers on **tone-mapping and color-correction effects author
 - **Effect registry**: Singleton with 40+ built-in D2D effects across 9 categories. Case-insensitive name lookup.
 - **ShaderLab effects library**: 33 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map + Scale), Source / Generator, Composition (Split Comparison), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use; bytecode cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` (decision #58 catalog → see [builtin-catalog.md](../docs/effects/builtin-catalog.md) for the full per-effect type table).
 - **MCP server**: JSON-RPC 2.0 server on port 47808 (47809 for headless to avoid shared-machine conflicts). The server itself + 20 engine-pure routes live in `Engine/Mcp/{McpHttpServer,EngineMcpRoutes}.{h,cpp}`; 16 UI-coupled / host-specific routes stay in `MainWindow.McpRoutes.cpp`. Both hosts register the same engine-side route set through the same `IEngineCommandSink` interface (decision #58). Engine-side routes are uniform: pure mutation closures dispatched via `sink.Dispatch`, with 8 event hooks (`OnNodeAdded`, `OnNodeRemoved`, `OnNodeChanged`, `OnGraphCleared`, `OnGraphLoaded`, `OnGraphStructureChanged`, `OnCustomEffectRecompiled`, `OnDisplayProfileChanged`) the GUI overrides to keep its UI in sync.
-- **Versioning**: `Version.h` defines app version (currently **1.7.1**) and graph format version (2). Both are stored in saved graphs. Forward compatibility check on load. `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` is independent — bumped manually on engine ABI breaks; mismatch between header and DLL aborts startup with a friendly message-box.
+- **Versioning**: `Version.h` defines app version (currently **1.7.2**) and graph format version (2). Both are stored in saved graphs. Forward compatibility check on load. `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` is independent — bumped manually on engine ABI breaks; mismatch between header and DLL aborts startup with a friendly message-box.
 - **Refresh-rate-driven render loop on the worker thread**: the render worker `std::jthread` runs the graph evaluate at the active monitor's refresh rate (clamped to 60–240 Hz). Dirty-gated: skips evaluate when no nodes changed, no output window is open, and `m_forceRender` is false. The UI thread runs a `DispatcherQueueTimer` at the same rate, but its body is just "drain dispatcher + blit offscreen + Present1" — sub-ms cost. The interval is re-applied on every display change so dragging the window across monitors picks up the new rate.
 - **`ProcessDeferredCompute` requires an active D2D draw session**: it calls `dc->DrawImage` internally to pre-render the upstream chain into an FP32 bitmap, and outside `BeginDraw`/`EndDraw` that DrawImage silently no-ops. The GUI's `RenderFrame`, the headless host's `runEval` / `RunRender`, and the test bench all wrap accordingly.
 - **Ctrl+Enter** compiles shader from the editor TextBox.

@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-05-10
+
+### Removed
+
+- **Win2D dependency dropped.** The `Microsoft.Graphics.Win2D` 1.3.0 NuGet package, the four `pch.h` includes (`winrt/Microsoft.Graphics.Canvas.h`, `.Effects.h`, `.UI.Xaml.h`, `Microsoft.Graphics.Canvas.native.h`), and the vcxproj `.props`/`.targets` imports are all removed. No source file in the repo had used a `Microsoft::Graphics::Canvas::*` symbol — every effect is implemented directly against D2D/D3D11 for the contract control the custom-effect path needs. Decision #7 from Day 1 ("Win2D interop via native headers") is marked reversed in the decision log. README + copilot-instructions + project-structure docs updated to drop the Win2D mention.
+
 ## [1.7.1] - 2026-05-10
 
 ### Fixed
