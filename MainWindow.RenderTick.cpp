@@ -61,9 +61,6 @@ namespace winrt::ShaderLab::implementation
         // SwapChainPanel-bound swap chain and Present.
         BlitOffscreenToSwapChain();
 
-        if (m_forceRender || m_graph.HasDirtyNodes())
-            m_frameCount.fetch_add(1, std::memory_order_relaxed);
-
         // Editor canvas redraw (UI-side D2D context, P4).
         // Trigger a redraw whenever the worker has published a new snapshot
         // since our last UI tick -- the canvas reads runtime fields like
@@ -86,7 +83,7 @@ namespace winrt::ShaderLab::implementation
             };
             const double a = 0.1;
             auto& t = m_frameTiming;
-            t.nodeGraphUs   = t.nodeGraphUs * (1-a) + usec(tTickStart, tNodeGraphEnd) * a;
+            t.uiTickUs      = t.uiTickUs * (1-a) + usec(tTickStart, tNodeGraphEnd) * a;
         }
 
         // Update video seek slider and position label while playing.
@@ -800,7 +797,7 @@ namespace winrt::ShaderLab::implementation
             t.evaluateUs     = t.evaluateUs * (1-a) + usec(tSourcesEnd, tEvalEnd) * a;
             t.deferredComputeUs = t.deferredComputeUs * (1-a) + usec(tEvalEnd, tComputeEnd) * a;
             t.drawUs         = t.drawUs * (1-a) + usec(tComputeEnd, tDrawEnd) * a;
-            t.presentUs      = t.presentUs * (1-a) + usec(tDrawEnd, tPresentEnd) * a;
+            t.endDrawFlushUs = t.endDrawFlushUs * (1-a) + usec(tDrawEnd, tPresentEnd) * a;
             t.computeDispatches = computeCount;
         }
 
@@ -1053,22 +1050,12 @@ namespace winrt::ShaderLab::implementation
         HRESULT hrEnd = dc->EndDraw();
         dc->SetTarget(oldTarget.get());
 
-        if (FAILED(hrEnd))
-            return;
-
         auto tEndDraw = std::chrono::high_resolution_clock::now();
 
-        // Publish: store this buffer's index with release semantics so the
-        // UI thread sees a fully-rendered frame before reading.
-        m_offscreenPublishedIdx.store(writeIdx, std::memory_order_release);
-        m_offscreenPublishedVersion.fetch_add(1, std::memory_order_release);
-
-        // Per-phase frame timing (exponential moving average, alpha=0.1) so
-        // /perf and the FPS-tooltip flyout report meaningful values for the
-        // P7 render-thread path. `presentUs` here is just the EndDraw flush
-        // -- the actual SwapChain Present1 happens on the UI thread in
-        // BlitOffscreenToSwapChain and is reflected in `nodeGraphUs +
-        // outputWindowsUs` from OnRenderTick.
+        // Always bump framesSampled BEFORE deciding whether to publish, so
+        // /perf accurately reflects worker activity even when EndDraw fails
+        // (device-lost, transient state, etc.). Without this, a single
+        // EndDraw glitch would freeze the displayed FPS at a stale value.
         {
             auto usec = [](auto a, auto b) {
                 return std::chrono::duration<double, std::micro>(b - a).count();
@@ -1079,13 +1066,22 @@ namespace winrt::ShaderLab::implementation
             t.evaluateUs        = t.evaluateUs        * (1-a) + usec(tSourcesEnd,  tEvalEnd)    * a;
             t.deferredComputeUs = t.deferredComputeUs * (1-a) + usec(tEvalEnd,     tComputeEnd) * a;
             t.drawUs            = t.drawUs            * (1-a) + usec(tComputeEnd,  tDrawEnd)    * a;
-            t.presentUs         = t.presentUs         * (1-a) + usec(tDrawEnd,     tEndDraw)    * a;
+            t.endDrawFlushUs    = t.endDrawFlushUs    * (1-a) + usec(tDrawEnd,     tEndDraw)    * a;
             t.computeDispatches = computeCount;
             t.totalUs           = t.totalUs           * (1-a) + usec(tFrameStart,  tEndDraw)    * a;
             t.framesSampled++;
+            t.endDrawFailed     = FAILED(hrEnd) ? (t.endDrawFailed + 1) : t.endDrawFailed;
             if (t.framesSampled % 30 == 0)
                 m_lastFrameTiming = t;
         }
+
+        if (FAILED(hrEnd))
+            return;
+
+        // Publish: store this buffer's index with release semantics so the
+        // UI thread sees a fully-rendered frame before reading.
+        m_offscreenPublishedIdx.store(writeIdx, std::memory_order_release);
+        m_offscreenPublishedVersion.fetch_add(1, std::memory_order_release);
     }
 
     void MainWindow::BlitOffscreenToSwapChain()

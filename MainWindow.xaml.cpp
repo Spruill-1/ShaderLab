@@ -991,6 +991,17 @@ namespace winrt::ShaderLab::implementation
 
         m_forceRender = true;
         UpdateStatusBar();
+
+        // Restart the render worker thread on the new device. SwitchAdapter
+        // stopped+joined it before teardown so it could release engine
+        // resources cleanly; we need to bring it back so the graph evaluates
+        // on the new GPU. Without this, the app appears frozen after a
+        // /gpu/switch -- no clock ticks, no video frames, no Present.
+        m_renderShouldStop.store(false, std::memory_order_release);
+        m_renderWorker = std::jthread([this](std::stop_token stop){
+            this->RenderWorkerLoop(stop);
+        });
+
         // Reopen output windows.
         auto outputIds = m_graph.GetOutputNodeIds();
         for (uint32_t id : outputIds)
@@ -5559,53 +5570,53 @@ namespace winrt::ShaderLab::implementation
 
     std::wstring MainWindow::BuildFpsTooltipText() const
     {
-        // Builds the multi-line per-phase breakdown shown in the FPS tooltip
-        // / flyout. Used by the main window's FPS counter and by every
-        // output window's status-bar hover tooltip so they all stay in sync.
+        // Builds the multi-line per-phase breakdown shown in the FPS tooltip.
+        // Split into "Graph eval" (the actual cost of one render-thread frame
+        // -- the meaningful number for HDR shader / tonemap perf evaluation,
+        // which is the primary purpose of this app) and "UI overhead" (the
+        // SwapChain blit + Present1 vsync wait + canvas redraw on the UI
+        // tick). FPS and total-ms reflect graph-eval throughput only.
         const auto& ft = m_frameTiming;
         double fps = m_lastFps;
         double total = ft.totalUs / 1000.0;
-        double sumPhases =
-            ft.videoTickUs / 1000.0 +
+        double sumGraph =
             ft.sourcesPrepUs / 1000.0 + ft.evaluateUs / 1000.0 +
             ft.deferredComputeUs / 1000.0 +
-            ft.drawUs / 1000.0 + ft.presentUs / 1000.0 +
-            ft.nodeGraphUs / 1000.0 +
-            ft.outputWindowsUs / 1000.0 +
-            ft.traceUs / 1000.0;
-        double idle = (std::max)(0.0, total - sumPhases);
+            ft.drawUs / 1000.0 + ft.endDrawFlushUs / 1000.0;
+        double idle = (std::max)(0.0, total - sumGraph);
 
         std::wstring text = std::format(
-            L"{:.0f} FPS  ({:.1f} ms total)\n"
+            L"{:.0f} FPS  ({:.1f} ms / graph eval)\n"
             L"\n"
-            L"  video tick    {:>6.2f} ms\n"
-            L"  sources prep  {:>6.2f} ms\n"
-            L"  eval          {:>6.2f} ms\n"
-            L"  compute       {:>6.2f} ms  ({} dispatch{})\n"
-            L"  draw          {:>6.2f} ms\n"
-            L"  present       {:>6.2f} ms\n"
-            L"  node graph    {:>6.2f} ms\n"
-            L"  output wins   {:>6.2f} ms\n"
-            L"  pixel trace   {:>6.2f} ms\n"
-            L"  --------------------------\n"
-            L"  sum           {:>6.2f} ms\n"
-            L"  idle / sched  {:>6.2f} ms",
+            L"  Graph eval (render thread):\n"
+            L"    sources prep    {:>6.2f} ms\n"
+            L"    eval            {:>6.2f} ms\n"
+            L"    compute         {:>6.2f} ms  ({} dispatch{})\n"
+            L"    draw            {:>6.2f} ms\n"
+            L"    end-draw flush  {:>6.2f} ms\n"
+            L"    -----------------------------\n"
+            L"    sum             {:>6.2f} ms\n"
+            L"    idle / sched    {:>6.2f} ms\n"
+            L"\n"
+            L"  UI overhead (UI thread, not in totals):\n"
+            L"    ui tick         {:>6.2f} ms  (drain + blit + Present1 + canvas)\n"
+            L"    output windows  {:>6.2f} ms\n"
+            L"    pixel trace     {:>6.2f} ms",
             fps, total,
-            ft.videoTickUs / 1000.0,
             ft.sourcesPrepUs / 1000.0,
             ft.evaluateUs / 1000.0,
             ft.deferredComputeUs / 1000.0, ft.computeDispatches,
                 (ft.computeDispatches == 1 ? L"" : L"es"),
             ft.drawUs / 1000.0,
-            ft.presentUs / 1000.0,
-            ft.nodeGraphUs / 1000.0,
+            ft.endDrawFlushUs / 1000.0,
+            sumGraph,
+            idle,
+            ft.uiTickUs / 1000.0,
             ft.outputWindowsUs / 1000.0,
-            ft.traceUs / 1000.0,
-            sumPhases,
-            idle);
+            ft.traceUs / 1000.0);
 
         if (m_lastVideoFps > 0.1f)
-            text += std::format(L"\n\n  video decode  {:>6.0f} fps", m_lastVideoFps);
+            text += std::format(L"\n\n  video decode    {:>6.0f} fps", m_lastVideoFps);
 
         return text;
     }

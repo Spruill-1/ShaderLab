@@ -352,17 +352,29 @@ namespace winrt::ShaderLab::implementation
         // Per-frame performance timings (microseconds, rolling averages).
         struct FrameTimings {
             double totalUs{};            // wall-clock between consecutive timer ticks (true frame interval)
-            double videoTickUs{};        // TickAndUploadLiveCaptures + TickAndUploadVideos + dirty propagation
-            double sourcesPrepUs{};      // PrepareSourceNode loop inside RenderFrame
+            // Graph evaluation phases (render thread, RenderFrameToOffscreen).
+            // These add up to totalUs and represent the actual cost of one
+            // graph eval -- which is the meaningful number for HDR shader /
+            // tonemap perf evaluation, the primary focus of this app.
+            double sourcesPrepUs{};      // PrepareSourceNode loop (image/video upload)
             double evaluateUs{};         // GraphEvaluator::Evaluate (passes 1 + 2)
             double deferredComputeUs{};  // ProcessDeferredCompute (D3D11 compute dispatches) + post-PDC eval
-            double drawUs{};             // swap-chain DrawImage (CPU command queueing)
-            double presentUs{};          // RenderEngine::Present (back-buffer swap, blocks on VSync/GPU)
-            double nodeGraphUs{};        // RenderNodeGraph + overlays (canvas redraw)
-            double outputWindowsUs{};    // PresentOutputWindows (peeled-off output panes)
-            double traceUs{};            // PopulatePixelTraceTree + RenderTraceSwatches
+            double drawUs{};             // DrawImage(preview) into the offscreen target
+            double endDrawFlushUs{};     // dc->EndDraw() flush; renamed from presentUs --
+                                          // actual SwapChain Present1 happens UI-side and
+                                          // is reported under uiTickUs.
+
+            // UI thread overhead (OnRenderTick total). Mostly Present1 vsync
+            // wait and Direct3D pipeline drain. NOT counted in totalUs.
+            double uiTickUs{};           // OnRenderTick wall time: drain + blit + Present1 + canvas redraw
+
+            // Misc per-frame work, both on the render side.
+            double videoTickUs{};        // (currently unused on P7 path; kept for compat)
+            double outputWindowsUs{};    // PresentOutputWindows (peeled-off output panes; P7-pending)
+            double traceUs{};            // PopulatePixelTraceTree + RenderTraceSwatches (UI thread)
             uint32_t computeDispatches{};
             uint32_t framesSampled{};
+            uint32_t endDrawFailed{};    // diagnostic: count of EndDraw failures (D2DERR_RECREATE_TARGET, etc.)
         };
         FrameTimings m_frameTiming;
         FrameTimings m_lastFrameTiming;  // snapshot for MCP read
