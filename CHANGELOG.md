@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-05-10
+
+### Fixed
+
+- **`/graph/set-property` had no effect on downstream D3D11 compute analysis nodes** when the analysis fields had already been populated on a previous frame. The smoke test caught it: bumping a Source's `Luminance` from 80 to 200 should give a 2.5× rise in a downstream `Luminance Statistics.Mean`, but Mean stayed at the old value. Root cause: `1.7.0`'s `m_deferredCompute.clear()` at the top of every `Evaluate()` (added to defend a UAF that owning `winrt::com_ptr<ID2D1Image>` already prevents) wiped the pass-1 deferred-compute entry between the two Evaluate passes inside a single render iteration. Pass 2 then found `node->dirty=false` (pass 1 cleared it) and `node->analysisOutput.fields` non-empty (populated last frame) and skipped re-pushing the entry — `ProcessDeferredCompute` dispatched an empty queue. The owning com_ptr is what actually keeps the chain alive across the two passes; the top-of-Evaluate clear is removed. `ProcessDeferredCompute` clears after dispatch as before.
+
 ## [1.7.0] - 2026-05-10
 
 The "render-engine worker thread" release. All D3D11/D2D graph evaluation moves

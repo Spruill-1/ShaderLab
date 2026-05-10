@@ -87,17 +87,28 @@ namespace ShaderLab::Rendering
         // Effects created on the previous frame are now fully initialized.
         m_justCreated.clear();
 
-        // Drop any deferred-compute entries left from a PRIOR Evaluate call
-        // in the same render iteration. Callers that run Evaluate twice
-        // (RenderFrameToOffscreen does, for "second pass for new effects")
-        // would otherwise accumulate duplicate entries with potentially
-        // stale ID2D1Image* pointers from the first pass -- the second
-        // pass can rebuild upstream effects, leaving the first-pass
-        // entry's inputImages[i] dangling. ProcessDeferredCompute then
-        // walks both, AVs on the dangling pointer in d2d1!ValidateRealization
-        // when GetImageLocalBounds tries to traverse the chain. The
-        // most-recent pass is always the correct one to consume.
-        m_deferredCompute.clear();
+        // NOTE on deferred-compute ownership:
+        //   `DeferredCompute::inputImages` holds owning `winrt::com_ptr<ID2D1Image>`
+        //   entries (not raw pointers), so even if a subsequent Evaluate
+        //   pass within the same render iteration rebuilds the producing
+        //   effect, this pass's entry keeps the image chain alive. We do
+        //   NOT clear m_deferredCompute here.
+        //
+        //   We used to clear at the top of Evaluate to prevent a UAF from
+        //   stale raw pointers across a two-pass render iteration. With
+        //   owning refs in place, that defence is moot -- and clearing here
+        //   actually breaks the steady-state flow: pass 1 pushes a deferred
+        //   entry while the node is dirty + fields are stale, pass 2 finds
+        //   `dirty=false` and `analysisOutput.fields` already populated
+        //   from a previous runEval, so it does NOT re-push. Clearing
+        //   between the passes then leaves m_deferredCompute empty and
+        //   ProcessDeferredCompute dispatches nothing -- set-property on
+        //   an upstream Source has no visible effect on a downstream
+        //   compute analysis node.
+        //
+        //   m_deferredCompute is drained + cleared at the bottom of
+        //   ProcessDeferredCompute; the source-not-ready early return
+        //   above (in ProcessDeferredCompute) also clears it.
 
         // Get topological ordering (sources first → output last).
         std::vector<uint32_t> order;
