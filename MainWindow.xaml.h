@@ -377,6 +377,21 @@ namespace winrt::ShaderLab::implementation
         D2D1_POINT_2F m_graphPanStart{};
         D2D1_POINT_2F m_graphPanOrigin{};
         void UpdatePropertiesPanel();
+
+        // Look up a node either in the latest published GraphUiSnapshot (if
+        // one has been published) or in the live graph (fallback during
+        // pre-first-render startup). Used by UI code paths that need to read
+        // runtime state -- runtimeError, analysisOutput -- which are written
+        // by the evaluator and would race on direct m_graph reads once the
+        // render thread spawns. Note: this returns a pointer into the
+        // snapshot which is owned by a shared_ptr; the caller should keep
+        // the snapshot alive (e.g., via a local copy) for the duration of
+        // their reads.
+        std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>
+            CurrentGraphSnapshot() const
+        {
+            return std::atomic_load(&m_uiGraphSnapshot);
+        }
         // True when any descendant of PropertiesPanel currently has keyboard
         // focus (TextBox cursor, NumberBox edit, dropdown open). Used by the
         // 4 Hz binding-value refresh path to avoid clobbering an in-progress

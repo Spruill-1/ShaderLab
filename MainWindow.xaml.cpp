@@ -2761,6 +2761,21 @@ namespace winrt::ShaderLab::implementation
         auto* node = m_graph.FindNode(m_selectedNodeId);
         if (!node) return;
 
+        // For *displayed* runtime fields (runtimeError, analysisOutput), read
+        // from the published snapshot when available -- these fields are
+        // written by the evaluator and would race direct m_graph reads once
+        // the render thread spawns. The snapshot is a value copy of the
+        // graph state at the last frame boundary. We keep a local copy of
+        // the shared_ptr so the snapshot stays alive for the duration of
+        // this method (the panel is rebuilt synchronously here).
+        // Mutating reads (name change, property change, etc.) still operate
+        // on the live `node` pointer because their writes must hit the live
+        // graph through the dispatcher.
+        auto graphSnapshot = CurrentGraphSnapshot();
+        const ::ShaderLab::Graph::EffectNode* snapNode =
+            graphSnapshot ? graphSnapshot->FindNode(m_selectedNodeId) : nullptr;
+        const ::ShaderLab::Graph::EffectNode* readNode = snapNode ? snapNode : node;
+
         uint32_t capturedId = m_selectedNodeId;
 
         // ---- Node name (editable) ----
@@ -4059,11 +4074,11 @@ namespace winrt::ShaderLab::implementation
         }
 
         // ---- Analysis output visualization ----
-        if (node->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Histogram &&
-            !node->analysisOutput.data.empty())
+        if (readNode->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Histogram &&
+            !readNode->analysisOutput.data.empty())
         {
             auto histHeader = Controls::TextBlock();
-            histHeader.Text(winrt::hstring(node->analysisOutput.label));
+            histHeader.Text(winrt::hstring(readNode->analysisOutput.label));
             histHeader.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
             histHeader.Margin({ 0, 8, 0, 4 });
             panel.Children().Append(histHeader);
@@ -4077,7 +4092,7 @@ namespace winrt::ShaderLab::implementation
             canvas.Background(Media::SolidColorBrush(
                 winrt::Windows::UI::Color{ 255, 30, 30, 30 }));
 
-            const auto& bins = node->analysisOutput.data;
+            const auto& bins = readNode->analysisOutput.data;
             uint32_t numBins = static_cast<uint32_t>(bins.size());
             if (numBins > 0)
             {
@@ -4087,7 +4102,7 @@ namespace winrt::ShaderLab::implementation
 
                 // Choose bar color based on channel.
                 winrt::Windows::UI::Color barColor;
-                switch (node->analysisOutput.channelIndex)
+                switch (readNode->analysisOutput.channelIndex)
                 {
                 case 0: barColor = { 200, 255, 60, 60 }; break;   // Red
                 case 1: barColor = { 200, 60, 255, 60 }; break;   // Green
@@ -4116,8 +4131,8 @@ namespace winrt::ShaderLab::implementation
         }
 
         // ---- Typed analysis output ----
-        if (node->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Typed &&
-            !node->analysisOutput.fields.empty())
+        if (readNode->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Typed &&
+            !readNode->analysisOutput.fields.empty())
         {
             auto analysisHeader = Controls::TextBlock();
             analysisHeader.Text(L"Analysis Results");
@@ -4125,7 +4140,7 @@ namespace winrt::ShaderLab::implementation
             analysisHeader.Margin({ 0, 8, 0, 4 });
             panel.Children().Append(analysisHeader);
 
-            for (const auto& fv : node->analysisOutput.fields)
+            for (const auto& fv : readNode->analysisOutput.fields)
             {
                 auto row = Controls::StackPanel();
                 row.Orientation(Controls::Orientation::Horizontal);
