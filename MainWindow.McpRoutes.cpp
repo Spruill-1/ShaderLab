@@ -148,6 +148,24 @@ namespace winrt::ShaderLab::implementation
     // Event hooks fire from inside Dispatch closures, which run on the
     // render thread. Anything that touches XAML or UI-thread-only controllers
     // must be marshalled back to the UI thread via DispatcherQueue().TryEnqueue.
+    //
+    // P7 race protection: NodeGraphController::AutoLayout / RebuildLayout
+    // iterate `m_graph.Nodes()` and each node's `properties` std::map. The
+    // render worker mutates those maps every tick (analysisOutput updates,
+    // clock advancement, source factory writes). To avoid use-after-free /
+    // iterator invalidation in std::map traversal, we run those layout
+    // calls THROUGH the render dispatcher with DispatchSync. The dispatcher
+    // drains queued closures BEFORE the worker's per-tick body, so when our
+    // closure runs the worker is implicitly paused -- m_graph is stable for
+    // the duration of the layout, and m_visuals isn't being concurrently
+    // read by the UI thread (which is blocked in DispatchSync).
+    static void RunLayoutOnRenderThread(::ShaderLab::Rendering::RenderThreadDispatcher& dispatcher,
+                                        std::function<void()> work)
+    {
+        dispatcher.DispatchSync([work = std::move(work)]() {
+            work();
+        });
+    }
 
     void MainWindow::GuiEngineCommandSink::OnNodeAdded(uint32_t /*nodeId*/)
     {
@@ -155,7 +173,8 @@ namespace winrt::ShaderLab::implementation
         window->m_forceRender = true;
         auto* w = window;
         w->DispatcherQueue().TryEnqueue([w]{
-            w->m_nodeGraphController.AutoLayout();
+            RunLayoutOnRenderThread(w->m_renderDispatcher,
+                [w]{ w->m_nodeGraphController.AutoLayout(); });
             w->PopulatePreviewNodeSelector();
         });
     }
@@ -168,7 +187,8 @@ namespace winrt::ShaderLab::implementation
         auto* w = window;
         w->DispatcherQueue().TryEnqueue([w, nodeId]{
             w->CloseOutputWindow(nodeId);
-            w->m_nodeGraphController.AutoLayout();
+            RunLayoutOnRenderThread(w->m_renderDispatcher,
+                [w]{ w->m_nodeGraphController.AutoLayout(); });
             w->PopulatePreviewNodeSelector();
         });
     }
@@ -187,7 +207,8 @@ namespace winrt::ShaderLab::implementation
         auto* w = window;
         w->DispatcherQueue().TryEnqueue([w]{
             w->m_outputWindows.clear();
-            w->m_nodeGraphController.AutoLayout();
+            RunLayoutOnRenderThread(w->m_renderDispatcher,
+                [w]{ w->m_nodeGraphController.AutoLayout(); });
             w->PopulatePreviewNodeSelector();
         });
     }
@@ -198,7 +219,8 @@ namespace winrt::ShaderLab::implementation
         auto* w = window;
         w->DispatcherQueue().TryEnqueue([w]{
             w->ResetAfterGraphLoad(/*reopenOutputWindows=*/true);
-            w->m_nodeGraphController.AutoLayout();
+            RunLayoutOnRenderThread(w->m_renderDispatcher,
+                [w]{ w->m_nodeGraphController.AutoLayout(); });
         });
     }
 
@@ -207,7 +229,8 @@ namespace winrt::ShaderLab::implementation
         window->m_forceRender = true;
         auto* w = window;
         w->DispatcherQueue().TryEnqueue([w]{
-            w->m_nodeGraphController.AutoLayout();
+            RunLayoutOnRenderThread(w->m_renderDispatcher,
+                [w]{ w->m_nodeGraphController.AutoLayout(); });
         });
     }
 
@@ -216,7 +239,8 @@ namespace winrt::ShaderLab::implementation
         window->m_forceRender = true;
         auto* w = window;
         w->DispatcherQueue().TryEnqueue([w]{
-            w->m_nodeGraphController.RebuildLayout();
+            RunLayoutOnRenderThread(w->m_renderDispatcher,
+                [w]{ w->m_nodeGraphController.RebuildLayout(); });
             w->PopulateAddNodeFlyout();
         });
     }

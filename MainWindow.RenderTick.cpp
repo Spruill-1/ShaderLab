@@ -905,6 +905,8 @@ namespace winrt::ShaderLab::implementation
         if (!m_renderEngine.EnsureOffscreenTargets(w, h))
             return;
 
+        auto tFrameStart = std::chrono::high_resolution_clock::now();
+
         // Pick the buffer to write to. We use the OPPOSITE of whatever was
         // just published, so UI thread can keep reading the other one
         // concurrently without contention.
@@ -935,6 +937,8 @@ namespace winrt::ShaderLab::implementation
                 }
             }
         }
+
+        auto tSourcesEnd = std::chrono::high_resolution_clock::now();
 
         // Compute which nodes are needed (mark roots + propagate upstream).
         {
@@ -982,6 +986,8 @@ namespace winrt::ShaderLab::implementation
         if (m_graph.HasDirtyNodes())
             m_graphEvaluator.Evaluate(m_graph, dc); // second pass for new effects
 
+        auto tEvalEnd = std::chrono::high_resolution_clock::now();
+
         // ---- BeginDraw on offscreen + ProcessDeferredCompute + draw preview --
         winrt::com_ptr<ID2D1Image> oldTarget;
         dc->GetTarget(oldTarget.put());
@@ -1020,6 +1026,9 @@ namespace winrt::ShaderLab::implementation
             }
         }
 
+        auto tComputeEnd = std::chrono::high_resolution_clock::now();
+        uint32_t computeCount = static_cast<uint32_t>(m_graphEvaluator.DeferredComputeCount());
+
         // Set DPI to 96 to match WinUI DIPs.
         float oldDpiX, oldDpiY;
         dc->GetDpi(&oldDpiX, &oldDpiY);
@@ -1039,27 +1048,40 @@ namespace winrt::ShaderLab::implementation
         dc->SetTransform(D2D1::Matrix3x2F::Identity());
         dc->SetDpi(oldDpiX, oldDpiY);
 
+        auto tDrawEnd = std::chrono::high_resolution_clock::now();
+
         HRESULT hrEnd = dc->EndDraw();
         dc->SetTarget(oldTarget.get());
 
         if (FAILED(hrEnd))
             return;
 
+        auto tEndDraw = std::chrono::high_resolution_clock::now();
+
         // Publish: store this buffer's index with release semantics so the
         // UI thread sees a fully-rendered frame before reading.
         m_offscreenPublishedIdx.store(writeIdx, std::memory_order_release);
         m_offscreenPublishedVersion.fetch_add(1, std::memory_order_release);
 
-        // Frame timing accumulation -- mirrors what the old RenderFrame
-        // path did so /perf reports meaningful values once a worker is up.
+        // Per-phase frame timing (exponential moving average, alpha=0.1) so
+        // /perf and the FPS-tooltip flyout report meaningful values for the
+        // P7 render-thread path. `presentUs` here is just the EndDraw flush
+        // -- the actual SwapChain Present1 happens on the UI thread in
+        // BlitOffscreenToSwapChain and is reflected in `nodeGraphUs +
+        // outputWindowsUs` from OnRenderTick.
         {
-            auto tickEnd = std::chrono::high_resolution_clock::now();
             auto usec = [](auto a, auto b) {
                 return std::chrono::duration<double, std::micro>(b - a).count();
             };
             const double a = 0.1;
             auto& t = m_frameTiming;
-            t.totalUs       = t.totalUs * (1-a) + (deltaSec * 1'000'000.0) * a;
+            t.sourcesPrepUs     = t.sourcesPrepUs     * (1-a) + usec(tFrameStart,  tSourcesEnd) * a;
+            t.evaluateUs        = t.evaluateUs        * (1-a) + usec(tSourcesEnd,  tEvalEnd)    * a;
+            t.deferredComputeUs = t.deferredComputeUs * (1-a) + usec(tEvalEnd,     tComputeEnd) * a;
+            t.drawUs            = t.drawUs            * (1-a) + usec(tComputeEnd,  tDrawEnd)    * a;
+            t.presentUs         = t.presentUs         * (1-a) + usec(tDrawEnd,     tEndDraw)    * a;
+            t.computeDispatches = computeCount;
+            t.totalUs           = t.totalUs           * (1-a) + usec(tFrameStart,  tEndDraw)    * a;
             t.framesSampled++;
             if (t.framesSampled % 30 == 0)
                 m_lastFrameTiming = t;

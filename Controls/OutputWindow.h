@@ -2,6 +2,7 @@
 
 #include "pch.h"
 #include "../Rendering/PipelineFormat.h"
+#include "OutputSinkRenderState.h"
 
 namespace ShaderLab::Controls
 {
@@ -24,7 +25,30 @@ namespace ShaderLab::Controls
             const std::wstring& nodeName,
             const Rendering::PipelineFormat& format);
 
+        // Legacy single-thread present path. Retained for compatibility but
+        // unused after P7; the new path is SyncSinkFromUi (UI) +
+        // RenderOutputSink (render thread, free function in RenderTick) +
+        // BlitAndPresent (UI). Will be removed when all call sites migrate.
         void Present(ID2D1DeviceContext5* dc, ID2D1Image* image);
+
+        // P7: push current UI-thread view state (window size, pan/zoom,
+        // autoFit, needsFit) into the shared sink under its viewMutex so
+        // the render thread can read a coherent snapshot. Called once per
+        // UI tick before BlitAndPresent.
+        void SyncSinkFromUi();
+
+        // P7: blit the latest published offscreen buffer (created on render
+        // thread, see RenderOutputSink in MainWindow.RenderTick.cpp) into
+        // this window's swap chain back buffer, then Present1. UI thread
+        // only. Lazily rebuilds the UI-side D2D bitmap source wrappers if
+        // the render thread bumped bufferGen since last blit.
+        void BlitAndPresent(ID2D1DeviceContext5* uiDc);
+
+        // P7 sink accessor. Lifetime is shared_ptr so the render thread can
+        // hold a reference for the duration of one frame even if the UI
+        // thread closes the window mid-render.
+        std::shared_ptr<OutputSinkRenderState> Sink() const { return m_sink; }
+
         void Close();
 
         bool IsOpen() const { return m_isOpen; }
@@ -62,6 +86,10 @@ namespace ShaderLab::Controls
         winrt::Microsoft::UI::Xaml::Controls::TextBlock m_fpsText{ nullptr };
         winrt::com_ptr<IDXGISwapChain3> m_swapChain;
         winrt::com_ptr<ID2D1Bitmap1> m_renderTarget;
+
+        // P7 cross-thread state. Created in Create(), shared with the
+        // render worker via MainWindow::m_outputSinks.
+        std::shared_ptr<OutputSinkRenderState> m_sink;
 
         // Last rendered image (non-owning, for save).
         ID2D1Image* m_lastImage{ nullptr };
