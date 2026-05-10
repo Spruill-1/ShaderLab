@@ -189,12 +189,29 @@ namespace winrt::ShaderLab::implementation
             RenderFrame(deltaSec);
             m_forceRender = false;
             m_frameCount++;
+            // graphGeneration tracks "user-driven mutation observed". Animation
+            // ticks (clock-driven dirty without forceRender) don't count -- those
+            // dirty bits flip every frame and would make graphGeneration useless
+            // as a "did the structure change" indicator. wasDirty plus
+            // forceRender is the right discriminator.
+            if (hasDirty || wasForceRender)
+                ++m_graphGeneration;
             // Rebuild layout only on user-initiated changes (not animation ticks)
             // to update analysis display sizing without killing performance.
             if (wasForceRender)
                 m_nodeGraphController.RebuildLayout();
         }
         auto tRenderFrameEnd = std::chrono::high_resolution_clock::now();
+
+        // Publish a fresh GraphUiSnapshot so UI / MCP consumers see the latest
+        // state. We do this every tick (not just when needsEval) so consumers
+        // can spin idle without missing updates that happen between ticks. The
+        // snapshot is cheap when the graph hasn't changed (a value copy of the
+        // current node + edge vectors).
+        ++m_frameGeneration;
+        auto snap = ::ShaderLab::Graph::BuildGraphUiSnapshot(
+            m_graph, m_previewNodeId, m_graphGeneration, m_frameGeneration);
+        std::atomic_store(&m_uiGraphSnapshot, std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>(snap));
 
         RenderNodeGraph();
         auto tNodeGraphEnd = std::chrono::high_resolution_clock::now();

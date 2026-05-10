@@ -5,6 +5,7 @@
 #include "Rendering/DisplayMonitor.h"
 #include "Rendering/GraphEvaluator.h"
 #include "Graph/EffectGraph.h"
+#include "Graph/GraphUiSnapshot.h"
 #include "Effects/EffectRegistry.h"
 #include "Effects/SourceNodeFactory.h"
 #include "Effects/CustomPixelShaderEffect.h"
@@ -19,6 +20,7 @@
 #include "EffectDesignerWindow.xaml.h"
 #include "Engine/Mcp/McpHttpServer.h"
 #include "Engine/Mcp/EngineMcpRoutes.h"
+#include "Rendering/RenderThreadDispatcher.h"
 
 namespace winrt::ShaderLab::implementation
 {
@@ -216,6 +218,27 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Rendering::RenderEngine       m_renderEngine;
         ::ShaderLab::Rendering::DisplayMonitor     m_displayMonitor;
         ::ShaderLab::Rendering::GraphEvaluator     m_graphEvaluator;
+
+        // Render-thread plumbing. The dispatcher carries closures from UI /
+        // MCP / NodeGraphController producers to whichever thread owns
+        // rendering. Until the actual worker thread spawns (Phase 7), the
+        // dispatcher runs in synchronous mode -- closures execute inline on
+        // the calling thread, preserving today's single-thread behavior.
+        ::ShaderLab::Rendering::RenderThreadDispatcher m_renderDispatcher{ /*synchronous=*/true };
+
+        // Latest published immutable snapshot of the graph + per-node runtime
+        // state. The render path republishes after each frame; UI reads pull
+        // via std::atomic_load(&m_uiGraphSnapshot). Initially nullptr until
+        // the first render tick publishes.
+        std::atomic<std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>>
+            m_uiGraphSnapshot{ nullptr };
+
+        // Generation counters. graphGeneration bumps every time the render
+        // path observes a graph mutation (HasDirtyNodes etc.); frameGeneration
+        // bumps once per render tick. Both are written only from the render
+        // path so a non-atomic uint64 is fine.
+        uint64_t m_graphGeneration{ 0 };
+        uint64_t m_frameGeneration{ 0 };
 
         // UI-side D2D stack -- separate D2D factory + device + immediate
         // context for drawing the node-graph editor canvas and pixel-trace
