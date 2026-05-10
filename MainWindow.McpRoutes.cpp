@@ -167,15 +167,25 @@ namespace winrt::ShaderLab::implementation
         });
     }
 
-    void MainWindow::GuiEngineCommandSink::OnNodeAdded(uint32_t /*nodeId*/)
+    void MainWindow::GuiEngineCommandSink::OnNodeAdded(uint32_t nodeId)
     {
         window->m_graph.MarkAllDirty();
         window->m_forceRender = true;
+        // Detect Output nodes added via /graph/apply or other engine-side
+        // routes and auto-open a window for each. Engine-pure hosts don't
+        // care about windows; this sink runs only in the GUI host.
+        bool isOutput = false;
+        if (auto* n = window->m_graph.FindNode(nodeId))
+            isOutput = (n->type == ::ShaderLab::Graph::NodeType::Output);
         auto* w = window;
-        w->DispatcherQueue().TryEnqueue([w]{
+        w->DispatcherQueue().TryEnqueue([w, nodeId, isOutput]{
             RunLayoutOnRenderThread(w->m_renderDispatcher,
                 [w]{ w->m_nodeGraphController.AutoLayout(); });
             w->PopulatePreviewNodeSelector();
+            if (isOutput)
+            {
+                try { w->OpenOutputWindow(nodeId); } catch (...) {}
+            }
         });
     }
 
@@ -207,6 +217,13 @@ namespace winrt::ShaderLab::implementation
         auto* w = window;
         w->DispatcherQueue().TryEnqueue([w]{
             w->m_outputWindows.clear();
+            // Also drop sinks so the render worker doesn't keep churning on
+            // closed windows. Without this the m_outputSinks vector grows
+            // unbounded across graph clear/load cycles.
+            {
+                std::scoped_lock lock(w->m_outputSinksMutex);
+                w->m_outputSinks.clear();
+            }
             RunLayoutOnRenderThread(w->m_renderDispatcher,
                 [w]{ w->m_nodeGraphController.AutoLayout(); });
             w->PopulatePreviewNodeSelector();

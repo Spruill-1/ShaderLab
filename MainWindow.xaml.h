@@ -329,9 +329,24 @@ namespace winrt::ShaderLab::implementation
 
         // Output windows (one per additional Output node).
         std::vector<std::unique_ptr<::ShaderLab::Controls::OutputWindow>> m_outputWindows;
+        // P7: parallel list of cross-thread sinks (one per OutputWindow). The
+        // render worker iterates this snapshot WITHOUT touching the UI-owned
+        // OutputWindow itself. Each entry's shared_ptr keeps the cross-thread
+        // state alive even if the UI closes the window mid-render. The list
+        // mutex protects vector mutations (open/close); the per-sink mutex
+        // inside OutputSinkRenderState protects view-state updates.
+        std::vector<std::shared_ptr<::ShaderLab::Controls::OutputSinkRenderState>> m_outputSinks;
+        std::mutex m_outputSinksMutex;
         void OpenOutputWindow(uint32_t nodeId);
         void CloseOutputWindow(uint32_t nodeId);
         void PresentOutputWindows();
+        // P7 render-thread entry point: iterate a snapshot of m_outputSinks
+        // and render each non-closed sink's offscreen pair from its node's
+        // current cachedOutput. Called from RenderFrameToOffscreen after
+        // the main preview offscreen draw completes (BeginDraw scope still
+        // open is fine; we do our own SetTarget+BeginDraw on each sink's
+        // render-side bitmap).
+        void RenderOutputSinks();
 
         // Per-node log system.
         std::unordered_map<uint32_t, ::ShaderLab::Controls::NodeLog> m_nodeLogs;

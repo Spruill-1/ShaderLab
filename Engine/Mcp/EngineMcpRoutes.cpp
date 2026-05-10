@@ -1092,6 +1092,21 @@ namespace ShaderLab::Mcp
                                         filePath, displayName);
                                     created = true;
                                 }
+                                else if (effectName == L"Output")
+                                {
+                                    // Output node: graph terminator + sink for an
+                                    // OutputWindow on hosts that have one. Engine-pure
+                                    // hosts (headless / tests) just keep it as graph
+                                    // metadata; the GUI host's OnNodeAdded hook detects
+                                    // the new Output and opens a SwapChainPanel-bound
+                                    // window for it.
+                                    node = ::ShaderLab::Effects::EffectRegistry::CreateOutputNode();
+                                    auto outputIds = ctx.graph->GetOutputNodeIds();
+                                    node.name = outputIds.empty()
+                                        ? std::wstring(L"Output")
+                                        : (L"Output " + std::to_wstring(outputIds.size() + 1));
+                                    created = true;
+                                }
 
                                 if (!created)
                                 {

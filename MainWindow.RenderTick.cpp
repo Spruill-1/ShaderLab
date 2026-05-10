@@ -82,6 +82,12 @@ namespace winrt::ShaderLab::implementation
             m_lastSeenFrameGeneration = m_frameGeneration;
         }
         RenderNodeGraph();
+
+        // P7: present any open output windows on the UI thread. Render
+        // worker has already drawn into each sink's offscreen pair (see
+        // MainWindow::RenderOutputSinks called from RenderFrameToOffscreen);
+        // here we just sync UI view state + blit + Present1 per window.
+        PresentOutputWindows();
         auto tNodeGraphEnd = std::chrono::high_resolution_clock::now();
 
         // Accumulate UI-tick timing.
@@ -304,7 +310,17 @@ namespace winrt::ShaderLab::implementation
 
                 bool wasForceRender = m_forceRender;
                 bool hasDirty = m_graph.HasDirtyNodes();
-                bool needsEval = hasDirty || m_needsFitPreview || m_forceRender;
+                // P7: when output windows are open, force eval every frame
+                // so the worker keeps producing frames into their offscreen
+                // pairs even if no graph node is dirty (e.g. static Gamut
+                // Source feeding an Output node). Same gate as the legacy
+                // RenderFrame had.
+                bool hasOutputWindows = false;
+                {
+                    std::scoped_lock lk(m_outputSinksMutex);
+                    hasOutputWindows = !m_outputSinks.empty();
+                }
+                bool needsEval = hasDirty || m_needsFitPreview || m_forceRender || hasOutputWindows;
                 if (needsEval)
                 {
                     RenderFrameToOffscreen(dt);
@@ -1090,6 +1106,161 @@ namespace winrt::ShaderLab::implementation
         // UI thread sees a fully-rendered frame before reading.
         m_offscreenPublishedIdx.store(writeIdx, std::memory_order_release);
         m_offscreenPublishedVersion.fetch_add(1, std::memory_order_release);
+
+        // P7: render any open output windows into THEIR offscreen pairs.
+        // Each sink has its own double-buffered offscreen managed by this
+        // method. UI thread blits the published buffer in BlitAndPresent.
+        RenderOutputSinks();
+    }
+
+    // ---------------------------------------------------------------------
+    // RenderOutputSinks -- render-thread output-window rendering. Iterates
+    // a snapshot of m_outputSinks (so we don't hold m_outputSinksMutex while
+    // doing GPU work), and for each non-closed sink:
+    //   - reads view state under sink->viewMutex
+    //   - ensures buffers exist at requested size (creates D3D textures +
+    //     render-side D2D bitmap targets, bumps bufferGen on size change)
+    //   - resolves the node's cachedOutput
+    //   - picks the write idx (opposite of publishedIdx)
+    //   - BeginDraw on render-side bitmap, Clear, apply pan/zoom transform,
+    //     DrawImage, EndDraw
+    //   - publishes the new idx + version
+    // The actual blit-to-swap-chain + Present1 happens on the UI thread.
+    // ---------------------------------------------------------------------
+    void MainWindow::RenderOutputSinks()
+    {
+        std::vector<std::shared_ptr<::ShaderLab::Controls::OutputSinkRenderState>> snapshot;
+        {
+            std::scoped_lock lock(m_outputSinksMutex);
+            snapshot = m_outputSinks;
+        }
+        if (snapshot.empty()) return;
+
+        auto* dc = m_renderEngine.RenderD2DContext();
+        auto* d3dDevice = m_renderEngine.D3DDevice();
+        if (!dc || !d3dDevice) return;
+        const auto& fmt = m_renderEngine.ActiveFormat();
+
+        for (auto& sink : snapshot)
+        {
+            if (!sink) continue;
+
+            bool closed = false;
+            {
+                std::scoped_lock lock(sink->viewMutex);
+                closed = sink->closed;
+            }
+            if (closed) continue;
+
+            // Resolve the source image (the node's cachedOutput).
+            auto* image = ResolveDisplayImage(sink->nodeId);
+            if (!image) continue;
+
+            // Get the image's natural bounds in DIPs at 96 DPI.
+            float oldDpiX, oldDpiY;
+            dc->GetDpi(&oldDpiX, &oldDpiY);
+            dc->SetDpi(96.0f, 96.0f);
+            D2D1_RECT_F bounds{};
+            HRESULT bhr = dc->GetImageLocalBounds(image, &bounds);
+            if (FAILED(bhr))
+            {
+                dc->SetDpi(oldDpiX, oldDpiY);
+                continue;
+            }
+            uint32_t imgW = static_cast<uint32_t>(bounds.right - bounds.left);
+            uint32_t imgH = static_cast<uint32_t>(bounds.bottom - bounds.top);
+            if (imgW == 0 || imgH == 0)
+            {
+                dc->SetDpi(oldDpiX, oldDpiY);
+                continue;
+            }
+            // Cap to a sensible max so a runaway-bounds source can't OOM
+            // us. 8192 matches the per-effect cap in PreRenderInputBitmap.
+            imgW = (std::min)(imgW, 8192u);
+            imgH = (std::min)(imgH, 8192u);
+
+            // Allocate the offscreen at the IMAGE's native size. This
+            // keeps the render path stateless about the panel's display
+            // size / DPI -- UI's BlitAndPresent does the fit when blitting
+            // into the swap chain back buffer (which it knows the size of
+            // first-hand). Avoids the cross-thread DPI/scale math that
+            // produced misaligned output earlier.
+            if (sink->bufW != imgW || sink->bufH != imgH ||
+                !sink->textures[0] || !sink->textures[1])
+            {
+                D3D11_TEXTURE2D_DESC td{};
+                td.Width = imgW;
+                td.Height = imgH;
+                td.MipLevels = 1;
+                td.ArraySize = 1;
+                td.Format = fmt.dxgiFormat;
+                td.SampleDesc.Count = 1;
+                td.Usage = D3D11_USAGE_DEFAULT;
+                td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+                bool ok = true;
+                for (uint32_t i = 0; i < 2 && ok; ++i)
+                {
+                    sink->renderTargets[i] = nullptr;
+                    sink->textures[i] = nullptr;
+                    if (FAILED(d3dDevice->CreateTexture2D(&td, nullptr,
+                            sink->textures[i].put())))
+                    { ok = false; break; }
+                    winrt::com_ptr<IDXGISurface> surface;
+                    if (FAILED(sink->textures[i]->QueryInterface(
+                            IID_PPV_ARGS(surface.put()))))
+                    { ok = false; break; }
+                    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+                        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                        D2D1::PixelFormat(fmt.dxgiFormat,
+                            D2D1_ALPHA_MODE_PREMULTIPLIED),
+                        96.0f, 96.0f);
+                    if (FAILED(dc->CreateBitmapFromDxgiSurface(
+                            surface.get(), bp, sink->renderTargets[i].put())))
+                    { ok = false; break; }
+                }
+                if (!ok)
+                {
+                    for (uint32_t i = 0; i < 2; ++i)
+                    {
+                        sink->renderTargets[i] = nullptr;
+                        sink->textures[i] = nullptr;
+                    }
+                    sink->bufW = sink->bufH = 0;
+                    dc->SetDpi(oldDpiX, oldDpiY);
+                    continue;
+                }
+                sink->bufW = imgW;
+                sink->bufH = imgH;
+                sink->bufferGen.fetch_add(1, std::memory_order_release);
+            }
+
+            // Pick write idx = opposite of last published.
+            int32_t lastPub = sink->publishedIdx.load(std::memory_order_acquire);
+            int32_t writeIdx = (lastPub == 0) ? 1 : 0;
+            auto* target = sink->renderTargets[writeIdx].get();
+            if (!target)
+            {
+                dc->SetDpi(oldDpiX, oldDpiY);
+                continue;
+            }
+
+            winrt::com_ptr<ID2D1Image> prevTarget;
+            dc->GetTarget(prevTarget.put());
+            dc->SetTarget(target);
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(-bounds.left, -bounds.top));
+            dc->BeginDraw();
+            dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
+            dc->DrawImage(image);
+            dc->SetTransform(D2D1::Matrix3x2F::Identity());
+            HRESULT hr = dc->EndDraw();
+            dc->SetTarget(prevTarget.get());
+            dc->SetDpi(oldDpiX, oldDpiY);
+            if (FAILED(hr)) continue;
+
+            sink->publishedIdx.store(writeIdx, std::memory_order_release);
+            sink->publishedVersion.fetch_add(1, std::memory_order_release);
+        }
     }
 
     void MainWindow::BlitOffscreenToSwapChain()

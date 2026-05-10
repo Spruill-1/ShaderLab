@@ -45,10 +45,15 @@ namespace ShaderLab::Controls
 
         // ---- UI-thread-mutated view state (under viewMutex) ----
         std::mutex viewMutex;
-        uint32_t   requestedW{ 0 };
-        uint32_t   requestedH{ 0 };
-        float      panX{ 0.0f };
-        float      panY{ 0.0f };
+        uint32_t   requestedW{ 0 };  // PHYSICAL pixels (offscreen buffer size)
+        uint32_t   requestedH{ 0 };  // PHYSICAL pixels
+        // Panel's composition scale (1.0 at 100% display scaling, 1.5 at
+        // 150%, 2.0 at 200%). Render thread multiplies SetDpi by this to
+        // compute fit math in DIP space at 96 DPI canonical, while still
+        // rendering into the PHYSICAL-pixel-sized offscreen buffer.
+        float      compositionScale{ 1.0f };
+        float      panX{ 0.0f };     // DIPs at 96
+        float      panY{ 0.0f };     // DIPs at 96
         float      zoom{ 1.0f };
         bool       autoFit{ true };
         bool       needsFit{ true };

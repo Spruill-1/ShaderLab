@@ -5454,11 +5454,28 @@ namespace winrt::ShaderLab::implementation
             node->name,
             m_renderEngine.ActiveFormat());
 
+        // P7: register the cross-thread sink with the worker. The shared_ptr
+        // keeps the OutputSinkRenderState alive across thread boundaries
+        // even if the user closes the window mid-render-frame.
+        if (auto sink = window->Sink())
+        {
+            std::scoped_lock lock(m_outputSinksMutex);
+            m_outputSinks.push_back(sink);
+        }
+
         m_outputWindows.push_back(std::move(window));
     }
 
     void MainWindow::CloseOutputWindow(uint32_t nodeId)
     {
+        // P7: remove the corresponding sink first so the worker stops
+        // rendering into its buffers BEFORE the OutputWindow tears down its
+        // swap chain. Sink->closed is also set by OutputWindow::Close.
+        {
+            std::scoped_lock lock(m_outputSinksMutex);
+            std::erase_if(m_outputSinks,
+                [nodeId](const auto& s){ return s && s->nodeId == nodeId; });
+        }
         std::erase_if(m_outputWindows, [nodeId](const auto& w)
         {
             return w->NodeId() == nodeId;
@@ -5467,15 +5484,28 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::PresentOutputWindows()
     {
+        // P7: UI-thread tick for output windows. Sync each window's view
+        // state into its sink, then blit the latest worker-published frame.
+        // The actual render-into-offscreen happens on the worker thread in
+        // RenderOutputSinks (called from RenderFrameToOffscreen).
         if (m_outputWindows.empty())
             return;
 
-        // Remove closed windows and their corresponding graph nodes.
+        // Remove closed windows and their corresponding graph nodes (and
+        // their sinks).
         std::vector<uint32_t> closedNodeIds;
         std::erase_if(m_outputWindows, [&closedNodeIds](const auto& w) {
             if (!w->IsOpen()) { closedNodeIds.push_back(w->NodeId()); return true; }
             return false;
         });
+        if (!closedNodeIds.empty())
+        {
+            std::scoped_lock lock(m_outputSinksMutex);
+            std::erase_if(m_outputSinks, [&closedNodeIds](const auto& s){
+                return !s || std::find(closedNodeIds.begin(), closedNodeIds.end(),
+                    s->nodeId) != closedNodeIds.end();
+            });
+        }
         for (uint32_t nodeId : closedNodeIds)
         {
             m_graph.RemoveNode(nodeId);
@@ -5493,21 +5523,12 @@ namespace winrt::ShaderLab::implementation
         }
         if (!closedNodeIds.empty())
         {
-            // Force the next render tick so the graph panel repaints without
-            // the deleted Output node (otherwise the tick gate would skip
-            // rendering since no nodes are dirty and m_outputWindows is now
-            // smaller/empty).
             m_forceRender = true;
             m_nodeGraphController.SetNeedsRedraw();
             MarkUnsaved();
         }
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) return;
-
-        // Canonical status string + tooltip pushed to every output window so
-        // they all show identical numbers in identical formatting to the main
-        // window's FPS counter.
+        // Canonical status string + tooltip pushed to every output window.
         std::wstring statusText  = BuildFpsStatusText();
         std::wstring tooltipText = BuildFpsTooltipText();
 
@@ -5516,15 +5537,15 @@ namespace winrt::ShaderLab::implementation
             if (!window->IsReady())
                 continue;
 
-            // Sync window title with node name.
             auto* node = m_graph.FindNode(window->NodeId());
             if (node)
                 window->SetTitle(node->name);
             window->SetStatusText(statusText);
             window->SetStatusTooltip(tooltipText);
 
-            auto* image = ResolveDisplayImage(window->NodeId());
-            window->Present(dc, image);
+            // P7: push UI view state, then blit latest worker frame.
+            window->SyncSinkFromUi();
+            window->BlitAndPresent(m_uiD2dContext.get());
         }
     }
 
