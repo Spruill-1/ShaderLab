@@ -1427,6 +1427,96 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
             TEST("Shutdown clears queue", d.QueueDepth() == 0);
             TEST("IsShuttingDown reflects state", d.IsShuttingDown());
         }
+
+        // ---- P19: many concurrent producers, single consumer. ------------
+        // Stress test: 8 producer threads each post 250 sync closures
+        // returning a unique tag. All 2000 closures must run on the consumer
+        // thread (single thread id seen) and each producer must observe its
+        // own tag back.
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d;
+            std::atomic<bool> stop{ false };
+            std::atomic<int> totalRan{ 0 };
+            std::atomic<std::thread::id> consumerId{};
+            std::atomic<bool> mixedThread{ false };
+            std::thread consumer([&]{
+                d.RegisterConsumer();
+                consumerId.store(std::this_thread::get_id(), std::memory_order_release);
+                while (!stop.load(std::memory_order_acquire)) {
+                    d.WaitFor(std::chrono::milliseconds(5));
+                    d.Drain();
+                }
+                d.Drain();
+            });
+
+            constexpr int producers = 8;
+            constexpr int perProducer = 250;
+            std::vector<std::thread> producerThreads;
+            std::atomic<int> mismatches{ 0 };
+            producerThreads.reserve(producers);
+            for (int p = 0; p < producers; ++p) {
+                producerThreads.emplace_back([&, p]{
+                    for (int i = 0; i < perProducer; ++i) {
+                        int tag = p * 1000 + i;
+                        int got = d.DispatchSync([&, tag]{
+                            if (std::this_thread::get_id() != consumerId.load())
+                                mixedThread.store(true);
+                            totalRan.fetch_add(1, std::memory_order_relaxed);
+                            return tag;
+                        });
+                        if (got != tag) mismatches.fetch_add(1);
+                    }
+                });
+            }
+            for (auto& t : producerThreads) t.join();
+            stop.store(true, std::memory_order_release);
+            d.Wake();
+            consumer.join();
+
+            TEST("8 producers x 250 closures all ran",
+                totalRan.load() == producers * perProducer);
+            TEST("every closure ran on the consumer thread",
+                !mixedThread.load());
+            TEST("every DispatchSync returned its own tag",
+                mismatches.load() == 0);
+        }
+
+        // ---- P19: shutdown with many pending closures unblocks all. ------
+        // Producers that are blocked in DispatchSync must wake when Shutdown
+        // is called. They get an exception (std::runtime_error from the
+        // dispatcher), not a hang.
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d;
+            std::thread consumer([&]{
+                d.RegisterConsumer();
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                // never drain -- closures pile up in the queue
+            });
+
+            constexpr int producers = 4;
+            std::vector<std::thread> producerThreads;
+            std::atomic<int> threwCount{ 0 };
+            std::atomic<int> noThrowCount{ 0 };
+            for (int p = 0; p < producers; ++p) {
+                producerThreads.emplace_back([&]{
+                    try {
+                        d.DispatchSync([]{ return 1; });
+                        noThrowCount.fetch_add(1);
+                    } catch (...) {
+                        threwCount.fetch_add(1);
+                    }
+                });
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            d.Shutdown();
+            for (auto& t : producerThreads) t.join();
+            consumer.join();
+
+            TEST("Shutdown unblocks pending DispatchSync producers",
+                threwCount.load() + noThrowCount.load() == producers);
+            TEST("at least some producers observed shutdown",
+                threwCount.load() > 0);
+        }
     }
 }
 
