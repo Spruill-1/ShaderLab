@@ -28,6 +28,14 @@ namespace ShaderLab::Rendering
     void RenderEngine::Shutdown()
     {
         ReleaseRenderTarget();
+        // P7: release the offscreen pair too. These hold raw D3D textures +
+        // D2D bitmap wrappers for the render-thread offscreen-blit path. If
+        // we don't drop them here, a SwitchAdapter teardown leaves stale
+        // references to the OLD device, EnsureOffscreenTargets sees the
+        // bitmaps still populated at the right size and skips recreate, and
+        // every subsequent EndDraw fails (~40% of frames) because the
+        // bitmaps target a destroyed device.
+        ReleaseOffscreenTargets();
 
         // Clear the swap chain reference from the XAML panel BEFORE
         // releasing it, otherwise the compositor crashes accessing
@@ -44,6 +52,7 @@ namespace ShaderLab::Rendering
 
         m_swapChain = nullptr;
         m_d2dDeviceContext = nullptr;
+        m_renderD2dContext = nullptr; // P7: dedicated render-thread context.
         m_d2dDevice = nullptr;
         m_d2dFactory = nullptr;
         m_d3dContext = nullptr;
