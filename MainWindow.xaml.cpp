@@ -4928,7 +4928,11 @@ namespace winrt::ShaderLab::implementation
 
     std::vector<uint8_t> MainWindow::CaptureImageAsPng(ID2D1Image* image, uint32_t maxDim)
     {
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        // Use the render-thread D2D context (the same one the worker uses
+        // for BeginDraw), since this is called from inside the render
+        // dispatcher's closure. Avoids cross-context state issues with the
+        // default context that output windows + UI capture paths use.
+        auto* dc = m_renderEngine.RenderD2DContext();
         if (!dc || !image) return {};
 
         // Use 96 DPI so GetImageLocalBounds returns pixel coordinates.

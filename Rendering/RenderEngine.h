@@ -80,7 +80,18 @@ namespace ShaderLab::Rendering
         ID3D11DeviceContext4*   D3DContext()       const { return m_d3dContext.get(); }
         ID2D1Factory7*          D2DFactory()       const { return m_d2dFactory.get(); }
         ID2D1Device6*           D2DDevice()        const { return m_d2dDevice.get(); }
+        // Default D2D context. Lives on whichever thread last touched it
+        // historically (UI thread). After P7, this is the UI-thread context
+        // for capture / pixel-inspector / source-prep paths that still run
+        // on UI. The render worker uses RenderD2DContext() instead.
         ID2D1DeviceContext5*    D2DDeviceContext()  const { return m_d2dDeviceContext.get(); }
+        // Dedicated D2D context for the render-worker thread. Created from
+        // the same multi-threaded D2D device as D2DDeviceContext, so
+        // resources interop, but state (target/transform/dpi) is
+        // independent. This gives the worker its own BeginDraw/EndDraw
+        // session so concurrent UI-thread BeginDraw on the default context
+        // can't put the device into error state mid-draw.
+        ID2D1DeviceContext5*    RenderD2DContext()  const { return m_renderD2dContext.get(); }
         IDXGISwapChain3*        SwapChain()        const { return m_swapChain.get(); }
         IDXGIFactory7*          DXGIFactory()      const { return m_dxgiFactory.get(); }
 
@@ -141,6 +152,7 @@ namespace ShaderLab::Rendering
         winrt::com_ptr<ID2D1Factory7>           m_d2dFactory;
         winrt::com_ptr<ID2D1Device6>            m_d2dDevice;
         winrt::com_ptr<ID2D1DeviceContext5>      m_d2dDeviceContext;
+        winrt::com_ptr<ID2D1DeviceContext5>      m_renderD2dContext; // P7: dedicated render-thread context
 
         // Swap chain
         winrt::com_ptr<IDXGISwapChain3>         m_swapChain;

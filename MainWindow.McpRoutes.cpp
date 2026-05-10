@@ -117,7 +117,10 @@ namespace winrt::ShaderLab::implementation
                     ctx.evaluator = &window->m_graphEvaluator;
                     ctx.displayMonitor = &window->m_displayMonitor;
                     ctx.sourceFactory = &window->m_sourceFactory;
-                    ctx.dc = window->m_renderEngine.D2DDeviceContext();
+                    // Closure runs on render thread now -- give it the render
+                    // D2D context so source-prep / evaluator ops it performs
+                    // share state with the per-frame render path.
+                    ctx.dc = window->m_renderEngine.RenderD2DContext();
                     ctx.d3dDevice = window->m_renderEngine.D3DDevice();
                     ctx.d3dContext = window->m_renderEngine.D3DContext();
                     ctx.renderFrame = [this]() { window->RenderFrameToOffscreen(0.0); };

@@ -186,6 +186,18 @@ namespace ShaderLab::Rendering
                 D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
                 baseDC.put()));
         m_d2dDeviceContext = baseDC.as<ID2D1DeviceContext5>();
+
+        // P7: dedicated render-thread D2D context, sharing the same
+        // multi-threaded D2D device. State (target/transform/dpi) is
+        // independent so the render worker's BeginDraw/EndDraw can't be
+        // corrupted by concurrent UI-thread draws on m_d2dDeviceContext
+        // (capture path, pixel inspector, etc.).
+        winrt::com_ptr<ID2D1DeviceContext> baseRenderDC;
+        winrt::check_hresult(
+            m_d2dDevice->CreateDeviceContext(
+                D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                baseRenderDC.put()));
+        m_renderD2dContext = baseRenderDC.as<ID2D1DeviceContext5>();
     }
 
     // -----------------------------------------------------------------------
@@ -385,7 +397,7 @@ namespace ShaderLab::Rendering
 
     bool RenderEngine::EnsureOffscreenTargets(uint32_t width, uint32_t height)
     {
-        if (!m_d3dDevice || !m_d2dDeviceContext)
+        if (!m_d3dDevice || !m_renderD2dContext)
             return false;
 
         if (width == 0 || height == 0)
@@ -423,7 +435,7 @@ namespace ShaderLab::Rendering
                 return false;
             }
 
-            // Wrap as D2D bitmap on the *render-engine* D2D context. This is
+            // Wrap as D2D bitmap on the render-thread D2D context. This is
             // the bitmap the render thread sets as its draw target.
             winrt::com_ptr<IDXGISurface> surface;
             hr = m_offscreenTexture[i]->QueryInterface(IID_PPV_ARGS(surface.put()));
@@ -437,7 +449,7 @@ namespace ShaderLab::Rendering
                 D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
                 D2D1::PixelFormat(m_format.dxgiFormat, D2D1_ALPHA_MODE_PREMULTIPLIED),
                 96.0f, 96.0f);
-            hr = m_d2dDeviceContext->CreateBitmapFromDxgiSurface(
+            hr = m_renderD2dContext->CreateBitmapFromDxgiSurface(
                 surface.get(), bp, m_offscreenRenderBitmap[i].put());
             if (FAILED(hr))
             {

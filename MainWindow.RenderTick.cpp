@@ -178,7 +178,11 @@ namespace winrt::ShaderLab::implementation
                 // propagation. Then the offscreen render itself.
                 UpdateWorkingSpaceNodes();
 
-                if (auto* dc5 = static_cast<ID2D1DeviceContext5*>(m_renderEngine.D2DDeviceContext()))
+                // Use the render-thread D2D context for source uploads. They
+                // create D2D bitmaps that the evaluator (also using the
+                // render context) will draw -- everything stays on one
+                // context to avoid cross-context state races.
+                if (auto* dc5 = static_cast<ID2D1DeviceContext5*>(m_renderEngine.RenderD2DContext()))
                 {
                     auto& nodes = const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes());
                     if (m_sourceFactory.TickAndUploadLiveCaptures(nodes, dc5))
@@ -254,7 +258,7 @@ namespace winrt::ShaderLab::implementation
 
                 m_graphEvaluator.ResolveSourceBindings(m_graph);
 
-                if (auto* dc = m_renderEngine.D2DDeviceContext())
+                if (auto* dc = m_renderEngine.RenderD2DContext())
                 {
                     try {
                         m_sourceFactory.TickAndUploadVideos(
@@ -896,7 +900,11 @@ namespace winrt::ShaderLab::implementation
         int32_t lastPub = m_offscreenPublishedIdx.load(std::memory_order_acquire);
         int32_t writeIdx = (lastPub == 0) ? 1 : 0;
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        // Use the render-thread-dedicated D2D context (not the default one
+        // -- that one is shared with capture / pixel-inspector paths that
+        // run on UI thread, and concurrent BeginDraw on it would put it
+        // into a wrong-state error mid-tick).
+        auto* dc = m_renderEngine.RenderD2DContext();
         if (!dc) return;
         auto* targetBitmap = m_renderEngine.OffscreenRenderBitmap(writeIdx);
         if (!targetBitmap) return;
@@ -1030,6 +1038,21 @@ namespace winrt::ShaderLab::implementation
         // UI thread sees a fully-rendered frame before reading.
         m_offscreenPublishedIdx.store(writeIdx, std::memory_order_release);
         m_offscreenPublishedVersion.fetch_add(1, std::memory_order_release);
+
+        // Frame timing accumulation -- mirrors what the old RenderFrame
+        // path did so /perf reports meaningful values once a worker is up.
+        {
+            auto tickEnd = std::chrono::high_resolution_clock::now();
+            auto usec = [](auto a, auto b) {
+                return std::chrono::duration<double, std::micro>(b - a).count();
+            };
+            const double a = 0.1;
+            auto& t = m_frameTiming;
+            t.totalUs       = t.totalUs * (1-a) + (deltaSec * 1'000'000.0) * a;
+            t.framesSampled++;
+            if (t.framesSampled % 30 == 0)
+                m_lastFrameTiming = t;
+        }
     }
 
     void MainWindow::BlitOffscreenToSwapChain()
