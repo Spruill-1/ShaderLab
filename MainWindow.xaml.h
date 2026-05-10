@@ -208,11 +208,20 @@ namespace winrt::ShaderLab::implementation
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
 
-        // Render loop.
+        // Render loop. UI-only work runs on the m_renderTimer DispatcherQueueTimer
+        // (XAML reads/writes, FPS panel updates, RenderNodeGraph against the UI
+        // D2D context). RenderTickBody runs on the dedicated render-worker
+        // thread (or, in synchronous mode, inline from OnRenderTick).
         void OnRenderTick(
             winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer const& sender,
             winrt::Windows::Foundation::IInspectable const& args);
+        void RenderTickBody(double deltaSec);
         void RenderFrame(double deltaSeconds = 0.0);
+
+        // Render-worker thread loop. Owns the render-engine D2D context. Drives
+        // its own cadence (16ms wakeup) and drains m_renderDispatcher commands
+        // each iteration. Spawned by InitializeRendering, joined in Shutdown.
+        void RenderWorkerLoop(std::stop_token stop);
 
         // Device stack.
         ::ShaderLab::Rendering::RenderEngine       m_renderEngine;
@@ -225,6 +234,13 @@ namespace winrt::ShaderLab::implementation
         // dispatcher runs in synchronous mode -- closures execute inline on
         // the calling thread, preserving today's single-thread behavior.
         ::ShaderLab::Rendering::RenderThreadDispatcher m_renderDispatcher{ /*synchronous=*/true };
+
+        // Render-worker thread. Scaffolding for a future P7 spawn; not
+        // currently spawned because Present1 on a SwapChainPanel-bound chain
+        // throws RPC_E_WRONG_THREAD from a render-thread MTA. Until that
+        // apartment-affinity issue is resolved, render work runs on the UI
+        // thread (synchronous dispatcher mode).
+        std::jthread m_renderWorker;
 
         // Latest published immutable snapshot of the graph + per-node runtime
         // state. The render path republishes after each frame; UI reads pull
@@ -275,7 +291,7 @@ namespace winrt::ShaderLab::implementation
 
         // Render loop timer.
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer m_renderTimer{ nullptr };
-        uint32_t m_frameCount{ 0 };
+        std::atomic<uint64_t> m_frameCount{ 0 };
         uint64_t m_lastVideoUploadCount{ 0 };
         float    m_lastFps{ 0.0f };
         float    m_lastVideoFps{ 0.0f };
@@ -312,6 +328,7 @@ namespace winrt::ShaderLab::implementation
         HWND m_hwnd{ nullptr };
         bool m_customEffectsRegistered{ false };
         bool m_isShuttingDown{ false };
+        std::atomic<bool> m_renderShouldStop{ false };
 
         // Video seek slider / position label (updated per-tick while playing).
         winrt::Microsoft::UI::Xaml::Controls::Slider m_videoSeekSlider{ nullptr };

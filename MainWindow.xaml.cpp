@@ -383,6 +383,7 @@ namespace winrt::ShaderLab::implementation
     MainWindow::~MainWindow()
     {
         m_isShuttingDown = true;
+        m_renderShouldStop.store(true, std::memory_order_release);
 
         // Stop MCP server before tearing down resources.
         if (m_mcpServer)
@@ -556,6 +557,12 @@ namespace winrt::ShaderLab::implementation
         m_renderTimer.Tick({ this, &MainWindow::OnRenderTick });
         UpdateRenderTimerInterval();
         m_renderTimer.Start();
+
+        // Note: the render-worker thread (m_renderWorker) is NOT yet spawned.
+        // Render work runs inline on the UI thread via the synchronous
+        // dispatcher mode. The worker spawn is deferred until the
+        // SwapChain/Present apartment-affinity issue is solved -- see
+        // MainWindow.RenderTick.cpp's RenderWorkerLoop comment.
 
         // Initialize the node graph editor panel.
         InitializeGraphPanel();
@@ -816,7 +823,7 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::SwitchAdapter(
         ::ShaderLab::Rendering::DevicePreference pref, LUID adapterLuid)
     {
-        // Stop render timer.
+        // Stop UI render timer.
         if (m_renderTimer) m_renderTimer.Stop();
 
         // Save graph + view state.

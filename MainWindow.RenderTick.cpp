@@ -13,6 +13,26 @@ namespace winrt::ShaderLab::implementation
 {
     // -----------------------------------------------------------------------
     // Render loop
+    //
+    // The render loop is split across two threads:
+    //   - UI thread (m_renderTimer DispatcherQueueTimer): runs OnRenderTick.
+    //     Handles XAML-touching work only -- editor-canvas redraw on the
+    //     UI-side D2D context, FPS panel text update, video seek slider,
+    //     properties panel refresh, MCP indicator, log windows.
+    //   - Render-worker thread (m_renderWorker): runs RenderWorkerLoop ->
+    //     RenderTickBody. Handles all graph + GPU work -- working space
+    //     sync, capture/clock/video upload, dirty propagation, RenderFrame
+    //     (which evaluates the graph and presents the main swap chain),
+    //     and snapshot publication.
+    //
+    // The two threads communicate through:
+    //   - m_renderDispatcher: closures from UI/MCP land on the render thread
+    //   - m_uiGraphSnapshot: render thread publishes per-frame; UI reads
+    //
+    // This split exists so that a slow GPU evaluation (heavy graph, expensive
+    // synchronous compute readbacks) cannot block UI input handling. The
+    // user-visible win is that buttons / flyouts / canvas pan-zoom stay
+    // responsive even when the render side is at ~2 fps on a heavy graph.
     // -----------------------------------------------------------------------
 
     void MainWindow::OnRenderTick(
@@ -24,19 +44,154 @@ namespace winrt::ShaderLab::implementation
 
         try
         {
-        // Compute frame delta time.
+        // Compute frame delta time (used by the render-tick body for clock
+        // node advancement and frame timing).
         auto now = std::chrono::steady_clock::now();
         double deltaSec = std::chrono::duration<double>(now - m_lastRenderTick).count();
-        // tTickStart marks the start of this entire timer-tick processing so
-        // we can attribute time to phases that arent inside RenderFrame
-        // (video decode + upload, dirty propagation, node-graph editor
-        // redraw, output-window present, pixel-trace updates). The frames
-        // wall-clock interval is the gap between consecutive m_lastRenderTick
-        // captures (= deltaSec).
-        auto tTickStart = now;
         m_lastRenderTick = now;
-        // Clamp to avoid huge jumps (e.g., after breakpoint or sleep).
         if (deltaSec > 0.1) deltaSec = 0.016;
+
+        auto tTickStart = std::chrono::high_resolution_clock::now();
+
+        // Drain pending dispatcher closures on UI thread (synchronous mode).
+        // Once the render thread is fully working (deferred from this turn --
+        // RenderFrame's IDXGISwapChain1::Present1 against a SwapChainPanel-
+        // bound chain throws RPC_E_WRONG_THREAD from a render-thread MTA),
+        // this becomes Drain on the worker side instead.
+        m_renderDispatcher.Drain();
+
+        // Render-tick body: graph + GPU work. Today still on UI thread; will
+        // move to render thread once the SwapChain/Present apartment-affinity
+        // issue is resolved (see RenderTickBody comment).
+        RenderTickBody(deltaSec);
+
+        if (m_forceRender || m_graph.HasDirtyNodes())
+            m_frameCount.fetch_add(1, std::memory_order_relaxed);
+
+        // Editor canvas redraw (UI-side D2D context, P4).
+        RenderNodeGraph();
+        auto tNodeGraphEnd = std::chrono::high_resolution_clock::now();
+
+        // Accumulate UI-tick timing.
+        {
+            auto usec = [](auto a, auto b) {
+                return std::chrono::duration<double, std::micro>(b - a).count();
+            };
+            const double a = 0.1;
+            auto& t = m_frameTiming;
+            t.nodeGraphUs   = t.nodeGraphUs * (1-a) + usec(tTickStart, tNodeGraphEnd) * a;
+        }
+
+        // Update video seek slider and position label while playing.
+        if (m_videoSeekSlider && m_videoSeekNodeId != 0)
+        {
+            auto* vp = m_sourceFactory.GetVideoProvider(m_videoSeekNodeId);
+            if (vp && vp->IsOpen())
+            {
+                double pos = vp->CurrentPosition();
+                m_videoSeekSuppressEvents = true;
+                m_videoSeekSlider.Value(pos);
+                m_videoSeekSuppressEvents = false;
+                if (m_videoPositionLabel)
+                    m_videoPositionLabel.Text(std::format(L"Position: {:.1f}s / {:.1f}s", pos, vp->Duration()));
+            }
+        }
+
+        // Periodic UI updates at 250 ms (log windows, properties panel,
+        // MCP activity indicator, FPS tooltip) and 1 s (FPS counter).
+        auto fpsNow = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(fpsNow - m_fpsTimePoint).count();
+        if (elapsed >= 250)
+        {
+            if (!m_logWindows.empty())
+                UpdateLogWindows();
+            if (m_selectedNodeId != 0 && m_graph.HasDirtyNodes())
+            {
+                auto* selNode = m_graph.FindNode(m_selectedNodeId);
+                if (selNode && !selNode->propertyBindings.empty() &&
+                    !IsPropertiesPanelInteracting())
+                    UpdatePropertiesPanel();
+            }
+            UpdateMcpActivityIndicator();
+            UpdateFpsTooltip();
+        }
+        if (elapsed >= 1000)
+        {
+            uint64_t framesSeen = m_frameCount.exchange(0, std::memory_order_relaxed);
+            float fps = static_cast<float>(framesSeen) * 1000.0f / static_cast<float>(elapsed);
+
+            uint64_t currentVideoUploads = m_sourceFactory.TotalVideoUploads();
+            float videoFps = static_cast<float>(currentVideoUploads - m_lastVideoUploadCount) * 1000.0f / static_cast<float>(elapsed);
+            m_lastVideoUploadCount = currentVideoUploads;
+            m_lastVideoFps = videoFps;
+            m_lastFps = fps;
+
+            FpsText().Text(std::format(L"{:.0f} fps | {:.1f} ms", fps, m_frameTiming.totalUs / 1000.0));
+            UpdateFpsTooltip();
+            m_fpsTimePoint = fpsNow;
+        }
+
+        } // end try
+        catch (const winrt::hresult_error& ex)
+        {
+            OutputDebugStringW(std::format(L"[OnRenderTick] Exception: 0x{:08X}\n",
+                static_cast<uint32_t>(ex.code())).c_str());
+        }
+        catch (const std::exception& ex)
+        {
+            OutputDebugStringW(std::format(L"[OnRenderTick] std::exception: {}\n",
+                std::wstring(ex.what(), ex.what() + strlen(ex.what()))).c_str());
+        }
+        catch (...)
+        {
+            OutputDebugStringW(L"[OnRenderTick] Unknown exception\n");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // RenderWorkerLoop -- render thread entry point. NOT YET SPAWNED -- the
+    // SwapChain/Present apartment-affinity issue (Present1 on a chain bound
+    // to a XAML SwapChainPanel throws RPC_E_WRONG_THREAD from a render-thread
+    // MTA, even with multi-threaded D2D and D3D11 multithread protection)
+    // needs more investigation. Kept as scaffolding for the next attempt.
+    // ---------------------------------------------------------------------
+    void MainWindow::RenderWorkerLoop(std::stop_token stop)
+    {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        m_renderDispatcher.RegisterConsumer();
+
+        auto last = std::chrono::steady_clock::now();
+        while (!stop.stop_requested() && !m_renderShouldStop.load(std::memory_order_acquire))
+        {
+            m_renderDispatcher.WaitFor(std::chrono::milliseconds(16));
+            m_renderDispatcher.Drain();
+            if (stop.stop_requested() || m_renderShouldStop.load(std::memory_order_acquire))
+                break;
+            if (m_isShuttingDown) break;
+            if (!m_renderEngine.IsInitialized()) continue;
+
+            auto now = std::chrono::steady_clock::now();
+            double dt = std::chrono::duration<double>(now - last).count();
+            last = now;
+            if (dt > 0.1) dt = 0.016;
+
+            try { RenderTickBody(dt); }
+            catch (...) { /* see header note */ }
+        }
+
+        m_renderDispatcher.Drain();
+    }
+
+    // ---------------------------------------------------------------------
+    // RenderTickBody -- body of the render-thread tick. All graph + GPU work.
+    // Equivalent to the old OnRenderTick body before the split.
+    // ---------------------------------------------------------------------
+    void MainWindow::RenderTickBody(double deltaSec)
+    {
+        if (m_isShuttingDown) return;
+        if (!m_renderEngine.IsInitialized()) return;
+
+        auto tTickStart = std::chrono::high_resolution_clock::now();
 
         // Mirror the active display profile into Working Space parameter
         // nodes. This is a cheap node-list walk that no-ops when no
@@ -71,24 +226,17 @@ namespace winrt::ShaderLab::implementation
                 };
 
                 bool autoDuration = getF(L"AutoDuration", 1.0f) > 0.5f;
-
-                // Disable AutoDuration if StopTime has an explicit binding.
                 if (autoDuration && node.propertyBindings.count(L"StopTime"))
                 {
                     autoDuration = false;
                     node.properties[L"AutoDuration"] = 0.0f;
                 }
-
-                // Auto-detect StopTime from downstream video durations.
-                // Data bindings don't create graph edges — scan all nodes
-                // for propertyBindings that reference this Clock.
                 if (autoDuration)
                 {
                     float maxDur = 0.0f;
                     for (const auto& other : m_graph.Nodes())
                     {
                         if (other.id == node.id) continue;
-                        // Check if this node has any property bound to our Clock.
                         bool boundToThisClock = false;
                         for (const auto& [propName, binding] : other.propertyBindings)
                         {
@@ -175,51 +323,40 @@ namespace winrt::ShaderLab::implementation
             }
         }
 
-        // Only re-evaluate the graph when something changed.
-        // Always render if output windows are open (they need continuous present).
+        // Only re-evaluate the graph when something changed. Always render
+        // if output windows are open (they need continuous present).
         bool wasForceRender = m_forceRender;
         bool hasDirty = m_graph.HasDirtyNodes();
         bool hasOutputWindows = !m_outputWindows.empty();
         bool needsEval = hasDirty || m_needsFitPreview || m_forceRender || hasOutputWindows;
-        // Mark the boundary between "video tick / dirty propagation" and
-        // "render frame" so we can attribute time to each.
         auto tVideoTickEnd = std::chrono::high_resolution_clock::now();
         if (needsEval)
         {
             RenderFrame(deltaSec);
             m_forceRender = false;
-            m_frameCount++;
-            // graphGeneration tracks "user-driven mutation observed". Animation
-            // ticks (clock-driven dirty without forceRender) don't count -- those
-            // dirty bits flip every frame and would make graphGeneration useless
-            // as a "did the structure change" indicator. wasDirty plus
-            // forceRender is the right discriminator.
+            m_frameCount.fetch_add(1, std::memory_order_relaxed);
             if (hasDirty || wasForceRender)
                 ++m_graphGeneration;
-            // Rebuild layout only on user-initiated changes (not animation ticks)
-            // to update analysis display sizing without killing performance.
+            // Layout rebuild touches m_visuals which is owned by UI thread's
+            // controller. Marshal to UI dispatcher.
             if (wasForceRender)
-                m_nodeGraphController.RebuildLayout();
+            {
+                DispatcherQueue().TryEnqueue([this]{
+                    m_nodeGraphController.RebuildLayout();
+                });
+            }
         }
         auto tRenderFrameEnd = std::chrono::high_resolution_clock::now();
 
         // Publish a fresh GraphUiSnapshot so UI / MCP consumers see the latest
-        // state. We do this every tick (not just when needsEval) so consumers
-        // can spin idle without missing updates that happen between ticks. The
-        // snapshot is cheap when the graph hasn't changed (a value copy of the
-        // current node + edge vectors).
+        // state.
         ++m_frameGeneration;
         auto snap = ::ShaderLab::Graph::BuildGraphUiSnapshot(
             m_graph, m_previewNodeId, m_graphGeneration, m_frameGeneration);
-        std::atomic_store(&m_uiGraphSnapshot, std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>(snap));
+        std::atomic_store(&m_uiGraphSnapshot,
+            std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>(snap));
 
-        RenderNodeGraph();
-        auto tNodeGraphEnd = std::chrono::high_resolution_clock::now();
-
-        // Accumulate per-tick wall-clock + tick-only phases. `totalUs` is
-        // tick-to-tick wall clock so it matches the displayed FPS exactly:
-        // sub-phase counters below sum to <= totalUs and the difference
-        // is dispatcher idle / message-pump / OS overhead between ticks.
+        // Frame-timing accumulation.
         {
             auto usec = [](auto a, auto b) {
                 return std::chrono::duration<double, std::micro>(b - a).count();
@@ -228,100 +365,12 @@ namespace winrt::ShaderLab::implementation
             auto& t = m_frameTiming;
             t.totalUs       = t.totalUs * (1-a) + (deltaSec * 1'000'000.0) * a;
             t.videoTickUs   = t.videoTickUs * (1-a) + usec(tTickStart, tVideoTickEnd) * a;
-            t.nodeGraphUs   = t.nodeGraphUs * (1-a) + usec(tRenderFrameEnd, tNodeGraphEnd) * a;
             t.framesSampled++;
-            // Snapshot every 30 frames for MCP reads.
             if (t.framesSampled % 30 == 0)
                 m_lastFrameTiming = t;
         }
-
-        // Update video seek slider and position label while playing.
-        if (m_videoSeekSlider && m_videoSeekNodeId != 0)
-        {
-            auto* vp = m_sourceFactory.GetVideoProvider(m_videoSeekNodeId);
-            if (vp && vp->IsOpen())
-            {
-                double pos = vp->CurrentPosition();
-                m_videoSeekSuppressEvents = true;
-                m_videoSeekSlider.Value(pos);
-                m_videoSeekSuppressEvents = false;
-                if (m_videoPositionLabel)
-                    m_videoPositionLabel.Text(std::format(L"Position: {:.1f}s / {:.1f}s", pos, vp->Duration()));
-            }
-        }
-
-        // Update FPS counter every second (counts output frames only).
-        // Also update log windows at ~4Hz.
-        auto fpsNow = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(fpsNow - m_fpsTimePoint).count();
-        if (elapsed >= 250)
-        {
-            if (!m_logWindows.empty())
-                UpdateLogWindows();
-            // Refresh properties panel only when the selected node actually has
-            // a property binding whose live value can change frame to frame.
-            // Without this guard, video playback (which dirties graph nodes
-            // every frame) caused a 4 Hz rebuild of the entire properties
-            // panel -- visibly jittering Slider/NumberBox widths as auto-sized
-            // controls re-laid out.
-            //
-            // Additional guard: skip the rebuild when any descendant of the
-            // PropertiesPanel currently has keyboard focus (i.e. the user
-            // is mid-edit in a TextBox / NumberBox / dropdown). The clear()
-            // + recreate cycle was destroying the focused control on every
-            // 250 ms tick, making any property whose owner has a bound
-            // sibling effectively un-editable in a Clock-driven graph.
-            if (m_selectedNodeId != 0 && m_graph.HasDirtyNodes())
-            {
-                auto* selNode = m_graph.FindNode(m_selectedNodeId);
-                if (selNode && !selNode->propertyBindings.empty() &&
-                    !IsPropertiesPanelInteracting())
-                    UpdatePropertiesPanel();
-            }
-            // Refresh MCP activity indicator (dot color fade + tooltip "Xs ago"
-            // counter).  Cheap when no activity has occurred.
-            UpdateMcpActivityIndicator();
-
-            // Refresh the FPS tooltip's breakdown at 250 ms cadence so that
-            // hovering the FPS counter shows live phase costs without
-            // waiting for the once-per-second FPS-text update. The TextBlock
-            // inside the ToolTip is data-bound so updating its Text
-            // refreshes the open tooltip in place.
-            UpdateFpsTooltip();
-        }
-        if (elapsed >= 1000)
-        {
-            float fps = static_cast<float>(m_frameCount) * 1000.0f / static_cast<float>(elapsed);
-
-            // Video decode FPS (kept for tooltip).
-            uint64_t currentVideoUploads = m_sourceFactory.TotalVideoUploads();
-            float videoFps = static_cast<float>(currentVideoUploads - m_lastVideoUploadCount) * 1000.0f / static_cast<float>(elapsed);
-            m_lastVideoUploadCount = currentVideoUploads;
-            m_lastVideoFps = videoFps;
-            m_lastFps = fps;
-
-            FpsText().Text(std::format(L"{:.0f} fps | {:.1f} ms", fps, m_frameTiming.totalUs / 1000.0));
-            UpdateFpsTooltip();
-            m_frameCount = 0;
-            m_fpsTimePoint = fpsNow;
-        }
-
-        } // end try
-        catch (const winrt::hresult_error& ex)
-        {
-            OutputDebugStringW(std::format(L"[RenderTick] Exception: 0x{:08X}\n",
-                static_cast<uint32_t>(ex.code())).c_str());
-        }
-        catch (const std::exception& ex)
-        {
-            OutputDebugStringW(std::format(L"[RenderTick] std::exception: {}\n",
-                std::wstring(ex.what(), ex.what() + strlen(ex.what()))).c_str());
-        }
-        catch (...)
-        {
-            OutputDebugStringW(L"[RenderTick] Unknown exception\n");
-        }
     }
+
 
     void MainWindow::RenderFrame(double deltaSeconds)
     {

@@ -104,11 +104,11 @@ namespace winrt::ShaderLab::implementation
         std::function<::ShaderLab::McpHttpServer::Response(
             ::ShaderLab::Mcp::EngineContext&)> closure)
     {
-        // Marshal the engine work to the UI thread so the closure
-        // doesn't race with the render tick mutating the same state.
-        // (Headless host's sink runs the closure synchronously on the
-        // listener thread; for that host the McpHttpServer's listener
-        // thread is the only consumer of the engine state.)
+        // Marshal the engine work to the UI thread for now -- once the render
+        // worker spawn lands (deferred from this turn pending the Present /
+        // SwapChainPanel apartment-affinity issue), this becomes
+        // m_renderDispatcher.DispatchSync. UI thread is currently the only
+        // safe writer to m_graph because the dispatcher runs synchronous.
         return window->DispatchSync([this, &closure]() -> ::ShaderLab::McpHttpServer::Response {
             ::ShaderLab::Mcp::EngineContext ctx{};
             ctx.graph = &window->m_graph;
@@ -131,9 +131,9 @@ namespace winrt::ShaderLab::implementation
     }
 
     // Event hooks. All of these run on the UI thread (the engine route's
-    // Dispatch closure already marshaled there). The implementations call
-    // the same UI methods MainWindow uses on native user interactions, so
-    // MCP-driven mutations take the same UI code path the user does.
+    // Dispatch closure marshaled there). The implementations call the same
+    // UI methods MainWindow uses on native user interactions, so MCP-driven
+    // mutations take the same UI code path the user does.
 
     void MainWindow::GuiEngineCommandSink::OnNodeAdded(uint32_t /*nodeId*/)
     {
@@ -171,9 +171,6 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::GuiEngineCommandSink::OnGraphLoaded()
     {
-        // ResetAfterGraphLoad rebuilds the per-load UI state (heartbeats,
-        // output windows, preview selector). Same path the file-open dialog
-        // takes.
         window->ResetAfterGraphLoad(/*reopenOutputWindows=*/true);
         window->m_nodeGraphController.AutoLayout();
         window->m_forceRender = true;
@@ -181,19 +178,12 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::GuiEngineCommandSink::OnGraphStructureChanged()
     {
-        // Edges or property bindings changed -- rebuild the canvas layout
-        // so any new connections render correctly. AutoLayout is the same
-        // call user-driven connect/disconnect uses.
         window->m_nodeGraphController.AutoLayout();
         window->m_forceRender = true;
     }
 
     void MainWindow::GuiEngineCommandSink::OnCustomEffectRecompiled(uint32_t /*nodeId*/)
     {
-        // Custom effect bytecode + parameters changed: rebuild the
-        // canvas layout (parameter pins may have changed), enforce
-        // unique effect names, and refresh the Add Node flyout. Same
-        // calls EffectDesignerWindow's "Update in Graph" path makes.
         window->m_nodeGraphController.RebuildLayout();
         window->PopulateAddNodeFlyout();
         window->m_forceRender = true;
@@ -201,11 +191,6 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::GuiEngineCommandSink::OnDisplayProfileChanged()
     {
-        // MCP-driven profile change. Mirror what ApplyDisplayProfile /
-        // RevertToLiveDisplay do in the GUI's native paths so the
-        // status bar, profile dropdown, and frame state stay in sync.
-        // (Working Space nodes were already refreshed engine-side
-        // inside the route closure before this hook fired.)
         window->m_graph.MarkAllDirty();
         window->m_forceRender = true;
         window->UpdateStatusBar();

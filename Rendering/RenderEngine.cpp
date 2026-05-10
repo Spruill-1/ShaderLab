@@ -159,7 +159,13 @@ namespace ShaderLab::Rendering
 #endif
         winrt::check_hresult(
             D2D1CreateFactory(
-                D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                // Multi-threaded factory: the engine D2D context is owned by
+                // the render-worker thread but the live capture providers
+                // (DXGI Desktop Duplication, Windows Graphics Capture) deliver
+                // frames on background threads, and adapter switch / device
+                // teardown runs on the UI thread. ID2D1Multithread serializes
+                // factory + device + context calls automatically.
+                D2D1_FACTORY_TYPE_MULTI_THREADED,
                 __uuidof(ID2D1Factory7),
                 &d2dOptions,
                 m_d2dFactory.put_void()));

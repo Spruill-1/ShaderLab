@@ -193,6 +193,18 @@ namespace ShaderLab::Rendering
         // Lifecycle
         // ------------------------------------------------------------------
 
+        // Lifecycle: clear consumer registration. Useful when the consumer
+        // thread exits and a new consumer is about to register (e.g. adapter
+        // switch teardown -> new RenderEngineThread). Caller must guarantee
+        // no thread is currently calling Drain/Wait.
+        void ResetConsumer()
+        {
+            m_consumerId.store(std::thread::id{}, std::memory_order_release);
+            std::scoped_lock lock(m_mutex);
+            m_shuttingDown = false;
+            m_queue.clear();
+        }
+
         // Stop accepting new work. Pending closures still in the queue are
         // dropped. Any threads waiting on DispatchSync() will time out after
         // their own deadline. Wait()/WaitFor() return immediately.
