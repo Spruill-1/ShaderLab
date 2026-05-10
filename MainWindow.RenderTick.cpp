@@ -65,6 +65,17 @@ namespace winrt::ShaderLab::implementation
             m_frameCount.fetch_add(1, std::memory_order_relaxed);
 
         // Editor canvas redraw (UI-side D2D context, P4).
+        // Trigger a redraw whenever the worker has published a new snapshot
+        // since our last UI tick -- the canvas reads runtime fields like
+        // clockTime / analysisOutput from the live graph, but doesn't
+        // self-invalidate when those change. Without this, the canvas only
+        // redraws on UI-side interaction, so a playing Clock or Video looks
+        // frozen even though the worker is ticking and republishing.
+        if (m_frameGeneration != m_lastSeenFrameGeneration)
+        {
+            m_nodeGraphController.SetNeedsRedraw();
+            m_lastSeenFrameGeneration = m_frameGeneration;
+        }
         RenderNodeGraph();
         auto tNodeGraphEnd = std::chrono::high_resolution_clock::now();
 

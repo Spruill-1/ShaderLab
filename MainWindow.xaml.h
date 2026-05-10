@@ -288,6 +288,16 @@ namespace winrt::ShaderLab::implementation
         uint64_t m_graphGeneration{ 0 };
         uint64_t m_frameGeneration{ 0 };
 
+        // UI-thread cached value of the last snapshot frameGeneration we
+        // observed in OnRenderTick. When the worker thread bumps
+        // m_frameGeneration (in RenderWorkerLoop, every iteration), this
+        // stays behind until the UI tick catches up. We use the difference
+        // to decide whether to redraw the editor canvas -- without it the
+        // canvas only redraws on UI-side interaction, so live values like
+        // clock progress, video position, and analysis-output fields
+        // appear frozen even though the snapshot has fresh data.
+        uint64_t m_lastSeenFrameGeneration{ 0 };
+
         // UI-side D2D stack -- separate D2D factory + device + immediate
         // context for drawing the node-graph editor canvas and pixel-trace
         // swatch panel. Shares the D3D11 device with the render engine but
