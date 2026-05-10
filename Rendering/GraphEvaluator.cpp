@@ -87,6 +87,18 @@ namespace ShaderLab::Rendering
         // Effects created on the previous frame are now fully initialized.
         m_justCreated.clear();
 
+        // Drop any deferred-compute entries left from a PRIOR Evaluate call
+        // in the same render iteration. Callers that run Evaluate twice
+        // (RenderFrameToOffscreen does, for "second pass for new effects")
+        // would otherwise accumulate duplicate entries with potentially
+        // stale ID2D1Image* pointers from the first pass -- the second
+        // pass can rebuild upstream effects, leaving the first-pass
+        // entry's inputImages[i] dangling. ProcessDeferredCompute then
+        // walks both, AVs on the dangling pointer in d2d1!ValidateRealization
+        // when GetImageLocalBounds tries to traverse the chain. The
+        // most-recent pass is always the correct one to consume.
+        m_deferredCompute.clear();
+
         // Get topological ordering (sources first → output last).
         std::vector<uint32_t> order;
         try
@@ -234,7 +246,7 @@ namespace ShaderLab::Rendering
                     // Collect all upstream input images, in pin-index order
                     // (matching customEffect.inputNames). The bridge binds
                     // them at t0..t(N-1).
-                    std::vector<ID2D1Image*> inputImages;
+                    std::vector<winrt::com_ptr<ID2D1Image>> inputImages;
                     {
                         // Find max destPin so we can size by declared input
                         // count. Slots not connected get nullptr (the bridge
@@ -248,15 +260,18 @@ namespace ShaderLab::Rendering
                             : 0;
                         uint32_t totalSlots = (std::max)(maxPin, declaredCount);
                         if (totalSlots == 0 && !inputs.empty()) totalSlots = 1;
-                        inputImages.assign(totalSlots, nullptr);
+                        inputImages.assign(totalSlots, {});
                         for (const auto* e : inputs)
                         {
                             auto* srcNode = graph.FindNode(e->sourceNodeId);
-                            if (srcNode && e->destPin < inputImages.size())
-                                inputImages[e->destPin] = srcNode->cachedOutput;
+                            if (srcNode && srcNode->cachedOutput &&
+                                e->destPin < inputImages.size())
+                            {
+                                inputImages[e->destPin].copy_from(srcNode->cachedOutput);
+                            }
                         }
                     }
-                    ID2D1Image* primaryInput = inputImages.empty() ? nullptr : inputImages[0];
+                    ID2D1Image* primaryInput = inputImages.empty() ? nullptr : inputImages[0].get();
                     bool hasImageOutput = !node->outputPins.empty();
                     // Image-producing compute: recompute when dirty or no cached output.
                     // Analysis-only compute: also recompute if no analysis fields yet.
@@ -301,7 +316,7 @@ namespace ShaderLab::Rendering
                             for (size_t i = 0; i < inputImages.size(); ++i)
                             {
                                 if (inputImages[i])
-                                    preRendered[i] = PreRenderInputBitmap(dc, inputImages[i]);
+                                    preRendered[i] = PreRenderInputBitmap(dc, inputImages[i].get());
                             }
                         }
                         m_deferredCompute.push_back({ nodeId, std::move(inputImages), std::move(preRendered) });
@@ -1023,17 +1038,19 @@ namespace ShaderLab::Rendering
             // EvaluateNode while D2D effect properties are fresh).
             // Otherwise share via the per-frame map.
             std::vector<ID2D1Bitmap1*> preRendered(deferred.inputImages.size(), nullptr);
+            std::vector<ID2D1Image*>   inputRaw(deferred.inputImages.size(), nullptr);
             for (size_t i = 0; i < deferred.inputImages.size(); ++i)
             {
                 if (!deferred.inputImages[i]) continue;
+                inputRaw[i] = deferred.inputImages[i].get();
                 if (i < deferred.preRenderedInputs.size() && deferred.preRenderedInputs[i])
                     preRendered[i] = deferred.preRenderedInputs[i].get();
                 else
-                    preRendered[i] = preRenderShared(deferred.inputImages[i]);
+                    preRendered[i] = preRenderShared(inputRaw[i]);
             }
 
             const bool readback = isReadbackNeeded(node->id);
-            DispatchViaBridge(dc, graph, *node, deferred.inputImages,
+            DispatchViaBridge(dc, graph, *node, inputRaw,
                 preRendered, bridge, readback);
 
             // Phase 8c: record the timestamp for hinted nodes whose

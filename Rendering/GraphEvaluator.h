@@ -265,8 +265,15 @@ namespace ShaderLab::Rendering
             // shaders (e.g. Delta E Comparator: Reference + Test) drive
             // the bridge with all of them so each input texture binds
             // at its own t-slot.
-            std::vector<ID2D1Image*> inputImages;             // non-owning
-            std::vector<winrt::com_ptr<ID2D1Bitmap1>> preRenderedInputs;  // owning, optional
+            //
+            // OWNING refs (changed from raw ID2D1Image* in mid-2026 P7):
+            // an evaluator pass between Evaluate (which records these)
+            // and ProcessDeferredCompute (which reads them) can rebuild
+            // an upstream effect, releasing the OLD output image. Holding
+            // a com_ptr keeps the image alive for the duration of the
+            // deferred entry's lifetime.
+            std::vector<winrt::com_ptr<ID2D1Image>>     inputImages;
+            std::vector<winrt::com_ptr<ID2D1Bitmap1>>   preRenderedInputs;  // owning, optional
         };
         std::vector<DeferredCompute> m_deferredCompute;
         bool m_deferredComputeFrozen{ false };
