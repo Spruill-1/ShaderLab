@@ -534,6 +534,11 @@ namespace winrt::ShaderLab::implementation
 
         m_nodeGraphController.SetGraph(&m_graph);
         m_nodeGraphController.SetDispatcher(&m_renderDispatcher);
+        // UI-thread reads in the controller go through the per-frame snapshot
+        // the render worker publishes, never the live graph. See the THREADING
+        // RULE block in NodeGraphController.h.
+        m_nodeGraphController.SetSnapshotProvider(
+            [this] { return CurrentGraphSnapshot(); });
         m_nodeGraphController.SetConnectionCallback(
             [this](uint32_t srcId, uint32_t srcPin, uint32_t dstId, uint32_t dstPin, bool isData) {
                 auto* srcNode = m_graph.FindNode(srcId);
@@ -2455,6 +2460,12 @@ namespace winrt::ShaderLab::implementation
         // thread, separately from the render thread's evaluator context.
         auto* dc = m_uiD2dContext.get();
         if (!dc) return;
+
+        // No graph lock here: NodeGraphController now paints from the per-frame
+        // GraphUiSnapshot rather than live EffectNode pointers, so this thread
+        // touches no mutable graph state. Taking m_graphMutex here would stall
+        // the canvas behind the render worker's tick, which reaches ~50ms on a
+        // heavy graph (measured: 4K source + 2K compute) versus ~0.6ms idle.
 
         float graphDpiX = 96.0f * (std::max)(1.0f, static_cast<float>(NodeGraphPanel().CompositionScaleX()));
         float graphDpiY = 96.0f * (std::max)(1.0f, static_cast<float>(NodeGraphPanel().CompositionScaleY()));

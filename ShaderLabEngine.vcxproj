@@ -65,7 +65,9 @@
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)third_party\exprtk;$(ProjectDir)third_party\miniz;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- third_party\ itself is on the path so miniz.h's #include "miniz_export.h"
+           resolves to our in-tree shim (the real one is CMake-generated upstream). -->
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)third_party;$(ProjectDir)third_party\exprtk;$(ProjectDir)third_party\miniz;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch_engine.h</PrecompiledHeaderFile>
       <PrecompiledHeaderOutputFile>$(IntDir)pch_engine.pch</PrecompiledHeaderOutputFile>
@@ -177,7 +179,22 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Engine\Mcp\EngineMcpRoutes.cpp" />
+    <!-- miniz (submodule, tag 3.1.2). The upstream git tree ships split sources;
+         only these three are needed for the .effectgraph DEFLATE path
+         (mz_free, tdefl_compress_mem_to_heap, tinfl_decompress_mem_to_heap).
+         miniz_zip.c is deliberately omitted: EffectGraphFile.cpp writes the
+         ZIP container itself and only uses raw DEFLATE. -->
     <ClCompile Include="third_party\miniz\miniz.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <CompileAs>CompileAsC</CompileAs>
+      <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="third_party\miniz\miniz_tdef.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <CompileAs>CompileAsC</CompileAs>
+      <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="third_party\miniz\miniz_tinfl.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <CompileAs>CompileAsC</CompileAs>
       <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -198,11 +215,13 @@
     <Error Condition="!Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets'))" />
   </Target>
 
-  <Target Name="EnsureExprTk" BeforeTargets="ClCompile" Inputs="scripts\EnsureExprTk.ps1" Outputs="$(ProjectDir)third_party\exprtk\exprtk.hpp">
-    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\EnsureExprTk.ps1&quot; -TargetDir &quot;$(ProjectDir)third_party\exprtk&quot;" />
-  </Target>
-
-  <Target Name="EnsureMiniz" BeforeTargets="PrepareForBuild" Inputs="scripts\EnsureMiniz.ps1" Outputs="$(ProjectDir)third_party\miniz\miniz.c;$(ProjectDir)third_party\miniz\miniz.h">
-    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\EnsureMiniz.ps1&quot; -TargetDir &quot;$(ProjectDir)third_party\miniz&quot;" />
+  <!-- exprtk and miniz are git submodules under third_party\. If the working
+       copy was cloned without them, fail with an actionable message instead of
+       a wall of missing-header errors. -->
+  <Target Name="VerifySubmodules" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(ProjectDir)third_party\exprtk\exprtk.hpp')"
+           Text="Missing third_party\exprtk\exprtk.hpp. The exprtk and miniz dependencies are git submodules. Run: git submodule update --init --recursive" />
+    <Error Condition="!Exists('$(ProjectDir)third_party\miniz\miniz.c')"
+           Text="Missing third_party\miniz\miniz.c. The exprtk and miniz dependencies are git submodules. Run: git submodule update --init --recursive" />
   </Target>
 </Project>

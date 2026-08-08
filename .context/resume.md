@@ -148,7 +148,7 @@ These are critical lessons learned during development. Any AI agent or developer
 - Windows App SDK 1.8.
 - Windows 10 SDK 10.0.26100+.
 - PowerShell 5.1+.
-- Internet on first build (for `EnsureExprTk.ps1` + `EnsureMiniz.ps1`).
+- Git (exprtk + miniz are submodules; clone with `--recurse-submodules`).
 
 ### Build
 ```pwsh
@@ -161,8 +161,7 @@ msbuild ShaderLab.slnx /p:Configuration=Debug /p:Platform=x64
 
 Pre-build scripts run automatically on first build:
 - `scripts\EnsureDevCert.ps1` — generates / installs the local F5 dev cert (`CN=ShaderLab`).
-- `scripts\EnsureExprTk.ps1` — downloads `exprtk.hpp` (MIT) into `third_party\exprtk\`.
-- `scripts\EnsureMiniz.ps1` — downloads `miniz` (MIT) for `.effectgraph` zip DEFLATE.
+- (exprtk + miniz are now git submodules under `third_party\`, not downloaded at build time.)
 
 NuGet packages restore automatically (packages.config style).
 
@@ -203,7 +202,7 @@ ShaderLab\
 ├── docs/                           # Architecture tree (architecture / effects / ui-ux / hosts / development / history)
 ├── docs/effects/new-effect-defaults.md  # D2D effect default-property reference
 ├── CHANGELOG.md                    # Version history
-├── Bootstrap.ps1                   # One-command fresh-clone setup
+├── .gitmodules                     # submodule pins (exprtk, miniz)
 │
 ├── pch.h / pch.cpp                 # App PCH
 ├── pch_engine.h / pch_engine.cpp   # Engine + Test + Headless PCH
@@ -281,8 +280,6 @@ ShaderLab\
 │
 ├── scripts\
 │   ├── EnsureDevCert.ps1
-│   ├── EnsureExprTk.ps1
-│   ├── EnsureMiniz.ps1
 │   └── Install.ps1                 # Per-arch unsigned-MSIX installer
 │
 ├── .github\

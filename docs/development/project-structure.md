@@ -15,7 +15,7 @@ ShaderLab/
 ├── Version.h                       # App version + graph format version
 ├── README.md                       # This file
 ├── CHANGELOG.md                    # Version history
-├── Bootstrap.ps1                   # One-command fresh-clone setup (cert + ExprTk + restore)
+├── .gitmodules                     # third_party submodule pins (exprtk, miniz)
 │
 ├── pch.h / pch.cpp                 # App PCH (WinRT, WinUI, D2D, D3D, STL)
 ├── pch_engine.h / pch_engine.cpp   # Engine/Test/Headless PCH (WinRT base, D2D, D3D, MF, STL)
@@ -101,10 +101,11 @@ ShaderLab/
 ├── Shaders/                        # HLSL source files (user shaders)
 ├── Assets/                         # App icons, splash screen
 ├── third_party/
-│   └── exprtk/                     # exprtk.hpp (downloaded by EnsureExprTk.ps1, gitignored)
+│   ├── exprtk/                     # submodule: ArashPartow/exprtk (MIT) — exprtk.hpp
+│   ├── miniz/                      # submodule: richgel999/miniz @ 3.1.2 (MIT)
+│   └── miniz_export.h              # in-tree shim: empty MINIZ_EXPORT (upstream CMake-generates it)
 ├── scripts/
 │   ├── EnsureDevCert.ps1           # Generates + installs CN=ShaderLab dev cert for F5
-│   ├── EnsureExprTk.ps1            # Downloads exprtk.hpp on first build
 │   └── Install.ps1                 # Per-arch unsigned-MSIX installer for end users
 ├── .github/
 │   ├── workflows/

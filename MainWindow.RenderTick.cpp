@@ -182,7 +182,15 @@ namespace winrt::ShaderLab::implementation
         while (!stop.stop_requested() && !m_renderShouldStop.load(std::memory_order_acquire))
         {
             m_renderDispatcher.WaitFor(std::chrono::milliseconds(16));
-            m_renderDispatcher.Drain();
+            {
+                // Every MCP mutation arrives as a closure drained here. Hold the
+                // graph exclusively across the whole drain rather than per
+                // closure: RenderThreadDispatcher runs a nested DispatchSync
+                // inline when already on the consumer thread, which would
+                // self-deadlock a non-recursive mutex taken per closure.
+                std::unique_lock<std::shared_mutex> graphLock(m_graphMutex);
+                m_renderDispatcher.Drain();
+            }
             if (stop.stop_requested() || m_renderShouldStop.load(std::memory_order_acquire))
                 break;
             if (m_isShuttingDown) break;
@@ -198,6 +206,16 @@ namespace winrt::ShaderLab::implementation
                 // Per-tick non-GPU work that previously lived in OnRenderTick:
                 // working space sync, capture/clock tick, video upload, dirty
                 // propagation. Then the offscreen render itself.
+                //
+                // This whole body mutates m_graph -- UpdateWorkingSpaceNodes
+                // writes Working Space properties, the clock tick does
+                // node.properties[...] = (a std::map INSERT), and the evaluator
+                // walks and dirties nodes. Hold the graph exclusively so the UI
+                // thread's canvas paint cannot read a half-mutated node. Taken
+                // in a separate scope from the Drain() lock above so the two
+                // never nest.
+                std::unique_lock<std::shared_mutex> graphLock(m_graphMutex);
+
                 UpdateWorkingSpaceNodes();
 
                 // Use the render-thread D2D context for source uploads. They

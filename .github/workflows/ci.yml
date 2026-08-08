@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -92,15 +94,21 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  bootstrap-smoke:
-    name: Bootstrap.ps1 smoke (clean clone)
+  clean-clone-smoke:
+    name: Clean-clone smoke (submodules + build)
     runs-on: windows-latest
-    # Catches onboarding-cliff regressions: a fresh clone must build via
-    # the documented one-command setup. Only runs Debug|x64 -- the full
-    # matrix is build-and-test above.
+    # Catches onboarding-cliff regressions: a fresh clone must build with
+    # nothing but `git submodule update --init --recursive` + restore +
+    # msbuild. Only runs Debug|x64 -- the full matrix is build-and-test above.
     steps:
-      - name: Checkout (clean)
+      - name: Checkout (clean, no submodules)
         uses: actions/checkout@v4
+
+      - name: Initialize submodules
+        # Done explicitly rather than via checkout's `submodules:` input so
+        # this job exercises the exact command the README tells contributors
+        # to run on a fresh clone.
+        run: git submodule update --init --recursive
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -108,9 +116,18 @@ jobs:
       - name: Setup NuGet
         uses: NuGet/setup-nuget@v2
 
-      - name: Run Bootstrap.ps1 (cert + ExprTk + restore + smoke build)
+      - name: NuGet restore
+        run: nuget restore ShaderLab.slnx -SolutionDirectory .
+
+      - name: Build (Debug | x64)
         shell: pwsh
-        run: .\Bootstrap.ps1 -Build -Configuration Debug -Platform x64
+        run: |
+          msbuild ShaderLab.slnx `
+            /p:Configuration=Debug `
+            /p:Platform=x64 `
+            /p:AppxBundle=Never `
+            /p:AppxPackageSigningEnabled=false `
+            /m /nologo /v:minimal
 
       - name: Run unit tests
         shell: pwsh

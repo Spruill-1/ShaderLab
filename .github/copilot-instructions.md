@@ -12,6 +12,7 @@ ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, 
 
 ## Build
 
+- Clone with `--recurse-submodules` (or run `git submodule update --init --recursive`). `exprtk` and `miniz` are git submodules under `third_party/`, pinned to explicit commits; `third_party/miniz_export.h` is an in-tree shim, not part of the submodule. See [build.md](../docs/development/build.md).
 - Open `ShaderLab.slnx` in Visual Studio 2022 17.8+
 - NuGet packages restore automatically (packages.config style, not PackageReference)
 - Build target: **Debug | x64** (also supports ARM64, Release)
@@ -63,6 +64,46 @@ ShaderLabHeadless.exe (console host, no WinUI dependency)
 ```
 
 Render loop: a **render worker `std::jthread`** (MTA) drives graph evaluation at the active monitor's refresh rate (clamped to 60–240 Hz, decision #50). Per tick: drain `RenderThreadDispatcher` closures → dirty-propagation BFS → `BeginDraw` on the render-side D2D context → `GraphEvaluator.Evaluate()` → `ProcessDeferredCompute()` (D3D11 compute analysis nodes; **must** be inside the `BeginDraw`/`EndDraw` so the internal `dc->DrawImage` actually runs — decision #63) → `DrawImage(previewOutput)` into one of two double-buffered offscreen `ID3D11Texture2D`s → `EndDraw` → publish `m_offscreenPublishedIdx`. The **UI thread** (XAML STA) runs a `DispatcherQueueTimer` that blits the latest published offscreen onto the `SwapChainPanel`-bound swap chain and `Present1`s; UI Present cost is sub-ms regardless of graph throughput. Users build tone mappers as graph effects (the ICtCp suite is the preferred path); there is no built-in tone-mapping pass. See [Threading Model](../docs/architecture/threading-model.md) for the full UI ↔ worker contract (decision #68).
+
+### Graph access rule (READ THIS BEFORE TOUCHING `m_graph` FROM UI CODE)
+
+The render worker is the **single writer** of the live `EffectGraph`, and it writes
+continuously — clock-node `properties[...] =` inserts every tick, plus every MCP
+closure (add/remove/clear/set-property). Getting this wrong is a data race that
+surfaces as an access violation deep inside `std::map`, **not** as a compile error.
+Two such crashes shipped before the rule was written down; both resolved to
+`node->properties.find()` called from the UI thread during canvas paint.
+
+Three access paths, pick deliberately:
+
+1. **UI-thread reads → the per-frame `GraphUiSnapshot`, never `m_graph`.**
+   The worker publishes an immutable value copy of every node and edge each frame
+   (`BuildGraphUiSnapshot`, atomically stored in `m_uiGraphSnapshot`); read it via
+   `MainWindow::CurrentGraphSnapshot()` or, inside the node-graph editor,
+   `NodeGraphController::Snapshot()`. At most one frame stale — fine for display
+   and hit-testing. Hold the returned `shared_ptr` for the whole read.
+2. **Writes (any thread) → `RenderThreadDispatcher::DispatchSync`.** Never mutate
+   `m_graph` directly from a pointer/interaction handler.
+3. **Layout computation** (`RebuildLayout` / `AutoLayout` / `ComputeNodeVisual`)
+   → live `m_graph`, but **only on the render thread**; it must see post-mutation
+   state immediately, so a snapshot would be a frame stale and miss a just-added
+   node. UI-side callers go through `MainWindow::RunLayoutOnRenderThread`.
+
+Two locks exist, with a strict order. `MainWindow::m_graphMutex` guards the worker's
+own tick/drain — a backstop, not the pattern; new code should use the snapshot
+rather than take it, because the worker holds it for the whole tick (~50 ms on a
+heavy graph) and locking the UI behind that stalls the canvas.
+`NodeGraphController::m_visualsMutex` guards `m_visuals`, which is genuinely written
+from both threads (`RebuildLayout` on the render thread; `AddNode` / `DeleteSelected`
+/ `UpdateDragNodes` on the UI thread) and read by every paint and hit-test.
+
+**Lock order: `m_graphMutex` → `m_visualsMutex`.** The render thread acquires them
+in that order, so UI code must **never** hold `m_visualsMutex` across a
+`DispatchSync` — dispatch the graph write first, release, then lock to update
+visuals. Two corollaries, both of which were live bugs: don't hold references into
+`m_visuals` across a dispatch (copy by value — they dangle if the worker rebuilds
+layout while you wait), and don't read `m_visuals` from inside a dispatched closure,
+which runs on the render thread.
 
 ## Namespace Convention
 

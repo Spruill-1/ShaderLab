@@ -216,6 +216,56 @@ namespace ShaderLab::Mcp
             }
             json += "}";
 
+            // Property bindings. Mirrors the shape EffectGraph::ToJson writes so
+            // an agent reading a node sees the same structure it would find in a
+            // saved .effectgraph. Without this an agent can create a binding via
+            // /graph/bind-property and observe its effect, but has no way to read
+            // back which properties are already bound — e.g. whether a custom
+            // gamut's primaries are wired to a Working Space node.
+            if (!node.propertyBindings.empty())
+            {
+                json += ",\"propertyBindings\":{";
+                bool firstBinding = true;
+                for (const auto& [propName, binding] : node.propertyBindings)
+                {
+                    if (!firstBinding) json += ",";
+                    json += "\"" + JsonEscape(WideToUtf8(propName)) + "\":{";
+                    if (binding.wholeArray)
+                    {
+                        json += std::format(
+                            "\"wholeArray\":true,\"sourceNodeId\":{},\"sourceFieldName\":\"{}\"",
+                            binding.wholeArraySourceNodeId,
+                            JsonEscape(WideToUtf8(binding.wholeArraySourceFieldName)));
+                    }
+                    else
+                    {
+                        json += "\"sources\":[";
+                        for (size_t i = 0; i < binding.sources.size(); ++i)
+                        {
+                            if (i > 0) json += ",";
+                            const auto& src = binding.sources[i];
+                            if (src.has_value())
+                            {
+                                json += std::format(
+                                    "{{\"nodeId\":{},\"field\":\"{}\",\"index\":{},\"comp\":{}}}",
+                                    src->sourceNodeId,
+                                    JsonEscape(WideToUtf8(src->sourceFieldName)),
+                                    src->sourceIndex,
+                                    src->sourceComponent);
+                            }
+                            else
+                            {
+                                json += "null";
+                            }
+                        }
+                        json += "]";
+                    }
+                    json += "}";
+                    firstBinding = false;
+                }
+                json += "}";
+            }
+
             // Pins.
             json += ",\"inputPins\":[";
             for (size_t i = 0; i < node.inputPins.size(); ++i)

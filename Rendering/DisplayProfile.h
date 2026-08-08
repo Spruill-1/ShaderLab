@@ -33,6 +33,41 @@ namespace ShaderLab::Rendering
         }
     }
 
+    // Classifies a set of CIE xy primaries against the well-known gamuts.
+    // Returns Custom when the primaries don't match any standard within
+    // tolerance — real panels frequently land there, so Custom is a normal
+    // result rather than an error. Shared by the ICC path and the live-display
+    // path so both classify identically.
+    inline GamutId DetectGamut(const ChromaticityXY& r,
+                               const ChromaticityXY& g,
+                               const ChromaticityXY& b) noexcept
+    {
+        auto close = [](float v, float target, float tol = 0.02f)
+        {
+            return std::abs(v - target) < tol;
+        };
+
+        // sRGB / BT.709
+        if (close(r.x, 0.64f) && close(r.y, 0.33f) &&
+            close(g.x, 0.30f) && close(g.y, 0.60f) &&
+            close(b.x, 0.15f) && close(b.y, 0.06f))
+            return GamutId::sRGB;
+
+        // DCI-P3 / Display P3
+        if (close(r.x, 0.680f) && close(r.y, 0.320f) &&
+            close(g.x, 0.265f) && close(g.y, 0.690f) &&
+            close(b.x, 0.150f) && close(b.y, 0.060f))
+            return GamutId::DCI_P3;
+
+        // BT.2020
+        if (close(r.x, 0.708f) && close(r.y, 0.292f) &&
+            close(g.x, 0.170f) && close(g.y, 0.797f) &&
+            close(b.x, 0.131f) && close(b.y, 0.046f))
+            return GamutId::BT2020;
+
+        return GamutId::Custom;
+    }
+
     // Extended display profile combining capabilities with colorimetry.
     struct DisplayProfile
     {

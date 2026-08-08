@@ -16,9 +16,18 @@ namespace ShaderLab::Controls
 
     void NodeGraphController::RebuildLayout()
     {
+        // Writer. Runs on the render thread when driven by the engine-sink event
+        // hooks, so the UI thread must not be iterating m_visuals meanwhile --
+        // that race crashed inside RenderNodes' loop header. Callers must not
+        // already hold m_visualsMutex (see the LOCK ORDER RULE in the header).
+        std::unique_lock<std::shared_mutex> lk(m_visualsMutex);
+
         m_visuals.clear();
         if (!m_graph) return;
 
+        // THREADING RULE #3: layout reads the LIVE graph, not a snapshot -- it
+        // must see a just-added node immediately, so callers are responsible for
+        // being on the render thread.
         for (const auto& node : m_graph->Nodes())
         {
             m_visuals[node.id] = ComputeNodeVisual(node);
@@ -188,6 +197,7 @@ namespace ShaderLab::Controls
 
     D2D1_RECT_F NodeGraphController::ContentBounds() const
     {
+        std::shared_lock<std::shared_mutex> lk(m_visualsMutex);
         if (m_visuals.empty())
             return D2D1::RectF(0.0f, 0.0f, 0.0f, 0.0f);
 
@@ -222,6 +232,7 @@ namespace ShaderLab::Controls
     uint32_t NodeGraphController::HitTestNode(D2D1_POINT_2F canvasPoint) const
     {
         // unordered_map has no ordering — just check all nodes.
+        std::shared_lock<std::shared_mutex> lk(m_visualsMutex);
         uint32_t hitId = 0;
         for (const auto& [id, v] : m_visuals)
         {
@@ -240,6 +251,7 @@ namespace ShaderLab::Controls
     {
         constexpr float hitRadius = PinRadius * 2.5f;
 
+        std::shared_lock<std::shared_mutex> lk(m_visualsMutex);
         for (const auto& [id, visual] : m_visuals)
         {
             // Check image output pins.
@@ -332,9 +344,14 @@ namespace ShaderLab::Controls
                 }
             }
         };
+        // LOCK ORDER RULE: dispatch the graph write first, WITHOUT holding
+        // m_visualsMutex -- taking it here and then waiting on the render thread
+        // would invert against the render thread's m_graphMutex -> m_visualsMutex
+        // order and deadlock.
         if (m_dispatcher) m_dispatcher->DispatchSync(applyPositions);
         else              applyPositions();
 
+        std::unique_lock<std::shared_mutex> lk(m_visualsMutex);
         for (uint32_t nodeId : m_selection.selectedNodeIds)
         {
             // Update visual.
@@ -477,15 +494,28 @@ namespace ShaderLab::Controls
                 return false;
             }
 
-            // Resolve pin indices to field/property names.
-            auto srcIt = m_visuals.find(srcNodeId);
-            auto dstIt = m_visuals.find(dstNodeId);
-            if (srcIt != m_visuals.end() && dstIt != m_visuals.end() &&
-                srcPinIdx < srcIt->second.dataOutputPinNames.size() &&
-                dstPinIdx < dstIt->second.dataInputPinNames.size())
+            // Resolve pin indices to field/property names. Copy them out by
+            // VALUE under the visuals lock, then release before dispatching:
+            // holding references into m_visuals across DispatchSync would both
+            // invert the lock order and dangle if the render thread rebuilt
+            // layout while we waited.
+            std::wstring fieldName, propName;
+            bool namesResolved = false;
             {
-                auto& fieldName = srcIt->second.dataOutputPinNames[srcPinIdx];
-                auto& propName = dstIt->second.dataInputPinNames[dstPinIdx];
+                std::shared_lock<std::shared_mutex> lk(m_visualsMutex);
+                auto srcIt = m_visuals.find(srcNodeId);
+                auto dstIt = m_visuals.find(dstNodeId);
+                if (srcIt != m_visuals.end() && dstIt != m_visuals.end() &&
+                    srcPinIdx < srcIt->second.dataOutputPinNames.size() &&
+                    dstPinIdx < dstIt->second.dataInputPinNames.size())
+                {
+                    fieldName = srcIt->second.dataOutputPinNames[srcPinIdx];
+                    propName  = dstIt->second.dataInputPinNames[dstPinIdx];
+                    namesResolved = true;
+                }
+            }
+            if (namesResolved)
+            {
                 std::wstring err;
                 if (m_dispatcher)
                 {
@@ -571,7 +601,10 @@ namespace ShaderLab::Controls
     void NodeGraphController::SelectAll()
     {
         if (!m_graph) return;
-        for (const auto& node : m_graph->Nodes())
+        // THREADING RULE #1: UI-thread read -> snapshot.
+        auto snap = Snapshot();
+        const auto& nodes = snap ? snap->nodes : m_graph->Nodes();
+        for (const auto& node : nodes)
         {
             m_selection.selectedNodeIds.insert(node.id);
         }
@@ -585,15 +618,19 @@ namespace ShaderLab::Controls
         if (m_dispatcher)
         {
             auto idsToRemove = m_selection.selectedNodeIds;
+            // LOCK ORDER RULE: dispatch first, unlocked; then take the visuals
+            // lock. Holding it across DispatchSync would deadlock.
             m_dispatcher->DispatchSync([&]{
                 for (uint32_t nodeId : idsToRemove)
                     m_graph->RemoveNode(nodeId);
             });
+            std::unique_lock<std::shared_mutex> lk(m_visualsMutex);
             for (uint32_t nodeId : idsToRemove)
                 m_visuals.erase(nodeId);
         }
         else
         {
+            std::unique_lock<std::shared_mutex> lk(m_visualsMutex);
             for (uint32_t nodeId : m_selection.selectedNodeIds)
             {
                 m_graph->RemoveNode(nodeId);
@@ -661,9 +698,14 @@ namespace ShaderLab::Controls
             id = m_graph->AddNode(std::move(movedNode));
         }
 
+        // The graph write above already went through the dispatcher, so taking
+        // the visuals lock here is after the fact -- never across DispatchSync.
         auto* added = m_graph->FindNode(id);
         if (added)
+        {
+            std::unique_lock<std::shared_mutex> lk(m_visualsMutex);
             m_visuals[id] = ComputeNodeVisual(*added);
+        }
 
         return id;
     }
@@ -972,6 +1014,18 @@ namespace ShaderLab::Controls
 
         EnsureResources(dc);
 
+        // THREADING RULE #1: the paint reads the published snapshot, never the
+        // live graph. Acquired once here (rather than per sub-call) so edges and
+        // nodes in one frame are mutually consistent, and held for the whole
+        // paint so EffectNode pointers into it stay valid.
+        m_paintSnapshot = Snapshot();
+
+        // m_visuals is written by RebuildLayout on the render thread, so the
+        // whole paint reads it under a shared lock. Held across all three
+        // sub-renders so they see one consistent layout. Nothing inside the
+        // paint dispatches, so this cannot invert the lock order.
+        std::shared_lock<std::shared_mutex> visualsLock(m_visualsMutex);
+
         // Apply pan/zoom transform.
         D2D1_MATRIX_3X2_F transform =
             D2D1::Matrix3x2F::Scale(m_zoom, m_zoom) *
@@ -984,13 +1038,15 @@ namespace ShaderLab::Controls
 
         dc->SetTransform(D2D1::Matrix3x2F::Identity());
         m_needsRedraw = false;
+        m_paintSnapshot.reset();
     }
 
     void NodeGraphController::RenderEdges(ID2D1DeviceContext* dc)
     {
         if (!m_brushEdge) return;
 
-        for (const auto& edge : m_graph->Edges())
+        const auto& edges = m_paintSnapshot ? m_paintSnapshot->edges : m_graph->Edges();
+        for (const auto& edge : edges)
         {
             auto srcIt = m_visuals.find(edge.sourceNodeId);
             auto dstIt = m_visuals.find(edge.destNodeId);
@@ -1033,7 +1089,8 @@ namespace ShaderLab::Controls
         // Render data edges (property bindings) as orange curves.
         if (m_brushDataEdge)
         {
-            for (const auto& node : m_graph->Nodes())
+            const auto& dataNodes = m_paintSnapshot ? m_paintSnapshot->nodes : m_graph->Nodes();
+            for (const auto& node : dataNodes)
             {
                 auto dstIt = m_visuals.find(node.id);
                 if (dstIt == m_visuals.end()) continue;
@@ -1116,7 +1173,11 @@ namespace ShaderLab::Controls
     {
         for (const auto& [nodeId, visual] : m_visuals)
         {
-            const auto* node = m_graph->FindNode(nodeId);
+            // THREADING RULE #1: snapshot, not the live graph. Every node->
+            // deref below (properties, analysisOutput, clockTime, customEffect)
+            // would otherwise race the render worker.
+            const auto* node = m_paintSnapshot ? m_paintSnapshot->FindNode(nodeId)
+                                               : m_graph->FindNode(nodeId);
             if (!node) continue;
 
             bool selected = m_selection.selectedNodeIds.contains(nodeId);
@@ -1599,6 +1660,7 @@ namespace ShaderLab::Controls
 
     uint32_t NodeGraphController::HitTestSlider(D2D1_POINT_2F canvasPoint) const
     {
+        std::shared_lock<std::shared_mutex> lk(m_visualsMutex);
         for (const auto& [id, v] : m_visuals)
         {
             if (!v.isParameterNode) continue;
@@ -1611,6 +1673,7 @@ namespace ShaderLab::Controls
 
     uint32_t NodeGraphController::HitTestPlayButton(D2D1_POINT_2F canvasPoint) const
     {
+        std::shared_lock<std::shared_mutex> lk(m_visualsMutex);
         for (const auto& [id, v] : m_visuals)
         {
             if (!v.isClockNode) continue;
@@ -1651,11 +1714,17 @@ namespace ShaderLab::Controls
         EdgeHit best{};
         if (!m_graph) return best;
 
+        // THREADING RULE #1: UI-thread (pointer handler) read -> snapshot.
+        // Held for the whole hit-test so both loops see one consistent frame.
+        auto snap = Snapshot();
+        std::shared_lock<std::shared_mutex> visualsLock(m_visualsMutex);
+
         const float tol2 = tolerance * tolerance;
         float bestDist = tol2;
 
         // Image edges.
-        for (const auto& edge : m_graph->Edges())
+        const auto& edges = snap ? snap->edges : m_graph->Edges();
+        for (const auto& edge : edges)
         {
             auto srcIt = m_visuals.find(edge.sourceNodeId);
             auto dstIt = m_visuals.find(edge.destNodeId);
@@ -1681,7 +1750,8 @@ namespace ShaderLab::Controls
         }
 
         // Data binding edges.
-        for (const auto& node : m_graph->Nodes())
+        const auto& hitNodes = snap ? snap->nodes : m_graph->Nodes();
+        for (const auto& node : hitNodes)
         {
             auto dstIt = m_visuals.find(node.id);
             if (dstIt == m_visuals.end()) continue;
@@ -1832,14 +1902,33 @@ namespace ShaderLab::Controls
 
     bool NodeGraphController::UpdateSliderDrag(uint32_t nodeId, D2D1_POINT_2F canvasPoint)
     {
-        auto vIt = m_visuals.find(nodeId);
-        if (vIt == m_visuals.end() || !vIt->second.isParameterNode) return false;
+        // Copy the two layout values we need out under the visuals lock, then
+        // release it. The closure below runs on the RENDER thread, so it must
+        // not touch m_visuals -- and we must not hold the lock across
+        // DispatchSync (LOCK ORDER RULE).
+        bool isClockNode = false;
+        D2D1_RECT_F sliderRect{};
+        {
+            std::shared_lock<std::shared_mutex> lk(m_visualsMutex);
+            auto vIt = m_visuals.find(nodeId);
+            if (vIt == m_visuals.end() || !vIt->second.isParameterNode) return false;
+            isClockNode = vIt->second.isClockNode;
+            sliderRect  = vIt->second.sliderRect;
+        }
+        if (!m_graph) return false;
+
+        // THREADING RULE #2: this reads AND WRITES node state (clockTime,
+        // properties, dirty), so the whole graph interaction runs on the render
+        // thread. It previously mutated the live graph straight from the
+        // pointer handler, racing the render worker's per-tick writes.
+        bool changed = false;
+        auto apply = [&] {
 
         auto* node = m_graph->FindNode(nodeId);
-        if (!node || !node->customEffect.has_value()) return false;
+        if (!node || !node->customEffect.has_value()) return;
 
         // Clock nodes: seek by setting clockTime.
-        if (vIt->second.isClockNode)
+        if (isClockNode)
         {
             float startTime = 0.0f, stopTime = 10.0f;
             auto stIt = node->properties.find(L"StartTime");
@@ -1851,13 +1940,13 @@ namespace ShaderLab::Controls
             float duration = stopTime - startTime;
             if (duration <= 0.0f) duration = 1.0f;
 
-            float t = (canvasPoint.x - vIt->second.sliderRect.left)
-                    / (vIt->second.sliderRect.right - vIt->second.sliderRect.left);
+            float t = (canvasPoint.x - sliderRect.left)
+                    / (sliderRect.right - sliderRect.left);
             t = (std::max)(0.0f, (std::min)(1.0f, t));
             node->clockTime = static_cast<double>(t * duration);
             node->dirty = true;
-            m_needsRedraw = true;
-            return true;
+            changed = true;
+            return;
         }
 
         float pMin = 0.0f, pMax = 1.0f, step = 0.01f;
@@ -1883,8 +1972,8 @@ namespace ShaderLab::Controls
             }
         }
 
-        float t = (canvasPoint.x - vIt->second.sliderRect.left)
-                / (vIt->second.sliderRect.right - vIt->second.sliderRect.left);
+        float t = (canvasPoint.x - sliderRect.left)
+                / (sliderRect.right - sliderRect.left);
         t = (std::max)(0.0f, (std::min)(1.0f, t));
         float newVal = pMin + t * (pMax - pMin);
 
@@ -1894,21 +1983,29 @@ namespace ShaderLab::Controls
         newVal = (std::max)(pMin, (std::min)(pMax, newVal));
 
         auto propIt = node->properties.find(L"Value");
-        if (propIt == node->properties.end()) return false;
+        if (propIt == node->properties.end()) return;
 
         float oldVal = 0.0f;
         if (auto* f = std::get_if<float>(&propIt->second)) oldVal = *f;
 
-        if (std::abs(newVal - oldVal) < 0.0001f) return false;
+        if (std::abs(newVal - oldVal) < 0.0001f) return;
 
         propIt->second = newVal;
         node->dirty = true;
-        m_needsRedraw = true;
-        return true;
+        changed = true;
+
+        };  // end apply
+
+        if (m_dispatcher) m_dispatcher->DispatchSync(apply);
+        else              apply();
+
+        if (changed) m_needsRedraw = true;
+        return changed;
     }
 
     bool NodeGraphController::IsParameterNode(uint32_t nodeId) const
     {
+        std::shared_lock<std::shared_mutex> lk(m_visualsMutex);
         auto it = m_visuals.find(nodeId);
         return it != m_visuals.end() && it->second.isParameterNode;
     }

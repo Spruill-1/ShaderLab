@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Native dependencies are now git submodules; `Bootstrap.ps1` and the `Ensure*` download scripts are gone.** `exprtk` and `miniz` were previously fetched over the network by MSBuild pre-build PowerShell into a wholly-gitignored `third_party/`, which meant the effective dependency versions were invisible to git and not reproducible — `EnsureExprTk.ps1` in particular pulled `exprtk.hpp` from `master`, an unpinned floating reference. Both are now submodules with explicit pins:
+  - `third_party/exprtk` → [ArashPartow/exprtk](https://github.com/ArashPartow/exprtk) @ `1e4a80b` (MIT)
+  - `third_party/miniz` → [richgel999/miniz](https://github.com/richgel999/miniz) @ tag `3.1.2` (MIT) — a deliberate bump from the 3.0.2 the old script downloaded, since `.effectgraph` archives can originate from untrusted sources.
+- **`third_party/miniz_export.h` added** — a 3-line in-tree shim defining an empty `MINIZ_EXPORT`. Upstream's `miniz.h` includes `miniz_export.h`, which their CMake generates via `generate_export_header()` and which is absent from the git tree; miniz's own amalgamation step substitutes the same empty define when producing the single-file release pair. This keeps a CMake toolchain out of an MSBuild-only repo. miniz links statically into `ShaderLabEngine.dll`, so an empty macro is the correct definition.
+- **Only three miniz sources are compiled** — `miniz.c`, `miniz_tdef.c`, `miniz_tinfl.c`. `miniz_zip.c` is omitted: `EffectGraphFile.cpp` writes the ZIP container itself and uses only `tdefl_compress_mem_to_heap`, `tinfl_decompress_mem_to_heap`, and `mz_free`.
+- **New `VerifySubmodules` MSBuild target** in `ShaderLabEngine.vcxproj`. The old scripts self-healed a fresh clone by downloading on first build; submodules don't, so a clone missing `--recurse-submodules` now fails fast with the exact `git submodule update --init --recursive` command instead of a cascade of missing-header errors.
+- **CI**: `actions/checkout` gains `submodules: recursive` in `ci.yml` and `release.yml`. The `bootstrap-smoke` job (decision #56) becomes `clean-clone-smoke` — it still guards the onboarding cliff, but runs the documented submodule-init command explicitly rather than relying on checkout's `submodules:` input, so the path contributors are told to use is the one CI exercises.
+
+### Removed
+
+- `Bootstrap.ps1`, `scripts/EnsureExprTk.ps1`, `scripts/EnsureMiniz.ps1`. Bootstrap's three jobs are covered elsewhere: the dev cert by the existing `EnsureDevSigningCertificate` target in `ShaderLab.vcxproj`, ExprTk by the submodule, and NuGet restore by Visual Studio / CI.
+- The blanket `third_party/` entry in `.gitignore`, which was hiding the dependency tree from git.
+
 ## [1.7.3] - 2026-05-10
 
 ### Fixed

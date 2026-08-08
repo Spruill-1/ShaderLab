@@ -85,6 +85,7 @@
 #include <optional>
 #include <queue>
 #include <set>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <thread>

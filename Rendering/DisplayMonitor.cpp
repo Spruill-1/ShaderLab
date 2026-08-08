@@ -299,6 +299,17 @@ namespace ShaderLab::Rendering
             default:                                    caps.activeColorMode = caps.hdrEnabled ? 2u : 0u; break;
             }
 
+            // Reconcile hdrEnabled with the mode we just read. The seed value
+            // came from the legacy DXGI_OUTPUT_DESC1::ColorSpace heuristic,
+            // which reports G22_NONE_P709 whenever the output snapshot predates
+            // the panel entering HDR — the EDID-derived luminance/primaries in
+            // that same desc are still correct, so the stale color space is easy
+            // to miss. DisplayConfig is the live authority, so it wins here just
+            // as it does for bitsPerColor below. Without this, an HDR display
+            // reports "SDR" in the status bar and over MCP while
+            // activeColorMode correctly says HDR.
+            caps.hdrEnabled = (caps.activeColorMode == 2u);
+
             // Trust DisplayConfig over the legacy color-space heuristic for
             // bitsPerColor too — DXGI_OUTPUT_DESC1 reports 8 in many WCG
             // configurations even though the actual scanout is 10-bit.
@@ -510,6 +521,10 @@ namespace ShaderLab::Rendering
         p.primaryGreen = { m_caps.greenPrimaryX, m_caps.greenPrimaryY };
         p.primaryBlue  = { m_caps.bluePrimaryX,  m_caps.bluePrimaryY };
         p.whitePoint   = { m_caps.whitePointX,   m_caps.whitePointY };
+        // Classify from the EDID primaries we just copied in. Without this the
+        // field keeps its struct default (sRGB), which misreports every
+        // wide-gamut panel as sRGB.
+        p.gamut = DetectGamut(p.primaryRed, p.primaryGreen, p.primaryBlue);
         return p;
     }
 
@@ -524,6 +539,7 @@ namespace ShaderLab::Rendering
         p.primaryGreen = { m_caps.greenPrimaryX, m_caps.greenPrimaryY };
         p.primaryBlue  = { m_caps.bluePrimaryX,  m_caps.bluePrimaryY };
         p.whitePoint   = { m_caps.whitePointX,   m_caps.whitePointY };
+        p.gamut = DetectGamut(p.primaryRed, p.primaryGreen, p.primaryBlue);
         return p;
     }
 }

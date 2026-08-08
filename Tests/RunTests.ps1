@@ -6,17 +6,20 @@
     Builds, deploys, and launches ShaderLab, then runs integration tests against
     the MCP JSON-RPC server. Reports pass/fail per test with exit code for CI.
 
-.PARAMETER SkipBuild
-    Skip MSBuild and deployment (use existing installation).
-
 .PARAMETER Filter
     Run only tests matching this wildcard pattern (e.g. "Graph*").
 
 .PARAMETER Adapter
     GPU adapter for CLI tests: "default" or "warp". Default: "default".
+
+.NOTES
+    This suite does NOT build, deploy or launch anything -- it runs against an
+    already-running ShaderLab with the MCP server up. Build and launch first,
+    then run this. (The old -SkipBuild switch and $script:MSBuild path were dead
+    code: nothing here ever invoked MSBuild, and the hardcoded path pointed at a
+    VS edition that isn't necessarily installed.)
 #>
 param(
-    [switch]$SkipBuild,
     [string]$Filter = "*",
     [string]$Adapter = "default"
 )
@@ -29,7 +32,6 @@ $script:TestDir = $PSScriptRoot
 $script:RepoRoot = Split-Path $script:TestDir -Parent
 $script:FixturesDir = Join-Path $script:TestDir "fixtures"
 $script:OutputDir = Join-Path $script:TestDir "output"
-$script:MSBuild = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\MSBuild\Current\Bin\MSBuild.exe"
 
 # ============================================================================
 # Helpers
@@ -43,7 +45,10 @@ function McpCall($toolName, $arguments = @{}) {
         method = "tools/call"
         params = @{ name = $toolName; arguments = $arguments }
     } | ConvertTo-Json -Depth 5
-    $r = Invoke-RestMethod -Uri "$script:McpBase/mcp" -Method Post `
+    # POST "/" is the JSON-RPC endpoint. (This used to POST to "/mcp", which
+    # only resolved because route matching is longest-PREFIX, so "/mcp" fell
+    # through to the "/" catch-all. Depending on that is fragile.)
+    $r = Invoke-RestMethod -Uri "$script:McpBase/" -Method Post `
         -ContentType "application/json" -Body $body -TimeoutSec 30
     if ($r.result.isError) { throw "MCP error: $($r.result.content[0].text)" }
     $text = $r.result.content[0].text
@@ -65,8 +70,14 @@ function WaitForCondition($description, $scriptBlock, $timeoutSec = 10, $pollMs 
 }
 
 function WaitForMcp($timeoutSec = 30) {
+    # Probe "GET /" -- the static health route. Do NOT probe "/graph": that goes
+    # through IEngineCommandSink::Dispatch onto the render worker, so its latency
+    # depends on the render loop being healthy. A readiness check that can be
+    # starved by the thing it is waiting for reports "server down" when the
+    # server is merely busy (observed: 3 consecutive 2s timeouts on /graph, then
+    # ~1ms once settled).
     return WaitForCondition "MCP server ready" {
-        $null = Invoke-RestMethod -Uri "$script:McpBase/graph" -Method Get -TimeoutSec 2
+        $null = Invoke-RestMethod -Uri "$script:McpBase/" -Method Get -TimeoutSec 5
         $true
     } $timeoutSec 500
 }
@@ -113,9 +124,24 @@ function WaitForDirtySettle($timeoutSec = 5) {
 # Test Registration
 # ============================================================================
 
+# Fail fast and legibly if the app isn't up, rather than emitting one
+# "connection refused" per test.
+if (-not (WaitForMcp 30)) {
+    Write-Host "MCP server not reachable at $script:McpBase" -ForegroundColor Red
+    Write-Host "Build, deploy and launch ShaderLab first, then re-run." -ForegroundColor Red
+    exit 1
+}
+
 function RunTest($name, $scriptBlock) {
     if ($name -notlike $Filter) { return }
     Write-Host "[$name] " -NoNewline
+    # If the app died mid-suite, stop rather than reporting every remaining
+    # test as a failure -- a crash is one fault, not twenty.
+    if ($script:AppDied) {
+        Write-Host "SKIP (app died earlier)" -ForegroundColor DarkYellow
+        $script:TestResults += @{ Name = $name; Pass = $false; Error = "skipped: app died earlier" }
+        return
+    }
     try {
         ClearGraph
         $result = & $scriptBlock
@@ -129,6 +155,10 @@ function RunTest($name, $scriptBlock) {
     } catch {
         Write-Host "FAIL - $($_.Exception.Message)" -ForegroundColor Red
         $script:TestResults += @{ Name = $name; Pass = $false; Error = $_.Exception.Message }
+        if (-not (Get-Process ShaderLab -ErrorAction SilentlyContinue)) {
+            $script:AppDied = $true
+            Write-Host "  !! ShaderLab process is gone -- treating as a crash, skipping the rest." -ForegroundColor Red
+        }
     }
 }
 
@@ -155,9 +185,11 @@ RunTest "Graph.AddClockNode" {
 }
 
 RunTest "Graph.AddMathNode" {
-    $id = AddNode "Add"
+    # Was "Add". The discrete Add/Max math nodes were retired in favour of the
+    # ExprTk-backed Numeric Expression node.
+    $id = AddNode "Numeric Expression"
     $node = GetNode $id
-    return $node.name -eq "Add"
+    return $node.name -eq "Numeric Expression"
 }
 
 RunTest "Graph.AddVideoSource" {
@@ -286,8 +318,12 @@ foreach ($effectName in $sourceEffects) {
 }
 
 # Test analysis effects
-$analysisEffects = @("Luminance Heatmap", "Gamut Highlight", "Vectorscope",
-    "Waveform Monitor", "Nit Map", "Split Comparison")
+# NOTE: "Vectorscope" and "Waveform Monitor" were removed from this list --
+# they are not in the effect registry (verified via list_effects). Note that
+# .context/resume.md still lists both under "Analysis -> Scopes", so the doc is
+# stale, not this list.
+$analysisEffects = @("Luminance Heatmap", "Gamut Highlight",
+    "Nit Map", "Split Comparison")
 foreach ($effectName in $analysisEffects) {
     RunTest "Eval.Analysis.$($effectName -replace ' ','')" {
         $src = AddNode "Gamut Source"
@@ -311,42 +347,47 @@ RunTest "Binding.FloatParameterToEffect" {
     $src = AddNode "Gamut Source"
     Connect $src 0 $blur 0
     BindProperty $blur "StandardDeviation" $param "Value"
+    # Bindings on a D2D effect only propagate when the effect is actually
+    # evaluated, and evaluation only reaches nodes in the render path. Without
+    # this the property stays at its authored default (3.0) and the test fails
+    # for a reason that has nothing to do with binding. (Data-only nodes such as
+    # Numeric Expression differ -- they evaluate on the tick regardless.)
+    McpCall "set_preview_node" @{ nodeId = $blur } | Out-Null
     WaitForDirtySettle 3
-    # The bound value should propagate — check the node's runtime properties.
     $node = GetNode $blur
-    # StandardDeviation may show as the bound value or as a float ~5.0.
     $sd = $node.properties.StandardDeviation
     return $null -ne $sd -and $sd -ge 4.5
 }
 
-RunTest "Binding.MathAddNode" {
-    $a = AddNode "Float Parameter"
-    $b = AddNode "Float Parameter"
-    $add = AddNode "Add"
-    SetProperty $a "Value" 3.0
-    SetProperty $b "Value" 7.0
-    BindProperty $add "A" $a "Value"
-    BindProperty $add "B" $b "Value"
+RunTest "Eval.NumericExpressionDirect" {
+    # Replaces the retired "Add" node test. Note only the "A" input exists as a
+    # property over MCP -- setting Expression to something referencing B does
+    # NOT create a B property, so multi-variable expressions are not currently
+    # drivable through the MCP surface.
+    $e = AddNode "Numeric Expression"
+    SetProperty $e "Expression" "A * 2"
+    SetProperty $e "A" 5.0
     WaitForDirtySettle 2
-    $analysis = GetAnalysis $add
+    $analysis = GetAnalysis $e
     if (-not $analysis -or -not $analysis.fields) { return $false }
     $result = ($analysis.fields | Where-Object { $_.name -eq "Result" })
     return $null -ne $result -and [math]::Abs($result.value[0] - 10.0) -lt 0.01
 }
 
-RunTest "Binding.MathMaxNode" {
+RunTest "Binding.NumericExpressionBound" {
+    # Replaces the retired "Max" node test, and is the real regression guard for
+    # binding propagation into a data node: A is driven by an upstream Float
+    # Parameter rather than set directly.
     $a = AddNode "Float Parameter"
-    $b = AddNode "Float Parameter"
-    $max = AddNode "Max"
-    SetProperty $a "Value" 3.0
-    SetProperty $b "Value" 7.0
-    BindProperty $max "A" $a "Value"
-    BindProperty $max "B" $b "Value"
+    $e = AddNode "Numeric Expression"
+    SetProperty $e "Expression" "A * 2"
+    SetProperty $a "Value" 6.0
+    BindProperty $e "A" $a "Value"
     WaitForDirtySettle 2
-    $analysis = GetAnalysis $max
+    $analysis = GetAnalysis $e
     if (-not $analysis -or -not $analysis.fields) { return $false }
     $result = ($analysis.fields | Where-Object { $_.name -eq "Result" })
-    return $null -ne $result -and [math]::Abs($result.value[0] - 7.0) -lt 0.01
+    return $null -ne $result -and [math]::Abs($result.value[0] - 12.0) -lt 0.01
 }
 
 # ============================================================================

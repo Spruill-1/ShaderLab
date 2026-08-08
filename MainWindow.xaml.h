@@ -319,6 +319,26 @@ namespace winrt::ShaderLab::implementation
 
         // Effect graph.
         ::ShaderLab::Graph::EffectGraph         m_graph;
+
+        // Guards m_graph against the UI thread reading it while the render
+        // worker mutates it.
+        //
+        // The render worker is the single WRITER (clock-property inserts every
+        // tick, plus every MCP closure drained from m_renderDispatcher), but the
+        // UI thread is a concurrent READER: RenderNodeGraph paints the canvas
+        // from live EffectNode pointers via NodeGraphController. With no lock,
+        // a canvas paint that lands during a graph mutation walks a std::map
+        // that is being rebalanced -- or a node that has just been destroyed by
+        // graph_clear -- and access-violates inside _Tree::_Find. Diagnosed from
+        // two distinct WER fault offsets that both resolved into
+        // NodeGraphController::RenderNodes' node->properties.find() calls.
+        //
+        // Writers take it exclusively on the render thread; the UI canvas paint
+        // takes it shared. Lock at the Drain()/tick-body level rather than
+        // per-closure, so a nested inline DispatchSync (which
+        // RenderThreadDispatcher permits on the consumer thread) cannot
+        // self-deadlock on a non-recursive mutex.
+        mutable std::shared_mutex             m_graphMutex;
         ::ShaderLab::Effects::SourceNodeFactory m_sourceFactory;
 
         // Controllers.

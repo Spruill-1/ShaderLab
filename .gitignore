@@ -87,7 +87,8 @@ $RECYCLE.BIN/
 .DS_Store
 Screenshot_53.png
 
-third_party/
+# third_party/ holds git submodules (exprtk, miniz) plus the in-tree
+# miniz_export.h shim -- all tracked. Do NOT ignore it.
 
 enc_temp_folder/
 

@@ -50,6 +50,7 @@ Reference for the effect catalog and per-effect mechanics.
 
 - [Build Instructions](development/build.md) — prerequisites, configurations, dependency map.
 - [Project Structure](development/project-structure.md) — full file tree with per-file descriptions.
+- [MCP Migration: HTTP → stdio](development/mcp-stdio-migration.md) — **in-progress** implementation plan for replacing the embedded HTTP MCP server with stdio + a broker relay. Step-by-step, with the platform questions already settled by spike.
 
 ## History
 

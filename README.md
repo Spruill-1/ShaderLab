@@ -28,19 +28,17 @@ The release manifest carries the special OID `2.25.31172936891398431765440773059
 
 ## Local Development
 
-The project ships without a code-signing certificate. On first build, MSBuild auto-runs:
-
-- **`scripts/EnsureDevCert.ps1`** — generates a self-signed cert (`CN=ShaderLab`) and imports it into `TrustedPeople` for F5 deploy.
-- **`scripts/EnsureExprTk.ps1`** — downloads `exprtk.hpp` (single-header math expression parser, MIT-licensed) into `third_party/exprtk/`.
-
-After that, F5 (Debug | x64, startup project = `ShaderLab`) deploys and launches the packaged app.
-
-For a one-shot setup on a fresh clone:
+Clone recursively — the two native dependencies (`exprtk`, `miniz`, both MIT) are git submodules under `third_party/`:
 
 ```pwsh
-.\Bootstrap.ps1            # cert + ExprTk + NuGet restore (no build)
-.\Bootstrap.ps1 -Build     # the above + Debug|x64 smoke build
+git clone --recurse-submodules https://github.com/<owner>/ShaderLab.git
 ```
+
+On an existing clone: `git submodule update --init --recursive`.
+
+Then open `ShaderLab.slnx` and F5 (Debug | x64, startup project = `ShaderLab`) to deploy and launch the packaged app. NuGet restores automatically, and MSBuild auto-runs **`scripts/EnsureDevCert.ps1`** on first build to generate a self-signed `CN=ShaderLab` cert and import it into `TrustedPeople` for F5 deploy — the project ships without a code-signing certificate.
+
+If the submodules are missing, the build stops with an actionable error rather than a cascade of missing-header failures.
 
 See [docs/development/build.md](docs/development/build.md) for full prerequisites, configurations, and the dependency map.
 
