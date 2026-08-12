@@ -2,9 +2,9 @@
 
 // Engine MCP routes — engine-side route handlers for the MCP server.
 //
-// Phase 7 architecture: the McpHttpServer runs in the engine DLL.
-// The GUI app and headless host both instantiate it and register a
-// mix of routes:
+// Phase 7 architecture: the McpRouter (né McpHttpServer, renamed in
+// stdio-migration Step 2) runs in the engine DLL. The GUI app and
+// headless host both instantiate it and register a mix of routes:
 //
 //   * Engine-pure routes (graph mutation, render capture, pixel
 //     readback, image stats, etc) live in this TU and are registered
@@ -24,11 +24,15 @@
 #include "pch_engine.h"
 #include "../../EngineExport.h"
 #include "../../Rendering/DisplayProfile.h"
-#include "McpHttpServer.h"
+#include "McpTypes.h"
 
 #include <functional>
 #include <optional>
 
+namespace ShaderLab
+{
+    class McpRouter;
+}
 namespace ShaderLab::Graph
 {
     class EffectGraph;
@@ -59,9 +63,9 @@ namespace ShaderLab::Mcp
         ID3D11DeviceContext*          d3dContext{ nullptr };
 
         // Force a fresh evaluation of the graph if the host has any
-        // dirty propagation / tick logic. Headless: no-op (caller did
-        // this already). GUI: calls MainWindow::RenderFrame so dirty
-        // nodes are repopulated before readback / capture.
+        // dirty propagation / tick logic. Headless: runs the eval closure
+        // (runEval). GUI: calls RenderFrameToOffscreen on the render worker
+        // so dirty nodes are repopulated before readback / capture.
         // Returning void; cannot fail.
         std::function<void()>         renderFrame;
 
@@ -70,6 +74,15 @@ namespace ShaderLab::Mcp
         // Optional — if unset, routes that surface previewNodeId default
         // to 0.
         std::function<uint32_t()>     getPreviewNodeId;
+
+        // Active pipeline-format display name (e.g. "scRGB FP16") for
+        // /display/info. The GUI reads RenderEngine::ActiveFormat();
+        // headless supplies the FormatScRgbFP16 constant. Optional — if
+        // unset the route reports "unknown". This is the EngineContext
+        // extension that made get_display_info engine-pure
+        // (stdio-migration Step 2; deferred from Step 1 pending the ABI
+        // bump).
+        std::function<std::wstring()> getPipelineFormatName;
 
         // Optional host-state shim for the most-recently-loaded ICC
         // profile (so it can appear under "loadedIcc" in the
@@ -82,7 +95,7 @@ namespace ShaderLab::Mcp
 
     // Functional / closure-based command sink (Q4 architecture choice).
     // The route handler hands a closure to Dispatch; the host runs it
-    // on the right thread and returns the McpHttpServer::Response back
+    // on the right thread and returns the Mcp::Response back
     // to the listener thread that the route returns on.
     //
     // Engine state mutations also fire **events** (the OnXxx virtuals
@@ -101,8 +114,8 @@ namespace ShaderLab::Mcp
         // host. Closure receives a freshly-built EngineContext.
         // Synchronous: the calling thread blocks until the closure
         // completes. Closure exceptions propagate.
-        virtual McpHttpServer::Response Dispatch(
-            std::function<McpHttpServer::Response(EngineContext&)> closure) = 0;
+        virtual Response Dispatch(
+            std::function<Response(EngineContext&)> closure) = 0;
 
         // ---- Engine state-change events (UI hooks) -----------------------
         //
@@ -138,6 +151,6 @@ namespace ShaderLab::Mcp
     // call once per process. The sink must outlive the server (handlers
     // capture it by reference).
     SHADERLAB_API void RegisterEngineRoutes(
-        McpHttpServer& server,
+        McpRouter& server,
         IEngineCommandSink& sink);
 }

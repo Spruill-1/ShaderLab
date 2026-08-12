@@ -340,21 +340,19 @@ namespace winrt::ShaderLab::implementation
             {
                 if (!m_mcpServer)
                     SetupMcpRoutes();
-                if (m_mcpServer && !m_mcpServer->IsRunning())
-                    m_mcpServer->Start(47808);
-                // Wait briefly for the listener thread to bind and set the port.
-                Sleep(100);
-                uint16_t actualPort = m_mcpServer ? m_mcpServer->Port() : 47808;
-                McpServerLabel().Text(std::format(L"MCP Server :{}", actualPort));
+                // Expose this window to MCP as a hub session. The HTTP
+                // listener was removed in stdio-migration Step 9 — the broker
+                // (shim → hub → session) is the only transport now.
+                StartMcpSession();
+                UpdateMcpStatusLabel();
                 McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
                 ResetMcpActivityState();
                 UpdateMcpActivityIndicator();
             }
             else
             {
-                if (m_mcpServer)
-                    m_mcpServer->Stop();
-                McpServerLabel().Text(L"MCP Server");
+                StopMcpSession();
+                McpServerLabel().Text(L"MCP: off");
                 McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
                 ResetMcpActivityState();
                 UpdateMcpActivityIndicator();
@@ -363,20 +361,50 @@ namespace winrt::ShaderLab::implementation
 
         McpExportConfigButton().Click([this](auto&&, auto&&)
         {
-            uint16_t port = m_mcpServer ? m_mcpServer->Port() : 47808;
             namespace DP = winrt::Windows::ApplicationModel::DataTransfer;
-            auto pkg = DP::DataPackage();
-            std::wstring config = std::format(
-                L"{{\n"
-                L"  \"mcpServers\": {{\n"
-                L"    \"shaderlab\": {{\n"
-                L"      \"url\": \"http://localhost:{}/\"\n"
-                L"    }}\n"
-                L"  }}\n"
-                L"}}", port);
-            pkg.SetText(config);
-            DP::Clipboard::SetContent(pkg);
-            PipelineFormatText().Text(std::format(L"MCP config copied to clipboard (http://localhost:{})", port));
+            auto jsonEsc = [](const std::wstring& s) {
+                std::wstring o;
+                for (wchar_t c : s) { if (c == L'\\' || c == L'"') o += L'\\'; o += c; }
+                return o;
+            };
+
+            std::wstring config, note;
+            auto shim = EnsureShimDistributed();
+            if (!shim.empty())
+            {
+                // Preferred: stdio config pointing at the stable unpackaged
+                // shim copy. The --hub-aumid lets the shim activate the
+                // packaged hub on demand (client-driven bootstrap).
+                auto aumid = HubAumid();
+                std::wstring argsJson = aumid.empty()
+                    ? L"\"--stdio\""
+                    : std::format(L"\"--stdio\", \"--hub-aumid\", \"{}\"", jsonEsc(aumid));
+                config = std::format(
+                    L"{{\n"
+                    L"  \"mcpServers\": {{\n"
+                    L"    \"shaderlab\": {{\n"
+                    L"      \"command\": \"{}\",\n"
+                    L"      \"args\": [{}]\n"
+                    L"    }}\n"
+                    L"  }}\n"
+                    L"}}", jsonEsc(shim), argsJson);
+                note = L"MCP stdio config copied to clipboard";
+            }
+            else
+            {
+                // No broker payload found (unexpected in a real build). There
+                // is no HTTP fallback any more — the listener is gone (Step 9).
+                config.clear();
+                note = L"MCP shim not found — reinstall or rebuild ShaderLab.";
+            }
+
+            if (!config.empty())
+            {
+                auto pkg = DP::DataPackage();
+                pkg.SetText(config);
+                DP::Clipboard::SetContent(pkg);
+            }
+            PipelineFormatText().Text(note);
         });
     }
 
@@ -385,9 +413,11 @@ namespace winrt::ShaderLab::implementation
         m_isShuttingDown = true;
         m_renderShouldStop.store(true, std::memory_order_release);
 
-        // Stop MCP server before tearing down resources.
-        if (m_mcpServer)
-            m_mcpServer->Stop();
+        // Stop the MCP session FIRST, while the render worker is still alive,
+        // so an in-flight session request drains rather than stranding on a
+        // joined worker (the 30 s stall the migration plan warns about).
+        // Then (below) the render dispatcher + worker.
+        StopMcpSession();
 
         if (m_renderTimer)
         {
@@ -513,13 +543,11 @@ namespace winrt::ShaderLab::implementation
         SetupMcpRoutes();
         if (m_autoStartMcp && m_mcpServer)
         {
-            m_mcpServer->Start(47808);
+            StartMcpSession();
             McpServerToggle().IsChecked(true);
-            // Delay slightly to let the listener thread bind.
             DispatcherQueue().TryEnqueue([this]()
             {
-                uint16_t actualPort = m_mcpServer ? m_mcpServer->Port() : 47808;
-                McpServerLabel().Text(std::format(L"MCP Server :{}", actualPort));
+                UpdateMcpStatusLabel();
                 McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
                 ResetMcpActivityState();
                 UpdateMcpActivityIndicator();
@@ -649,12 +677,12 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::UpdateMcpActivityIndicator()
     {
-        // Hide the dot entirely when the server is off.
-        if (!m_mcpServer || !m_mcpServer->IsRunning())
+        // Hide the dot entirely when this window isn't exposed as a session.
+        if (!m_sessionClient)
         {
             McpActivityDot().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
             Controls::ToolTipService::SetToolTip(McpServerToggle(),
-                winrt::box_value(winrt::hstring(L"Start/stop MCP server for AI assistant integration")));
+                winrt::box_value(winrt::hstring(L"Expose this window to MCP (AI assistant integration)")));
             return;
         }
 
@@ -707,10 +735,9 @@ namespace winrt::ShaderLab::implementation
             return;
         m_mcpLastUiUpdateSeq = seq;
         std::wstring tooltip;
-        uint16_t port = m_mcpServer->Port();
         if (totalCount == 0)
         {
-            tooltip = std::format(L"MCP Server :{} \u2014 listening (no requests yet)", port);
+            tooltip = L"MCP session \u2014 registered (no requests yet)";
         }
         else
         {
@@ -741,10 +768,10 @@ namespace winrt::ShaderLab::implementation
             else                     ageStr = std::format(L"{}m ago", ageMs / 60000);
 
             tooltip = std::format(
-                L"MCP Server :{} \u2014 {} request{}\n"
+                L"MCP session \u2014 {} request{}\n"
                 L"Last: {} {} \u2192 {} ({})\n"
                 L"From: {}{}",
-                port, totalCount, (totalCount == 1 ? L"" : L"s"),
+                totalCount, (totalCount == 1 ? L"" : L"s"),
                 methodW, pathW, status, ageStr,
                 peerW.empty() ? L"(unknown)" : peerW.c_str(),
                 peerCount > 1 ? std::format(L"  (\u00d7{} distinct clients)", peerCount).c_str() : L"");
@@ -843,6 +870,11 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::SwitchAdapter(
         ::ShaderLab::Rendering::DevicePreference pref, LUID adapterLuid)
     {
+        // Gate MCP session/HTTP requests to 503 for the whole teardown +
+        // rebuild window (GuiEngineCommandSink::Dispatch checks this). Reset
+        // in the exit paths below.
+        m_adapterSwitchInProgress.store(true, std::memory_order_release);
+
         // Stop UI render timer.
         if (m_renderTimer) m_renderTimer.Stop();
 
@@ -912,6 +944,7 @@ namespace winrt::ShaderLab::implementation
             catch (...) {
                 // Total failure — restart timer and bail.
                 if (m_renderTimer) m_renderTimer.Start();
+                m_adapterSwitchInProgress.store(false, std::memory_order_release);
                 return;
             }
         }
@@ -1032,6 +1065,10 @@ namespace winrt::ShaderLab::implementation
                 }
                 m_forceRender = true;
             });
+
+        // Switch complete: the worker is back on the new device and the
+        // engine is usable again, so let MCP requests through.
+        m_adapterSwitchInProgress.store(false, std::memory_order_release);
     }
 
     // -----------------------------------------------------------------------
@@ -5050,72 +5087,12 @@ namespace winrt::ShaderLab::implementation
         catch (...) { return {}; }
     }
 
-    std::vector<uint8_t> MainWindow::CaptureNodeAsPng(uint32_t nodeId,
-                                                     bool& outNotFound,
-                                                     bool& outNotReady)
-    {
-        outNotFound = false;
-        outNotReady = false;
-
-        // Force a render frame so dirty downstream nodes evaluate before we
-        // try to resolve the output.  Same convention as /render/capture.
-        RenderFrame();
-
-        auto* image = ResolveDisplayImage(nodeId);
-        if (!image)
-        {
-            // Disambiguate "no such node" vs "node exists but isn't ready".
-            auto* node = m_graph.FindNode(nodeId);
-            if (!node) { outNotFound = true; return {}; }
-            outNotReady = true;
-            return {};
-        }
-        return CaptureImageAsPng(image);
-    }
-
-    bool MainWindow::ReadPixelRegion(uint32_t nodeId,
-                                     int32_t x, int32_t y, uint32_t w, uint32_t h,
-                                     std::vector<float>& outPixels,
-                                     uint32_t& outActualW, uint32_t& outActualH,
-                                     bool& outNotFound, bool& outNotReady)
-    {
-        outPixels.clear();
-        outActualW = 0;
-        outActualH = 0;
-        outNotFound = false;
-        outNotReady = false;
-
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) return false;
-
-        // Force a fresh frame so dirty nodes evaluate before readback.
-        // The engine helper (Rendering::ReadPixelRegion) is otherwise
-        // pure -- doesn't drive eval -- so the host has to ensure the
-        // graph is up-to-date.
-        RenderFrame();
-
-        auto result = ::ShaderLab::Rendering::ReadPixelRegion(
-            m_graph, nodeId, x, y, w, h, dc);
-
-        switch (result.status)
-        {
-        case ::ShaderLab::Rendering::ReadPixelRegionStatus::Success:
-            outPixels = std::move(result.pixels);
-            outActualW = result.actualWidth;
-            outActualH = result.actualHeight;
-            return true;
-        case ::ShaderLab::Rendering::ReadPixelRegionStatus::NotFound:
-            outNotFound = true;
-            return false;
-        case ::ShaderLab::Rendering::ReadPixelRegionStatus::NotReady:
-            outNotReady = true;
-            return false;
-        case ::ShaderLab::Rendering::ReadPixelRegionStatus::InvalidRegion:
-        case ::ShaderLab::Rendering::ReadPixelRegionStatus::D2DError:
-        default:
-            return false;
-        }
-    }
+    // MainWindow::CaptureNodeAsPng and MainWindow::ReadPixelRegion were
+    // removed in the stdio-migration Step 7 residual sweep. They were
+    // pre-worker MCP shims (each calling the dead MainWindow::RenderFrame on
+    // the UI D2D context) with no remaining callers -- the render_capture_node
+    // and read_pixel_region routes are engine-side now, driving the render
+    // worker and using Rendering::CaptureNodeAsPng / Rendering::ReadPixelRegion.
 
     std::vector<uint8_t> MainWindow::CaptureGraphAsPng()
     {

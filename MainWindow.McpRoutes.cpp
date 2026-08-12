@@ -1,6 +1,10 @@
 #include "pch.h"
 #include "MainWindow.xaml.h"
-#include "Engine/Mcp/McpHttpServer.h"
+#include "Engine/Mcp/McpRouter.h"
+#include "Engine/Mcp/McpJsonRpc.h"
+#include "Engine/Mcp/McpTimeouts.h"
+#include <appmodel.h>
+#include <shlobj.h>
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
 #include "Effects/ShaderLabEffects.h"
@@ -82,36 +86,184 @@ namespace winrt::ShaderLab::implementation
         // Move the lambda into a shared_ptr so it stays alive even if the
         // DispatcherQueue holds the callback longer than this scope.
         auto fnPtr = std::make_shared<std::decay_t<F>>(std::forward<F>(fn));
-        DispatcherQueue().TryEnqueue([state, fnPtr]()
+        // TryEnqueue returns false once the DispatcherQueue is shutting down
+        // (window closing). The old code DISCARDED that bool, so the event
+        // never fired and every in-flight request ate its full 30 s timeout
+        // during shutdown. Fail fast instead — this is the DispatchSync rung
+        // of the timeout ladder (Engine/Mcp/McpTimeouts.h).
+        if (!DispatcherQueue().TryEnqueue([state, fnPtr]()
+            {
+                try { state->result = (*fnPtr)(); }
+                catch (...) { state->ex = std::current_exception(); }
+                SetEvent(state->event);
+            }))
         {
-            try { state->result = (*fnPtr)(); }
-            catch (...) { state->ex = std::current_exception(); }
-            SetEvent(state->event);
-        });
+            throw std::runtime_error("DispatchSync: UI dispatcher queue is shutting down");
+        }
 
-        // 30s timeout -- generous for stats/readback paths but still a
-        // backstop against a wedged UI thread.
-        DWORD wait = WaitForSingleObject(state->event, 30000);
+        DWORD wait = WaitForSingleObject(state->event,
+            static_cast<DWORD>(::ShaderLab::Mcp::kDispatchSyncTimeout.count()));
         if (wait != WAIT_OBJECT_0)
-            throw std::runtime_error("DispatchSync: UI thread did not respond within 30s");
+            throw std::runtime_error("DispatchSync: UI thread did not respond in time");
         if (state->ex) std::rethrow_exception(state->ex);
         if (!state->result.has_value())
             throw std::runtime_error("DispatchSync: lambda completed without producing a result");
         return std::move(*state->result);
     }
 
-    ::ShaderLab::McpHttpServer::Response MainWindow::GuiEngineCommandSink::Dispatch(
-        std::function<::ShaderLab::McpHttpServer::Response(
+    // stdio-migration Step 8: the hub's AUMID for the client's shim to
+    // activate. Packaged: "<PackageFamilyName>!Hub". Unpackaged (dev): empty
+    // — no packaged hub to activate, so the shim only works against a hub
+    // that's already running (e.g. a deployed GUI, or a manual --hub).
+    std::wstring MainWindow::HubAumid()
+    {
+        UINT32 len = 0;
+        LONG rc = ::GetCurrentPackageFamilyName(&len, nullptr);
+        if (rc != ERROR_INSUFFICIENT_BUFFER)
+            return {};   // APPMODEL_ERROR_NO_PACKAGE -> unpackaged
+        std::wstring pfn(len, L'\0');
+        if (::GetCurrentPackageFamilyName(&len, pfn.data()) != ERROR_SUCCESS)
+            return {};
+        pfn.resize(len ? len - 1 : 0);   // drop the null terminator
+        return pfn + L"!Hub";
+    }
+
+    // stdio-migration Step 8: copy the shim (ShaderLabMcpBroker.exe, next to
+    // ShaderLab.exe in the package payload) to a STABLE UNPACKAGED path,
+    // %LOCALAPPDATA%\ShaderLab\bin\. Being unpackaged, that copy is immune to
+    // MSIX update / uninstall — the MCP client keeps talking to it across a
+    // ShaderLab upgrade. Returns the target path (empty on failure).
+    //
+    // Rename-then-write: a running shim holds the file open, so overwrite-in-
+    // place fails. Renaming the existing copy aside works even while it runs
+    // (the process keeps its image), then the fresh binary lands at the
+    // canonical path for the NEXT client launch. Stale .old files are reaped
+    // best-effort (a still-running shim keeps its .old locked until it exits).
+    std::wstring MainWindow::EnsureShimDistributed()
+    {
+        wchar_t exePath[MAX_PATH * 2]{};
+        if (::GetModuleFileNameW(nullptr, exePath, ARRAYSIZE(exePath)) == 0)
+            return {};
+        std::wstring dir = exePath;
+        auto slash = dir.find_last_of(L'\\');
+        if (slash == std::wstring::npos) return {};
+        std::wstring source = dir.substr(0, slash) + L"\\ShaderLabMcpBroker.exe";
+        if (::GetFileAttributesW(source.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return {};   // no broker payload (unexpected in a real build)
+
+        PWSTR local = nullptr;
+        if (FAILED(::SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)))
+            return {};
+        std::wstring binDir = std::wstring(local) + L"\\ShaderLab\\bin";
+        ::CoTaskMemFree(local);
+        ::SHCreateDirectoryExW(nullptr, binDir.c_str(), nullptr);
+        std::wstring target = binDir + L"\\ShaderLabMcpBroker.exe";
+
+        if (::GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            std::wstring aside = target + L"." + std::to_wstring(::GetTickCount64()) + L".old";
+            ::MoveFileExW(target.c_str(), aside.c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
+        ::CopyFileW(source.c_str(), target.c_str(), FALSE);
+
+        // Reap stale .old copies whose shim has since exited.
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = ::FindFirstFileW((target + L".*.old").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            do { ::DeleteFileW((binDir + L"\\" + fd.cFileName).c_str()); }
+            while (::FindNextFileW(h, &fd));
+            ::FindClose(h);
+        }
+        return (::GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES)
+            ? target : std::wstring{};
+    }
+
+    // stdio-migration Step 7: register this window with the broker hub as a
+    // session. The client serves each sealed request by routing through
+    // m_mcpServer -- the same router/dispatcher/engine routes the HTTP
+    // transport uses -- so tool calls marshal to the render worker and fire
+    // the 8 event hooks exactly like an HTTP request. Idempotent.
+    void MainWindow::StartMcpSession()
+    {
+        if (m_sessionClient || !m_mcpServer)
+            return;
+
+        // Refresh the on-disk shim (rename-then-write) so a client launching
+        // it gets this build, while any shim an MCP client already has open
+        // keeps running (update-immune by design, stdio-migration Step 8).
+        EnsureShimDistributed();
+
+        if (m_mcpSessionId.empty())
+        {
+            GUID g{};
+            CoCreateGuid(&g);
+            wchar_t buf[64]{};
+            StringFromGUID2(g, buf, ARRAYSIZE(buf));
+            m_mcpSessionId = buf;   // stable for this window's lifetime, not an ordinal
+        }
+
+        ::ShaderLab::Mcp::SessionClientOptions opts;
+        opts.sessionId = m_mcpSessionId;
+        opts.label = std::format(L"ShaderLab {} (pid {})",
+            std::wstring(::ShaderLab::VersionString), GetCurrentProcessId());
+        m_sessionClient = std::make_unique<::ShaderLab::Mcp::McpSessionClient>(
+            *m_mcpServer, std::move(opts));
+        m_sessionThread = std::thread([this] { m_sessionClient->Run(); });
+    }
+
+    // Stop the session BEFORE the render dispatcher shuts down: reject-new ->
+    // (Run observes stop) -> close pipe (CancelIo equivalent) -> join. If we
+    // instead joined after m_renderDispatcher.Shutdown(), an in-flight
+    // session request could be mid-DispatchSync onto a worker that is already
+    // gone -- the 30 s stall the plan warns about.
+    void MainWindow::StopMcpSession()
+    {
+        if (m_sessionClient)
+            m_sessionClient->Stop();
+        if (m_sessionThread.joinable())
+            m_sessionThread.join();
+        m_sessionClient.reset();
+    }
+
+    // Toolbar label. The toggle means "expose this window to MCP"; the label
+    // reflects whether this window is registered as a hub session. (Richer
+    // "session N of M / no hub" wording would need a hub round-trip on the UI
+    // tick; deferred.)
+    void MainWindow::UpdateMcpStatusLabel()
+    {
+        if (!McpServerLabel())
+            return;
+        McpServerLabel().Text(m_sessionClient ? L"MCP: on" : L"MCP: off");
+    }
+
+    ::ShaderLab::Mcp::Response MainWindow::GuiEngineCommandSink::Dispatch(
+        std::function<::ShaderLab::Mcp::Response(
             ::ShaderLab::Mcp::EngineContext&)> closure)
     {
+        // While an adapter switch is in flight the render worker is joined
+        // and the device stack is being torn down + rebuilt, so there is no
+        // valid consumer or D2D context to marshal to. Fail with 503 rather
+        // than dispatching into a half-dead engine. A user clicking the GPU
+        // dropdown mid-request hits exactly this.
+        if (window->m_adapterSwitchInProgress.load(std::memory_order_acquire))
+        {
+            ::ShaderLab::Mcp::Response busy;
+            busy.statusCode = 503;
+            busy.body = R"({"error":"GPU adapter switch in progress; retry shortly"})";
+            return busy;
+        }
+
         // Marshal the engine work to the render thread (single writer to
         // m_graph). Re-entrant calls from inside the consumer thread run
-        // inline (RenderThreadDispatcher detects this).
-        ::ShaderLab::McpHttpServer::Response resp;
+        // inline (RenderThreadDispatcher detects this). The render rung of
+        // the timeout ladder (Engine/Mcp/McpTimeouts.h) bounds the wait so a
+        // wedged closure surfaces before MainWindow::DispatchSync above it.
+        ::ShaderLab::Mcp::Response resp;
         try
         {
             resp = window->m_renderDispatcher.DispatchSync(
-                [this, &closure]() -> ::ShaderLab::McpHttpServer::Response {
+                [this, &closure]() -> ::ShaderLab::Mcp::Response {
                     ::ShaderLab::Mcp::EngineContext ctx{};
                     ctx.graph = &window->m_graph;
                     ctx.evaluator = &window->m_graphEvaluator;
@@ -125,6 +277,9 @@ namespace winrt::ShaderLab::implementation
                     ctx.d3dContext = window->m_renderEngine.D3DContext();
                     ctx.renderFrame = [this]() { window->RenderFrameToOffscreen(0.0); };
                     ctx.getPreviewNodeId = [this]() -> uint32_t { return window->m_previewNodeId; };
+                    ctx.getPipelineFormatName = [this]() -> std::wstring {
+                        return std::wstring(window->m_renderEngine.ActiveFormat().name);
+                    };
                     ctx.getLoadedIccProfile = [this]() -> std::optional<::ShaderLab::Rendering::DisplayProfile> {
                         return window->m_loadedIccProfile;
                     };
@@ -132,11 +287,12 @@ namespace winrt::ShaderLab::implementation
                         window->m_loadedIccProfile = p;
                     };
                     return closure(ctx);
-                });
+                },
+                ::ShaderLab::Mcp::kRenderClosureTimeout);
         }
         catch (const std::exception& e)
         {
-            ::ShaderLab::McpHttpServer::Response err;
+            ::ShaderLab::Mcp::Response err;
             err.statusCode = 500;
             err.body = std::string(R"({"error":")") + e.what() + R"("})";
             err.contentType = "application/json";
@@ -298,7 +454,7 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::SetupMcpRoutes()
     {
         if (!m_mcpServer)
-            m_mcpServer = std::make_unique<::ShaderLab::McpHttpServer>();
+            m_mcpServer = std::make_unique<::ShaderLab::McpRouter>();
         if (!m_engineSink)
             m_engineSink = std::make_unique<GuiEngineCommandSink>(this);
 
@@ -337,22 +493,22 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Mcp::RegisterEngineRoutes(*m_mcpServer, *m_engineSink);
 
         // =====================================================================
-        // GET /  — Health check / probe (some MCP clients GET / before POST).
+        // GET / (health) + POST / (JSON-RPC dispatcher) — engine-provided
+        // (stdio-migration Step 3). RegisterJsonRpcEndpoint installs both on
+        // this router; the dispatcher forwards tools/call into the routes
+        // registered here via the declarative Engine/Mcp/McpToolCatalog.
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/", [](const std::wstring& path, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
         {
-            // Only match exact "/" — longer GET paths fall through to other routes.
-            if (path != L"/")
-                return { 404, R"({"error":"Not found"})" };
-            return { 200, R"({"name":"shaderlab","transport":"streamable-http","endpoint":"POST /"})" };
-        });
+            ::ShaderLab::Mcp::JsonRpcOptions rpcOptions;
+            rpcOptions.hostKind = "gui";
+            ::ShaderLab::Mcp::RegisterJsonRpcEndpoint(*m_mcpServer, std::move(rpcOptions));
+        }
 
         // =====================================================================
         // GET /context  — System prompt / onboarding for calling agents
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/context", [](const std::wstring&, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"GET", L"/context", [](const std::wstring&, const std::wstring&, const std::string&)
+            -> ::ShaderLab::Mcp::Response
         {
             std::string doc = R"JSON({
 "name": "ShaderLab",
@@ -382,7 +538,7 @@ namespace winrt::ShaderLab::implementation
     "customExample": "Gamut analysis: Output[0,0].x = maxLuminance (float), Output[1,0] = gamutBounds (float4), etc."
 },
 "nodeTypes": ["Source", "BuiltInEffect", "PixelShader", "ComputeShader", "Output"],
-"outputNote": "PNG captures are tone-mapped SDR. Use /render/pixel/X/Y for true scRGB float values. Values above 1.0 are HDR.",
+"outputNote": "PNG captures are tone-mapped SDR. Use POST /render/pixel-region for true scRGB float values. Values above 1.0 are HDR.",
 "endpoints": {
     "GET /context": "This document",
     "GET /graph": "Full graph state with nodes, edges, properties, custom effects",
@@ -390,7 +546,7 @@ namespace winrt::ShaderLab::implementation
     "GET /registry/effects": "All built-in D2D effects",
     "GET /custom-effects": "All custom effects in graph with HLSL source",
     "GET /render/capture": "Output as base64 PNG, SDR tone-mapped",
-    "GET /render/pixel/{x}/{y}": "scRGB float4 plus luminance at coordinates",
+    "POST /render/pixel-region": "FP32 scRGB region readback, body: nodeId x y w h",
     "POST /graph/add-node": "Add a node, body: effectName string",
     "POST /graph/remove-node": "Remove node, body: nodeId number",
     "POST /graph/connect": "Connect pins, body: srcId srcPin dstId dstPin",
@@ -463,14 +619,14 @@ namespace winrt::ShaderLab::implementation
         // =====================================================================
         // POST /render/preview-node
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/render/preview-node", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"POST", L"/render/preview-node", [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
         {
             try
             {
                 auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
                 uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
-                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                     m_previewNodeId = nodeId;
                     m_needsFitPreview = true;
                     m_forceRender = true;
@@ -490,53 +646,66 @@ namespace winrt::ShaderLab::implementation
         // =====================================================================
 
         // =====================================================================
-        // GET /render/pixel/{x}/{y}
+        // GET /render/pixel/{x}/{y} -- REMOVED (stdio-migration Step 1).
+        // Was a "coming soon" stub that touched the UI D2D context on the
+        // listener thread with no dispatch and std::stof'd unvalidated
+        // input. True pixel readback is POST /render/pixel-region (engine
+        // route); an unmatched GET path now 404s from the router.
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/render/pixel/", [this](const std::wstring& path, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
+
+        // =====================================================================
+        // POST /graph/rename-node
+        // =====================================================================
+        // Promoted from the inline `graph_rename_node` tools/call handler
+        // (stdio-migration Step 1). Stays app-side: the rename must refresh
+        // XAML surfaces (preview selector + Add Node flyout) and
+        // IEngineCommandSink has no rename hook -- adding one is an engine
+        // ABI change, deferred until Step 2 bumps the ABI anyway.
+        // Threading: mutation + RebuildLayout run on the render thread
+        // (layout's home per the NodeGraphController rules); the XAML
+        // refresh is TryEnqueue'd to the UI thread fire-and-forget, so a
+        // busy UI can no longer turn a committed rename into a 500.
+        m_mcpServer->AddRoute(L"POST", L"/graph/rename-node", [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
         {
-            // Parse /render/pixel/{x}/{y}
-            auto rest = path.substr(14); // after "/render/pixel/"
-            auto slash = rest.find(L'/');
-            if (slash == std::wstring::npos)
-                return { 400, R"({"error":"Format: /render/pixel/{x}/{y}"})" };
+            uint32_t nodeId = 0;
+            std::wstring newName;
+            try
+            {
+                auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+                nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
+                newName = std::wstring(jobj.GetNamedString(L"name"));
+            }
+            catch (...) { return { 400, R"({"error":"Invalid request: need nodeId + name"})" }; }
 
-            float x = std::stof(rest.substr(0, slash));
-            float y = std::stof(rest.substr(slash + 1));
+            auto resp = m_renderDispatcher.DispatchSync(
+                [this, nodeId, &newName]() -> ::ShaderLab::Mcp::Response {
+                    auto* node = m_graph.FindNode(nodeId);
+                    if (!node) return { 404, R"({"error":"Node not found"})" };
+                    node->name = newName;
+                    m_nodeGraphController.RebuildLayout();
+                    return { 200, R"({"ok":true})" };
+                });
 
-            auto* dc = m_renderEngine.D2DDeviceContext();
-            if (!dc) return { 500, R"({"error":"No device context"})" };
-
-            auto* image = ResolveDisplayImage(m_previewNodeId);
-            if (!image) return { 404, R"({"error":"No output image"})" };
-
-            // Read pixel value using a 1x1 bitmap copy.
-            D2D1_POINT_2U srcPoint = { static_cast<UINT32>(x), static_cast<UINT32>(y) };
-            D2D1_BITMAP_PROPERTIES1 bmpProps = {};
-            bmpProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-            bmpProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
-
-            winrt::com_ptr<ID2D1Bitmap1> readBitmap;
-            HRESULT hr = dc->CreateBitmap(D2D1::SizeU(1, 1), nullptr, 0, bmpProps, readBitmap.put());
-            if (FAILED(hr)) return { 500, R"({"error":"Failed to create read bitmap"})" };
-
-            D2D1_RECT_U srcRect = { srcPoint.x, srcPoint.y, srcPoint.x + 1, srcPoint.y + 1 };
-            // Need to render the image to a target first, then copy.
-            // For simplicity, report from the cached pixel inspector logic.
-            // TODO: implement proper pixel readback
-
-            return { 200, std::format("{{\"x\":{:.0f},\"y\":{:.0f},\"note\":\"Pixel readback via MCP coming soon\"}}", x, y) };
+            if (resp.statusCode == 200)
+            {
+                DispatcherQueue().TryEnqueue([this]() {
+                    PopulatePreviewNodeSelector();
+                    PopulateAddNodeFlyout();
+                });
+            }
+            return resp;
         });
 
         // =====================================================================
         // =====================================================================
         // GET /render/capture -- Save output PNG to temp file, return path
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/render/capture", [this](const std::wstring&, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"GET", L"/render/capture", [this](const std::wstring&, const std::wstring&, const std::string&)
+            -> ::ShaderLab::Mcp::Response
         {
             return m_renderDispatcher.DispatchSync(
-                [this]() -> ::ShaderLab::McpHttpServer::Response {
+                [this]() -> ::ShaderLab::Mcp::Response {
                 // Run on render thread (single writer to graph + owns the
                 // engine D2D context). Force a full re-evaluation so the
                 // capture reflects current state.
@@ -558,10 +727,7 @@ namespace winrt::ShaderLab::implementation
                 WriteFile(hFile, pngData.data(), static_cast<DWORD>(pngData.size()), &written, nullptr);
                 CloseHandle(hFile);
 
-                auto pathUtf8 = ToUtf8(filePath);
-                // Escape backslashes for JSON.
-                std::string escaped;
-                for (char c : pathUtf8) { if (c == '\\') escaped += "\\\\"; else escaped += c; }
+                auto escaped = ::ShaderLab::Mcp::JsonEscape(ToUtf8(filePath));
 
                 return { 200, std::format("{{\"path\":\"{}\",\"size\":{}}}", escaped, pngData.size()) };
             });
@@ -570,8 +736,8 @@ namespace winrt::ShaderLab::implementation
         // =====================================================================
         // GET /perf — Return per-frame performance timings
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/perf", [this](const std::wstring&, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"GET", L"/perf", [this](const std::wstring&, const std::wstring&, const std::string&)
+            -> ::ShaderLab::Mcp::Response
         {
             auto& t = m_lastFrameTiming;
             if (t.framesSampled == 0)
@@ -595,12 +761,21 @@ namespace winrt::ShaderLab::implementation
         });
 
         // =====================================================================
+        // GET /display/info -- moved to Engine/Mcp/EngineMcpRoutes.cpp
+        // (stdio-migration Step 2). Step 1 parked it here because it needs
+        // the pipeline-format name; EngineContext::getPipelineFormatName
+        // (supplied by GuiEngineCommandSink::Dispatch from
+        // RenderEngine::ActiveFormat()) closed that gap, so it is now
+        // engine-pure and headless serves it too.
+        // =====================================================================
+
+        // =====================================================================
         // GET /node/{id}/logs — Return per-node log entries
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/node/", [this](const std::wstring& path, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"GET", L"/node/", [this](const std::wstring& path, const std::wstring& query, const std::string&)
+            -> ::ShaderLab::Mcp::Response
         {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+            return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                 // Parse nodeId and optional /logs suffix from path.
                 // Expected: /node/{id}/logs or /node/{id}/logs?since={seq}
                 auto stripped = path.substr(6); // remove "/node/"
@@ -614,12 +789,16 @@ namespace winrt::ShaderLab::implementation
                     return { 200, R"({"logs":[]})" };
 
                 auto& log = it->second;
-                // Check for ?since= parameter.
+                // ?since= arrives via the query argument (stdio-migration
+                // Step 2). Previously the HTTP listener stripped the query
+                // before routing, so raw-HTTP polls silently returned the
+                // whole log every time; only RouteRequest callers that
+                // embedded "?since=" in the path string got filtering.
                 uint64_t sinceSeq = 0;
-                auto qPos = path.find(L"since=");
+                auto qPos = query.find(L"since=");
                 if (qPos != std::wstring::npos)
                 {
-                    try { sinceSeq = std::stoull(path.substr(qPos + 6)); } catch (...) {}
+                    try { sinceSeq = std::stoull(query.substr(qPos + 6)); } catch (...) {}
                 }
 
                 std::string json = "{\"logs\":[";
@@ -643,19 +822,9 @@ namespace winrt::ShaderLab::implementation
                     if (entry.level == ::ShaderLab::Controls::LogLevel::Warning) levelStr = "Warning";
                     else if (entry.level == ::ShaderLab::Controls::LogLevel::Error) levelStr = "Error";
 
-                    // JSON-escape the message.
-                    std::string msg = ToUtf8(entry.message);
-                    std::string escaped;
-                    for (char c : msg) {
-                        if (c == '"') escaped += "\\\"";
-                        else if (c == '\\') escaped += "\\\\";
-                        else if (c == '\n') escaped += "\\n";
-                        else if (c == '\r') escaped += "\\r";
-                        else if (c == '\t') escaped += "\\t";
-                        else if (static_cast<unsigned char>(c) < 0x20)
-                            escaped += std::format("\\u{:04x}", static_cast<unsigned char>(c));
-                        else escaped += c;
-                    }
+                    // Shared escaper (stdio-migration Step 3 unified the
+                    // previously-divergent copies).
+                    std::string escaped = ::ShaderLab::Mcp::JsonEscape(ToUtf8(entry.message));
 
                     json += std::format("{{\"seq\":{},\"time\":\"{}\",\"level\":\"{}\",\"message\":\"{}\"}}",
                         entry.sequence, timeBuf, levelStr, escaped);
@@ -680,8 +849,8 @@ namespace winrt::ShaderLab::implementation
         // =====================================================================
         // POST /render/pixel-trace — Run pixel trace at normalized coordinates
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/render/pixel-trace", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"POST", L"/render/pixel-trace", [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
         {
             try
             {
@@ -690,7 +859,7 @@ namespace winrt::ShaderLab::implementation
                 float normX = static_cast<float>(jobj.GetNamedNumber(L"x"));
                 float normY = static_cast<float>(jobj.GetNamedNumber(L"y"));
 
-                return m_renderDispatcher.DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                return m_renderDispatcher.DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                     // P13: pixel-trace runs on the render thread. m_graph is
                     // single-writer there; the render-side D2D context shares
                     // the engine's multi-threaded D2D device with the worker's
@@ -832,10 +1001,10 @@ namespace winrt::ShaderLab::implementation
         // Captures the live node-graph view at the swap-chain panel size.
         // Always writes PNG to a unique %TEMP% file. When inline=true, also
         // returns base64-encoded bytes in the response.
-        m_mcpServer->AddRoute(L"POST", L"/graph/snapshot", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"POST", L"/graph/snapshot", [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
         {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+            return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                 bool wantInline = false;
                 if (!body.empty())
                 {
@@ -891,10 +1060,10 @@ namespace winrt::ShaderLab::implementation
         });
 
         // GET /graph/view — current pan/zoom + viewport + content bounds
-        m_mcpServer->AddRoute(L"GET", L"/graph/view", [this](const std::wstring&, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"GET", L"/graph/view", [this](const std::wstring&, const std::wstring&, const std::string&)
+            -> ::ShaderLab::Mcp::Response
         {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+            return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                 m_nodeGraphController.RebuildLayout();
                 auto pan = m_nodeGraphController.PanOffset();
                 float zoom = m_nodeGraphController.Zoom();
@@ -914,10 +1083,10 @@ namespace winrt::ShaderLab::implementation
         });
 
         // POST /graph/view — body: { zoom?, panX?, panY? }
-        m_mcpServer->AddRoute(L"POST", L"/graph/view", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"POST", L"/graph/view", [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
         {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+            return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                 winrt::Windows::Data::Json::JsonObject jo{ nullptr };
                 if (!winrt::Windows::Data::Json::JsonObject::TryParse(winrt::to_hstring(body), jo))
                     return { 400, R"({"error":"Invalid JSON body"})" };
@@ -964,10 +1133,10 @@ namespace winrt::ShaderLab::implementation
         });
 
         // POST /graph/view/fit — body: { padding?:number (DIPs, default 40) }
-        m_mcpServer->AddRoute(L"POST", L"/graph/view/fit", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"POST", L"/graph/view/fit", [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
         {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+            return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                 float padding = 40.0f;
                 if (!body.empty())
                 {
@@ -994,10 +1163,10 @@ namespace winrt::ShaderLab::implementation
         // =====================================================================
         // GET /gpu/list  — Enumerate GPU adapters + identify the active one
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/gpu/list", [this](const std::wstring&, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"GET", L"/gpu/list", [this](const std::wstring&, const std::wstring&, const std::string&)
+            -> ::ShaderLab::Mcp::Response
         {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+            return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                 auto adapters = ::ShaderLab::Rendering::RenderEngine::EnumerateAdapters();
                 std::string json = "{\"active\":{";
                 json += "\"name\":\"" + ToUtf8(m_renderEngine.AdapterName()) + "\"";
@@ -1039,10 +1208,10 @@ namespace winrt::ShaderLab::implementation
         // SwitchAdapter sequence: graph save -> device teardown -> new
         // device init -> graph reload.
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/gpu/switch", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"POST", L"/gpu/switch", [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
         {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+            return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                 using namespace ::ShaderLab::Rendering;
                 namespace WDJ = winrt::Windows::Data::Json;
                 WDJ::JsonObject jobj{ nullptr };
@@ -1143,10 +1312,10 @@ namespace winrt::ShaderLab::implementation
         // =====================================================================
         // GET /preview/view  — Current preview pan/zoom + image bounds
         // =====================================================================
-        m_mcpServer->AddRoute(L"GET", L"/preview/view", [this](const std::wstring&, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"GET", L"/preview/view", [this](const std::wstring&, const std::wstring&, const std::string&)
+            -> ::ShaderLab::Mcp::Response
         {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+            return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                 auto bounds = GetPreviewImageBounds();
                 float imgW = (std::max)(0.0f, bounds.right - bounds.left);
                 float imgH = (std::max)(0.0f, bounds.bottom - bounds.top);
@@ -1163,10 +1332,10 @@ namespace winrt::ShaderLab::implementation
         // POST /preview/view  — Set preview pan/zoom (any subset).
         // Body: { zoom?, panX?, panY? }   zoom clamped to [0.01, 100.0]
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/preview/view", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"POST", L"/preview/view", [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
         {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+            return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                 namespace WDJ = winrt::Windows::Data::Json;
                 WDJ::JsonObject jo{ nullptr };
                 if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
@@ -1211,10 +1380,10 @@ namespace winrt::ShaderLab::implementation
         // =====================================================================
         // POST /preview/view/fit  — Fit preview image to viewport.
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/preview/view/fit", [this](const std::wstring&, const std::string&)
-            -> ::ShaderLab::McpHttpServer::Response
+        m_mcpServer->AddRoute(L"POST", L"/preview/view/fit", [this](const std::wstring&, const std::wstring&, const std::string&)
+            -> ::ShaderLab::Mcp::Response
         {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+            return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                 FitPreviewToView();
                 m_forceRender = true;
                 return { 200, std::format(
@@ -1227,492 +1396,11 @@ namespace winrt::ShaderLab::implementation
         // GET /effect/hlsl/{nodeId} -- moved to Engine/Mcp/EngineMcpRoutes.cpp
         // =====================================================================
         // =====================================================================
-        // POST /  — MCP JSON-RPC 2.0 endpoint (Streamable HTTP transport)
+        // POST / (JSON-RPC dispatcher) + GET / (health) -- moved to
+        // Engine/Mcp/McpJsonRpc.cpp (stdio-migration Step 3). The GUI
+        // registers the shared endpoint via RegisterJsonRpcEndpoint in
+        // SetupMcpRoutes above; the tool catalog lives in
+        // Engine/Mcp/McpToolCatalog.cpp.
         // =====================================================================
-        m_mcpServer->AddRoute(L"POST", L"/", [this](const std::wstring&, const std::string& body)
-            -> ::ShaderLab::McpHttpServer::Response
-        {
-            try
-            {
-                {
-                    std::string preview = body.size() > 512 ? body.substr(0, 512) + "..." : body;
-                    OutputDebugStringA(("[MCP] POST / body: " + preview + "\n").c_str());
-                }
-                winrt::Windows::Data::Json::JsonObject jobj{ nullptr };
-                if (!winrt::Windows::Data::Json::JsonObject::TryParse(winrt::to_hstring(body), jobj))
-                {
-                    OutputDebugStringA(("[MCP] POST / parse error. bodySize=" + std::to_string(body.size())
-                        + " raw=[" + body + "]\n").c_str());
-                    return { 200, R"({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}})" };
-                }
-                if (!jobj.HasKey(L"method"))
-                {
-                    OutputDebugStringA("[MCP] POST / missing method field\n");
-                    return { 200, R"({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}})" };
-                }
-                auto method = ToUtf8(std::wstring(jobj.GetNamedString(L"method")));
-                OutputDebugStringA(("[MCP] method=" + method + "\n").c_str());
-                auto id = jobj.HasKey(L"id") ? jobj.GetNamedValue(L"id") : winrt::Windows::Data::Json::JsonValue::CreateNullValue();
-                std::string idStr;
-                if (id.ValueType() == winrt::Windows::Data::Json::JsonValueType::Number)
-                    idStr = std::format("{}", static_cast<int64_t>(id.GetNumber()));
-                else if (id.ValueType() == winrt::Windows::Data::Json::JsonValueType::String)
-                    idStr = "\"" + ToUtf8(std::wstring(id.GetString())) + "\"";
-                else
-                    idStr = "null";
-
-                auto wrapResult = [&](const std::string& result) -> std::string {
-                    return std::format(R"JSON({{"jsonrpc":"2.0","id":{},"result":{}}})JSON", idStr, result);
-                };
-
-                // ---- initialize ----
-                if (method == "initialize")
-                {
-                    auto verStr = ToUtf8(std::wstring(::ShaderLab::VersionString));
-                    std::string result = R"JSON({
-"protocolVersion": "2024-11-05",
-"capabilities": {
-    "tools": {},
-    "resources": {}
-},
-"serverInfo": {
-    "name": "shaderlab",
-    "version": ")JSON" + verStr + R"JSON("
-}
-})JSON";
-                    return { 200, wrapResult(result) };
-                }
-
-                // ---- notifications/initialized (no response needed but we ack) ----
-                if (method == "notifications/initialized")
-                {
-                    return { 202, "" };
-                }
-                // Any other notification (no id, method starts with "notifications/")
-                if (method.rfind("notifications/", 0) == 0)
-                {
-                    return { 202, "" };
-                }
-
-                // ---- tools/list ----
-                if (method == "tools/list")
-                {
-                    std::string tools = R"JSON({"tools":[
-{"name":"graph_add_node","description":"Add a node. Use effectName for built-in/ShaderLab effects. For sources use effectName='Video' or 'Image' with optional filePath.","inputSchema":{"type":"object","properties":{"effectName":{"type":"string","description":"Effect name, or 'Video'/'Image' for source nodes"},"filePath":{"type":"string","description":"File path for Video/Image source nodes (optional)"}},"required":["effectName"]}},
-{"name":"graph_remove_node","description":"Remove a node by ID","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
-{"name":"graph_connect","description":"Connect output pin to input pin","inputSchema":{"type":"object","properties":{"srcId":{"type":"number"},"srcPin":{"type":"number"},"dstId":{"type":"number"},"dstPin":{"type":"number"}},"required":["srcId","srcPin","dstId","dstPin"]}},
-{"name":"graph_disconnect","description":"Disconnect an edge","inputSchema":{"type":"object","properties":{"srcId":{"type":"number"},"srcPin":{"type":"number"},"dstId":{"type":"number"},"dstPin":{"type":"number"}},"required":["srcId","srcPin","dstId","dstPin"]}},
-{"name":"graph_set_property","description":"Set a node property. Value can be number, bool, string, or array for vectors.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"key":{"type":"string"},"value":{}},"required":["nodeId","key","value"]}},
-{"name":"graph_get_node","description":"Get detailed info about a node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
-{"name":"graph_save_json","description":"Serialize graph to JSON","inputSchema":{"type":"object","properties":{}}},
-{"name":"graph_load_json","description":"Load graph from JSON string","inputSchema":{"type":"object","properties":{"json":{"type":"string"}},"required":["json"]}},
-{"name":"graph_clear","description":"Clear the graph","inputSchema":{"type":"object","properties":{}}},
-{"name":"graph_apply","description":"Apply a graph patch in one call: add nodes (using client refs), connect edges, set property bindings. Call /graph/clear first if you need a fresh graph. Body: { nodes:[{ref,effect,filePath?,properties?}], edges:[{from,to,fromPin?,toPin?}], bindings:[{node,property,from:'ref.field'|{node,field},component?}] }. 'from' and 'to' accept either a ref string or numeric nodeId. Returns refToId map + nodeIds in add order.","inputSchema":{"type":"object","properties":{"nodes":{"type":"array"},"edges":{"type":"array"},"bindings":{"type":"array"}}}},
-{"name":"effect_compile","description":"Compile HLSL for a custom effect node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"hlsl":{"type":"string"}},"required":["nodeId","hlsl"]}},
-{"name":"set_preview_node","description":"Set which node is previewed","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
-{"name":"render_capture","description":"Capture preview as PNG. Note: HDR values clipped to SDR.","inputSchema":{"type":"object","properties":{}}},
-{"name":"perf_timings","description":"Get per-frame performance timings (ms) for render pipeline phases","inputSchema":{"type":"object","properties":{}}},
-{"name":"node_logs","description":"Get per-node log entries (timestamped info/warning/error). Use sinceSeq for incremental reads.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"sinceSeq":{"type":"number","description":"Only return entries after this sequence number"}},"required":["nodeId"]}},
-{"name":"registry_get_effect","description":"Get metadata for a built-in effect","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
-{"name":"graph_bind_property","description":"Bind a node property to an upstream analysis output field","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"propertyName":{"type":"string"},"sourceNodeId":{"type":"number"},"sourceFieldName":{"type":"string"},"sourceComponent":{"type":"number","description":"0-3 for .xyzw component (scalar dest only)"}},"required":["nodeId","propertyName","sourceNodeId","sourceFieldName"]}},
-{"name":"graph_unbind_property","description":"Remove a property binding","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"propertyName":{"type":"string"}},"required":["nodeId","propertyName"]}},
-{"name":"read_analysis_output","description":"Read typed analysis output fields from a compute/analysis node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
-{"name":"read_pixel_trace","description":"Run pixel trace at normalized coordinates, returns per-node pixel values and analysis outputs","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"x":{"type":"number","description":"Normalized X (0-1)"},"y":{"type":"number","description":"Normalized Y (0-1)"}},"required":["nodeId","x","y"]}},
-{"name":"list_effects","description":"List all available effects (Built-in D2D + ShaderLab) with categories","inputSchema":{"type":"object","properties":{}}},
-{"name":"graph_overview","description":"Compact graph summary: nodes (id, name, type, error), edges, preview node","inputSchema":{"type":"object","properties":{}}},
-{"name":"get_display_info","description":"Current display capabilities, active profile, pipeline format, app version","inputSchema":{"type":"object","properties":{}}},
-{"name":"graph_rename_node","description":"Rename a node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"name":{"type":"string"}},"required":["nodeId","name"]}},
-{"name":"graph_snapshot","description":"Capture a PNG snapshot of the live node-graph editor view at the current pan/zoom and panel size. With inline=true returns the image as MCP image content (base64). Without inline, returns the temp file path only.","inputSchema":{"type":"object","properties":{"inline":{"type":"boolean","description":"If true, return the PNG bytes inline as MCP image content"}}}},
-{"name":"graph_get_view","description":"Get the node-graph view's current zoom, pan offset, viewport size, and the bounding box of all nodes (in canvas space).","inputSchema":{"type":"object","properties":{}}},
-{"name":"graph_set_view","description":"Pan and/or zoom the node-graph editor view. Any subset of {zoom, panX, panY} may be supplied. Changes apply immediately to the live UI. zoom is clamped to [0.1, 5.0]; pan has no clamp. Coordinate convention: screen = zoom * canvas + pan.","inputSchema":{"type":"object","properties":{"zoom":{"type":"number"},"panX":{"type":"number"},"panY":{"type":"number"}}}},
-{"name":"graph_fit_view","description":"Fit the node-graph view to show all nodes with the given viewport-space padding (DIPs, default 40). No-op when the graph is empty.","inputSchema":{"type":"object","properties":{"padding":{"type":"number"}}}},
-{"name":"list_display_profiles","description":"List all built-in display profile presets and the currently active simulated/live profile. Returns full caps (HDR, peak nits, SDR white) and CIE primaries.","inputSchema":{"type":"object","properties":{}}},
-{"name":"set_display_profile","description":"Apply a simulated display profile (overrides OS-reported caps until cleared). Specify exactly ONE of: preset (factory or display name), presetIndex (0-based), iccPath (.icc/.icm file), custom (full chroma + nits spec).","inputSchema":{"type":"object","properties":{"preset":{"type":"string"},"presetIndex":{"type":"number"},"iccPath":{"type":"string"},"custom":{"type":"object","properties":{"name":{"type":"string"},"hdrEnabled":{"type":"boolean"},"sdrWhiteNits":{"type":"number"},"peakNits":{"type":"number"},"minNits":{"type":"number"},"maxFullFrameNits":{"type":"number"},"primaryRed":{"type":"array","items":{"type":"number"}},"primaryGreen":{"type":"array","items":{"type":"number"}},"primaryBlue":{"type":"array","items":{"type":"number"}},"whitePoint":{"type":"array","items":{"type":"number"}},"gamut":{"type":"string"}},"required":["peakNits"]}}}},
-{"name":"clear_simulated_profile","description":"Revert to the live OS-reported display profile (clears any simulated/preset/ICC override).","inputSchema":{"type":"object","properties":{}}},
-{"name":"render_capture_node","description":"Capture any node's resolved output as PNG (FORCES a render frame so dirty nodes evaluate). With inline=true returns the image as MCP image content (base64). 404 if node missing; 409 with notReady=true if the node is dirty / has unconnected inputs.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"inline":{"type":"boolean"}},"required":["nodeId"]}},
-{"name":"preview_get_view","description":"Get the preview pane's current zoom + pan + image bounds + zoom limits.","inputSchema":{"type":"object","properties":{}}},
-{"name":"preview_set_view","description":"Set the preview pane's zoom and/or pan. zoom clamped to [0.01, 100.0]. Returns post-clamp values.","inputSchema":{"type":"object","properties":{"zoom":{"type":"number"},"panX":{"type":"number"},"panY":{"type":"number"}}}},
-{"name":"preview_fit_view","description":"Fit the preview image to the preview viewport (auto zoom + center).","inputSchema":{"type":"object","properties":{}}},
-{"name":"image_stats","description":"GPU-accelerated per-channel image statistics (min/max/mean/median/p95/sum + nonzero counts). Forces a render frame first so the target node is fresh. Channels default to luminance+R+G+B+A; pass channels:[\"luminance\"] to skip the others. nonzeroOnly excludes zero pixels from min/max/mean/sum.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"nonzeroOnly":{"type":"boolean"},"channels":{"type":"array","items":{"type":"string","enum":["luminance","r","g","b","a"]}}},"required":["nodeId"]}},
-{"name":"read_pixel_region","description":"Read a small w x h region of FP32 RGBA pixels from a node's output (scRGB linear-light). Region is capped at 32x32 (1024 pixels) and per-axis at 64. Pixels are returned row-major as a flat float array (RGBARGBA...).","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"x":{"type":"number"},"y":{"type":"number"},"w":{"type":"number"},"h":{"type":"number"}},"required":["nodeId","x","y","w","h"]}},
-{"name":"effect_get_hlsl","description":"Read a node's custom-effect HLSL source, parameter list, compile state, and last runtime error. For non-custom nodes returns hasCustomEffect=false (200, not 404). For ShaderLab library effects, also includes isLibraryEffect=true + shaderLabEffectId/Version.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
-{"name":"list_gpus","description":"Enumerate available GPU adapters (DXGI). Returns the active adapter and a list of all installed adapters with name, vendorId, deviceId, dedicated VRAM (MB), LUID, and isWarp flag.","inputSchema":{"type":"object","properties":{}}},
-{"name":"switch_gpu","description":"Switch the active GPU adapter. Triggers a full graph-save, device-teardown, and graph-reload cycle. Use mode='warp' for the WARP software adapter, 'default' to let the driver pick, or 'adapter' with either {luid:{low,high}} or {name:'partial-match'}. Falls back to default if the requested adapter fails to initialize.","inputSchema":{"type":"object","properties":{"mode":{"type":"string","enum":["warp","default","adapter"]},"name":{"type":"string","description":"Substring match against adapter name (used when mode='adapter')"},"luid":{"type":"object","properties":{"low":{"type":"number"},"high":{"type":"number"}}}},"required":["mode"]}}
-]})JSON";
-                    return { 200, wrapResult(tools) };
-                }
-
-                // ---- tools/call ----
-                if (method == "tools/call")
-                {
-                    auto params = jobj.GetNamedObject(L"params");
-                    auto toolName = ToUtf8(std::wstring(params.GetNamedString(L"name")));
-                    auto args = params.HasKey(L"arguments") ? params.GetNamedObject(L"arguments") : winrt::Windows::Data::Json::JsonObject();
-                    auto argsStr = ToUtf8(std::wstring(args.Stringify()));
-
-                    // Route to existing REST handlers.
-                    ::ShaderLab::McpHttpServer::Response restResp = { 404, "" };
-
-                    if (toolName == "graph_add_node")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/add-node", argsStr);
-                    else if (toolName == "graph_remove_node")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/remove-node", argsStr);
-                    else if (toolName == "graph_connect")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/connect", argsStr);
-                    else if (toolName == "graph_disconnect")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/disconnect", argsStr);
-                    else if (toolName == "graph_set_property")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/set-property", argsStr);
-                    else if (toolName == "graph_get_node")
-                    {
-                        auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(L"nodeId"));
-                        restResp = m_mcpServer->RouteRequest(L"GET", std::format(L"/graph/node/{}", nodeId), "");
-                    }
-                    else if (toolName == "graph_save_json")
-                        restResp = m_mcpServer->RouteRequest(L"GET", L"/graph/save", "");
-                    else if (toolName == "graph_load_json")
-                    {
-                        auto jsonStr = ToUtf8(std::wstring(args.GetNamedString(L"json")));
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/load", jsonStr);
-                    }
-                    else if (toolName == "graph_clear")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/clear", "");
-                    else if (toolName == "graph_apply")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/apply", argsStr);
-                    else if (toolName == "effect_compile")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/effect/compile", argsStr);
-                    else if (toolName == "set_preview_node")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/render/preview-node", argsStr);
-                    else if (toolName == "render_capture")
-                        restResp = m_mcpServer->RouteRequest(L"GET", L"/render/capture", "");
-                    else if (toolName == "perf_timings")
-                        restResp = m_mcpServer->RouteRequest(L"GET", L"/perf", "");
-                    else if (toolName == "node_logs")
-                    {
-                        auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(L"nodeId"));
-                        uint64_t sinceSeq = 0;
-                        if (args.HasKey(L"sinceSeq"))
-                            sinceSeq = static_cast<uint64_t>(args.GetNamedNumber(L"sinceSeq"));
-                        restResp = m_mcpServer->RouteRequest(L"GET",
-                            std::format(L"/node/{}/logs?since={}", nodeId, sinceSeq), "");
-                    }
-                    else if (toolName == "registry_get_effect")
-                    {
-                        auto name = std::wstring(args.GetNamedString(L"name"));
-                        restResp = m_mcpServer->RouteRequest(L"GET", L"/registry/effect/" + name, "");
-                    }
-                    else if (toolName == "graph_bind_property")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/bind-property", argsStr);
-                    else if (toolName == "graph_unbind_property")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/unbind-property", argsStr);
-                    else if (toolName == "read_analysis_output")
-                    {
-                        auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(L"nodeId"));
-                        restResp = m_mcpServer->RouteRequest(L"GET", std::format(L"/analysis/{}", nodeId), "");
-                    }
-                    else if (toolName == "read_pixel_trace")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/render/pixel-trace", argsStr);
-                    else if (toolName == "list_effects")
-                    {
-                        restResp = DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                            std::string json = "{\"builtIn\":{";
-                            auto& reg = ::ShaderLab::Effects::EffectRegistry::Instance();
-                            auto cats = reg.Categories();
-                            bool firstCat = true;
-                            for (const auto& cat : cats)
-                            {
-                                if (cat == L"Analysis") continue;
-                                if (!firstCat) json += ",";
-                                json += "\"" + ToUtf8(cat) + "\":[";
-                                auto effects = reg.ByCategory(cat);
-                                bool firstFx = true;
-                                for (const auto* e : effects)
-                                {
-                                    if (!firstFx) json += ",";
-                                    json += "\"" + ToUtf8(e->name) + "\"";
-                                    firstFx = false;
-                                }
-                                json += "]";
-                                firstCat = false;
-                            }
-                            json += "},\"shaderLab\":{";
-                            auto& sl = ::ShaderLab::Effects::ShaderLabEffects::Instance();
-                            auto slCats = sl.Categories();
-                            firstCat = true;
-                            for (const auto& cat : slCats)
-                            {
-                                if (!firstCat) json += ",";
-                                json += "\"" + ToUtf8(cat) + "\":[";
-                                auto effects = sl.ByCategory(cat);
-                                bool firstFx = true;
-                                for (const auto* e : effects)
-                                {
-                                    if (!firstFx) json += ",";
-                                    json += "\"" + ToUtf8(e->name) + "\"";
-                                    firstFx = false;
-                                }
-                                json += "]";
-                                firstCat = false;
-                            }
-                            json += "}}";
-                            return { 200, json };
-                        });
-                    }
-                    else if (toolName == "graph_overview")
-                    {
-                        restResp = DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                            std::string json = "{\"previewNodeId\":" + std::to_string(m_previewNodeId) + ",\"nodes\":[";
-                            bool first = true;
-                            for (const auto& n : m_graph.Nodes())
-                            {
-                                if (!first) json += ",";
-                                std::string typeStr;
-                                switch (n.type)
-                                {
-                                case ::ShaderLab::Graph::NodeType::Source:        typeStr = "Source"; break;
-                                case ::ShaderLab::Graph::NodeType::BuiltInEffect: typeStr = "BuiltIn"; break;
-                                case ::ShaderLab::Graph::NodeType::PixelShader:   typeStr = "PixelShader"; break;
-                                case ::ShaderLab::Graph::NodeType::ComputeShader: typeStr = "ComputeShader"; break;
-                                case ::ShaderLab::Graph::NodeType::Output:        typeStr = "Output"; break;
-                                }
-                                json += std::format("{{\"id\":{},\"name\":\"{}\",\"type\":\"{}\"",
-                                    n.id, ToUtf8(n.name), typeStr);
-                                if (!n.runtimeError.empty())
-                                    json += ",\"error\":\"" + ToUtf8(n.runtimeError) + "\"";
-                                json += std::format(",\"inputs\":{},\"outputs\":{}}}", n.inputPins.size(), n.outputPins.size());
-                                first = false;
-                            }
-                            json += "],\"edges\":[";
-                            first = true;
-                            for (const auto& e : m_graph.Edges())
-                            {
-                                if (!first) json += ",";
-                                json += std::format("[{},{},{},{}]", e.sourceNodeId, e.sourcePin, e.destNodeId, e.destPin);
-                                first = false;
-                            }
-                            json += "]}";
-                            return { 200, json };
-                        });
-                    }
-                    else if (toolName == "get_display_info")
-                    {
-                        restResp = DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                            auto profile = m_displayMonitor.ActiveProfile();
-                            auto live = m_displayMonitor.LiveProfile();
-                            auto caps = m_displayMonitor.CachedCapabilities();
-                            auto verStr = ToUtf8(std::wstring(::ShaderLab::VersionString));
-                            std::string json = std::format(
-                                "{{\"appVersion\":\"{}\",\"graphFormatVersion\":{}"
-                                ",\"pipeline\":\"{}\""
-                                ",\"display\":{{\"hdr\":{},\"maxNits\":{:.0f},\"sdrWhiteNits\":{:.0f}"
-                                ",\"simulated\":{},\"profileName\":\"{}\""
-                                ",\"activeGamut\":{{\"red\":[{:.4f},{:.4f}],\"green\":[{:.4f},{:.4f}],\"blue\":[{:.4f},{:.4f}]}}"
-                                ",\"monitorGamut\":{{\"red\":[{:.4f},{:.4f}],\"green\":[{:.4f},{:.4f}],\"blue\":[{:.4f},{:.4f}]}}"
-                                "}}}}",
-                                verStr, ::ShaderLab::GraphFormatVersion,
-                                ToUtf8(std::wstring(m_renderEngine.ActiveFormat().name)),
-                                caps.hdrEnabled ? "true" : "false",
-                                caps.maxLuminanceNits, caps.sdrWhiteLevelNits,
-                                profile.isSimulated ? "true" : "false",
-                                ToUtf8(profile.profileName),
-                                profile.primaryRed.x, profile.primaryRed.y,
-                                profile.primaryGreen.x, profile.primaryGreen.y,
-                                profile.primaryBlue.x, profile.primaryBlue.y,
-                                live.primaryRed.x, live.primaryRed.y,
-                                live.primaryGreen.x, live.primaryGreen.y,
-                                live.primaryBlue.x, live.primaryBlue.y);
-                            return { 200, json };
-                        });
-                    }
-                    else if (toolName == "graph_rename_node")
-                    {
-                        restResp = DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                            auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(L"nodeId"));
-                            auto newName = std::wstring(args.GetNamedString(L"name"));
-                            auto* node = m_graph.FindNode(nodeId);
-                            if (!node) return { 404, R"({"error":"Node not found"})" };
-                            node->name = newName;
-                            m_nodeGraphController.RebuildLayout();
-                            PopulatePreviewNodeSelector();
-                            PopulateAddNodeFlyout();
-                            return { 200, R"({"ok":true})" };
-                        });
-                    }
-                    else if (toolName == "graph_snapshot")
-                    {
-                        // Forward to REST handler. Re-serialize args to JSON so
-                        // the route gets a proper body containing {inline:bool}.
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/snapshot", argsStr);
-
-                        // When the agent requested inline image bytes, repack
-                        // the response as MCP-native image content (not text).
-                        bool wantInline = false;
-                        if (args.HasKey(L"inline"))
-                        {
-                            auto v = args.GetNamedValue(L"inline");
-                            if (v.ValueType() == winrt::Windows::Data::Json::JsonValueType::Boolean)
-                                wantInline = v.GetBoolean();
-                        }
-                        if (wantInline && restResp.statusCode == 200)
-                        {
-                            // Parse base64 + mimeType out of the REST response
-                            // and emit MCP image content directly so we skip
-                            // the text-escape wrapping below.
-                            winrt::Windows::Data::Json::JsonObject ro{ nullptr };
-                            if (winrt::Windows::Data::Json::JsonObject::TryParse(
-                                    winrt::to_hstring(restResp.body), ro)
-                                && ro.HasKey(L"base64") && ro.HasKey(L"mimeType"))
-                            {
-                                auto b64 = ToUtf8(std::wstring(ro.GetNamedString(L"base64")));
-                                auto mime = ToUtf8(std::wstring(ro.GetNamedString(L"mimeType")));
-                                std::string content = std::format(
-                                    R"JSON({{"content":[{{"type":"image","data":"{}","mimeType":"{}"}}],"isError":false}})JSON",
-                                    b64, mime);
-                                return { 200, wrapResult(content) };
-                            }
-                        }
-                    }
-                    else if (toolName == "graph_get_view")
-                        restResp = m_mcpServer->RouteRequest(L"GET", L"/graph/view", "");
-                    else if (toolName == "graph_set_view")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/view", argsStr);
-                    else if (toolName == "graph_fit_view")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/view/fit", argsStr);
-                    else if (toolName == "list_display_profiles")
-                        restResp = m_mcpServer->RouteRequest(L"GET", L"/display/profiles", "");
-                    else if (toolName == "set_display_profile")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/display/profile", argsStr);
-                    else if (toolName == "clear_simulated_profile")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/display/profile/clear", "");
-                    else if (toolName == "preview_get_view")
-                        restResp = m_mcpServer->RouteRequest(L"GET", L"/preview/view", "");
-                    else if (toolName == "preview_set_view")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/preview/view", argsStr);
-                    else if (toolName == "preview_fit_view")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/preview/view/fit", "");
-                    else if (toolName == "image_stats")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/render/image-stats", argsStr);
-                    else if (toolName == "read_pixel_region")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/render/pixel-region", argsStr);
-                    else if (toolName == "effect_get_hlsl")
-                    {
-                        auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(L"nodeId"));
-                        restResp = m_mcpServer->RouteRequest(L"GET",
-                            std::format(L"/effect/hlsl/{}", nodeId), "");
-                    }
-                    else if (toolName == "list_gpus")
-                        restResp = m_mcpServer->RouteRequest(L"GET", L"/gpu/list", "");
-                    else if (toolName == "switch_gpu")
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/gpu/switch", argsStr);
-                    else if (toolName == "render_capture_node")
-                    {
-                        // Forward to REST handler; if inline=true was requested
-                        // and we got a successful PNG back, repack as MCP-native
-                        // image content (mirroring the graph_snapshot flow).
-                        restResp = m_mcpServer->RouteRequest(L"POST", L"/render/capture-node", argsStr);
-                        bool wantInline = args.HasKey(L"inline")
-                            && args.GetNamedValue(L"inline").ValueType() == winrt::Windows::Data::Json::JsonValueType::Boolean
-                            && args.GetNamedBoolean(L"inline");
-                        if (wantInline && restResp.statusCode == 200)
-                        {
-                            winrt::Windows::Data::Json::JsonObject ro{ nullptr };
-                            if (winrt::Windows::Data::Json::JsonObject::TryParse(
-                                    winrt::to_hstring(restResp.body), ro)
-                                && ro.HasKey(L"base64") && ro.HasKey(L"mimeType"))
-                            {
-                                auto b64 = ToUtf8(std::wstring(ro.GetNamedString(L"base64")));
-                                auto mime = ToUtf8(std::wstring(ro.GetNamedString(L"mimeType")));
-                                std::string content = std::format(
-                                    R"JSON({{"content":[{{"type":"image","data":"{}","mimeType":"{}"}}],"isError":false}})JSON",
-                                    b64, mime);
-                                return { 200, wrapResult(content) };
-                            }
-                        }
-                    }
-
-                    bool isError = restResp.statusCode >= 400;
-
-                    // MCP requires content[].text to be a STRING, not raw JSON.
-                    // Escape the body for embedding in a JSON string value.
-                    std::string escaped;
-                    for (char c : restResp.body)
-                    {
-                        if (c == '"') escaped += "\\\"";
-                        else if (c == '\\') escaped += "\\\\";
-                        else if (c == '\n') escaped += "\\n";
-                        else if (c == '\r') escaped += "\\r";
-                        else if (c == '\t') escaped += "\\t";
-                        else escaped += c;
-                    }
-
-                    std::string content = std::format(
-                        R"JSON({{"content":[{{"type":"text","text":"{}"}}],"isError":{}}})JSON",
-                        escaped.empty() ? "" : escaped,
-                        isError ? "true" : "false");
-
-                    return { 200, wrapResult(content) };
-                }
-
-                // ---- resources/list ----
-                if (method == "resources/list")
-                {
-                    std::string resources = R"JSON({"resources":[
-{"uri":"shaderlab://context","name":"ShaderLab Context","description":"System prompt: pipeline format, shader conventions, API reference","mimeType":"application/json"},
-{"uri":"shaderlab://graph","name":"Effect Graph","description":"Full graph state with nodes, edges, properties, custom effect definitions","mimeType":"application/json"},
-{"uri":"shaderlab://registry/effects","name":"Built-in Effects","description":"All 48+ built-in D2D effects with property metadata","mimeType":"application/json"},
-{"uri":"shaderlab://custom-effects","name":"Custom Effects","description":"Custom effects in graph with HLSL source and compile status","mimeType":"application/json"}
-]})JSON";
-                    return { 200, wrapResult(resources) };
-                }
-
-                // ---- resources/read ----
-                if (method == "resources/read")
-                {
-                    auto params2 = jobj.GetNamedObject(L"params");
-                    auto uri = ToUtf8(std::wstring(params2.GetNamedString(L"uri")));
-
-                    std::string restPath;
-                    if (uri == "shaderlab://context") restPath = "/context";
-                    else if (uri == "shaderlab://graph") restPath = "/graph";
-                    else if (uri == "shaderlab://registry/effects") restPath = "/registry/effects";
-                    else if (uri == "shaderlab://custom-effects") restPath = "/custom-effects";
-                    else
-                        return { 200, wrapResult(R"JSON({"contents":[]})JSON") };
-
-                    auto restResp = m_mcpServer->RouteRequest(L"GET", std::wstring(restPath.begin(), restPath.end()), "");
-
-                    // Escape the JSON body for embedding in the text field.
-                    std::string escaped;
-                    for (char c : restResp.body)
-                    {
-                        if (c == '"') escaped += "\\\"";
-                        else if (c == '\\') escaped += "\\\\";
-                        else if (c == '\n') escaped += "\\n";
-                        else if (c == '\r') escaped += "\\r";
-                        else escaped += c;
-                    }
-
-                    std::string result = std::format(
-                        R"JSON({{"contents":[{{"uri":"{}","mimeType":"application/json","text":"{}"}}]}})JSON",
-                        uri, escaped);
-                    return { 200, wrapResult(result) };
-                }
-
-                // ---- ping ----
-                if (method == "ping")
-                    return { 200, wrapResult("{}") };
-
-                // Unknown method.
-                return { 200, std::format(
-                    R"JSON({{"jsonrpc":"2.0","id":{},"error":{{"code":-32601,"message":"Method not found: {}"}}}})JSON",
-                    idStr, method) };
-            }
-            catch (const std::exception& ex)
-            {
-                return { 200, std::format(
-                    R"JSON({{"jsonrpc":"2.0","id":null,"error":{{"code":-32700,"message":"Parse error: {}"}}}})JSON",
-                    ex.what()) };
-            }
-        });
     }
 }

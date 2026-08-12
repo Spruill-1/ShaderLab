@@ -74,6 +74,51 @@ jobs:
             exit $LASTEXITCODE
           }
 
+      # Broker smoke (stdio-migration Step 5): election, framing, idle
+      # exit, stdout hygiene, no-session shim protocol. The script
+      # PRE-LAUNCHES an unpackaged hub -- no unpackaged activation path
+      # exists, so IApplicationActivationManager-based election of the
+      # PACKAGED hub is NOT covered here (documented gap; manual test).
+      - name: Broker smoke
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File Tests\RunBrokerSmoke.ps1 -Configuration ${{ env.Configuration }} -Platform ${{ env.Platform }}
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "RunBrokerSmoke.ps1 reported $LASTEXITCODE failure(s)"
+            exit $LASTEXITCODE
+          }
+
+      # MCP suite vs a real headless session over the broker (stdio-migration
+      # Step 9: HTTP is gone, so the suite drives shim -> hub -> session).
+      # Pre-launch a hub + a headless --mcp-session on an isolated pipe, then
+      # RunTests.ps1 starts a shim and pins that session. GUI-only tests
+      # self-skip (the pinned session's label is "headless"). CI is unpackaged,
+      # so SHADERLAB_MCP_ALLOW_UNPACKAGED=1 enables the same-build-tree pairing.
+      - name: MCP suite vs headless session
+        shell: pwsh
+        env:
+          SHADERLAB_MCP_ALLOW_UNPACKAGED: '1'
+        run: |
+          $bin = "$env:GITHUB_WORKSPACE\${{ env.Platform }}\${{ env.Configuration }}"
+          $broker   = "$bin\ShaderLabMcpBroker\ShaderLabMcpBroker.exe"
+          $headless = "$bin\ShaderLabHeadless\ShaderLabHeadless.exe"
+          $pipe = "ShaderLab.mcp.ci.$([guid]::NewGuid().ToString('N'))"
+          $hub = Start-Process $broker -ArgumentList '--hub','--pipe',$pipe,'--idle-exit-sec','600' -PassThru
+          $sess = Start-Process $headless -ArgumentList `
+            '--graph','Tests\fixtures\test_cli_basic.json', `
+            '--mcp-session','--pipe',$pipe,'--session-label','ci-headless','--adapter','warp' -PassThru
+          try {
+            pwsh -NoProfile -File Tests\RunTests.ps1 -Pipe $pipe -Adapter warp
+            $suiteExit = $LASTEXITCODE
+          } finally {
+            Stop-Process -Id $sess.Id -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $hub.Id -Force -ErrorAction SilentlyContinue
+          }
+          if ($suiteExit -ne 0) {
+            Write-Error "RunTests.ps1 reported $suiteExit failure(s) against the headless session"
+            exit $suiteExit
+          }
+
       - name: Upload AppX layout artifact
         if: matrix.configuration == 'Release'
         uses: actions/upload-artifact@v4

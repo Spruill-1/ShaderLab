@@ -21,7 +21,7 @@
 //     --width N       Output width in pixels (default: 1024)
 //     --height N      Output height in pixels (default: 1024)
 //     --adapter X     'warp' or 'default' (default: 'default'; CI uses warp)
-//     --port N        MCP port (reserved for the full Phase 7 MCP migration; not yet active)
+//     --mcp-session   Register with the broker hub as an MCP session
 //
 // Exit code: 0 on success, non-zero on any failure.
 //
@@ -45,7 +45,10 @@
 #include "Effects/BytecodeCache.h"
 #include "Effects/Performance.h"
 #include "Rendering/PixelReadback.h"
-#include "Engine/Mcp/McpHttpServer.h"
+#include "Rendering/PipelineFormat.h"
+#include "Engine/Mcp/McpRouter.h"
+#include "Engine/Mcp/McpJsonRpc.h"
+#include "Engine/Mcp/McpSessionClient.h"
 #include "Engine/Mcp/EngineMcpRoutes.h"
 
 #include <winrt/Windows.Data.Json.h>
@@ -69,7 +72,6 @@ namespace
         uint32_t     width{ 1024 };
         uint32_t     height{ 1024 };
         bool         useWarp{ false };
-        uint16_t     mcpPort{ 47809 };  // q-p7-mcp-port-conflict default
         // D2D HdrToneMap parameters: InputMaxLuminance is the peak nit
         // value of the source content; OutputMaxLuminance is the peak
         // nit value the SDR PNG can represent (80 == scRGB 1.0). The
@@ -102,6 +104,17 @@ namespace
         std::wstring scriptPath;
         std::wstring scriptOutputPath;  // empty -> stdout
 
+        // MCP session mode (stdio-migration Step 6). Registers with the
+        // broker hub as a session so a shim-fronted MCP client can select
+        // it with use_session. --session-id is a persisted per-window
+        // GUID (a fresh one is generated when omitted); --session-label
+        // is the human name list_sessions surfaces; --pipe overrides the
+        // broker pipe base (dev/CI isolation).
+        bool         mcpSessionMode{ false };
+        std::wstring sessionId;
+        std::wstring sessionLabel;
+        std::wstring pipeName;
+
         // p8-cache-reaper: bytecode-cache management modes. When set,
         // the headless host runs the requested op then exits without
         // loading a graph or starting MCP. Useful for CI / cleanup.
@@ -129,7 +142,6 @@ L"Options:\n"
 L"  --width N                Output width (default: 1024)\n"
 L"  --height N               Output height (default: 1024)\n"
 L"  --adapter X              'warp' or 'default' (default: default)\n"
-L"  --port N                 Reserved for MCP server (default: 47809)\n"
 L"  --input-peak-nits N      D2D HdrToneMap input peak (default: 1000)\n"
 L"  --output-peak-nits N     D2D HdrToneMap output peak (default: 80 = SDR)\n"
 L"  --no-tonemap             Skip HdrToneMap, raw scRGB -> sRGB clamp\n"
@@ -200,7 +212,6 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
             else if (a == L"--width")   { auto v = needNext(L"--width"); if (!v) return false; out.width = static_cast<uint32_t>(std::wcstoul(v, nullptr, 10)); }
             else if (a == L"--height")  { auto v = needNext(L"--height"); if (!v) return false; out.height = static_cast<uint32_t>(std::wcstoul(v, nullptr, 10)); }
             else if (a == L"--adapter") { auto v = needNext(L"--adapter"); if (!v) return false; out.useWarp = (std::wstring_view{v} == L"warp"); }
-            else if (a == L"--port")    { auto v = needNext(L"--port"); if (!v) return false; out.mcpPort = static_cast<uint16_t>(std::wcstoul(v, nullptr, 10)); }
             else if (a == L"--input-peak-nits")  { auto v = needNext(L"--input-peak-nits"); if (!v) return false; out.inputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); }
             else if (a == L"--output-peak-nits") { auto v = needNext(L"--output-peak-nits"); if (!v) return false; out.outputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); }
             else if (a == L"--no-tonemap") { out.skipToneMap = true; }
@@ -238,6 +249,10 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
             }
             else if (a == L"--script")        { auto v = needNext(L"--script"); if (!v) return false; out.scriptPath = v; }
             else if (a == L"--script-output") { auto v = needNext(L"--script-output"); if (!v) return false; out.scriptOutputPath = v; }
+            else if (a == L"--mcp-session")   { out.mcpSessionMode = true; }
+            else if (a == L"--session-id")    { auto v = needNext(L"--session-id"); if (!v) return false; out.sessionId = v; }
+            else if (a == L"--session-label") { auto v = needNext(L"--session-label"); if (!v) return false; out.sessionLabel = v; }
+            else if (a == L"--pipe")          { auto v = needNext(L"--pipe"); if (!v) return false; out.pipeName = v; }
             else if (a == L"--reap-shader-cache")   { out.reapShaderCache = true; }
             else if (a == L"--clear-shader-cache")  { out.clearShaderCache = true; }
             else if (a == L"--reap-shader-cache-stale-sec")
@@ -258,10 +273,10 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
         {
             // No further validation -- cache modes don't need a graph.
         }
-        else if (!out.scriptPath.empty())
+        else if (!out.scriptPath.empty() || out.mcpSessionMode)
         {
             if (out.graphPath.empty()) {
-                std::wprintf(L"ERROR: --graph is required (script mode)\n");
+                std::wprintf(L"ERROR: --graph is required (script / mcp-session mode)\n");
                 return false;
             }
         }
@@ -692,8 +707,8 @@ struct HeadlessSink : ShaderLab::Mcp::IEngineCommandSink
 {
     std::function<void(ShaderLab::Mcp::EngineContext&)> populateContext;
 
-    ShaderLab::McpHttpServer::Response Dispatch(
-        std::function<ShaderLab::McpHttpServer::Response(
+    ShaderLab::Mcp::Response Dispatch(
+        std::function<ShaderLab::Mcp::Response(
             ShaderLab::Mcp::EngineContext&)> closure) override
     {
         ShaderLab::Mcp::EngineContext ctx{};
@@ -858,10 +873,50 @@ int RunScript(const Args& args)
         ctx.d3dDevice      = d3dDevice.get();
         ctx.d3dContext     = d3dContext.get();
         ctx.renderFrame    = runEval;  // routes that need fresh eval call this
+        // Headless always renders scRGB FP16 (there is no swap chain or
+        // RenderEngine to ask); /display/info reports this name.
+        ctx.getPipelineFormatName = [] {
+            return ShaderLab::Rendering::FormatScRgbFP16.name;
+        };
     };
 
-    ShaderLab::McpHttpServer server;
+    ShaderLab::McpRouter server;
     ShaderLab::Mcp::RegisterEngineRoutes(server, sink);
+
+    // ---- MCP session mode (stdio-migration Step 6) ------------------------
+    // Register with the broker hub as a session; the McpSessionClient
+    // serves incoming channel requests by routing sealed JSON-RPC through
+    // this same `server` router (its POST / dispatcher), so a shim-fronted
+    // MCP client drives the graph. (The old --serve HTTP mode was removed in
+    // Step 9 with the rest of the HTTP transport; this is the only MCP host
+    // mode now, and what CI drives via a shim.)
+    if (args.mcpSessionMode)
+    {
+        ShaderLab::Mcp::JsonRpcOptions rpcOptions;
+        rpcOptions.hostKind = "headless";
+        ShaderLab::Mcp::RegisterJsonRpcEndpoint(server, std::move(rpcOptions));
+
+        ShaderLab::Mcp::SessionClientOptions sopts;
+        sopts.pipeBaseName = args.pipeName;
+        sopts.sessionId = args.sessionId;
+        if (sopts.sessionId.empty())
+        {
+            GUID g{};
+            CoCreateGuid(&g);
+            wchar_t buf[64]{};
+            StringFromGUID2(g, buf, ARRAYSIZE(buf));
+            sopts.sessionId = buf;   // {....} form
+        }
+        sopts.label = args.sessionLabel.empty()
+            ? std::format(L"headless {}", GetCurrentProcessId())
+            : args.sessionLabel;
+
+        std::wprintf(L"MCP session %ls (%ls). Kill the process to stop.\n",
+            sopts.sessionId.c_str(), sopts.label.c_str());
+        ShaderLab::Mcp::McpSessionClient client(server, std::move(sopts));
+        client.Run();   // blocks until killed (reconnects with backoff)
+        return 0;
+    }
 
     // ---- Read script JSON -------------------------------------------------
     auto scriptText = ReadFileUtf8(args.scriptPath);
@@ -1153,7 +1208,8 @@ int wmain(int argc, wchar_t* argv[])
     // and other engine objects destruct before MFShutdown / apartment
     // teardown. (GraphEvaluator owns com_ptrs to D2D effects that need
     // the factory alive at destruction time.)
-    int rc = !args.scriptPath.empty() ? RunScript(args) : RunRender(args);
+    int rc = (!args.scriptPath.empty() || args.mcpSessionMode)
+        ? RunScript(args) : RunRender(args);
 
     ::MFShutdown();
     winrt::uninit_apartment();

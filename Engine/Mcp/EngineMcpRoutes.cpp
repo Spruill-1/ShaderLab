@@ -1,5 +1,6 @@
 #include "pch_engine.h"
 #include "EngineMcpRoutes.h"
+#include "McpRouter.h"
 
 #include "../../Graph/EffectGraph.h"
 #include "../../Rendering/GraphEvaluator.h"
@@ -28,67 +29,24 @@ namespace ShaderLab::Mcp
     namespace
     {
         // ---- Small response helpers --------------------------------------
-        McpHttpServer::Response Json(uint16_t status, const std::string& body)
+        Response Json(uint16_t status, const std::string& body)
         {
-            McpHttpServer::Response r;
+            Response r;
             r.statusCode = status;
             r.body = body;
             r.contentType = "application/json";
             return r;
         }
 
-        McpHttpServer::Response Error(uint16_t status, const std::string& msg)
+        Response Error(uint16_t status, const std::string& msg)
         {
             return Json(status, "{\"error\":\"" + msg + "\"}");
         }
 
-        std::string WideToUtf8(std::wstring_view ws)
-        {
-            if (ws.empty()) return {};
-            int len = ::WideCharToMultiByte(CP_UTF8, 0,
-                ws.data(), static_cast<int>(ws.size()),
-                nullptr, 0, nullptr, nullptr);
-            std::string out(len, '\0');
-            ::WideCharToMultiByte(CP_UTF8, 0,
-                ws.data(), static_cast<int>(ws.size()),
-                out.data(), len, nullptr, nullptr);
-            return out;
-        }
-
-        // Escape a UTF-8 string for embedding in a JSON string literal.
-        // Mirrors the helper that used to live in MainWindow.McpRoutes.cpp;
-        // covers the required JSON escapes plus the most common control-
-        // char cases. Same output bytes for ASCII-clean inputs.
-        std::string JsonEscape(std::string_view s)
-        {
-            std::string out;
-            out.reserve(s.size() + 8);
-            for (char c : s)
-            {
-                switch (c)
-                {
-                case '"':  out += "\\\""; break;
-                case '\\': out += "\\\\"; break;
-                case '\n': out += "\\n";  break;
-                case '\r': out += "\\r";  break;
-                case '\t': out += "\\t";  break;
-                case '\b': out += "\\b";  break;
-                case '\f': out += "\\f";  break;
-                default:
-                    if (static_cast<unsigned char>(c) < 0x20)
-                    {
-                        char buf[8];
-                        std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
-                        out += buf;
-                    }
-                    else
-                    {
-                        out += c;
-                    }
-                }
-            }
-            return out;
-        }
+        // WideToUtf8 + JsonEscape now come from McpTypes.h (the single
+        // shared implementations — stdio-migration Step 3 unified the
+        // previously-divergent escapers). This TU sits inside namespace
+        // ShaderLab::Mcp, so unqualified calls resolve to them directly.
 
         // Base64 (standard alphabet, '=' padding, no line wrapping).
         // Used for /render/capture-node `inline` PNG payloads.
@@ -406,10 +364,10 @@ namespace ShaderLab::Mcp
         // graph_snapshot, preview/graph view tools, render/preview-node.
 
         // ---- GET /registry — D2D + ShaderLab effect catalog (static) -------
-        void RegisterRegistry(McpHttpServer& server)
+        void RegisterRegistry(McpRouter& server)
         {
             server.AddRoute(L"GET", L"/registry",
-                [](const std::wstring& path, const std::string&) -> McpHttpServer::Response {
+                [](const std::wstring& path, const std::wstring&, const std::string&) -> Response {
                     auto& reg = ::ShaderLab::Effects::EffectRegistry::Instance();
 
                     // /registry/effect/<name> — detailed effect info.
@@ -459,17 +417,161 @@ namespace ShaderLab::Mcp
                 });
         }
 
+        // ---- GET /effects — all effects grouped by category (static) ------
+        // Promoted from the GUI's inline `list_effects` tools/call handler
+        // (stdio-migration Step 1) so the headless host serves it too. Both
+        // catalogs are immutable after startup, so no Dispatch is needed —
+        // same reasoning as /registry. The built-in D2D "Analysis" category
+        // is deliberately skipped: the ShaderLab analysis effects supersede
+        // those wrappers in the catalog agents should pick from.
+        void RegisterListEffects(McpRouter& server)
+        {
+            server.AddRoute(L"GET", L"/effects",
+                [](const std::wstring&, const std::wstring&, const std::string&) -> Response {
+                    std::string json = "{\"builtIn\":{";
+                    auto& reg = ::ShaderLab::Effects::EffectRegistry::Instance();
+                    bool firstCat = true;
+                    for (const auto& cat : reg.Categories())
+                    {
+                        if (cat == L"Analysis") continue;
+                        if (!firstCat) json += ",";
+                        json += "\"" + JsonEscape(WideToUtf8(cat)) + "\":[";
+                        bool firstFx = true;
+                        for (const auto* e : reg.ByCategory(cat))
+                        {
+                            if (!firstFx) json += ",";
+                            json += "\"" + JsonEscape(WideToUtf8(e->name)) + "\"";
+                            firstFx = false;
+                        }
+                        json += "]";
+                        firstCat = false;
+                    }
+                    json += "},\"shaderLab\":{";
+                    auto& sl = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+                    firstCat = true;
+                    for (const auto& cat : sl.Categories())
+                    {
+                        if (!firstCat) json += ",";
+                        json += "\"" + JsonEscape(WideToUtf8(cat)) + "\":[";
+                        bool firstFx = true;
+                        for (const auto* e : sl.ByCategory(cat))
+                        {
+                            if (!firstFx) json += ",";
+                            json += "\"" + JsonEscape(WideToUtf8(e->name)) + "\"";
+                            firstFx = false;
+                        }
+                        json += "]";
+                        firstCat = false;
+                    }
+                    json += "}}";
+                    return Json(200, json);
+                });
+        }
+
+        // ---- GET /graph/overview — compact summary (nodes, edges, preview) -
+        // Promoted from the GUI's inline `graph_overview` tools/call handler
+        // (stdio-migration Step 1). Reads the live graph, so it runs through
+        // sink.Dispatch; previously it read m_graph on the UI thread while
+        // the render worker mutated it. Longest-prefix routing sends
+        // /graph/overview here rather than to the shorter GET /graph route.
+        void RegisterGraphOverview(McpRouter& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"GET", L"/graph/overview",
+                [&sink](const std::wstring&, const std::wstring&, const std::string&) -> Response
+                {
+                    return sink.Dispatch([](EngineContext& ctx) -> Response {
+                        uint32_t previewId = ctx.getPreviewNodeId ? ctx.getPreviewNodeId() : 0;
+                        std::string json = "{\"previewNodeId\":" + std::to_string(previewId) + ",\"nodes\":[";
+                        bool first = true;
+                        for (const auto& n : ctx.graph->Nodes())
+                        {
+                            if (!first) json += ",";
+                            std::string typeStr;
+                            switch (n.type)
+                            {
+                            case Graph::NodeType::Source:        typeStr = "Source"; break;
+                            case Graph::NodeType::BuiltInEffect: typeStr = "BuiltIn"; break;
+                            case Graph::NodeType::PixelShader:   typeStr = "PixelShader"; break;
+                            case Graph::NodeType::ComputeShader: typeStr = "ComputeShader"; break;
+                            case Graph::NodeType::Output:        typeStr = "Output"; break;
+                            }
+                            json += std::format("{{\"id\":{},\"name\":\"{}\",\"type\":\"{}\"",
+                                n.id, JsonEscape(WideToUtf8(n.name)), typeStr);
+                            if (!n.runtimeError.empty())
+                                json += ",\"error\":\"" + JsonEscape(WideToUtf8(n.runtimeError)) + "\"";
+                            json += std::format(",\"inputs\":{},\"outputs\":{}}}",
+                                n.inputPins.size(), n.outputPins.size());
+                            first = false;
+                        }
+                        json += "],\"edges\":[";
+                        first = true;
+                        for (const auto& e : ctx.graph->Edges())
+                        {
+                            if (!first) json += ",";
+                            json += std::format("[{},{},{},{}]",
+                                e.sourceNodeId, e.sourcePin, e.destNodeId, e.destPin);
+                            first = false;
+                        }
+                        json += "]}";
+                        return Json(200, json);
+                    });
+                });
+        }
+
+        // ---- GET /display/info — caps + active profile + pipeline ---------
+        // Moved from MainWindow.McpRoutes.cpp in stdio-migration Step 2.
+        // Step 1 left it app-side because it needs the pipeline-format
+        // name and EngineContext had no way to supply one; the
+        // getPipelineFormatName shim (added with this step's ABI bump)
+        // closes that gap, so both hosts serve it now.
+        void RegisterDisplayInfo(McpRouter& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"GET", L"/display/info",
+                [&sink](const std::wstring&, const std::wstring&, const std::string&) -> Response
+                {
+                    return sink.Dispatch([](EngineContext& ctx) -> Response {
+                        auto profile = ctx.displayMonitor->ActiveProfile();
+                        auto live = ctx.displayMonitor->LiveProfile();
+                        auto caps = ctx.displayMonitor->CachedCapabilities();
+                        auto verStr = WideToUtf8(std::wstring(::ShaderLab::VersionString));
+                        std::wstring fmtName = ctx.getPipelineFormatName
+                            ? ctx.getPipelineFormatName() : std::wstring(L"unknown");
+                        std::string json = std::format(
+                            "{{\"appVersion\":\"{}\",\"graphFormatVersion\":{}"
+                            ",\"pipeline\":\"{}\""
+                            ",\"display\":{{\"hdr\":{},\"maxNits\":{:.0f},\"sdrWhiteNits\":{:.0f}"
+                            ",\"simulated\":{},\"profileName\":\"{}\""
+                            ",\"activeGamut\":{{\"red\":[{:.4f},{:.4f}],\"green\":[{:.4f},{:.4f}],\"blue\":[{:.4f},{:.4f}]}}"
+                            ",\"monitorGamut\":{{\"red\":[{:.4f},{:.4f}],\"green\":[{:.4f},{:.4f}],\"blue\":[{:.4f},{:.4f}]}}"
+                            "}}}}",
+                            verStr, ::ShaderLab::GraphFormatVersion,
+                            JsonEscape(WideToUtf8(fmtName)),
+                            caps.hdrEnabled ? "true" : "false",
+                            caps.maxLuminanceNits, caps.sdrWhiteLevelNits,
+                            profile.isSimulated ? "true" : "false",
+                            JsonEscape(WideToUtf8(profile.profileName)),
+                            profile.primaryRed.x, profile.primaryRed.y,
+                            profile.primaryGreen.x, profile.primaryGreen.y,
+                            profile.primaryBlue.x, profile.primaryBlue.y,
+                            live.primaryRed.x, live.primaryRed.y,
+                            live.primaryGreen.x, live.primaryGreen.y,
+                            live.primaryBlue.x, live.primaryBlue.y);
+                        return Json(200, json);
+                    });
+                });
+        }
+
         // ---- POST /graph/connect — wire output pin -> input pin -----------
         // Note: the GUI app also runs m_nodeGraphController.AutoLayout()
         // and adds NodeLog entries. Those are UI side effects; the engine
         // route just does the graph mutation. The GUI's render tick will
         // pick up the dirty state and refresh the canvas next frame.
-        void RegisterConnect(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterConnect(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/graph/connect",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -489,12 +591,12 @@ namespace ShaderLab::Mcp
         }
 
         // ---- POST /graph/disconnect — remove a single edge ----------------
-        void RegisterDisconnect(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterDisconnect(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/graph/disconnect",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -517,12 +619,12 @@ namespace ShaderLab::Mcp
         // Note: the GUI's m_nodeGraphController.RebuildLayout() drops out;
         // the render tick will pick up the dirty state and rebuild
         // automatically. Headless host has no canvas anyway.
-        void RegisterBindProperty(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterBindProperty(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/graph/bind-property",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -545,12 +647,12 @@ namespace ShaderLab::Mcp
         }
 
         // ---- POST /graph/unbind-property -----------------------------------
-        void RegisterUnbindProperty(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterUnbindProperty(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/graph/unbind-property",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -577,12 +679,12 @@ namespace ShaderLab::Mcp
         // After AddNode the OnNodeAdded event fires so the host (if any)
         // can run AutoLayout + PopulatePreviewNodeSelector + log entry.
         // Same UI path the toolbar AddNode flyout takes.
-        void RegisterAddNode(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterAddNode(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/graph/add-node",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -590,7 +692,7 @@ namespace ShaderLab::Mcp
                                 return Json(400, R"({"error":"Provide effectName"})");
                             auto name = jobj.GetNamedString(L"effectName");
 
-                            auto addAndReply = [&](Graph::EffectNode&& node) -> McpHttpServer::Response {
+                            auto addAndReply = [&](Graph::EffectNode&& node) -> Response {
                                 auto id = ctx.graph->AddNode(std::move(node));
                                 ctx.graph->MarkAllDirty();
                                 sink.OnNodeAdded(id);
@@ -707,12 +809,12 @@ namespace ShaderLab::Mcp
         // Read-only; no Dispatch needed. Library effects (ShaderLab built-in)
         // are reported with isLibraryEffect=true so agents know they're
         // read-only-shipped and shouldn't try to recompile them.
-        void RegisterEffectHlsl(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterEffectHlsl(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"GET", L"/effect/hlsl/",
-                [&sink](const std::wstring& path, const std::string&) -> McpHttpServer::Response
+                [&sink](const std::wstring& path, const std::wstring&, const std::string&) -> Response
                 {
-                    return sink.Dispatch([path](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([path](EngineContext& ctx) -> Response {
                         if (path.size() <= 13)
                             return Json(400, R"({"error":"Missing nodeId in URL"})");
                         uint32_t nodeId = 0;
@@ -788,12 +890,12 @@ namespace ShaderLab::Mcp
         // Engine drops graph state and the evaluator cache. The OnGraphCleared
         // event runs the host's UI cleanup (output windows, preview selector
         // reset). Same path /graph/clear via UI button takes.
-        void RegisterClear(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterClear(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/graph/clear",
-                [&sink](const std::wstring&, const std::string&) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string&) -> Response
                 {
-                    return sink.Dispatch([&sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&sink](EngineContext& ctx) -> Response {
                         ctx.evaluator->ReleaseCache();
                         ctx.graph->Clear();
                         ctx.graph->MarkAllDirty();
@@ -808,10 +910,10 @@ namespace ShaderLab::Mcp
         // OnGraphLoaded event runs the host's per-load setup (heartbeats,
         // re-opens output windows for nodes that had them, preview selector
         // refresh). Same path the file-open dialog takes.
-        void RegisterLoad(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterLoad(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/graph/load",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
                     // Parse on the listener thread; assignment requires the
                     // dispatch thread (it owns m_graph).
@@ -824,7 +926,7 @@ namespace ShaderLab::Mcp
                     {
                         return Json(400, std::string(R"({"error":")") + ex.what() + R"("})");
                     }
-                    return sink.Dispatch([&loaded, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&loaded, &sink](EngineContext& ctx) -> Response {
                         ctx.evaluator->ReleaseCache();
                         *ctx.graph = std::move(loaded);
                         ctx.graph->MarkAllDirty();
@@ -835,12 +937,12 @@ namespace ShaderLab::Mcp
         }
 
         // ---- POST /graph/remove-node ---------------------------------------
-        void RegisterRemoveNode(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterRemoveNode(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/graph/remove-node",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -856,12 +958,12 @@ namespace ShaderLab::Mcp
         }
 
         // ---- POST /graph/set-property — mutates m_graph -------------------
-        void RegisterSetProperty(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterSetProperty(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/graph/set-property",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -900,8 +1002,43 @@ namespace ShaderLab::Mcp
                                 node->properties[key] = val.GetBoolean();
                                 break;
                             case WDJ::JsonValueType::String:
-                                node->properties[key] = std::wstring(val.GetString());
+                            {
+                                // Some MCP clients stringify untyped (schema {})
+                                // argument values, so a numeric/bool param can
+                                // arrive as a JSON string ("203", "true"). Coerce
+                                // to the target's real type -- a bogus wstring
+                                // otherwise both starves the shader (param reads 0)
+                                // and breaks bindability (IsBindablePropertyType
+                                // rejects non-float/bool variants).
+                                std::wstring sval(val.GetString());
+                                std::wstring want;   // float | uint | int | bool | ""
+                                if (node->customEffect.has_value())
+                                    for (const auto& p : node->customEffect->parameters)
+                                        if (p.name == key) { want = p.typeName; break; }
+                                if (want.empty())
+                                {
+                                    auto it = node->properties.find(key);
+                                    if (it != node->properties.end())
+                                    {
+                                        if (std::holds_alternative<float>(it->second)) want = L"float";
+                                        else if (std::holds_alternative<uint32_t>(it->second)) want = L"uint";
+                                        else if (std::holds_alternative<int32_t>(it->second)) want = L"int";
+                                        else if (std::holds_alternative<bool>(it->second)) want = L"bool";
+                                    }
+                                }
+                                if (want.empty() && (key == L"IsPlaying" || key == L"isPlaying"))
+                                    want = L"bool";
+                                try
+                                {
+                                    if (want == L"float")     node->properties[key] = std::stof(sval);
+                                    else if (want == L"uint") node->properties[key] = static_cast<uint32_t>(std::stoul(sval));
+                                    else if (want == L"int")  node->properties[key] = static_cast<int32_t>(std::stol(sval));
+                                    else if (want == L"bool") node->properties[key] = (sval == L"true" || sval == L"1");
+                                    else                      node->properties[key] = sval;
+                                }
+                                catch (...) { node->properties[key] = sval; }
                                 break;
+                            }
                             case WDJ::JsonValueType::Array:
                             {
                                 auto arr = val.GetArray();
@@ -972,12 +1109,12 @@ namespace ShaderLab::Mcp
         // nodes; refs and numeric IDs are interchangeable in those positions.
         // The whole closure runs as a single render-thread dispatch -- atomic
         // either succeeds or fails as one unit.
-        void RegisterApply(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterApply(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/graph/apply",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> Response {
                         WDJ::JsonObject root;
                         try { root = WDJ::JsonObject::Parse(winrt::to_hstring(body)); }
                         catch (...) { return Json(400, R"({"error":"Invalid JSON"})"); }
@@ -1053,8 +1190,40 @@ namespace ShaderLab::Mcp
                                 node.properties[key] = val.GetBoolean();
                                 break;
                             case WDJ::JsonValueType::String:
-                                node.properties[key] = std::wstring(val.GetString());
+                            {
+                                // Same coercion as /graph/set-property: untyped MCP
+                                // arg values may arrive stringified, so map "203" /
+                                // "true" to the target param's real type instead of
+                                // storing a bindability-breaking, shader-starving wstring.
+                                std::wstring sval(val.GetString());
+                                std::wstring want;
+                                if (node.customEffect.has_value())
+                                    for (const auto& p : node.customEffect->parameters)
+                                        if (p.name == key) { want = p.typeName; break; }
+                                if (want.empty())
+                                {
+                                    auto it = node.properties.find(key);
+                                    if (it != node.properties.end())
+                                    {
+                                        if (std::holds_alternative<float>(it->second)) want = L"float";
+                                        else if (std::holds_alternative<uint32_t>(it->second)) want = L"uint";
+                                        else if (std::holds_alternative<int32_t>(it->second)) want = L"int";
+                                        else if (std::holds_alternative<bool>(it->second)) want = L"bool";
+                                    }
+                                }
+                                if (want.empty() && (key == L"IsPlaying" || key == L"isPlaying"))
+                                    want = L"bool";
+                                try
+                                {
+                                    if (want == L"float")     node.properties[key] = std::stof(sval);
+                                    else if (want == L"uint") node.properties[key] = static_cast<uint32_t>(std::stoul(sval));
+                                    else if (want == L"int")  node.properties[key] = static_cast<int32_t>(std::stol(sval));
+                                    else if (want == L"bool") node.properties[key] = (sval == L"true" || sval == L"1");
+                                    else                      node.properties[key] = sval;
+                                }
+                                catch (...) { node.properties[key] = sval; }
                                 break;
+                            }
                             case WDJ::JsonValueType::Array:
                             {
                                 auto arr = val.GetArray();
@@ -1340,14 +1509,14 @@ namespace ShaderLab::Mcp
         }
 
 
-        void RegisterPixelRegion(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterPixelRegion(McpRouter& server, IEngineCommandSink& sink)
         {
             // POST /render/pixel-region -- Read FP32 RGBA pixel grid.
             // Body: { nodeId, x, y, w, h }   (capped at 32x32 = 1024 pixels)
             server.AddRoute(L"POST", L"/render/pixel-region",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> Response {
                         WDJ::JsonObject jo{ nullptr };
                         if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
                             return Json(400, R"({"error":"Invalid JSON body"})");
@@ -1420,12 +1589,12 @@ namespace ShaderLab::Mcp
         // The host that wants /graph to surface a "previewNodeId" provides
         // ctx.getPreviewNodeId. Headless leaves it null and we emit 0,
         // which matches "no preview pane" semantics.
-        void RegisterGetGraph(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterGetGraph(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"GET", L"/graph",
-                [&sink](const std::wstring& path, const std::string&) -> McpHttpServer::Response
+                [&sink](const std::wstring& path, const std::wstring&, const std::string&) -> Response
                 {
-                    return sink.Dispatch([&path](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&path](EngineContext& ctx) -> Response {
                         // /graph/save -> raw graph JSON via EffectGraph::ToJson.
                         if (path == L"/graph/save")
                         {
@@ -1472,12 +1641,12 @@ namespace ShaderLab::Mcp
         }
 
         // ---- GET /custom-effects — all nodes with a customEffect def -----
-        void RegisterCustomEffects(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterCustomEffects(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"GET", L"/custom-effects",
-                [&sink](const std::wstring&, const std::string&) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string&) -> Response
                 {
-                    return sink.Dispatch([](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([](EngineContext& ctx) -> Response {
                         std::string json = "[";
                         bool first = true;
                         for (const auto& node : ctx.graph->Nodes())
@@ -1494,12 +1663,12 @@ namespace ShaderLab::Mcp
         }
 
         // ---- GET /analysis/{id} — analysis output fields ------------------
-        void RegisterAnalysisOutput(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterAnalysisOutput(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"GET", L"/analysis/",
-                [&sink](const std::wstring& path, const std::string&) -> McpHttpServer::Response
+                [&sink](const std::wstring& path, const std::wstring&, const std::string&) -> Response
                 {
-                    return sink.Dispatch([&path](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&path](EngineContext& ctx) -> Response {
                         auto rest = path.substr(10); // after "/analysis/"
                         uint32_t nodeId = 0;
                         try { nodeId = static_cast<uint32_t>(std::stoul(rest)); }
@@ -1576,12 +1745,12 @@ namespace ShaderLab::Mcp
         // Body: { nodeId }. Returns { width, height } at 96 DPI in pixels.
         // Useful for diagnosing rect-bloat issues that the capture-node
         // route hides via its maxDim clamp.
-        void RegisterImageBounds(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterImageBounds(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/render/image-bounds",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body](EngineContext& ctx) -> Response {
                         WDJ::JsonObject jo{ nullptr };
                         if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
                             return Json(400, R"({"error":"Invalid JSON body"})");
@@ -1611,12 +1780,12 @@ namespace ShaderLab::Mcp
         // path + size. If inline=true, also returns a base64 PNG payload.
         // Uses Rendering::CaptureNodeAsPng so this route is identical
         // between GUI and headless hosts.
-        void RegisterCaptureNode(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterCaptureNode(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/render/capture-node",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body](EngineContext& ctx) -> Response {
                         WDJ::JsonObject jo{ nullptr };
                         if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), jo))
                             return Json(400, R"({"error":"Invalid JSON body"})");
@@ -1693,12 +1862,12 @@ namespace ShaderLab::Mcp
         // OnCustomEffectRecompiled so the GUI rebuilds the canvas
         // layout (parameter pins may have changed) and Add Node flyout.
         // Mirrors EffectDesignerWindow's "Update in Graph" path.
-        void RegisterCompileEffect(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterCompileEffect(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/effect/compile",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> Response {
                         try
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
@@ -1868,12 +2037,12 @@ namespace ShaderLab::Mcp
         }
 
         // GET /display/profiles  — All built-in presets + active + live.
-        void RegisterGetDisplayProfiles(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterGetDisplayProfiles(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"GET", L"/display/profiles",
-                [&sink](const std::wstring&, const std::string&) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string&) -> Response
                 {
-                    return sink.Dispatch([](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([](EngineContext& ctx) -> Response {
                         auto presets = ::ShaderLab::Rendering::AllPresets();
                         std::string json = "{\"presets\":[";
                         for (size_t i = 0; i < presets.size(); ++i)
@@ -1901,12 +2070,12 @@ namespace ShaderLab::Mcp
 
         // POST /display/profile — apply a simulated profile.
         // Body: exactly one of {preset, presetIndex, iccPath, custom}.
-        void RegisterSetDisplayProfile(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterSetDisplayProfile(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/display/profile",
-                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
                 {
-                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> Response {
                         using namespace ::ShaderLab::Rendering;
 
                         WDJ::JsonObject jo{ nullptr };
@@ -2035,12 +2204,12 @@ namespace ShaderLab::Mcp
         }
 
         // POST /display/profile/clear — revert to the live OS profile.
-        void RegisterClearDisplayProfile(McpHttpServer& server, IEngineCommandSink& sink)
+        void RegisterClearDisplayProfile(McpRouter& server, IEngineCommandSink& sink)
         {
             server.AddRoute(L"POST", L"/display/profile/clear",
-                [&sink](const std::wstring&, const std::string&) -> McpHttpServer::Response
+                [&sink](const std::wstring&, const std::wstring&, const std::string&) -> Response
                 {
-                    return sink.Dispatch([&sink](EngineContext& ctx) -> McpHttpServer::Response {
+                    return sink.Dispatch([&sink](EngineContext& ctx) -> Response {
                         ctx.displayMonitor->ClearSimulatedProfile();
                         ::ShaderLab::Rendering::UpdateWorkingSpaceNodes(*ctx.graph, *ctx.displayMonitor);
                         sink.OnDisplayProfileChanged();
@@ -2050,9 +2219,12 @@ namespace ShaderLab::Mcp
         }
     }
 
-    void RegisterEngineRoutes(McpHttpServer& server, IEngineCommandSink& sink)
+    void RegisterEngineRoutes(McpRouter& server, IEngineCommandSink& sink)
     {
         RegisterRegistry(server);
+        RegisterListEffects(server);
+        RegisterGraphOverview(server, sink);
+        RegisterDisplayInfo(server, sink);
         RegisterEffectHlsl(server, sink);
         RegisterAddNode(server, sink);
         RegisterRemoveNode(server, sink);

@@ -84,6 +84,8 @@ bite when building ARM64 natively on an ARM64 machine, and both fail in misleadi
    - `x64\Debug\ShaderLabEngine\ShaderLabEngine.dll`
    - `x64\Debug\ShaderLab\ShaderLab.exe`
    - `x64\Debug\ShaderLabTests\ShaderLabTests.exe`
+   - `x64\Debug\ShaderLabHeadless\ShaderLabHeadless.exe`
+   - `x64\Debug\ShaderLabMcpBroker\ShaderLabMcpBroker.exe` (also copied into the app layout + MSIX payload as the `Hub` application)
 
 ### Updating a dependency
 

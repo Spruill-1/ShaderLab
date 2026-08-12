@@ -289,6 +289,14 @@
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <LinkLibraryDependencies>true</LinkLibraryDependencies>
     </ProjectReference>
+    <!-- Build-order + payload dependency only (stdio-migration Step 5).
+         LinkLibraryDependencies must be false: an exe produces no import
+         lib, and the app must never link the broker anyway. -->
+    <ProjectReference Include="ShaderLabMcpBroker.vcxproj">
+      <Project>{E4F5A6B7-3344-4D55-BE66-778899AABB22}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
   </ItemGroup>
   <ItemGroup>
     <None Include=".github\workflows\ci.yml" />
@@ -333,6 +341,21 @@
     <ItemGroup>
       <AppxPackagePayload Include="$(OutDir)ShaderLabEngine.dll">
         <TargetPath>ShaderLabEngine.dll</TargetPath>
+      </AppxPackagePayload>
+    </ItemGroup>
+  </Target>
+  <!--
+    Broker payload (stdio-migration Step 5). Mirrors CopyEngineRuntime:
+    must run BeforeTargets="_ComputeAppxPackagePayload" or the package
+    builds clean with the Hub application's exe silently missing and
+    activation fails at runtime.
+  -->
+  <Target Name="CopyBrokerRuntime" AfterTargets="Link" BeforeTargets="_ComputeAppxPackagePayload;AfterBuild" Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabMcpBroker\ShaderLabMcpBroker.exe')">
+    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabMcpBroker\ShaderLabMcpBroker.exe" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabMcpBroker\ShaderLabMcpBroker.pdb" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabMcpBroker\ShaderLabMcpBroker.pdb')" />
+    <ItemGroup>
+      <AppxPackagePayload Include="$(OutDir)ShaderLabMcpBroker.exe">
+        <TargetPath>ShaderLabMcpBroker.exe</TargetPath>
       </AppxPackagePayload>
     </ItemGroup>
   </Target>

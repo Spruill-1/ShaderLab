@@ -3,37 +3,48 @@
 ```
 ShaderLab/
 ├── ShaderLab.slnx                  # Solution file
-├── ShaderLab.vcxproj               # WinUI 3 app project (MSIX packaged app)
+├── ShaderLab.vcxproj               # WinUI 3 app project (MSIX packaged app; packages the Hub too)
 ├── ShaderLabEngine.vcxproj         # Shared native engine DLL project
 ├── ShaderLabTests.vcxproj          # Standalone console test runner project
 ├── ShaderLabHeadless.vcxproj       # Console host project (no WinUI dependency)
+├── ShaderLabMcpBroker.vcxproj      # MCP broker (hub + stdio shim); no engine link
 ├── packages.config                 # NuGet package manifest
 ├── Package.appxmanifest            # MSIX app identity
 ├── app.manifest                    # DPI awareness, heap type
 ├── EngineExport.h                  # SHADERLAB_API import/export macro + ABI version constant
 ├── EngineExport.cpp                # ShaderLab_GetAbiVersion() C export
 ├── Version.h                       # App version + graph format version
-├── README.md                       # This file
+├── README.md                       # Slim repo intro: install, dev quickstart, doc index
 ├── CHANGELOG.md                    # Version history
 ├── .gitmodules                     # third_party submodule pins (exprtk, miniz)
+├── .mcp.json                       # MCP client config for contributors (stdio → build-tree ShaderLabMcpBroker --stdio)
 │
 ├── pch.h / pch.cpp                 # App PCH (WinRT, WinUI, D2D, D3D, STL)
 ├── pch_engine.h / pch_engine.cpp   # Engine/Test/Headless PCH (WinRT base, D2D, D3D, MF, STL)
 ├── App.xaml / .h / .cpp            # Application entry point
-├── MainWindow.xaml / .h / .cpp     # Main window layout + initialization (~4700 lines)
+├── MainWindow.xaml / .h / .cpp     # Main window layout + initialization (~5000 lines)
 ├── MainWindow.WorkingSpace.cpp     # Display-profile selection + ICC loader + UpdateWorkingSpaceNodes shim
 ├── MainWindow.GraphFileIo.cpp      # Save/load + miniz embedded-media archive + heartbeat reaper
-├── MainWindow.RenderTick.cpp       # OnRenderTick / RenderFrame / dirty-propagation pre-pass / output-window present
-├── MainWindow.McpRoutes.cpp        # 16 UI-coupled MCP routes + GuiEngineCommandSink + JSON-RPC dispatcher (~1500 lines)
+├── MainWindow.RenderTick.cpp       # OnRenderTick (UI blit + Present) / RenderWorkerLoop + RenderFrameToOffscreen (render worker) / dirty propagation
+├── MainWindow.McpRoutes.cpp        # 16 app-side MCP routes + GuiEngineCommandSink (~1150 lines; JSON-RPC dispatcher moved engine-side in Step 3)
 ├── MainWindow.idl                  # WinRT interface definition
 ├── EffectDesignerWindow.xaml / .h / .cpp  # Effect Designer modal window
 │
-├── Engine/Mcp/                     # Engine DLL: MCP server + engine-pure routes
-│   ├── McpHttpServer.h / .cpp      # Winsock2 TCP server, route registration, JSON-RPC
-│   ├── EngineMcpRoutes.h / .cpp    # 20 engine-pure routes + IEngineCommandSink + EngineContext
+├── Engine/Mcp/                     # Engine DLL: MCP router + engine-pure routes
+│   ├── McpRouter.h / .cpp          # Pure route registry (longest-prefix, query split, HasRoute); HTTP listener deleted in Step 9
+│   ├── McpTypes.h                  # Transport-neutral Mcp::Response (+ noReply) + shared JsonEscape/WideToUtf8
+│   ├── McpJsonRpc.h / .cpp         # Engine-side JSON-RPC dispatcher: initialize / tools / resources / ping (Step 3)
+│   ├── McpToolCatalog.h / .cpp     # Declarative 39-tool table: list JSON + route mapping + arg modes
+│   ├── McpFrame.h / .cpp           # Broker wire codec: [len][channelId][seq][body], 64 MB cap (Step 4, no IPC yet)
+│   ├── McpCrypto.h / .cpp          # P-256 ECDH -> HKDF-SHA256 -> AES-256-GCM via BCrypt (Step 4)
+│   ├── McpPeerIdentity.h / .cpp    # Package-family peer identity + binary-pairing policy (Step 4)
+│   ├── McpChannel.h / .cpp         # Per-channel SecureChannel: P-256 handshake + AES-GCM seal/open (Step 6)
+│   ├── McpSessionClient.h / .cpp   # Registers a session with the hub, serves sealed requests via the router (Step 6; used by headless + GUI)
+│   ├── McpTimeouts.h               # The MCP timeout ladder (render < DispatchSync < shim < client), static_assert-ordered (Step 7)
+│   ├── EngineMcpRoutes.h / .cpp    # 25 engine-pure routes + IEngineCommandSink + EngineContext
 │
 ├── Tests/                          # ShaderLabTests + smoke scripts
-│   ├── TestRunner.cpp              # 113 tests (graph, evaluator, MCP, math bench)
+│   ├── TestRunner.cpp              # 261 tests total (graph, evaluator, dispatcher [+fail-fast], snapshot, bytecode cache, router, JSON-RPC, frame/crypto/peer/channel, math bench)
 │   ├── TestCommon.h                # Shared TEST() macro across TUs
 │   ├── ShaderTestBench.h / .cpp    # D3D11 compute test harness for HLSL math
 │   ├── Math/                       # 51 HLSL math tests
@@ -42,12 +53,19 @@ ShaderLab/
 │   │   ├── MobiusReinhardTests.cpp    # ICtCp tone-map curve invariants
 │   │   ├── DeltaETests.cpp            # Sharma reference pairs for CIEDE2000
 │   │   └── GamutTests.cpp             # CIE xy boundary tests
+│   ├── RunTests.ps1                # 40-test MCP integration suite (shim-driven; pins a running session, GUI-only tests self-skip on headless)
 │   ├── RunMathTests.ps1            # Local runner for the math test bench
 │   ├── RunHeadlessSmoke.ps1        # CI smoke (PNG + FP32 pixels + script batch)
+│   ├── RunBrokerSmoke.ps1          # CI smoke (Step 5): hub election, shim protocol, idle exit
 │   └── fixtures/test_cli_basic.json   # Golden graph for headless smoke
 │
 ├── ShaderLabHeadless/
-│   └── Main.cpp                    # Console host: PNG render / --pixels / --script
+│   └── Main.cpp                    # Console host: PNG render / --pixels / --script / --serve / --mcp-session
+│
+├── ShaderLabMcpBroker/            # MCP broker binary: --hub relay + --stdio shim
+│   └── Main.cpp                    # election, overlapped pipe I/O, session registry + channel relay,
+│                                   # shim pinning + handshake + tools/list splice (no engine link;
+│                                   # compiles Engine/Mcp/Mcp{Frame,Crypto,PeerIdentity,Channel})
 │
 ├── Graph/                          # Engine: effect graph data model
 │   ├── NodeType.h                  # NodeType enum
@@ -55,6 +73,7 @@ ShaderLab/
 │   ├── EffectNode.h                # EffectNode struct, ParameterDefinition, AnalysisFieldDef
 │   ├── EffectEdge.h                # EffectEdge struct
 │   ├── EffectGraph.h / .cpp        # DAG, topological sort, JSON, versioning
+│   ├── GraphUiSnapshot.h / .cpp    # Immutable per-frame value copy of nodes + edges for UI-thread reads (decision #70)
 │
 ├── Rendering/                      # Engine: rendering + analysis (RenderEngine stays app-side)
 │   ├── DisplayInfo.h               # DisplayCapabilities struct
@@ -69,6 +88,8 @@ ShaderLab/
 │   ├── PixelReadback.h / .cpp      # Engine helper: FP32 RGBA region readback
 │   ├── CaptureNode.h / .cpp        # Engine helper: D2D + WIC PNG encode of any node's output
 │   ├── WorkingSpaceSync.h / .cpp   # Engine helper: refresh Working Space parameter nodes
+│   ├── EffectGraphFile.h / .cpp    # .effectgraph zip container (miniz DEFLATE) + embedded media
+│   ├── FalseColorOverlay.h / .cpp  # Clipping / luminance-zone / out-of-gamut overlays
 │   ├── MathExpression.h / .cpp     # ExprTk-backed expression evaluator (PCH disabled on .cpp)
 │
 ├── Effects/                        # Engine: built-in effect wrappers + custom effect base
@@ -83,6 +104,8 @@ ShaderLab/
 │   ├── CustomComputeShaderEffect.h / .cpp   # ID2D1EffectImpl + ID2D1ComputeTransform for user D2D compute
 │   ├── CustomComputeBridgeEffect.h / .cpp   # D2D wrapper for D3D11 compute (Phase 8 unifies discovery)
 │   ├── BytecodeCache.h / .cpp      # Compile-once bytecode store + disk LRU cache
+│   ├── ShaderLabParamsHlsl.h / .cpp # Engine-embedded shaderlab_params.hlsli macro library (Phase 8)
+│   ├── Performance.h / .cpp        # GPU-binding feature flags + telemetry counters
 │   ├── IEngineComputeOutput.h      # COM interface for compute effects exposing GPU-resident SRVs
 │   ├── DxgiDuplicationSourceProvider.h / .cpp        # Live-capture provider for DXGI Desktop Duplication
 │   ├── VideoSourceProvider.h / .cpp                  # Media Foundation video decode + frame upload
@@ -109,13 +132,13 @@ ShaderLab/
 │   └── Install.ps1                 # Per-arch unsigned-MSIX installer for end users
 ├── .github/
 │   ├── workflows/
-│   │   ├── ci.yml                  # PR / push CI build + tests + bootstrap-smoke
+│   │   ├── ci.yml                  # PR / push CI: build-and-test (unit + MCP suite vs headless serve) + clean-clone-smoke
 │   │   └── release.yml             # Tagged-release matrix (x64 + ARM64)
 │   └── copilot-instructions.md
-├── x64\Debug\ShaderLabEngine\      # Engine DLL output
-├── x64\Debug\ShaderLab\            # WinUI app output
-├── x64\Debug\ShaderLabTests\       # Console test output
-├── x64\Debug\ShaderLabHeadless\    # Console host output
+├── <Platform>\<Config>\ShaderLabEngine\   # Engine DLL output (x64|ARM64 × Debug|Release)
+├── <Platform>\<Config>\ShaderLab\         # WinUI app output — deploy from here, never from AppX\
+├── <Platform>\<Config>\ShaderLabTests\    # Console test output
+├── <Platform>\<Config>\ShaderLabHeadless\ # Console host output
 └── packages/                       # NuGet packages (restored)
 ```
 

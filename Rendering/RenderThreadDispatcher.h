@@ -59,7 +59,8 @@ namespace ShaderLab::Rendering
 
         // Enqueue a closure. Returns immediately. In synchronous mode (or when
         // called re-entrantly from the consumer thread), the closure runs
-        // inline on the calling thread instead of being queued.
+        // inline on the calling thread instead of being queued. Fire-and-
+        // forget work is simply dropped once the dispatcher is shutting down.
         void DispatchAsync(std::function<void()> fn)
         {
             if (!fn) return;
@@ -68,10 +69,13 @@ namespace ShaderLab::Rendering
                 fn();
                 return;
             }
+            // Wrap as the cancel-aware queue element: on cancel it is a no-op
+            // (async work has no promise to fail).
+            Item item = [fn = std::move(fn)](bool cancelled) { if (!cancelled) fn(); };
             {
                 std::scoped_lock lock(m_mutex);
                 if (m_shuttingDown) return;
-                m_queue.push_back(std::move(fn));
+                m_queue.push_back(std::move(item));
             }
             m_cv.notify_one();
         }
@@ -100,9 +104,25 @@ namespace ShaderLab::Rendering
             auto prom = std::make_shared<std::promise<R>>();
             auto fut = prom->get_future();
 
-            DispatchAsync(
-                [prom, fn = std::forward<F>(fn)]() mutable
+            // Cancel-aware element: when the dispatcher shuts down (or an
+            // adapter switch resets the consumer) the queued item is invoked
+            // with cancelled=true so this promise FAILS FAST rather than the
+            // caller eating its full timeout. This is what makes the
+            // render < DispatchSync < shim < client timeout ladder
+            // enforceable (see Engine/Mcp/McpTimeouts.h).
+            Item item =
+                [prom, fn = std::forward<F>(fn)](bool cancelled) mutable
                 {
+                    if (cancelled)
+                    {
+                        try { throw std::runtime_error(
+                            "RenderThreadDispatcher::DispatchSync: dispatcher shut down"); }
+                        catch (...) {
+                            try { prom->set_exception(std::current_exception()); }
+                            catch (...) {}
+                        }
+                        return;
+                    }
                     try
                     {
                         if constexpr (std::is_void_v<R>) { fn(); prom->set_value(); }
@@ -113,7 +133,21 @@ namespace ShaderLab::Rendering
                         try { prom->set_exception(std::current_exception()); }
                         catch (...) { /* promise already satisfied */ }
                     }
-                });
+                };
+
+            bool queued = false;
+            {
+                std::scoped_lock lock(m_mutex);
+                if (!m_shuttingDown)
+                {
+                    m_queue.push_back(std::move(item));
+                    queued = true;
+                }
+            }
+            if (queued)
+                m_cv.notify_one();
+            else
+                item(true);   // shutting down: fail the promise immediately
 
             if (fut.wait_for(timeout) != std::future_status::ready)
                 throw std::runtime_error("RenderThreadDispatcher::DispatchSync: timed out");
@@ -142,14 +176,14 @@ namespace ShaderLab::Rendering
             if (m_consumerId.load(std::memory_order_acquire) == std::thread::id{})
                 RegisterConsumer();
 
-            std::deque<std::function<void()>> local;
+            std::deque<Item> local;
             {
                 std::scoped_lock lock(m_mutex);
                 local.swap(m_queue);
             }
             for (auto& fn : local)
             {
-                try { fn(); }
+                try { fn(false); }
                 catch (...)
                 {
                     // Closures own their own error reporting (e.g. promises).
@@ -196,26 +230,35 @@ namespace ShaderLab::Rendering
         // Lifecycle: clear consumer registration. Useful when the consumer
         // thread exits and a new consumer is about to register (e.g. adapter
         // switch teardown -> new RenderEngineThread). Caller must guarantee
-        // no thread is currently calling Drain/Wait.
+        // no thread is currently calling Drain/Wait. Pending DispatchSync
+        // promises are FAILED (not silently dropped), so a request in flight
+        // during an adapter switch returns an error instead of hanging.
         void ResetConsumer()
         {
+            std::deque<Item> local;
+            {
+                std::scoped_lock lock(m_mutex);
+                local.swap(m_queue);
+                m_shuttingDown = false;
+            }
+            for (auto& fn : local) { try { fn(true); } catch (...) {} }
             m_consumerId.store(std::thread::id{}, std::memory_order_release);
-            std::scoped_lock lock(m_mutex);
-            m_shuttingDown = false;
-            m_queue.clear();
         }
 
-        // Stop accepting new work. Pending closures still in the queue are
-        // dropped. Any threads waiting on DispatchSync() will time out after
-        // their own deadline. Wait()/WaitFor() return immediately.
+        // Stop accepting new work. Pending closures are invoked with
+        // cancelled=true so their DispatchSync promises FAIL FAST (rather
+        // than the caller eating a 30 s timeout). Wait()/WaitFor() return
+        // immediately; subsequent DispatchSync calls also fail fast.
         void Shutdown()
         {
             if (m_synchronous) return;
+            std::deque<Item> local;
             {
                 std::scoped_lock lock(m_mutex);
                 m_shuttingDown = true;
-                m_queue.clear();
+                local.swap(m_queue);
             }
+            for (auto& fn : local) { try { fn(true); } catch (...) {} }
             m_cv.notify_all();
         }
 
@@ -241,10 +284,14 @@ namespace ShaderLab::Rendering
                    std::this_thread::get_id();
         }
 
+        // Queue element carries a cancel flag: run(false) executes normally,
+        // run(true) fails any attached promise (shutdown / consumer reset).
+        using Item = std::function<void(bool)>;
+
         const bool m_synchronous;
         mutable std::mutex m_mutex;
         std::condition_variable m_cv;
-        std::deque<std::function<void()>> m_queue;
+        std::deque<Item> m_queue;
         std::atomic<std::thread::id> m_consumerId{};
         bool m_shuttingDown{ false };
     };

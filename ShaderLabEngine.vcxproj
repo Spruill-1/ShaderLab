@@ -101,7 +101,15 @@
     <ClInclude Include="EngineExport.h" />
     <ClInclude Include="Version.h" />
     <ClInclude Include="pch_engine.h" />
-    <ClInclude Include="Engine\Mcp\McpHttpServer.h" />
+    <ClInclude Include="Engine\Mcp\McpRouter.h" />
+    <ClInclude Include="Engine\Mcp\McpTypes.h" />
+    <ClInclude Include="Engine\Mcp\McpJsonRpc.h" />
+    <ClInclude Include="Engine\Mcp\McpToolCatalog.h" />
+    <ClInclude Include="Engine\Mcp\McpFrame.h" />
+    <ClInclude Include="Engine\Mcp\McpCrypto.h" />
+    <ClInclude Include="Engine\Mcp\McpPeerIdentity.h" />
+    <ClInclude Include="Engine\Mcp\McpChannel.h" />
+    <ClInclude Include="Engine\Mcp\McpSessionClient.h" />
     <ClInclude Include="Engine\Mcp\EngineMcpRoutes.h" />
     <ClInclude Include="Graph\EffectEdge.h" />
     <ClInclude Include="Graph\EffectGraph.h" />
@@ -175,10 +183,15 @@
     <ClCompile Include="Effects\WindowsGraphicsCaptureSourceProvider.cpp" />
     <ClCompile Include="Effects\SourceNodeFactory.cpp" />
     <ClCompile Include="Effects\VideoSourceProvider.cpp" />
-    <ClCompile Include="Engine\Mcp\McpHttpServer.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
+    <ClCompile Include="Engine\Mcp\McpRouter.cpp" />
     <ClCompile Include="Engine\Mcp\EngineMcpRoutes.cpp" />
+    <ClCompile Include="Engine\Mcp\McpJsonRpc.cpp" />
+    <ClCompile Include="Engine\Mcp\McpToolCatalog.cpp" />
+    <ClCompile Include="Engine\Mcp\McpFrame.cpp" />
+    <ClCompile Include="Engine\Mcp\McpCrypto.cpp" />
+    <ClCompile Include="Engine\Mcp\McpPeerIdentity.cpp" />
+    <ClCompile Include="Engine\Mcp\McpChannel.cpp" />
+    <ClCompile Include="Engine\Mcp\McpSessionClient.cpp" />
     <!-- miniz (submodule, tag 3.1.2). The upstream git tree ships split sources;
          only these three are needed for the .effectgraph DEFLATE path
          (mz_free, tdefl_compress_mem_to_heap, tinfl_decompress_mem_to_heap).

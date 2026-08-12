@@ -84,3 +84,24 @@ if (Test-Path $depsDir) {
 # Install the main package. -AllowUnsigned needs Developer Mode.
 Add-AppxPackage -Path $MsixPath -AllowUnsigned -ForceApplicationShutdown
 Write-Host 'Installed. Launch ShaderLab from the Start menu.' -ForegroundColor Green
+
+# ---- MCP client config (stdio-migration Step 8) -------------------------
+# ShaderLab copies its MCP shim to %LOCALAPPDATA%\ShaderLab\bin\ on first
+# launch, and exposes each window as an MCP session via the broker hub. Print
+# a ready-to-paste stdio client config: the shim path is stable + unpackaged
+# (immune to ShaderLab updates), and --hub-aumid lets it start the packaged
+# hub on demand. Launch ShaderLab once so the shim is present before use.
+try {
+    $pkg = Get-AppxPackage -Name 'ShaderLab' | Select-Object -First 1
+    if ($pkg) {
+        $aumid = "$($pkg.PackageFamilyName)!Hub"
+        $shim  = Join-Path $env:LOCALAPPDATA 'ShaderLab\bin\ShaderLabMcpBroker.exe'
+        $cfg = [ordered]@{ mcpServers = [ordered]@{ shaderlab = [ordered]@{
+            command = $shim
+            args    = @('--stdio', '--hub-aumid', $aumid)
+        } } }
+        Write-Host ''
+        Write-Host 'MCP client config (paste into your MCP client after launching ShaderLab once):' -ForegroundColor Cyan
+        Write-Host ($cfg | ConvertTo-Json -Depth 6)
+    }
+} catch { }

@@ -35,9 +35,9 @@ flowchart LR
         Eval["GraphEvaluator<br/>+ ProcessDeferredCompute"]
     end
 
-    subgraph MCP["MCP server (Winsock thread pool)"]
-        Server["McpHttpServer<br/>port 47808"]
-        Routes["EngineMcpRoutes<br/>+ MainWindow.McpRoutes"]
+    subgraph MCP["MCP (broker session client thread)"]
+        Server["McpSessionClient<br/>(sealed shim → hub → session)"]
+        Routes["McpRouter → EngineMcpRoutes<br/>+ MainWindow.McpRoutes"]
     end
 
     DispatchTimer --> XAML
@@ -109,20 +109,23 @@ frame.
 
 ## MCP mutation (e.g. `/graph/add-node`, `/graph/set-property`)
 
-The MCP server's Winsock thread receives the request, parses the JSON body,
-and asks `GuiEngineCommandSink::Dispatch` to marshal the work. The sink
-posts a closure to the dispatcher and blocks until the worker has run it.
+The `McpSessionClient` thread opens a sealed channel request, routes it
+through `McpRouter` to the tool's route, and `GuiEngineCommandSink::Dispatch`
+marshals the work. The sink posts a closure to the dispatcher and blocks
+until the worker has run it. (The transport is the broker — shim → hub →
+session over named pipes — since the HTTP listener was deleted in
+stdio-migration Step 9; the threading below is unchanged from the HTTP era.)
 
 ```mermaid
 sequenceDiagram
-    participant Net as MCP client
-    participant Srv as MCP server thread
+    participant Net as MCP client (via shim/hub)
+    participant Srv as Session client thread
     participant Sink as GuiEngineCommandSink
     participant Disp as RenderThreadDispatcher
     participant W as Render worker
     participant UI as UI thread (event hook)
 
-    Net->>Srv: POST /graph/add-node {effect:"..."}
+    Net->>Srv: tools/call graph_add_node {effect:"..."}
     Srv->>Sink: Dispatch(closure)
     Sink->>Disp: DispatchSync<Response>(...)
     Note over Srv: blocks here<br/>(returns response when worker is done)
@@ -134,7 +137,7 @@ sequenceDiagram
     Sink->>Sink: OnNodeAdded(nodeId)
     Sink->>UI: DispatcherQueue().TryEnqueue(<br/>update XAML, AutoLayout, etc.)
     Sink-->>Srv: Response{200, JSON body}
-    Srv-->>Net: HTTP 200 + body
+    Srv-->>Net: sealed response frame
     UI->>UI: (later) rebuild Properties panel,<br/>repaint node-graph canvas
 ```
 
@@ -157,14 +160,14 @@ sequenceDiagram
     participant DC as m_renderD2dContext
     participant Graph as m_graph
 
-    Net->>Sink: POST /render/pixel-region {nodeId,x,y,w,h}
+    Net->>Sink: tools/call read_pixel_region {nodeId,x,y,w,h}
     Sink->>W: DispatchSync(closure)
     W->>Graph: ResolveDisplayImage(nodeId)
     W->>W: force RenderFrameToOffscreen()<br/>so dirty nodes evaluate
     W->>DC: PixelReadback::ReadRegion()<br/>(BeginDraw → DrawImage → EndDraw → Map)
     DC-->>W: vector<float> RGBA pixels
     W-->>Sink: Response{200, JSON pixel data}
-    Sink-->>Net: HTTP 200 + body
+    Sink-->>Net: sealed response frame
 ```
 
 The `Map()` call inside `PixelReadback` is synchronous — it blocks the worker

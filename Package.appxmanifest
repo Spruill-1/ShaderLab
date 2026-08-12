@@ -3,8 +3,10 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/application/windows10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap rescap">
+  IgnorableNamespaces="uap uap3 desktop rescap">
 
   <Identity
     Name="ShaderLab"
@@ -55,6 +57,29 @@
           </uap:FileTypeAssociation>
         </uap:Extension>
       </Extensions>
+    </Application>
+
+    <!-- MCP broker hub (stdio-migration Step 5). Activation via this
+         AUMID is the ONLY way the hub survives the MCP client's job
+         object (spike: plain CreateProcess children die with the job;
+         CREATE_BREAKAWAY_FROM_JOB is ERROR_ACCESS_DENIED). Executable is
+         literal — $targetnametoken$ substitutes only for the primary
+         app. AppListEntry="none" hides it from Start; the full
+         VisualElements block stays because the logo attributes are
+         mandatory even for hidden entries (omitting them fails package
+         validation). Deliberately NO AppExecutionAlias — the shim is
+         reached via its stable %LOCALAPPDATA% copy (Step 8), never an
+         alias that dies with the package. -->
+    <Application Id="Hub"
+      Executable="ShaderLabMcpBroker.exe"
+      EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        AppListEntry="none"
+        DisplayName="ShaderLab MCP Hub"
+        Description="ShaderLab MCP broker hub (background relay)"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
     </Application>
   </Applications>
 
