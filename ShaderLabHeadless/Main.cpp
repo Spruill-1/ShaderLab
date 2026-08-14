@@ -799,7 +799,11 @@ int RunScript(const Args& args)
 
     ShaderLab::Effects::SourceNodeFactory sourceFactory;
     ShaderLab::Rendering::GraphEvaluator evaluator;
-    ShaderLab::Rendering::DisplayMonitor displayMonitor;  // headless: live caps default
+    // Snapshot the primary monitor's real advanced-color caps (no change
+    // events — headless runs no DispatcherQueue). Falls back to struct
+    // defaults when no display is reachable (CI, session 0).
+    ShaderLab::Rendering::DisplayMonitor displayMonitor;
+    displayMonitor.InitializeForPrimaryMonitor();
 
     // Prep source nodes once (loads media off disk). Properties on
     // source nodes are typically static (file path); set-property on

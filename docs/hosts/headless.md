@@ -49,6 +49,19 @@ ShaderLabHeadless --graph PATH --node ID --output PNG_PATH [options]
 
 - **MCP session** (`--mcp-session [--session-id GUID] [--session-label NAME] [--pipe BASE]`; stdio-migration Step 6). Loads a graph and registers with the broker hub as a **session**, so a shim-fronted MCP client selects it with `use_session` and drives it through the sealed relay. `initialize` / `tools/list` / `tools/call` / `resources/*` all work with no GUI; requests arrive as sealed channel frames, get routed through the router's `POST /` dispatcher, and the response is sealed back. Tools whose backing route is GUI-only (snapshot/view/gpu/perf/logs) return an `isError` "Tool not available on this host" result. `--session-id` is a persisted per-window GUID (a fresh one is generated when omitted); `--session-label` is what `list_sessions` surfaces (headless labels contain "headless", which the test suite uses to self-skip GUI-only tests). Reconnects to the hub with backoff after a drop. This is what CI's "MCP suite vs headless session" step drives, and the headless half of `RunBrokerSmoke.ps1`. (The Step 3 `--serve` HTTP mode was removed with the rest of the HTTP transport in Step 9.)
 
+## Display capabilities without a window
+
+The headless host has no HWND and runs no `DispatcherQueue`, so it cannot
+bind a `DisplayInformation` to a window or receive
+`AdvancedColorInfoChanged` events. Instead it calls
+`DisplayMonitor::InitializeForPrimaryMonitor()` at startup — a one-shot
+`GetForMonitor` snapshot of the primary monitor's real advanced-color
+caps (HDR state, luminance, SDR white level, primaries). `get_display_info`
+therefore reports genuine values, but they are frozen at launch; display
+changes during a headless run are not observed. When no display is
+reachable (CI runners, session 0) the snapshot fails silently and
+struct-default capabilities are served (SDR, 80-nit white, sRGB).
+
 ## Engine-side reuse
 
 The MCP route registry (`RegisterEngineRoutes`) is what backs every host — the GUI window's session, the headless `--mcp-session`, and the headless `--script` mode all register the same routes. The same closures execute against the same engine state — only the sink's `Dispatch` impl differs between hosts. The GUI sink marshals to the render worker thread via `RenderThreadDispatcher::DispatchSync` (post-P7); the headless sink runs the closure inline since the script runner thread is the only consumer. The headless host overrides none of the eight `IEngineCommandSink` event hooks; without a UI to keep in sync, every hook is a no-op.

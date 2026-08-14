@@ -54,6 +54,15 @@ namespace winrt::ShaderLab::implementation
 
         auto tTickStart = std::chrono::high_resolution_clock::now();
 
+        // Cache the preview panel's DIP size (UI-thread-only XAML read) so the
+        // render worker can fit a newly-selected node to view after eval
+        // without touching XAML. See FitPreviewToView / m_needsFitPreview.
+        if (auto panel = PreviewPanel())
+        {
+            m_previewViewportW = static_cast<float>(panel.ActualWidth());
+            m_previewViewportH = static_cast<float>(panel.ActualHeight());
+        }
+
         // Drain pending dispatcher closures: NO-OP from the UI side post-P7.
         // The worker thread is the registered consumer and drains its own
         // queue. UI thread reading the queue would race graph mutations and
@@ -360,6 +369,16 @@ namespace winrt::ShaderLab::implementation
                     m_frameCount.fetch_add(1, std::memory_order_relaxed);
                     if (hasDirty || wasForceRender)
                         ++m_graphGeneration;
+                    // Fit-after-eval: the selected node's cachedOutput now has
+                    // valid bounds, so a pending fit (set by SelectPreviewNode)
+                    // computes zoom/pan here on the worker -- worker-owned
+                    // bounds + the UI-cached viewport, no XAML. Force one more
+                    // frame so the fitted transform actually renders.
+                    if (m_needsFitPreview && FitPreviewToView())
+                    {
+                        m_needsFitPreview = false;
+                        m_forceRender = true;
+                    }
                 }
 
                 // Publish snapshot.

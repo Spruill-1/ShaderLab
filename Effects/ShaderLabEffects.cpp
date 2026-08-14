@@ -2280,6 +2280,7 @@ cbuffer constants : register(b0) {
     SHADERLAB_PARAM(float, SourcePeakNits)        // SDR source peak (e.g. 80, 203)
     SHADERLAB_PARAM(float, TargetPeakNits)        // typical 1000-10000
     float  Strength;                              // 0..1 lerp from identity to expanded
+    float  DiffuseWhiteNits;                      // shadow/mid anchor (HDR paper white)
 };
 
 [numthreads(8, 8, 1)]
@@ -2300,6 +2301,17 @@ void main(uint3 dtid : SV_DispatchThreadID)
     float sdrI = NitsToI(SourcePeakNits);
     float hdrI = NitsToI(TargetPeakNits);
     float expanded = ReinhardExpandI(ictcp.x, hdrI, sdrI);
+
+    // Shadow/mid anchor: the pure inverse-Reinhard has slope 1 at black
+    // in I-space, so shadows keep their SDR nit levels while the rest of
+    // the picture expands -- perceptually crushed blacks. Let the low end
+    // instead scale like an SDR presentation at DiffuseWhiteNits paper
+    // white (nits x D/S, the BT.2446-style lift), and let the expansion
+    // curve take over wherever it exceeds that.
+    float diffuseScale = max(DiffuseWhiteNits, 1.0) / max(SourcePeakNits, 1.0);
+    float lifted = NitsToI(IToNits(ictcp.x) * diffuseScale);
+    expanded = min(max(expanded, lifted), hdrI);
+
     ictcp.x = lerp(ictcp.x, expanded, saturate(Strength));
 
     float3 outRgb = ICtCpToScRGB(ictcp);
@@ -2308,7 +2320,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Inverse Tone Map (SDR -> HDR)";
-            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 11;
+            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 12;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -2322,6 +2334,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
                 Graph::ParameterDefinition{ L"SourcePeakNits", L"float",  203.0f,   80.0f,   500.0f,  1.0f, {}, L"", true },
                 Graph::ParameterDefinition{ L"TargetPeakNits", L"float", 1000.0f,  100.0f, 10000.0f, 50.0f, {}, L"", true },
                 Graph::ParameterDefinition{ L"Strength",       L"float",    1.0f,    0.0f,     1.0f, 0.05f },
+                Graph::ParameterDefinition{ L"DiffuseWhiteNits", L"float",  203.0f,   80.0f,   400.0f, 1.0f },
             };
             m_effects.push_back(std::move(desc));
         }

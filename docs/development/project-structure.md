@@ -77,7 +77,7 @@ ShaderLab/
 │
 ├── Rendering/                      # Engine: rendering + analysis (RenderEngine stays app-side)
 │   ├── DisplayInfo.h               # DisplayCapabilities struct
-│   ├── DisplayMonitor.h / .cpp     # WM_DISPLAYCHANGE + adapter-changed event + simulated profile
+│   ├── DisplayMonitor.h / .cpp     # WinRT AdvancedColorInfoChanged event + simulated profile
 │   ├── DisplayProfile.h            # DisplayProfile struct + preset factories
 │   ├── IccProfileParser.h / .cpp   # mscms.dll-based ICC reader
 │   ├── PipelineFormat.h            # PipelineFormat struct (scRGB FP16 always)

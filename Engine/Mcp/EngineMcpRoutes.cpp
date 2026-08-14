@@ -536,6 +536,14 @@ namespace ShaderLab::Mcp
                         auto verStr = WideToUtf8(std::wstring(::ShaderLab::VersionString));
                         std::wstring fmtName = ctx.getPipelineFormatName
                             ? ctx.getPipelineFormatName() : std::wstring(L"unknown");
+                        // Non-empty when the WinRT display binding or last
+                        // query failed — the caps below are struct defaults,
+                        // not measurements. Emitted so clients can tell.
+                        auto monitorErr = ctx.displayMonitor->LastError();
+                        std::string statusField = monitorErr.empty()
+                            ? std::string{}
+                            : std::format(",\"monitorStatus\":\"{}\"",
+                                  JsonEscape(WideToUtf8(monitorErr)));
                         std::string json = std::format(
                             "{{\"appVersion\":\"{}\",\"graphFormatVersion\":{}"
                             ",\"pipeline\":\"{}\""
@@ -543,6 +551,7 @@ namespace ShaderLab::Mcp
                             ",\"simulated\":{},\"profileName\":\"{}\""
                             ",\"activeGamut\":{{\"red\":[{:.4f},{:.4f}],\"green\":[{:.4f},{:.4f}],\"blue\":[{:.4f},{:.4f}]}}"
                             ",\"monitorGamut\":{{\"red\":[{:.4f},{:.4f}],\"green\":[{:.4f},{:.4f}],\"blue\":[{:.4f},{:.4f}]}}"
+                            "{}"
                             "}}}}",
                             verStr, ::ShaderLab::GraphFormatVersion,
                             JsonEscape(WideToUtf8(fmtName)),
@@ -555,7 +564,8 @@ namespace ShaderLab::Mcp
                             profile.primaryBlue.x, profile.primaryBlue.y,
                             live.primaryRed.x, live.primaryRed.y,
                             live.primaryGreen.x, live.primaryGreen.y,
-                            live.primaryBlue.x, live.primaryBlue.y);
+                            live.primaryBlue.x, live.primaryBlue.y,
+                            statusField);
                         return Json(200, json);
                     });
                 });
@@ -1795,13 +1805,21 @@ namespace ShaderLab::Mcp
                         bool wantInline = jo.HasKey(L"inline")
                             && jo.GetNamedValue(L"inline").ValueType() == WDJ::JsonValueType::Boolean
                             && jo.GetNamedBoolean(L"inline");
+                        // Optional maxDim: fit the longer edge to this many px
+                        // (aspect preserved). Smaller = lower-res preview =
+                        // fewer inline tokens; omit for the 2048 default.
+                        uint32_t maxDim = 2048;
+                        if (jo.HasKey(L"maxDim")
+                            && jo.GetNamedValue(L"maxDim").ValueType() == WDJ::JsonValueType::Number)
+                            maxDim = std::clamp(
+                                static_cast<uint32_t>(jo.GetNamedNumber(L"maxDim")), 32u, 8192u);
 
                         // Force a fresh frame so dirty nodes evaluate before
                         // capture. Headless host's renderFrame is a no-op.
                         if (ctx.renderFrame) ctx.renderFrame();
 
                         auto cap = ::ShaderLab::Rendering::CaptureNodeAsPng(
-                            *ctx.graph, nodeId, ctx.dc);
+                            *ctx.graph, nodeId, ctx.dc, maxDim);
                         using S = ::ShaderLab::Rendering::CaptureNodeStatus;
                         switch (cap.status)
                         {
@@ -2147,10 +2165,6 @@ namespace ShaderLab::Mcp
                                 p.profileName = L"Custom MCP profile";
 
                             p.caps.hdrEnabled = co.HasKey(L"hdrEnabled") && co.GetNamedBoolean(L"hdrEnabled");
-                            p.caps.colorSpace = p.caps.hdrEnabled
-                                ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-                                : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-                            p.caps.bitsPerColor = p.caps.hdrEnabled ? 10 : 8;
                             p.caps.sdrWhiteLevelNits = co.HasKey(L"sdrWhiteNits")
                                 ? static_cast<float>(co.GetNamedNumber(L"sdrWhiteNits"))
                                 : (p.caps.hdrEnabled ? 203.0f : 80.0f);
@@ -2177,7 +2191,12 @@ namespace ShaderLab::Mcp
                                 !readChroma(L"whitePoint",   p.whitePoint))
                                 return Json(400, R"({"error":"primaries / whitePoint must be 2-element arrays"})");
 
-                            p.gamut = GamutId::Custom;
+                            // Default the gamut from the primaries (sRGB
+                            // struct defaults classify as sRGB) so the
+                            // stamp below doesn't misread a plain-sRGB
+                            // custom as wide-gamut; an explicit "gamut"
+                            // key still overrides. Mirrors the ICC path.
+                            p.gamut = DetectGamut(p.primaryRed, p.primaryGreen, p.primaryBlue);
                             if (co.HasKey(L"gamut"))
                             {
                                 auto gn = std::wstring(co.GetNamedString(L"gamut"));
@@ -2186,6 +2205,12 @@ namespace ShaderLab::Mcp
                                 else if (gn == L"BT.2020" || gn == L"BT2020" || gn == L"Rec2020") p.gamut = GamutId::BT2020;
                                 else                       p.gamut = GamutId::Custom;
                             }
+                            // Stamp coherent activeColorMode / *Supported /
+                            // *UserEnabled / bitsPerColor — without this a
+                            // custom HDR profile reported ActiveColorMode=0
+                            // (SDR) through the Working Space node while
+                            // get_display_info said hdr:true.
+                            StampSimulatedColorMode(p);
                             chosen = p;
                         }
 

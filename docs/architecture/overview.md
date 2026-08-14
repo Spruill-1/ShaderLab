@@ -13,7 +13,7 @@ graph TB
         EV[GraphEvaluator / FalseColorOverlay]
         FX[EffectRegistry / ShaderLabEffects / SourceNodeFactory]
         IO[ImageLoader / VideoSourceProvider / ShaderCompiler]
-        MON[DisplayMonitor / ICC / GPU reduction]
+        MON[DisplayMonitor / ICC]
         MCP[Engine/Mcp: McpRouter + EngineMcpRoutes]
     end
 

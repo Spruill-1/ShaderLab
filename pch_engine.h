@@ -12,6 +12,7 @@
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.Numerics.h>
 #include <winrt/Windows.Data.Json.h>
+#include <winrt/Windows.Graphics.Display.h>
 
 // Direct3D / Direct2D / DXGI
 #include <d3d11_4.h>

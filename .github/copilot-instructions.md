@@ -37,7 +37,7 @@ ShaderLabEngine.dll (host-agnostic)
   ├── Graph/                    — EffectGraph, EffectNode, EffectEdge, NodeType, PropertyValue
   ├── Rendering/
   │   ├── GraphEvaluator        — Topological walk + per-node D2D effect cache + ProcessDeferredCompute
-  │   ├── DisplayMonitor        — HDR/SDR detection, WM_DISPLAYCHANGE + adapter-changed jthread
+  │   ├── DisplayMonitor        — HDR/SDR/WCG detection via WinRT AdvancedColorInfo (event-driven)
   │   ├── D3D11ComputeRunner    — Generic D3D11 compute dispatch (RWStructuredBuffer<float4>),
   │   │                           also implements IEngineComputeOutput (Phase 8 GPU-binding interface)
   │   ├── PixelReadback         — FP32 RGBA region readback helper
@@ -176,7 +176,7 @@ Active development centers on **tone-mapping and color-correction effects author
 
 - **Pipeline is always scRGB FP16**: `DXGI_FORMAT_R16G16B16A16_FLOAT` with `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`. No pipeline format switching — DWM/ACM handles final display conversion.
 - **Swap chain**: `CreateSwapChainForComposition` + `ISwapChainPanelNative` (WinUI 3 requirement). Color space set via `SetColorSpace1()`.
-- **Display monitoring**: Dual path — `WM_DISPLAYCHANGE` via hidden message-only HWND + `IDXGIFactory7::RegisterAdaptersChangedEvent` on a jthread.
+- **Display monitoring**: Event-driven — `DisplayInformation` bound to the main window (`IDisplayInformationStaticsInterop::GetForWindow`) raises `AdvancedColorInfoChanged` for HDR toggles, the SDR-brightness slider, and monitor moves; one `AdvancedColorInfo` snapshot feeds all of `DisplayCapabilities`. Requires Win11 22H2 (10.0.22621 min OS). Headless snapshots the primary monitor via `GetForMonitor` (no events).
 - **Graph serialization**: `Windows.Data.Json` (zero extra dependencies). GUID fields use `StringFromGUID2`/`CLSIDFromString`.
 - **Effect registry**: Singleton with 40+ built-in D2D effects across 9 categories. Case-insensitive name lookup.
 - **ShaderLab effects library**: 33 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map + Scale), Source / Generator, Composition (Split Comparison), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use; bytecode cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` (decision #58 catalog → see [builtin-catalog.md](../docs/effects/builtin-catalog.md) for the full per-effect type table).

@@ -89,31 +89,36 @@ namespace ShaderLab::Rendering
     // Preset factory functions
     // -----------------------------------------------------------------------
 
-    // Preset helper: stamp coherent ACM/WCG/activeColorMode flags into a
-    // `caps` block based on hdrEnabled. Used by every Preset*() factory so
+    // Preset helper: stamp coherent ACM/WCG/activeColorMode flags and the
+    // derived bits-per-channel into a profile from its hdrEnabled + gamut.
+    // Call AFTER caps.hdrEnabled and p.gamut are set. Used by every
+    // Preset*() factory, the ICC path, and the MCP custom-profile route so
     // simulated profiles report a self-consistent display mode through the
-    // Working Space node and other consumers.
-    inline void StampSimulatedColorMode(DisplayCapabilities& caps)
+    // Working Space node and other consumers. Mirrors the live-display
+    // derivation in DisplayMonitor's CapsFromAdvancedColorInfo: a
+    // wide-gamut SDR profile simulates Windows ACM (activeColorMode 1).
+    inline void StampSimulatedColorMode(DisplayProfile& p)
     {
-        caps.activeColorMode = caps.hdrEnabled ? 2u : 0u; // 2=HDR, 0=SDR
-        caps.hdrSupported    = caps.hdrEnabled;
-        caps.hdrUserEnabled  = caps.hdrEnabled;
-        caps.wcgSupported    = caps.hdrEnabled; // SDR presets don't simulate ACM/WCG
-        caps.wcgUserEnabled  = false;
+        const bool hdr  = p.caps.hdrEnabled;
+        const bool wide = (p.gamut != GamutId::sRGB);
+        p.caps.activeColorMode = hdr ? 2u : (wide ? 1u : 0u); // 2=HDR, 1=WCG/ACM, 0=SDR
+        p.caps.hdrSupported    = hdr;
+        p.caps.hdrUserEnabled  = hdr;
+        p.caps.wcgSupported    = hdr || wide;
+        p.caps.wcgUserEnabled  = !hdr && wide;
+        p.caps.bitsPerColor    = (p.caps.activeColorMode != 0u) ? 10u : 8u;
     }
 
     inline DisplayProfile PresetSrgbSdr()
     {
         DisplayProfile p{};
         p.caps.hdrEnabled = false;
-        p.caps.bitsPerColor = 8;
-        p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         p.caps.sdrWhiteLevelNits = 80.0f;
         p.caps.maxLuminanceNits = 80.0f;
         p.caps.minLuminanceNits = 0.5f;
         p.caps.maxFullFrameLuminanceNits = 80.0f;
-        StampSimulatedColorMode(p.caps);
         p.gamut = GamutId::sRGB;
+        StampSimulatedColorMode(p);
         p.profileName = L"sRGB SDR (80 nits)";
         p.isSimulated = true;
         return p;
@@ -123,14 +128,12 @@ namespace ShaderLab::Rendering
     {
         DisplayProfile p{};
         p.caps.hdrEnabled = false;
-        p.caps.bitsPerColor = 8;
-        p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         p.caps.sdrWhiteLevelNits = 100.0f;
         p.caps.maxLuminanceNits = 270.0f;
         p.caps.minLuminanceNits = 0.5f;
         p.caps.maxFullFrameLuminanceNits = 270.0f;
-        StampSimulatedColorMode(p.caps);
         p.gamut = GamutId::sRGB;
+        StampSimulatedColorMode(p);
         p.profileName = L"sRGB SDR (270 nits, typical laptop)";
         p.isSimulated = true;
         return p;
@@ -140,19 +143,17 @@ namespace ShaderLab::Rendering
     {
         DisplayProfile p{};
         p.caps.hdrEnabled = true;
-        p.caps.bitsPerColor = 10;
-        p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
         p.caps.sdrWhiteLevelNits = 203.0f;
         p.caps.maxLuminanceNits = 600.0f;
         p.caps.minLuminanceNits = 0.05f;
         p.caps.maxFullFrameLuminanceNits = 500.0f;
-        StampSimulatedColorMode(p.caps);
         // DCI-P3 primaries
         p.primaryRed   = { 0.680f, 0.320f };
         p.primaryGreen = { 0.265f, 0.690f };
         p.primaryBlue  = { 0.150f, 0.060f };
         p.whitePoint   = { 0.3127f, 0.3290f };
         p.gamut = GamutId::DCI_P3;
+        StampSimulatedColorMode(p);
         p.profileName = L"DCI-P3 HDR (600 nits, MacBook Pro-class)";
         p.isSimulated = true;
         return p;
@@ -162,19 +163,17 @@ namespace ShaderLab::Rendering
     {
         DisplayProfile p{};
         p.caps.hdrEnabled = true;
-        p.caps.bitsPerColor = 10;
-        p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
         p.caps.sdrWhiteLevelNits = 203.0f;
         p.caps.maxLuminanceNits = 1000.0f;
         p.caps.minLuminanceNits = 0.05f;
         p.caps.maxFullFrameLuminanceNits = 600.0f;
-        StampSimulatedColorMode(p.caps);
         // DCI-P3 primaries
         p.primaryRed   = { 0.680f, 0.320f };
         p.primaryGreen = { 0.265f, 0.690f };
         p.primaryBlue  = { 0.150f, 0.060f };
         p.whitePoint   = { 0.3127f, 0.3290f };
         p.gamut = GamutId::DCI_P3;
+        StampSimulatedColorMode(p);
         p.profileName = L"DCI-P3 HDR (1000 nits, reference monitor)";
         p.isSimulated = true;
         return p;
@@ -184,19 +183,17 @@ namespace ShaderLab::Rendering
     {
         DisplayProfile p{};
         p.caps.hdrEnabled = true;
-        p.caps.bitsPerColor = 10;
-        p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
         p.caps.sdrWhiteLevelNits = 203.0f;
         p.caps.maxLuminanceNits = 1000.0f;
         p.caps.minLuminanceNits = 0.005f;
         p.caps.maxFullFrameLuminanceNits = 600.0f;
-        StampSimulatedColorMode(p.caps);
         // BT.2020 primaries
         p.primaryRed   = { 0.708f, 0.292f };
         p.primaryGreen = { 0.170f, 0.797f };
         p.primaryBlue  = { 0.131f, 0.046f };
         p.whitePoint   = { 0.3127f, 0.3290f };
         p.gamut = GamutId::BT2020;
+        StampSimulatedColorMode(p);
         p.profileName = L"BT.2020 HDR (1000 nits, HDR TV)";
         p.isSimulated = true;
         return p;
@@ -206,19 +203,17 @@ namespace ShaderLab::Rendering
     {
         DisplayProfile p{};
         p.caps.hdrEnabled = true;
-        p.caps.bitsPerColor = 10;
-        p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
         p.caps.sdrWhiteLevelNits = 203.0f;
         p.caps.maxLuminanceNits = 4000.0f;
         p.caps.minLuminanceNits = 0.005f;
         p.caps.maxFullFrameLuminanceNits = 1000.0f;
-        StampSimulatedColorMode(p.caps);
         // BT.2020 primaries
         p.primaryRed   = { 0.708f, 0.292f };
         p.primaryGreen = { 0.170f, 0.797f };
         p.primaryBlue  = { 0.131f, 0.046f };
         p.whitePoint   = { 0.3127f, 0.3290f };
         p.gamut = GamutId::BT2020;
+        StampSimulatedColorMode(p);
         p.profileName = L"BT.2020 HDR (4000 nits, mastering)";
         p.isSimulated = true;
         return p;
@@ -228,19 +223,17 @@ namespace ShaderLab::Rendering
     {
         DisplayProfile p{};
         p.caps.hdrEnabled = false;
-        p.caps.bitsPerColor = 8;
-        p.caps.colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         p.caps.sdrWhiteLevelNits = 160.0f;
         p.caps.maxLuminanceNits = 160.0f;
         p.caps.minLuminanceNits = 0.5f;
         p.caps.maxFullFrameLuminanceNits = 160.0f;
-        StampSimulatedColorMode(p.caps);
         // Adobe RGB (1998) primaries
         p.primaryRed   = { 0.6400f, 0.3300f };
         p.primaryGreen = { 0.2100f, 0.7100f };
         p.primaryBlue  = { 0.1500f, 0.0600f };
         p.whitePoint   = { 0.3127f, 0.3290f };
         p.gamut = GamutId::Custom;
+        StampSimulatedColorMode(p);
         p.profileName = L"Adobe RGB (1998)";
         p.isSimulated = true;
         return p;

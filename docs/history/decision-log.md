@@ -100,4 +100,10 @@
 
 ---
 
+| # | Decision | Rationale | Date |
+|---|----------|-----------|------|
+| 72 | Display monitoring rewritten on WinRT `AdvancedColorInfo` + `AdvancedColorInfoChanged`; min OS raised to Win11 22H2 (**supersedes #12 and #13**) | The old three-path detection was mostly dead: the `WM_DISPLAYCHANGE` window (#12) was created with `HWND_MESSAGE` — message-only windows never receive broadcasts, so that handler could not fire — leaving only a 500 ms HMONITOR-move poll and the adapter hot-plug event (#13), neither of which catches a same-monitor HDR toggle or the Windows "SDR content brightness" slider; the change-diff also omitted `sdrWhiteLevelNits` entirely, so slider moves were doubly invisible. The replacement binds a `DisplayInformation` to the app window (`IDisplayInformationStaticsInterop::GetForWindow`, desktop interop, needs 10.0.22621) whose `AdvancedColorInfoChanged` event fires on the UI thread for *any* advanced-color change — slider, HDR toggle, monitor move (the object hooks the window's message loop) — and one `AdvancedColorInfo` snapshot replaces `IDXGIOutput6::GetDesc1` + both `QueryDisplayConfig` walks (SDR white, type-15) with kind/availability/luminance/primaries in a single agile object that MCP routes can also re-query cross-thread. Net: ~350 lines of Win32 plumbing (message window, two jthreads, DXGI enumeration, DisplayConfig path-matching ×2) deleted; the DXGI-factory Initialize parameter and the GUI's shutdown-and-reinit-to-attach-it churn are gone; the callback now defers graph work to the render worker via atomic flags instead of mutating `m_graph` from the UI thread (the same class of race decision #70 killed). Headless gets real primary-monitor caps via `GetForMonitor` (snapshot-only — no DispatcherQueue, no events). Cost: the app now requires Win11 22H2; accepted deliberately — the SDR-Advanced-Color feature set the app analyzes barely exists before 22H2, and the machine fleet is already there. | Day 15 |
+
+---
+
 Back to [docs/](../README.md) • [Repo root](../../README.md)

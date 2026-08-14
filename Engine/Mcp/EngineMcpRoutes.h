@@ -16,10 +16,11 @@
 //
 // Routes execute through `IEngineCommandSink::Dispatch`, which marshals
 // the closure to the right thread for the host:
-//   * GUI app: dispatches to the UI thread via DispatcherQueue (so
-//     concurrent UI tick and MCP requests don't race the graph).
-//   * Headless host: synchronous direct call (single-threaded MCP
-//     access; the listener thread serializes requests).
+//   * GUI app: marshals to the RENDER WORKER thread via
+//     RenderThreadDispatcher::DispatchSync (post-P7 the worker is the
+//     single graph writer; see MainWindow.McpRoutes.cpp).
+//   * Headless host: synchronous direct call on the session client's
+//     run thread (single-threaded MCP access serializes requests).
 
 #include "pch_engine.h"
 #include "../../EngineExport.h"

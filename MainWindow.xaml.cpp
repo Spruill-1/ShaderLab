@@ -16,6 +16,9 @@
 #include <microsoft.ui.xaml.media.dxinterop.h>
 #include <shlobj.h>
 #include <KnownFolders.h>
+#include <DispatcherQueue.h>
+
+#pragma comment(lib, "CoreMessaging.lib")
 
 using namespace winrt;
 using namespace Microsoft::UI::Xaml;
@@ -319,7 +322,7 @@ namespace winrt::ShaderLab::implementation
                 {
                     if (n.type == ::ShaderLab::Graph::NodeType::Output)
                     {
-                        m_previewNodeId = n.id;
+                        SelectPreviewNode(n.id);
                         break;
                     }
                 }
@@ -460,6 +463,25 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::InitializeRendering()
     {
+        // DisplayInformation::GetForWindow requires a running
+        // Windows.System.DispatcherQueue on this thread. WinUI 3 threads
+        // run Microsoft.UI.Dispatching.DispatcherQueue — a distinct type —
+        // so create the system one if absent (same pattern system-backdrop
+        // controllers use). It pumps via this thread's existing message
+        // loop; the controller must outlive the queue's consumers.
+        if (!m_systemDqController &&
+            !winrt::Windows::System::DispatcherQueue::GetForCurrentThread())
+        {
+            DispatcherQueueOptions options{
+                sizeof(DispatcherQueueOptions),
+                DQTYPE_THREAD_CURRENT,
+                DQTAT_COM_NONE };
+            ABI::Windows::System::IDispatcherQueueController* controller{ nullptr };
+            if (SUCCEEDED(::CreateDispatcherQueueController(options, &controller)))
+                m_systemDqController.attach(
+                    reinterpret_cast<::IUnknown*>(controller));
+        }
+
         // Query display capabilities and pick a default pipeline format.
         m_displayMonitor.Initialize(m_hwnd);
         auto caps = m_displayMonitor.CachedCapabilities();
@@ -477,28 +499,29 @@ namespace winrt::ShaderLab::implementation
         // always return fresh values regardless of selection.
         ::ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(true);
 
-        // Now that we have a DXGI factory, register adapter-change monitoring.
-        if (m_renderEngine.DXGIFactory())
-        {
-            m_displayMonitor.Shutdown();
-            m_displayMonitor.Initialize(m_hwnd, m_renderEngine.DXGIFactory());
-        }
-
-        // Subscribe to display changes so we can update the status bar.
+        // Subscribe to display changes (AdvancedColorInfoChanged: HDR
+        // toggle, SDR-brightness slider, monitor move, profile sim).
+        // NO graph work here: the render worker's per-tick
+        // UpdateWorkingSpaceNodes reads ActiveProfile() and dirties the
+        // Working Space node when a field really moved — that dirty is
+        // the designed propagation to binding consumers, and nothing
+        // else in the graph depends on display state ("bind, don't
+        // hide"). Displays with adaptive color fire this event at
+        // sensor rate (several Hz, sub-nit deltas), so the UI refresh
+        // is coalesced behind a pending flag — an event storm results
+        // in at most one queued refresh at a time. A MarkAllDirty here
+        // previously turned that storm into a continuous full-graph
+        // re-eval that froze the app.
         m_displayMonitor.SetCallback([this](const ::ShaderLab::Rendering::DisplayCapabilities& /*newCaps*/)
         {
+            if (m_displayUiRefreshPending.exchange(true))
+                return;
             this->DispatcherQueue().TryEnqueue([this]()
             {
-                // Re-evaluate graph so effects using monitor gamut
-                // pick up the new primaries.
-                m_graph.MarkAllDirty();
-                m_forceRender = true;
+                m_displayUiRefreshPending = false;
                 // Pick up new refresh rate (e.g. user changed displays
                 // or switched modes from 60 Hz to 144 Hz).
                 UpdateRenderTimerInterval();
-                // Push the new capabilities into any Working Space nodes
-                // so downstream binders see the live values immediately.
-                UpdateWorkingSpaceNodes();
                 UpdateStatusBar();
             });
         });
@@ -1212,13 +1235,12 @@ namespace winrt::ShaderLab::implementation
 
             int32_t count = static_cast<int32_t>(m_topoOrder.size());
             if (key == vkOpenBracket && curIdx > 0)
-                m_previewNodeId = m_topoOrder[curIdx - 1];
+                SelectPreviewNode(m_topoOrder[curIdx - 1]);
             else if (key == vkCloseBracket && curIdx < count - 1)
-                m_previewNodeId = m_topoOrder[curIdx + 1];
+                SelectPreviewNode(m_topoOrder[curIdx + 1]);
 
             UpdatePreviewOverlay();
             m_forceRender = true;
-            FitPreviewToView();
             args.Handled(true);
         }
     }
@@ -2679,15 +2701,9 @@ namespace winrt::ShaderLab::implementation
             bool isDataOnly = clickedNode && clickedNode->outputPins.empty();
 
             if (!isAnalysisEffect && !isParamNode && !isDataOnly)
-                m_previewNodeId = hitNodeId;
+                SelectPreviewNode(hitNodeId);   // fit on first view, else restore this node's pan/zoom
 
             m_forceRender = true;
-            // Defer the fit until the next eval populates cachedOutput. On
-            // the very first selection of a node (before its first eval),
-            // GetPreviewImageBounds() returns an empty rect, so an immediate
-            // FitPreviewToView() lands on the wrong zoom. The deferred path
-            // in OnRenderTick re-fits once bounds are available.
-            m_needsFitPreview = true;
             UpdatePreviewOverlay();
         }
         else
@@ -5025,9 +5041,12 @@ namespace winrt::ShaderLab::implementation
         try
         {
             winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
+            // _SRGB: encode the linear scRGB scene on write so the saved
+            // PNG is correctly gamma-encoded (pairs with the ImageLoader's
+            // decode-on-sample).
             D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_TARGET,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, D2D1_ALPHA_MODE_PREMULTIPLIED));
             winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bmpProps, renderBitmap.put()));
 
             winrt::com_ptr<ID2D1Image> oldTarget;
@@ -5043,7 +5062,7 @@ namespace winrt::ShaderLab::implementation
             winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
             D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, D2D1_ALPHA_MODE_PREMULTIPLIED));
             winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, cpuProps, cpuBitmap.put()));
             D2D1_POINT_2U destPt = { 0, 0 };
             D2D1_RECT_U srcRc = { 0, 0, w, h };
@@ -5407,30 +5426,33 @@ namespace winrt::ShaderLab::implementation
     // Preview pan/zoom
     // -----------------------------------------------------------------------
 
-    void MainWindow::FitPreviewToView()
+    // Returns true if a real fit was applied (viewport + evaluated image bounds
+    // both valid, or a permanent default for an infinite source); false if
+    // bounds/viewport aren't ready yet, so callers can defer and retry. Reads
+    // the UI-cached viewport (m_previewViewportW/H), so it is safe to call from
+    // the render worker right after an eval -- not only from the UI thread.
+    bool MainWindow::FitPreviewToView()
     {
-        auto vp = PreviewViewportDips();
-        float vpW = vp.width;
-        float vpH = vp.height;
+        float vpW = m_previewViewportW;
+        float vpH = m_previewViewportH;
         if (vpW <= 0 || vpH <= 0)
-        {
-            m_previewZoom = 1.0f;
-            m_previewPanX = 0.0f;
-            m_previewPanY = 0.0f;
-            return;
-        }
+            return false;   // viewport not measured yet -- defer
 
         auto bounds = GetPreviewImageBounds();
         float imgW = bounds.right - bounds.left;
         float imgH = bounds.bottom - bounds.top;
 
-        // For infinite or very large images (e.g., Flood), use a default view.
-        if (imgW <= 0 || imgH <= 0 || imgW > 100000.0f || imgH > 100000.0f)
+        if (imgW <= 0 || imgH <= 0)
+            return false;   // node not evaluated yet -- defer, leave view as-is
+
+        // For infinite / very large images (e.g., Flood), settle on a default
+        // view and report it as fitted so the pending-fit flag clears.
+        if (imgW > 100000.0f || imgH > 100000.0f)
         {
             m_previewZoom = 1.0f;
             m_previewPanX = 0.0f;
             m_previewPanY = 0.0f;
-            return;
+            return true;
         }
 
         // Scale to fit with some padding.
@@ -5441,6 +5463,32 @@ namespace winrt::ShaderLab::implementation
         // Center the image.
         m_previewPanX = (vpW - imgW * m_previewZoom) * 0.5f - bounds.left * m_previewZoom;
         m_previewPanY = (vpH - imgH * m_previewZoom) * 0.5f - bounds.top * m_previewZoom;
+        return true;
+    }
+
+    // Change which node the preview shows, remembering per-node pan/zoom.
+    // The outgoing node's current view is saved; the incoming node's saved
+    // view is restored, or -- if it's never been examined -- we request a fit
+    // (deferred until its bounds exist; the OnRenderTick path applies it).
+    void MainWindow::SelectPreviewNode(uint32_t nodeId)
+    {
+        if (nodeId == m_previewNodeId)
+            return;
+        if (m_previewNodeId != 0)
+            m_previewViews[m_previewNodeId] = { m_previewZoom, m_previewPanX, m_previewPanY };
+        m_previewNodeId = nodeId;
+        auto it = (nodeId != 0) ? m_previewViews.find(nodeId) : m_previewViews.end();
+        if (it != m_previewViews.end())
+        {
+            m_previewZoom = it->second.zoom;
+            m_previewPanX = it->second.panX;
+            m_previewPanY = it->second.panY;
+            m_needsFitPreview = false;
+        }
+        else
+        {
+            m_needsFitPreview = true;
+        }
     }
 
     // -----------------------------------------------------------------------

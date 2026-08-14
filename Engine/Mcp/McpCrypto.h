@@ -3,9 +3,9 @@
 // Session crypto for the MCP broker pipe (stdio-migration Step 4).
 //
 // Ephemeral P-256 ECDH -> HKDF-SHA256 -> AES-256-GCM, all via BCrypt —
-// no new dependency. X25519 was rejected: CNG named-curve support is
-// unverified at the manifest's declared 10.0.17763 floor and buys
-// nothing against an empty threat model.
+// no new dependency. X25519 was rejected: CNG named-curve support was
+// unverified at the OS floor declared at the time (10.0.17763; since
+// raised to 10.0.22621) and buys nothing against an empty threat model.
 //
 // WHY ENCRYPT AT ALL: not defence against a local attacker (same-user
 // isolation is not a hard boundary on Windows, and this must never be

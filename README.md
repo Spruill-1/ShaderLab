@@ -20,7 +20,7 @@ Release builds ship as **unsigned MSIX packages** — no signing certificate nee
    ```
 4. Launch ShaderLab from the Start menu.
 
-`Install.ps1` calls `Add-AppxPackage -AllowUnsigned`, which installs unsigned MSIX packages on systems with Developer Mode enabled (Windows 10 1903+ / Windows 11). The script installs the bundled dependency packages (Microsoft VCLibs, Windows App Runtime) for the host architecture first, then ShaderLab itself.
+`Install.ps1` calls `Add-AppxPackage -AllowUnsigned`, which installs unsigned MSIX packages on systems with Developer Mode enabled. ShaderLab requires **Windows 11 22H2 (build 22621) or later** — the display pipeline uses WinRT `AdvancedColorInfo` via desktop interop, which first shipped there. The script installs the bundled dependency packages (Microsoft VCLibs, Windows App Runtime) for the host architecture first, then ShaderLab itself.
 
 > ⚠️ **Known limitation — admin is required (unsigned + full-trust).** ShaderLab is a full-trust packaged app: its main app and the background MCP **Hub** both declare `Windows.FullTrustApplication` (executable activations). Per [Microsoft's unsigned-package rules](https://learn.microsoft.com/windows/msix/package/unsigned-package), an unsigned package containing executable content can only be installed **for all users, which requires elevation** — a per-user, non-elevated `Add-AppxPackage -AllowUnsigned` fails with `0x80073D2B` ("an unsigned package cannot include Executable activations"). Run `Install.ps1` from an **elevated** PowerShell. A **signed** release would install per-user with no admin; signing the release with a real code-signing certificate is the cleaner long-term fix (tracked as a release-process gap).
 
@@ -73,10 +73,10 @@ Core capabilities:
 - **Effect Designer** for authoring custom pixel & compute shaders with live HLSL compile + reflection-driven property generation.
 - **Analysis viewers** (Luminance / Channel / Chromaticity Statistics, CIE Histogram + Plot, Gamut Coverage, Luminance Heatmap, etc.) — all share the same compute-bridge architecture and route their outputs as SRVs to downstream consumers when possible.
 - **Tone-mapping suite** (D2D `HDR Tone Map`, ICtCp Tone Map, ICtCp Inverse Tone Map, ICtCp Gamut Map, etc.) operating in scRGB FP16 with PQ / HLG / sRGB transfer functions.
-- **HDR / WCG aware** — DXGI adapter-change tracking, ICC profile parsing, monitor primaries piped into Custom-gamut analysis effects via the Working Space node.
+- **HDR / WCG aware** — event-driven display tracking (WinRT `AdvancedColorInfoChanged`: HDR toggles, the Windows SDR-brightness slider, monitor moves), ICC profile parsing, monitor primaries piped into Custom-gamut analysis effects via the Working Space node.
 - **MCP integration** (stdio, via a broker: shim → hub → per-window sessions) + **headless host** for AI-agent and CI use; the MCP route layer lives in `ShaderLabEngine.dll` so headless and GUI hosts share the route implementations.
 
-Build: Visual Studio 2022 17.8+, Windows 10 SDK 10.0.26100+, C++/WinRT only (no C#).
+Build: Visual Studio 2022 17.8+, Windows 10 SDK 10.0.26100+, C++/WinRT only (no C#). Runtime: Windows 11 22H2 (10.0.22621)+.
 
 ---
 

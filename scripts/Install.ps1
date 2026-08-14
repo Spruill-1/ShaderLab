@@ -4,8 +4,9 @@
 
 .DESCRIPTION
     Calls Add-AppxPackage with -AllowUnsigned, which lets Windows install an
-    unsigned MSIX when Developer Mode is on (Windows 10 1903+ / Windows 11).
-    No code-signing certificate is required.
+    unsigned MSIX when Developer Mode is on. ShaderLab's manifest declares a
+    minimum OS of Windows 11 22H2 (10.0.22621); older builds are rejected at
+    install time. No code-signing certificate is required.
 
 .PARAMETER MsixPath
     Path to the .msix file. If omitted, looks for the first .msix next to this script.

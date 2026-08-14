@@ -54,24 +54,36 @@ namespace ShaderLab::Rendering
 
         D2D1_RECT_F bounds{};
         dc->GetImageLocalBounds(image, &bounds);
-        uint32_t w = static_cast<uint32_t>(bounds.right - bounds.left);
-        uint32_t h = static_cast<uint32_t>(bounds.bottom - bounds.top);
+        float srcW = bounds.right - bounds.left;
+        float srcH = bounds.bottom - bounds.top;
 
         dc->SetDpi(oldDpiX, oldDpiY);
 
-        if (w == 0 || h == 0) {
+        if (srcW <= 0.f || srcH <= 0.f) {
             result.status = CaptureNodeStatus::EmptyImage;
             return result;
         }
-        w = (std::min)(w, maxDim);
-        h = (std::min)(h, maxDim);
+
+        // Fit the LONGER edge to maxDim, preserving aspect ratio (never
+        // upscale). The previous code clamped each edge to maxDim
+        // independently and drew at native scale, so any image whose *both*
+        // dimensions exceeded maxDim was cropped to a maxDim-square of its
+        // top-left corner. Scale-to-fit captures the whole frame instead.
+        float scale = (std::min)(1.0f,
+            static_cast<float>(maxDim) / (std::max)(srcW, srcH));
+        uint32_t w = (std::max)(1u, static_cast<uint32_t>(srcW * scale + 0.5f));
+        uint32_t h = (std::max)(1u, static_cast<uint32_t>(srcH * scale + 0.5f));
 
         try
         {
             winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
+            // _SRGB target: the scene is linear scRGB; encode-on-write
+            // produces correctly gamma-encoded PNG bytes. (Paired with the
+            // loader's decode-on-sample — a plain-UNORM target would write
+            // linear values as bytes and captures would come out dark.)
             D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_TARGET,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, D2D1_ALPHA_MODE_PREMULTIPLIED));
             winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0,
                 bmpProps, renderBitmap.put()));
 
@@ -80,15 +92,21 @@ namespace ShaderLab::Rendering
             dc->SetTarget(renderBitmap.get());
             dc->BeginDraw();
             dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-            dc->SetTransform(D2D1::Matrix3x2F::Identity());
+            // Shift the image's local origin to 0,0, then scale to fit the
+            // (w,h) target so the whole frame lands aspect-correct.
+            dc->SetTransform(
+                D2D1::Matrix3x2F::Translation(-bounds.left, -bounds.top) *
+                D2D1::Matrix3x2F::Scale(scale, scale));
             dc->DrawImage(image);
             dc->EndDraw();
             dc->SetTarget(oldTarget.get());
 
             winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
+            // Same _SRGB variant as the render target — CopyFromBitmap
+            // requires matching formats; the bytes are already encoded.
             D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, D2D1_ALPHA_MODE_PREMULTIPLIED));
             winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0,
                 cpuProps, cpuBitmap.put()));
             D2D1_POINT_2U destPt = { 0, 0 };

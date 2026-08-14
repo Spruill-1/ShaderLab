@@ -84,8 +84,9 @@ Verify the peer **process**, not its claims, and keep it version-tolerant:
 
 Measured with throwaway packages, not reasoned about. **Platform:** Windows 11
 (10.0.26xxx), ARM64. Behaviour is expected to be identical on x64, but the two items
-marked ⚠ are worth re-checking if they ever look wrong, and none of this was verified
-at the manifest's declared `10.0.17763` floor.
+marked ⚠ are worth re-checking if they ever look wrong. (The manifest's declared
+floor was `10.0.17763` when these were measured; it has since been raised to
+`10.0.22621`, which only narrows the unverified range.)
 
 | Question | Answer |
 |---|---|
@@ -680,9 +681,9 @@ New `Engine/Mcp/McpFrame.{h,cpp}`, `McpCrypto.{h,cpp}`, `McpPeerIdentity.{h,cpp}
   sealed. Keep that split explicit in the type so it cannot drift.
 - 64 MB cap. A 4K inline capture is ~33 MB of base64; 8K would be ~130 MB, so either
   cap resolution server-side or fail explicitly rather than desyncing.
-- Crypto: BCrypt ephemeral **P-256**. X25519 was rejected — CNG named-curve support is
-  unverified at the declared `10.0.17763` floor and it buys nothing against an empty
-  threat model. Two traps: `BCryptDeriveKey` with `BCRYPT_KDF_RAW_SECRET` returns the
+- Crypto: BCrypt ephemeral **P-256**. X25519 was rejected — CNG named-curve support was
+  unverified at the OS floor declared at the time (`10.0.17763`; since raised to
+  `10.0.22621`) and it buys nothing against an empty threat model. Two traps: `BCryptDeriveKey` with `BCRYPT_KDF_RAW_SECRET` returns the
   secret **byte-reversed**, and CNG's `ECCPUBLICBLOB` carries a header, so don't size
   buffers against the raw curve.
 - Peer identity: `GetNamedPipeClientProcessId` / `ServerProcessId` → `OpenProcess`

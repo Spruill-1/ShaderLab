@@ -244,6 +244,12 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Rendering::DisplayMonitor     m_displayMonitor;
         ::ShaderLab::Rendering::GraphEvaluator     m_graphEvaluator;
 
+        // Keeps the Windows.System.DispatcherQueue we create for the UI
+        // thread alive (WinUI 3 threads only run the Microsoft.UI variant;
+        // DisplayInformation::GetForWindow needs the system one). Held as
+        // IUnknown so the ABI type stays out of this header.
+        winrt::com_ptr<::IUnknown>                 m_systemDqController;
+
         // Render-thread plumbing. The dispatcher carries closures from UI /
         // MCP / NodeGraphController producers to whichever thread owns
         // rendering. Until the actual worker thread spawns (Phase 7), the
@@ -658,8 +664,22 @@ namespace winrt::ShaderLab::implementation
         float m_previewPanX{ 0.0f };
         float m_previewPanY{ 0.0f };
         float m_previewZoom{ 1.0f };
-        bool  m_needsFitPreview{ false };
-        bool  m_forceRender{ true }; // Force first render + after pan/zoom changes
+        std::atomic<bool> m_needsFitPreview{ false };  // set on UI/dispatch, read+cleared on worker
+        // Per-node preview view memory: returning to a previously-examined node
+        // restores its pan/zoom; a node examined for the first time fits.
+        struct PreviewView { float zoom{ 1.0f }; float panX{ 0.0f }; float panY{ 0.0f }; };
+        std::unordered_map<uint32_t, PreviewView> m_previewViews;
+        // Preview panel size, cached on the UI thread (OnRenderTick) so the
+        // render worker can fit-to-view after an eval without touching XAML.
+        float m_previewViewportW{ 0.0f };
+        float m_previewViewportH{ 0.0f };
+        // Written from the UI thread, the render worker, and MCP dispatch
+        // closures — atomic for cross-thread visibility.
+        std::atomic<bool> m_forceRender{ true }; // Force first render + after pan/zoom changes
+        // Coalesces display-change UI refreshes: adaptive-color displays
+        // raise AdvancedColorInfoChanged at sensor rate, and only one
+        // status-bar/timer refresh may be queued at a time.
+        std::atomic<bool> m_displayUiRefreshPending{ false };
         bool m_isPreviewPanning{ false };
         float m_previewPanStartX{ 0.0f };
         float m_previewPanStartY{ 0.0f };
@@ -673,7 +693,8 @@ namespace winrt::ShaderLab::implementation
         float m_traceClickZoom{ 1.0f };
         bool m_traceOutOfBounds{ false };
         void UpdateCrosshairOverlay();
-        void FitPreviewToView();
+        bool FitPreviewToView();   // true if a real fit applied; false = defer (bounds/viewport not ready)
+        void SelectPreviewNode(uint32_t nodeId);
 
         // Trace swatch HDR swap chain.
         winrt::com_ptr<IDXGISwapChain1>   m_traceSwapChain;

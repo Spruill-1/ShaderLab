@@ -290,6 +290,19 @@ namespace winrt::ShaderLab::implementation
                 },
                 ::ShaderLab::Mcp::kRenderClosureTimeout);
         }
+        catch (const winrt::hresult_error& e)
+        {
+            // winrt::hresult_error does NOT derive from std::exception —
+            // without this catch a throwing WinRT call inside a route
+            // closure surfaces as an opaque 500 from McpRouter's catch(...).
+            ::ShaderLab::Mcp::Response err;
+            err.statusCode = 500;
+            err.body = std::string(R"({"error":")")
+                + ::ShaderLab::Mcp::JsonEscape(winrt::to_string(e.message()))
+                + R"("})";
+            err.contentType = "application/json";
+            return err;
+        }
         catch (const std::exception& e)
         {
             ::ShaderLab::Mcp::Response err;
@@ -627,8 +640,7 @@ namespace winrt::ShaderLab::implementation
                 auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
                 uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
                 return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
-                    m_previewNodeId = nodeId;
-                    m_needsFitPreview = true;
+                    SelectPreviewNode(nodeId);
                     m_forceRender = true;
                     m_graph.MarkAllDirty();
                     return { 200, R"({"ok":true})" };

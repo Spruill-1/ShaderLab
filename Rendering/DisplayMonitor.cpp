@@ -1,8 +1,76 @@
 #include "pch_engine.h"
 #include "DisplayMonitor.h"
 
+#include <windows.graphics.display.interop.h>
+
+namespace WGD = winrt::Windows::Graphics::Display;
+
 namespace ShaderLab::Rendering
 {
+    namespace
+    {
+        uint32_t ModeFromKind(WGD::AdvancedColorKind kind)
+        {
+            switch (kind)
+            {
+            case WGD::AdvancedColorKind::HighDynamicRange: return 2u;
+            case WGD::AdvancedColorKind::WideColorGamut:   return 1u;
+            default:                                       return 0u;
+            }
+        }
+
+        DisplayCapabilities CapsFromAdvancedColorInfo(WGD::AdvancedColorInfo const& aci)
+        {
+            DisplayCapabilities caps{};
+
+            caps.activeColorMode = ModeFromKind(aci.CurrentAdvancedColorKind());
+            caps.hdrEnabled      = (caps.activeColorMode == 2u);
+            caps.hdrSupported    = aci.IsAdvancedColorKindAvailable(WGD::AdvancedColorKind::HighDynamicRange);
+            caps.wcgSupported    = aci.IsAdvancedColorKindAvailable(WGD::AdvancedColorKind::WideColorGamut);
+            // AdvancedColorInfo has no separate user-toggle probe; mirror
+            // the active kind (see DisplayInfo.h field docs).
+            caps.hdrUserEnabled  = caps.hdrEnabled;
+            caps.wcgUserEnabled  = (caps.activeColorMode == 1u);
+
+            // Scanout depth isn't exposed; WCG/HDR modes composite FP16 and
+            // scan out 10-bit+, plain SDR is 8-bit.
+            caps.bitsPerColor = (caps.activeColorMode != 0u) ? 10u : 8u;
+
+            // Virtual/remote outputs can report zeroed luminance — keep the
+            // struct defaults (270-nit class panel) rather than 0 nits.
+            if (const float maxNits = aci.MaxLuminanceInNits(); maxNits > 0.0f)
+                caps.maxLuminanceNits = maxNits;
+            if (const float maxFF = aci.MaxAverageFullFrameLuminanceInNits(); maxFF > 0.0f)
+                caps.maxFullFrameLuminanceNits = maxFF;
+            caps.minLuminanceNits = (std::max)(aci.MinLuminanceInNits(), 0.0f);
+
+            // Tracks the Windows Settings "SDR content brightness" slider
+            // when HDR is active; 80 nits (scRGB 1.0) otherwise.
+            if (const float sdrWhite = aci.SdrWhiteLevelInNits(); sdrWhite > 0.0f)
+                caps.sdrWhiteLevelNits = sdrWhite;
+
+            // EDID chromaticities. All-zero points mean the output has no
+            // colorimetry data (virtual display) — keep the sRGB defaults.
+            const auto r = aci.RedPrimary();
+            const auto g = aci.GreenPrimary();
+            const auto b = aci.BluePrimary();
+            const auto w = aci.WhitePoint();
+            if (r.X + r.Y + g.X + g.Y + b.X + b.Y > 0.01)
+            {
+                caps.redPrimaryX   = static_cast<float>(r.X);
+                caps.redPrimaryY   = static_cast<float>(r.Y);
+                caps.greenPrimaryX = static_cast<float>(g.X);
+                caps.greenPrimaryY = static_cast<float>(g.Y);
+                caps.bluePrimaryX  = static_cast<float>(b.X);
+                caps.bluePrimaryY  = static_cast<float>(b.Y);
+                caps.whitePointX   = static_cast<float>(w.X);
+                caps.whitePointY   = static_cast<float>(w.Y);
+            }
+
+            return caps;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------
@@ -12,51 +80,121 @@ namespace ShaderLab::Rendering
         Shutdown();
     }
 
-    void DisplayMonitor::Initialize(HWND appHwnd, IDXGIFactory7* dxgiFactory)
+    void DisplayMonitor::Initialize(HWND appHwnd)
     {
-        m_appHwnd = appHwnd;
+        Shutdown();
 
-        // Take a fresh snapshot before anything else.
-        m_caps = QueryCurrentCapabilities();
-        m_lastMonitor = MonitorFromWindow(m_appHwnd, MONITOR_DEFAULTTOPRIMARY);
-
-        // Create a hidden message-only window to receive WM_DISPLAYCHANGE.
-        CreateMessageWindow();
-
-        // If a DXGI factory is available, register for adapter hot-plug.
-        if (dxgiFactory)
+        try
         {
-            RegisterAdapterChangeEvent(dxgiFactory);
+            // GetForWindow requires a top-level HWND owned by this thread
+            // and a running DispatcherQueue; it hooks the window's message
+            // loop so the returned DisplayInformation tracks monitor moves
+            // and raises AdvancedColorInfoChanged on this thread.
+            auto interop = winrt::get_activation_factory<
+                WGD::DisplayInformation, IDisplayInformationStaticsInterop>();
+
+            WGD::DisplayInformation info{ nullptr };
+            winrt::check_hresult(interop->GetForWindow(
+                appHwnd,
+                winrt::guid_of<WGD::DisplayInformation>(),
+                winrt::put_abi(info)));
+
+            {
+                std::lock_guard lock(m_capsMutex);
+                m_displayInfo = info;
+            }
+
+            m_aciRevoker = info.AdvancedColorInfoChanged(
+                winrt::auto_revoke,
+                [this](WGD::DisplayInformation const&,
+                       winrt::Windows::Foundation::IInspectable const&)
+                {
+                    OnDisplayChanged();
+                });
+
+            {
+                std::lock_guard lock(m_capsMutex);
+                m_lastError.clear();
+            }
+        }
+        catch (const winrt::hresult_error& e)
+        {
+            // No display binding — serve struct defaults, never fire.
+            std::lock_guard lock(m_capsMutex);
+            m_displayInfo = nullptr;
+            m_lastError = L"GetForWindow failed: " + std::wstring(e.message());
+        }
+        catch (...)
+        {
+            std::lock_guard lock(m_capsMutex);
+            m_displayInfo = nullptr;
+            m_lastError = L"GetForWindow failed (non-hresult exception)";
         }
 
-        // Poll for monitor changes (moving the window between displays).
-        m_monitorPollThread = std::jthread([this](std::stop_token stop)
+        const auto caps = QueryCurrentCapabilities();
         {
-            while (!stop.stop_requested())
-            {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                if (stop.stop_requested()) break;
+            std::lock_guard lock(m_capsMutex);
+            m_caps = caps;
+        }
+    }
 
-                HMONITOR current = MonitorFromWindow(m_appHwnd, MONITOR_DEFAULTTOPRIMARY);
-                if (current != m_lastMonitor)
-                {
-                    m_lastMonitor = current;
-                    OnDisplayChanged();
-                }
+    void DisplayMonitor::InitializeForPrimaryMonitor()
+    {
+        Shutdown();
+
+        try
+        {
+            // Snapshot-only binding for windowless hosts. Event
+            // registration would need a DispatcherQueue, which headless
+            // doesn't run — so no AdvancedColorInfoChanged subscription.
+            auto interop = winrt::get_activation_factory<
+                WGD::DisplayInformation, IDisplayInformationStaticsInterop>();
+
+            const HMONITOR primary =
+                MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+
+            WGD::DisplayInformation info{ nullptr };
+            winrt::check_hresult(interop->GetForMonitor(
+                primary,
+                winrt::guid_of<WGD::DisplayInformation>(),
+                winrt::put_abi(info)));
+
+            {
+                std::lock_guard lock(m_capsMutex);
+                m_displayInfo = info;
+                m_lastError.clear();
             }
-        });
+        }
+        catch (const winrt::hresult_error& e)
+        {
+            // No reachable display (CI, session 0) — struct defaults.
+            std::lock_guard lock(m_capsMutex);
+            m_displayInfo = nullptr;
+            m_lastError = L"GetForMonitor failed: " + std::wstring(e.message());
+        }
+        catch (...)
+        {
+            std::lock_guard lock(m_capsMutex);
+            m_displayInfo = nullptr;
+            m_lastError = L"GetForMonitor failed (non-hresult exception)";
+        }
+
+        const auto caps = QueryCurrentCapabilities();
+        {
+            std::lock_guard lock(m_capsMutex);
+            m_caps = caps;
+        }
     }
 
     void DisplayMonitor::Shutdown()
     {
-        if (m_monitorPollThread.joinable())
-        {
-            m_monitorPollThread.request_stop();
-            m_monitorPollThread.join();
-        }
-        UnregisterAdapterChangeEvent();
-        DestroyMessageWindow();
-        m_appHwnd = nullptr;
+        // Revoke on the owning (UI) thread: the event fires on this
+        // thread's DispatcherQueue, so after revoke() returns no handler
+        // is in flight and none will start.
+        m_aciRevoker.revoke();
+
+        std::lock_guard lock(m_capsMutex);
+        m_displayInfo = nullptr;
     }
 
     // -----------------------------------------------------------------------
@@ -65,406 +203,89 @@ namespace ShaderLab::Rendering
 
     DisplayCapabilities DisplayMonitor::QueryCurrentCapabilities() const
     {
-        DisplayCapabilities caps{};
-
-        auto output = GetOutputForWindow();
-        if (!output)
-            return caps;
-
-        DXGI_OUTPUT_DESC1 desc{};
-        if (SUCCEEDED(output->GetDesc1(&desc)))
+        WGD::DisplayInformation info{ nullptr };
         {
-            // AdvancedColorSupported flag alone isn't enough — the user
-            // must also have toggled "Use HDR" in Windows Settings, which
-            // sets AdvancedColor*Active* (aka the color-space check).
-            caps.hdrEnabled = (desc.ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-            caps.bitsPerColor = desc.BitsPerColor;
-            caps.colorSpace = desc.ColorSpace;
-            caps.maxLuminanceNits = desc.MaxLuminance;
-            caps.minLuminanceNits = desc.MinLuminance;
-            caps.maxFullFrameLuminanceNits = desc.MaxFullFrameLuminance;
-
-            // Monitor color primaries from DXGI EDID data.
-            caps.redPrimaryX   = desc.RedPrimary[0];
-            caps.redPrimaryY   = desc.RedPrimary[1];
-            caps.greenPrimaryX = desc.GreenPrimary[0];
-            caps.greenPrimaryY = desc.GreenPrimary[1];
-            caps.bluePrimaryX  = desc.BluePrimary[0];
-            caps.bluePrimaryY  = desc.BluePrimary[1];
-            caps.whitePointX   = desc.WhitePoint[0];
-            caps.whitePointY   = desc.WhitePoint[1];
-
-            // SDR white level: when HDR is on, this controls the nit value
-            // that scRGB 1.0 (a.k.a. SDR reference white) maps to on the
-            // display. Read it from the OS via DisplayConfigGetDeviceInfo
-            // so it tracks the user's Windows Settings -> Display -> HDR ->
-            // "SDR content brightness" slider. The returned SDRWhiteLevel
-            // is in 1/1000ths of 80 nits, per Microsoft's documentation.
-            // Fallback to 80 nits when the call isn't available (older
-            // Windows builds, non-DXGI outputs, virtual displays).
-            caps.sdrWhiteLevelNits = QuerySdrWhiteLevelForOutput(output.get());
-
-            // Pull ACM / advanced-color state (HDR/WCG support, user-enabled
-            // toggles, activeColorMode SDR/WCG/HDR) from DisplayConfig.
-            // Falls back to a hdrEnabled-derived activeColorMode internally
-            // when the type-15 query is unavailable.
-            QueryAdvancedColorInfo2(output.get(), caps);
+            std::lock_guard lock(m_capsMutex);
+            info = m_displayInfo;
         }
+        if (!info)
+            return DisplayCapabilities{};
 
-        return caps;
-    }
-
-    // -----------------------------------------------------------------------
-    // DXGI output for the app window
-    // -----------------------------------------------------------------------
-
-    winrt::com_ptr<IDXGIOutput6> DisplayMonitor::GetOutputForWindow() const
-    {
-        if (!m_appHwnd)
-            return nullptr;
-
-        // Find the monitor that contains the majority of the app window.
-        HMONITOR hmon = MonitorFromWindow(m_appHwnd, MONITOR_DEFAULTTOPRIMARY);
-
-        // Enumerate adapters → outputs to find the matching HMONITOR.
-        winrt::com_ptr<IDXGIFactory1> factory;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put()))))
-            return nullptr;
-
-        winrt::com_ptr<IDXGIAdapter1> adapter;
-        for (UINT ai = 0; factory->EnumAdapters1(ai, adapter.put()) != DXGI_ERROR_NOT_FOUND; ++ai)
+        try
         {
-            winrt::com_ptr<IDXGIOutput> output;
-            for (UINT oi = 0; adapter->EnumOutputs(oi, output.put()) != DXGI_ERROR_NOT_FOUND; ++oi)
-            {
-                DXGI_OUTPUT_DESC desc{};
-                if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == hmon)
-                {
-                    winrt::com_ptr<IDXGIOutput6> output6;
-                    if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(output6.put()))))
-                        return output6;
-                }
-                output = nullptr;
-            }
-            adapter = nullptr;
+            // DisplayInformation is agile — safe from any thread.
+            return CapsFromAdvancedColorInfo(info.GetAdvancedColorInfo());
         }
-
-        return nullptr;
-    }
-
-    // -----------------------------------------------------------------------
-    // SDR white level query (DisplayConfig)
-    // -----------------------------------------------------------------------
-
-    float DisplayMonitor::QuerySdrWhiteLevelForOutput(IDXGIOutput6* output)
-    {
-        // Default: 80 nits == scRGB 1.0 reference. Returned on any failure
-        // path (older Windows, virtual outputs, no DXGI desc).
-        constexpr float kDefaultNits = 80.0f;
-        if (!output) return kDefaultNits;
-
-        DXGI_OUTPUT_DESC desc{};
-        if (FAILED(output->GetDesc(&desc)) || desc.Monitor == nullptr)
-            return kDefaultNits;
-
-        // Resolve HMONITOR -> GDI device name -> source mode -> target.
-        MONITORINFOEXW mi{};
-        mi.cbSize = sizeof(mi);
-        if (!::GetMonitorInfoW(desc.Monitor, &mi))
-            return kDefaultNits;
-
-        UINT32 pathCount = 0;
-        UINT32 modeCount = 0;
-        if (::GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
-            return kDefaultNits;
-
-        std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
-        std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
-        if (::QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
-                                 &pathCount, paths.data(),
-                                 &modeCount, modes.data(),
-                                 nullptr) != ERROR_SUCCESS)
-            return kDefaultNits;
-        paths.resize(pathCount);
-        modes.resize(modeCount);
-
-        for (const auto& path : paths)
+        catch (const winrt::hresult_error& e)
         {
-            // Match by GDI device name on the source.
-            DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName{};
-            srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-            srcName.header.size = sizeof(srcName);
-            srcName.header.adapterId = path.sourceInfo.adapterId;
-            srcName.header.id = path.sourceInfo.id;
-            if (::DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
-                continue;
-            if (wcscmp(srcName.viewGdiDeviceName, mi.szDevice) != 0)
-                continue;
-
-            // SDRWhiteLevel is reported in 1/1000ths of 80 nits, i.e.
-            // nits = SDRWhiteLevel / 1000.0 * 80.0. Confirmed by the
-            // documented sample on Microsoft Learn.
-            DISPLAYCONFIG_SDR_WHITE_LEVEL whiteLevel{};
-            whiteLevel.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
-            whiteLevel.header.size = sizeof(whiteLevel);
-            whiteLevel.header.adapterId = path.targetInfo.adapterId;
-            whiteLevel.header.id = path.targetInfo.id;
-            if (::DisplayConfigGetDeviceInfo(&whiteLevel.header) != ERROR_SUCCESS)
-                return kDefaultNits;
-
-            const float nits = static_cast<float>(whiteLevel.SDRWhiteLevel) / 1000.0f * 80.0f;
-            if (nits >= 40.0f && nits <= 480.0f)  // sanity-clamp to the slider's UI range
-                return nits;
-            return kDefaultNits;
+            std::lock_guard lock(m_capsMutex);
+            m_lastError = L"GetAdvancedColorInfo failed: " + std::wstring(e.message());
+            return DisplayCapabilities{};
         }
-
-        return kDefaultNits;
-    }
-
-    // -----------------------------------------------------------------------
-    // Advanced color info (ACM / WCG / HDR mode)
-    // -----------------------------------------------------------------------
-
-    void DisplayMonitor::QueryAdvancedColorInfo2(IDXGIOutput6* output,
-                                                 DisplayCapabilities& caps)
-    {
-        // Default fallback: derive from already-populated caps.hdrEnabled
-        // (legacy DXGI_OUTPUT_DESC1 path). 0=SDR, 2=HDR. WCG isn't
-        // distinguishable without the type-15 query so we never report
-        // 1=WCG from the fallback.
-        caps.activeColorMode = caps.hdrEnabled ? 2u : 0u;
-        caps.hdrSupported    = caps.hdrEnabled;
-        caps.hdrUserEnabled  = caps.hdrEnabled;
-        caps.wcgSupported    = false;
-        caps.wcgUserEnabled  = false;
-
-        if (!output) return;
-
-        DXGI_OUTPUT_DESC desc{};
-        if (FAILED(output->GetDesc(&desc)) || desc.Monitor == nullptr)
-            return;
-
-        // Resolve HMONITOR -> GDI device name -> source path -> target ID.
-        MONITORINFOEXW mi{};
-        mi.cbSize = sizeof(mi);
-        if (!::GetMonitorInfoW(desc.Monitor, &mi))
-            return;
-
-        UINT32 pathCount = 0;
-        UINT32 modeCount = 0;
-        if (::GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
-            return;
-
-        std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
-        std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
-        if (::QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
-                                 &pathCount, paths.data(),
-                                 &modeCount, modes.data(),
-                                 nullptr) != ERROR_SUCCESS)
-            return;
-        paths.resize(pathCount);
-        modes.resize(modeCount);
-
-        for (const auto& path : paths)
+        catch (...)
         {
-            DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName{};
-            srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-            srcName.header.size = sizeof(srcName);
-            srcName.header.adapterId = path.sourceInfo.adapterId;
-            srcName.header.id = path.sourceInfo.id;
-            if (::DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
-                continue;
-            if (wcscmp(srcName.viewGdiDeviceName, mi.szDevice) != 0)
-                continue;
-
-            DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 info{};
-            info.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2;
-            info.header.size = sizeof(info);
-            info.header.adapterId = path.targetInfo.adapterId;
-            info.header.id = path.targetInfo.id;
-            if (::DisplayConfigGetDeviceInfo(&info.header) != ERROR_SUCCESS)
-                return; // keep the hdrEnabled-derived fallback
-
-            caps.hdrSupported   = info.highDynamicRangeSupported  != 0;
-            caps.hdrUserEnabled = info.highDynamicRangeUserEnabled != 0;
-            caps.wcgSupported   = info.wideColorSupported          != 0;
-            caps.wcgUserEnabled = info.wideColorUserEnabled        != 0;
-
-            // Map DISPLAYCONFIG_ADVANCED_COLOR_MODE -> 0/1/2.
-            switch (info.activeColorMode)
-            {
-            case DISPLAYCONFIG_ADVANCED_COLOR_MODE_SDR: caps.activeColorMode = 0; break;
-            case DISPLAYCONFIG_ADVANCED_COLOR_MODE_WCG: caps.activeColorMode = 1; break;
-            case DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR: caps.activeColorMode = 2; break;
-            default:                                    caps.activeColorMode = caps.hdrEnabled ? 2u : 0u; break;
-            }
-
-            // Reconcile hdrEnabled with the mode we just read. The seed value
-            // came from the legacy DXGI_OUTPUT_DESC1::ColorSpace heuristic,
-            // which reports G22_NONE_P709 whenever the output snapshot predates
-            // the panel entering HDR — the EDID-derived luminance/primaries in
-            // that same desc are still correct, so the stale color space is easy
-            // to miss. DisplayConfig is the live authority, so it wins here just
-            // as it does for bitsPerColor below. Without this, an HDR display
-            // reports "SDR" in the status bar and over MCP while
-            // activeColorMode correctly says HDR.
-            caps.hdrEnabled = (caps.activeColorMode == 2u);
-
-            // Trust DisplayConfig over the legacy color-space heuristic for
-            // bitsPerColor too — DXGI_OUTPUT_DESC1 reports 8 in many WCG
-            // configurations even though the actual scanout is 10-bit.
-            if (info.bitsPerColorChannel != 0)
-                caps.bitsPerColor = info.bitsPerColorChannel;
-
-            return;
+            std::lock_guard lock(m_capsMutex);
+            m_lastError = L"GetAdvancedColorInfo failed (non-hresult exception)";
+            return DisplayCapabilities{};
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // WM_DISPLAYCHANGE via hidden message-only window
-    // -----------------------------------------------------------------------
-
-    void DisplayMonitor::CreateMessageWindow()
-    {
-        WNDCLASSEXW wc{};
-        wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = &DisplayMonitor::WndProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.lpszClassName = L"ShaderLab_DisplayMonitor";
-
-        m_wndClass = RegisterClassExW(&wc);
-        if (!m_wndClass)
-            return;
-
-        // HWND_MESSAGE makes this a message-only window (invisible, no taskbar).
-        m_msgHwnd = CreateWindowExW(
-            0, MAKEINTATOM(m_wndClass), L"",
-            0, 0, 0, 0, 0,
-            HWND_MESSAGE, nullptr, wc.hInstance, this);
-    }
-
-    void DisplayMonitor::DestroyMessageWindow()
-    {
-        if (m_msgHwnd)
-        {
-            DestroyWindow(m_msgHwnd);
-            m_msgHwnd = nullptr;
-        }
-        if (m_wndClass)
-        {
-            UnregisterClassW(MAKEINTATOM(m_wndClass), GetModuleHandleW(nullptr));
-            m_wndClass = 0;
-        }
-    }
-
-    LRESULT CALLBACK DisplayMonitor::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-    {
-        if (msg == WM_CREATE)
-        {
-            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
-            return 0;
-        }
-
-        auto* self = reinterpret_cast<DisplayMonitor*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-
-        if (msg == WM_DISPLAYCHANGE && self)
-        {
-            self->OnDisplayChanged();
-            return 0;
-        }
-
-        return DefWindowProcW(hwnd, msg, wParam, lParam);
-    }
-
-    // -----------------------------------------------------------------------
-    // IDXGIFactory7 adapter-changed event
-    // -----------------------------------------------------------------------
-
-    void DisplayMonitor::RegisterAdapterChangeEvent(IDXGIFactory7* factory)
-    {
-        if (!factory)
-            return;
-
-        m_dxgiFactory.copy_from(factory);
-
-        m_adapterEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!m_adapterEvent)
-            return;
-
-        if (FAILED(m_dxgiFactory->RegisterAdaptersChangedEvent(m_adapterEvent, &m_adapterCookie)))
-        {
-            CloseHandle(m_adapterEvent);
-            m_adapterEvent = nullptr;
-            return;
-        }
-
-        // Background thread waits on the event and calls OnDisplayChanged.
-        m_adapterThread = std::jthread([this](std::stop_token stop)
-        {
-            while (!stop.stop_requested())
-            {
-                DWORD result = WaitForSingleObject(m_adapterEvent, 500 /*ms poll for stop*/);
-                if (result == WAIT_OBJECT_0)
-                {
-                    OnDisplayChanged();
-                }
-            }
-        });
-    }
-
-    void DisplayMonitor::UnregisterAdapterChangeEvent()
-    {
-        // Stop the wait thread first.
-        if (m_adapterThread.joinable())
-        {
-            m_adapterThread.request_stop();
-            m_adapterThread.join();
-        }
-
-        if (m_dxgiFactory && m_adapterCookie)
-        {
-            m_dxgiFactory->UnregisterAdaptersChangedEvent(m_adapterCookie);
-            m_adapterCookie = 0;
-        }
-
-        if (m_adapterEvent)
-        {
-            CloseHandle(m_adapterEvent);
-            m_adapterEvent = nullptr;
-        }
-
-        m_dxgiFactory = nullptr;
     }
 
     // -----------------------------------------------------------------------
     // Change detection & callback dispatch
     // -----------------------------------------------------------------------
 
+    bool DisplayMonitor::CapsChanged(const DisplayCapabilities& a,
+                                     const DisplayCapabilities& b)
+    {
+        const auto nits   = [](float x, float y) { return std::abs(x - y) > 0.5f; };
+        const auto black  = [](float x, float y) { return std::abs(x - y) > 0.01f; };
+        const auto chroma = [](float x, float y) { return std::abs(x - y) > 0.001f; };
+
+        return a.hdrEnabled      != b.hdrEnabled
+            || a.activeColorMode != b.activeColorMode
+            || a.bitsPerColor    != b.bitsPerColor
+            || a.hdrSupported    != b.hdrSupported
+            || a.hdrUserEnabled  != b.hdrUserEnabled
+            || a.wcgSupported    != b.wcgSupported
+            || a.wcgUserEnabled  != b.wcgUserEnabled
+            || nits(a.maxLuminanceNits, b.maxLuminanceNits)
+            || nits(a.maxFullFrameLuminanceNits, b.maxFullFrameLuminanceNits)
+            || nits(a.sdrWhiteLevelNits, b.sdrWhiteLevelNits)
+            || black(a.minLuminanceNits, b.minLuminanceNits)
+            || chroma(a.redPrimaryX,   b.redPrimaryX)
+            || chroma(a.redPrimaryY,   b.redPrimaryY)
+            || chroma(a.greenPrimaryX, b.greenPrimaryX)
+            || chroma(a.greenPrimaryY, b.greenPrimaryY)
+            || chroma(a.bluePrimaryX,  b.bluePrimaryX)
+            || chroma(a.bluePrimaryY,  b.bluePrimaryY)
+            || chroma(a.whitePointX,   b.whitePointX)
+            || chroma(a.whitePointY,   b.whitePointY);
+    }
+
     void DisplayMonitor::OnDisplayChanged()
     {
-        auto newCaps = QueryCurrentCapabilities();
+        // Query before locking — the WinRT read must not run under
+        // m_capsMutex (CachedCapabilities is called on hot paths).
+        const auto newCaps = QueryCurrentCapabilities();
 
-        // Only fire the callback if something meaningful changed.
         bool changed = false;
         {
             std::lock_guard lock(m_capsMutex);
-            changed = (newCaps.hdrEnabled != m_caps.hdrEnabled)
-                || (newCaps.colorSpace != m_caps.colorSpace)
-                || (newCaps.bitsPerColor != m_caps.bitsPerColor)
-                || (std::abs(newCaps.maxLuminanceNits - m_caps.maxLuminanceNits) > 0.5f)
-                || (std::abs(newCaps.redPrimaryX - m_caps.redPrimaryX) > 0.001f)
-                || (std::abs(newCaps.greenPrimaryX - m_caps.greenPrimaryX) > 0.001f)
-                || (std::abs(newCaps.bluePrimaryX - m_caps.bluePrimaryX) > 0.001f);
+            changed = CapsChanged(m_caps, newCaps);
             m_caps = newCaps;
         }
+        if (!changed)
+            return;
 
-        if (changed)
+        // Copy the callback out so subscriber code never runs under our
+        // lock (re-entrant SetCallback would otherwise self-deadlock).
+        DisplayChangeCallback cb;
         {
             std::lock_guard lock(m_callbackMutex);
-            if (m_callback)
-                m_callback(newCaps);
+            cb = m_callback;
         }
+        if (cb)
+            cb(newCaps);
     }
 
     void DisplayMonitor::SetCallback(DisplayChangeCallback callback)
@@ -485,26 +306,36 @@ namespace ShaderLab::Rendering
             m_simulatedProfile->isSimulated = true;
         }
 
-        // Notify subscribers with the simulated capabilities.
-        std::lock_guard lock(m_callbackMutex);
-        if (m_callback)
-            m_callback(profile.caps);
+        DisplayChangeCallback cb;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            cb = m_callback;
+        }
+        if (cb)
+            cb(profile.caps);
     }
 
     void DisplayMonitor::ClearSimulatedProfile()
     {
-        DisplayCapabilities liveCaps{};
         {
             std::lock_guard lock(m_capsMutex);
             m_simulatedProfile.reset();
-            // Re-query live display to get current state.
-            m_caps = QueryCurrentCapabilities();
-            liveCaps = m_caps;
         }
 
-        std::lock_guard lock(m_callbackMutex);
-        if (m_callback)
-            m_callback(liveCaps);
+        // Re-query live state outside the lock, then publish.
+        const auto liveCaps = QueryCurrentCapabilities();
+        {
+            std::lock_guard lock(m_capsMutex);
+            m_caps = liveCaps;
+        }
+
+        DisplayChangeCallback cb;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            cb = m_callback;
+        }
+        if (cb)
+            cb(liveCaps);
     }
 
     DisplayProfile DisplayMonitor::ActiveProfile() const

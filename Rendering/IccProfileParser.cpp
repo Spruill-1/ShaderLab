@@ -216,17 +216,9 @@ namespace ShaderLab::Rendering
 
 		p.caps.maxLuminanceNits = lum;
 		p.caps.hdrEnabled = (lum > 400.0f);
-		p.caps.bitsPerColor = p.caps.hdrEnabled ? 10u : 8u;
-		p.caps.colorSpace = p.caps.hdrEnabled
-			? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-			: DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 		p.caps.sdrWhiteLevelNits = 80.0f;
 		p.caps.minLuminanceNits = p.caps.hdrEnabled ? 0.05f : 0.5f;
 		p.caps.maxFullFrameLuminanceNits = (std::min)(lum, lum * 0.8f + 100.0f);
-
-		// Reuse the preset helper to stamp coherent ACM/WCG/activeColorMode
-		// flags into the simulated caps, derived from hdrEnabled.
-		StampSimulatedColorMode(p.caps);
 
 		p.primaryRed   = icc.primaryRed;
 		p.primaryGreen = icc.primaryGreen;
@@ -234,6 +226,10 @@ namespace ShaderLab::Rendering
 		p.whitePoint   = icc.whitePoint;
 
 		p.gamut = DetectGamut(icc.primaryRed, icc.primaryGreen, icc.primaryBlue);
+
+		// Reuse the preset helper to stamp coherent ACM/WCG/activeColorMode
+		// flags + bits-per-channel, derived from hdrEnabled and the gamut.
+		StampSimulatedColorMode(p);
 		p.profileName = icc.description.empty() ? L"ICC Profile" : icc.description;
 		p.isSimulated = true;
 

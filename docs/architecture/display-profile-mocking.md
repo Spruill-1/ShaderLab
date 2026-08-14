@@ -7,11 +7,13 @@ classDiagram
     class DisplayCapabilities {
         +bool hdrEnabled
         +uint32_t bitsPerColor
-        +DXGI_COLOR_SPACE_TYPE colorSpace
         +float sdrWhiteLevelNits
         +float maxLuminanceNits
         +float minLuminanceNits
         +float maxFullFrameLuminanceNits
+        +float redPrimaryX/Y greenPrimaryX/Y bluePrimaryX/Y whitePointX/Y
+        +uint32_t activeColorMode
+        +bool hdrSupported hdrUserEnabled wcgSupported wcgUserEnabled
     }
 
     class ChromaticityXY {
@@ -91,7 +93,7 @@ sequenceDiagram
 
     alt Clear simulation
         UI->>DM: ClearSimulatedProfile()
-        DM->>DM: Re-query live DXGI output
+        DM->>DM: Re-query live AdvancedColorInfo
         DM->>CB: callback(liveCaps)
     end
 ```

@@ -2,7 +2,7 @@
 
 #include "pch.h"
 #include "PipelineFormat.h"
-#include "DisplayMonitor.h"
+#include "DisplayInfo.h"
 
 namespace ShaderLab::Rendering
 {
