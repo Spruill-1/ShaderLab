@@ -44,7 +44,7 @@ ShaderLab/
 │   ├── EngineMcpRoutes.h / .cpp    # 25 engine-pure routes + IEngineCommandSink + EngineContext
 │
 ├── Tests/                          # ShaderLabTests + smoke scripts
-│   ├── TestRunner.cpp              # 261 tests total (graph, evaluator, dispatcher [+fail-fast], snapshot, bytecode cache, router, JSON-RPC, frame/crypto/peer/channel, math bench)
+│   ├── TestRunner.cpp              # 289 tests (the runner prints the authoritative total) (graph, evaluator, dispatcher [+fail-fast], snapshot, bytecode cache, router, JSON-RPC, frame/crypto/peer/channel, math bench)
 │   ├── TestCommon.h                # Shared TEST() macro across TUs
 │   ├── ShaderTestBench.h / .cpp    # D3D11 compute test harness for HLSL math
 │   ├── Math/                       # 51 HLSL math tests
@@ -93,7 +93,7 @@ ShaderLab/
 │   ├── MathExpression.h / .cpp     # ExprTk-backed expression evaluator (PCH disabled on .cpp)
 │
 ├── Effects/                        # Engine: built-in effect wrappers + custom effect base
-│   ├── ShaderLabEffects.h / .cpp   # 35 ShaderLab effects (versioned) — embedded HLSL
+│   ├── ShaderLabEffects.h / .cpp   # 36 ShaderLab effects (versioned) — embedded HLSL
 │   ├── ColorMath.cpp               # Shared HLSL color math library (extracted from ShaderLabEffects)
 │   ├── PropertyMetadata.h          # Effect property metadata for UI generation
 │   ├── ImageLoader.h / .cpp        # WIC HDR/SDR image loading

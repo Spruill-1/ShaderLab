@@ -1,14 +1,14 @@
 # MCP Server (AI Agent Integration)
 
-ShaderLab includes an embedded HTTP server implementing the **Model Context Protocol (MCP)** JSON-RPC 2.0 for programmatic control by AI agents. The full protocol surface ships in the engine DLL: the route registry + HTTP listener (`Engine/Mcp/McpRouter.{h,cpp}`), the JSON-RPC dispatcher (`McpJsonRpc.{h,cpp}` — `initialize`, `tools/*`, `resources/*`, `ping`), the declarative 39-tool catalog (`McpToolCatalog.{h,cpp}`), and **25 engine-pure routes**. Both hosts get the identical dispatcher via `RegisterJsonRpcEndpoint`; `ShaderLabHeadless --serve` therefore answers `tools/call` with no GUI at all (see [Engine / Host Split](../architecture/engine-host-split.md)). A further **16 app-side routes** (view/preview/GPU tools, `/context`, `/perf`, node logs) live in `MainWindow.McpRoutes.cpp`; calling a tool whose backing route is absent on the answering host returns an `isError` "Tool not available on this host" result. Handlers receive `(path, query, body)`; the router owns the query split, so `?since=`-style parameters work identically over HTTP, the tools ladder, and headless scripts.
+ShaderLab implements the **Model Context Protocol (MCP)** JSON-RPC 2.0 for programmatic control by AI agents, carried over **stdio via the broker** (shim → hub → session over named pipes). The full protocol surface ships in the engine DLL: the route registry (`Engine/Mcp/McpRouter.{h,cpp}`), the JSON-RPC dispatcher (`McpJsonRpc.{h,cpp}` — `initialize`, `tools/*`, `resources/*`, `ping`), the declarative 39-tool catalog (`McpToolCatalog.{h,cpp}`), and **25 engine-pure routes**. Both hosts get the identical dispatcher via `RegisterJsonRpcEndpoint`; `ShaderLabHeadless --mcp-session` therefore answers `tools/call` with no GUI at all (see [Engine / Host Split](../architecture/engine-host-split.md)). A further **16 app-side routes** (view/preview/GPU tools, `/context`, `/perf`, node logs) live in `MainWindow.McpRoutes.cpp`; calling a tool whose backing route is absent on the answering host returns an `isError` "Tool not available on this host" result. Handlers receive `(path, query, body)`; the router owns the query split, so `?since=`-style parameters work identically across the tools ladder and headless scripts.
 
 **Protocol version: `2025-06-18`.** Batch (JSON array) requests are rejected with `-32600` — 2025-06-18 removed batching from MCP, making it the first revision this server is actually conformant with. Responses are single-line JSON; notifications (absent `id`) produce no reply body (zero bytes on the wire).
 
-> **Transport migration in progress.** The HTTP transport described here is being
-> replaced by a stdio shim + named-pipe broker so multiple ShaderLab windows
-> become individually addressable. Plan, rationale, and status:
-> [mcp-stdio-migration.md](../development/mcp-stdio-migration.md). Everything on
-> this page describes the **current** (HTTP) behaviour.
+> **Transport migration complete.** The embedded HTTP listener was deleted in
+> migration Step 9 (decision #71, engine ABI **3**); the stdio shim + named-pipe
+> broker is now the only transport, which is what makes multiple ShaderLab windows
+> individually addressable. Plan and rationale:
+> [mcp-stdio-migration.md](../development/mcp-stdio-migration.md).
 
 ## Connection
 

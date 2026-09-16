@@ -1046,6 +1046,12 @@ namespace ShaderLab::Mcp
                                     else if (want == L"bool") node->properties[key] = (sval == L"true" || sval == L"1");
                                     else                      node->properties[key] = sval;
                                 }
+                                // Not-a-number: keep the raw string rather than
+                                // dropping the write. Note this lands back in
+                                // the broken state the coercion above exists to
+                                // prevent (a wstring in a numeric slot), so it
+                                // should only ever be reached for a genuinely
+                                // non-numeric value the caller sent by mistake.
                                 catch (...) { node->properties[key] = sval; }
                                 break;
                             }
@@ -1231,6 +1237,9 @@ namespace ShaderLab::Mcp
                                     else if (want == L"bool") node.properties[key] = (sval == L"true" || sval == L"1");
                                     else                      node.properties[key] = sval;
                                 }
+                                // See the matching note in /graph/set-property:
+                                // keeping the raw string preserves the write but
+                                // lands back in the state the coercion prevents.
                                 catch (...) { node.properties[key] = sval; }
                                 break;
                             }

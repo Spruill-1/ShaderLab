@@ -602,10 +602,16 @@ namespace winrt::ShaderLab::implementation
         auto tComputeEnd = std::chrono::high_resolution_clock::now();
         uint32_t computeCount = static_cast<uint32_t>(m_graphEvaluator.DeferredComputeCount());
 
-        // Set DPI to 96 to match WinUI DIPs.
+        // Set DPI to 96 to match WinUI DIPs — but only when the context
+        // isn't already there: a real per-frame DPI flip invalidates every
+        // D2D1_PROPERTY_CACHED effect intermediate in the context. The
+        // render context is pinned at 96 (RenderEngine), so this is
+        // normally a no-op kept as a safety net.
         float oldDpiX, oldDpiY;
         dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
+        const bool dpiFlip = (oldDpiX != 96.0f || oldDpiY != 96.0f);
+        if (dpiFlip)
+            dc->SetDpi(96.0f, 96.0f);
 
         dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
 
@@ -619,7 +625,8 @@ namespace winrt::ShaderLab::implementation
             dc->DrawImage(previewImage);
 
         dc->SetTransform(D2D1::Matrix3x2F::Identity());
-        dc->SetDpi(oldDpiX, oldDpiY);
+        if (dpiFlip)
+            dc->SetDpi(oldDpiX, oldDpiY);
 
         auto tDrawEnd = std::chrono::high_resolution_clock::now();
 

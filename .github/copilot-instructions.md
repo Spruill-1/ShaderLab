@@ -1,5 +1,11 @@
 # Copilot Instructions
 
+> **Companion file:** [`CLAUDE.md`](../CLAUDE.md) at the repo root is the equivalent
+> for Claude Code, and carries the machine-specific build / deploy / MCP procedures
+> that live nowhere else (further detail in `.claude/skills/`). The two files overlap
+> deliberately on the rules that cause crashes or build failures — the graph-access
+> threading rule and the D2D effect gotchas. **Change one, check the other.**
+
 ## Project Identity
 
 ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging Direct2D shader effects with full HDR/WCG support. The primary focus is building tone-mapping and color-correction effects as graph nodes, with empirical fidelity tooling — Delta E Comparator + Luminance Statistics + Working Space node form a closed-loop CIEDE2000 readout that lets us tune effect parameters against measured color accuracy, not visual impression.
@@ -13,10 +19,17 @@ ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, 
 ## Build
 
 - Clone with `--recurse-submodules` (or run `git submodule update --init --recursive`). `exprtk` and `miniz` are git submodules under `third_party/`, pinned to explicit commits; `third_party/miniz_export.h` is an in-tree shim, not part of the submodule. See [build.md](../docs/development/build.md).
-- Open `ShaderLab.slnx` in Visual Studio 2022 17.8+
+- Open `ShaderLab.slnx` in Visual Studio 2022 17.8+ (VS 2026 / v18 also supported)
 - NuGet packages restore automatically (packages.config style, not PackageReference)
-- Build target: **Debug | x64** (also supports ARM64, Release)
-- No command-line build scripts exist; use MSBuild via VS or `msbuild ShaderLab.vcxproj /p:Configuration=Debug /p:Platform=x64`
+- Configurations: **Debug | x64** and **Debug | ARM64** (plus Release for both).
+  CI builds x64 on `windows-latest` and ARM64 natively on `windows-11-arm`.
+- No wrapper build scripts exist; use MSBuild via VS or
+  `msbuild ShaderLab.slnx /p:Configuration=Debug /p:Platform=x64`
+- **Building ARM64 on an ARM64 host** needs the `arm64\MSBuild.exe` binary and the
+  `Microsoft.VisualStudio.Component.UWP.VC.ARM64` component — the default MSBuild is
+  32-bit and fails with misleading `C3859`/`C1076` PCH errors. Full explanation in
+  [build.md](../docs/development/build.md); the commands are in
+  [`CLAUDE.md`](../CLAUDE.md) and `.claude/skills/shaderlab-build/`.
 - Required: Windows App SDK 1.8, Windows 10 SDK 10.0.26100+
 - Linked native libs: `d3d11.lib`, `d2d1.lib`, `dxgi.lib`, `d3dcompiler.lib`, `dxguid.lib`, `windowscodecs.lib`
 - `/bigobj` is enabled; language standard is C++20 (VS 18+) or C++17 (VS 17)
@@ -46,7 +59,7 @@ ShaderLabEngine.dll (host-agnostic)
   │   ├── IccProfileParser      — mscms.dll-based ICC reader
   │   └── MathExpression        — ExprTk-backed expression evaluator (Numeric Expression node)
   ├── Effects/
-  │   ├── ShaderLabEffects      — 35 ShaderLab effects (analysis/source/tone-map/parameter) with embedded HLSL
+  │   ├── ShaderLabEffects      — 36 ShaderLab effects (analysis/source/tone-map/parameter) with embedded HLSL
   │   ├── ColorMath.cpp         — Shared HLSL color math library (BT.709/BT.2020/P3, PQ/HLG, ICtCp)
   │   ├── EffectRegistry        — 40+ wrapped D2D effects across 9 categories
   │   ├── ShaderCompiler        — D3DCompile + D3DReflect + ID3DInclude resolver for shaderlab_params.hlsli
@@ -162,6 +175,32 @@ When creating new D2D effects (the core purpose of this tool):
 5. Register effects in `Effects::RegisterEngineD2DEffects()` at engine init (called from app + headless + tests)
 6. Follow `CustomPixelShaderEffect` / `CustomComputeShaderEffect` as templates
 
+## Looking at HDR Output (an AI agent cannot, directly)
+
+An agent's vision input is 8-bit SDR. A captured PNG of an HDR frame has already
+clipped everything above scRGB 1.0 (80 nits) and discarded the negative components
+that carry wide-gamut chroma. *Seeing* an HDR image requires tone mapping it — which
+in this project is usually the thing under test, so judging a tone mapper from a
+tone-mapped screenshot is circular. In order of preference:
+
+1. **Numbers first** — `read_pixel_region` / headless `--pixels` (FP32, unclipped) and
+   `read_analysis_output` on a Statistics node. Ground truth.
+2. **Measured difference** — `Delta E Comparator` with `Method = dE ITP (BT.2124)` →
+   `Luminance Statistics` → Mean / p95 / Max. Use ITP rather than the CIE Lab metrics
+   for anything HDR or wide-gamut; Lab leaves its fitted domain above ~100 nits
+   (measured on a 1100 vs 1000 nit step: ITP 7.47, CIEDE2000 118.09, CIE76 253.26).
+3. **Diagnostic renders when you need to look** — these encode HDR facts into an
+   SDR-visible image, so capturing them is legitimate: `Nit Map`, `Luminance Heatmap`,
+   `Gamut Highlight`, `CIE Chromaticity Plot`, `ICtCp Boundary`, and
+   `Delta E Comparator` in Heatmap mode.
+4. **A raw capture of HDR content** — composition and gross sanity only.
+
+**State which path was used, and flag when a verdict passes through a tone map or is a
+taste call rather than a measurement.** `render_capture` / `render_capture_node` clip
+to SDR and their MCP tool descriptions say so. Headless `--output foo.jxr` writes a
+lossless full-range artifact, but it still cannot be viewed — it is for archiving,
+golden-image comparison, and round-tripping back in as an Image source.
+
 ## Tone Mapping & Color Correction (Primary Development Focus)
 
 Active development centers on **tone-mapping and color-correction effects authored as graph nodes** — not a built-in tone-mapping pass. The render pipeline is intentionally pass-through (scRGB FP16 in, scRGB FP16 out); users compose tone mappers and color correction from graph effects, validate them with empirical fidelity tooling, and iterate.
@@ -179,7 +218,7 @@ Active development centers on **tone-mapping and color-correction effects author
 - **Display monitoring**: Event-driven — `DisplayInformation` bound to the main window (`IDisplayInformationStaticsInterop::GetForWindow`) raises `AdvancedColorInfoChanged` for HDR toggles, the SDR-brightness slider, and monitor moves; one `AdvancedColorInfo` snapshot feeds all of `DisplayCapabilities`. Requires Win11 22H2 (10.0.22621 min OS). Headless snapshots the primary monitor via `GetForMonitor` (no events).
 - **Graph serialization**: `Windows.Data.Json` (zero extra dependencies). GUID fields use `StringFromGUID2`/`CLSIDFromString`.
 - **Effect registry**: Singleton with 40+ built-in D2D effects across 9 categories. Case-insensitive name lookup.
-- **ShaderLab effects library**: 33 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map + Scale), Source / Generator, Composition (Split Comparison), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use; bytecode cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` (decision #58 catalog → see [builtin-catalog.md](../docs/effects/builtin-catalog.md) for the full per-effect type table).
+- **ShaderLab effects library**: 36 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map + Scale), Source / Generator, Composition (Split Comparison), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use; bytecode cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` (decision #58 catalog → see [builtin-catalog.md](../docs/effects/builtin-catalog.md) for the full per-effect type table).
 - **MCP server**: JSON-RPC 2.0 (protocol 2025-06-18, batching rejected) over **stdio via the broker** — the embedded HTTP listener was deleted in stdio-migration Step 9 (decision #71, superseding #31/#58; engine ABI **3**). The router, dispatcher, 39-tool catalog + 25 engine-pure routes live in `Engine/Mcp/` (handlers take `(path, query, body)`); 16 app-side routes stay in `MainWindow.McpRoutes.cpp`. Each host registers as a hub **session** (`McpSessionClient`, GUID-identified); a client's shim (`ShaderLabMcpBroker --stdio`, unpackaged, distributed to `%LOCALAPPDATA%\ShaderLab\bin\`) activates the packaged hub and pins a session with `use_session`. Both hosts register the same engine-side route set through `IEngineCommandSink`: pure mutation closures dispatched via `sink.Dispatch`, with 8 event hooks (`OnNodeAdded`, `OnNodeRemoved`, `OnNodeChanged`, `OnGraphCleared`, `OnGraphLoaded`, `OnGraphStructureChanged`, `OnCustomEffectRecompiled`, `OnDisplayProfileChanged`) the GUI overrides to keep its UI in sync. CI drives `RunTests.ps1` through a shim against a headless `--mcp-session`.
 - **Versioning**: `Version.h` defines app version (currently **1.7.3**) and graph format version (2). Both are stored in saved graphs. Forward compatibility check on load. `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` is independent — bumped manually on engine ABI breaks; mismatch between header and DLL aborts startup with a friendly message-box.
 - **Refresh-rate-driven render loop on the worker thread**: the render worker `std::jthread` runs the graph evaluate at the active monitor's refresh rate (clamped to 60–240 Hz). Dirty-gated: skips evaluate when no nodes changed, no output window is open, and `m_forceRender` is false. The UI thread runs a `DispatcherQueueTimer` at the same rate, but its body is just "drain dispatcher + blit offscreen + Present1" — sub-ms cost. The interval is re-applied on every display change so dragging the window across monitors picks up the new rate.
@@ -216,7 +255,7 @@ The built-in effects library lives in `Effects/ShaderLabEffects.h/.cpp`:
 - **Embedded HLSL**: Each effect's shader code is stored as a `const char*` string constant. No external `.hlsl` files.
 - **Shared color math**: A common HLSL library (BT.709/BT.2020/P3 color matrices, PQ/HLG transfer functions, CIE XYZ↔xy conversions, luminance calculations) is prepended to each shader at compile time.
 - **Auto-compile**: Effects are compiled via `ShaderCompiler` at first use (when added to graph). Compiled bytecode is cached.
-- **Categories** (33 effects total):
+- **Categories** (36 effects total):
   - **Analysis → Heatmaps** (D3D11 Compute with image output): Luminance Heatmap, Luminance Highlight, Delta E Comparator. **Pixel Shader**: Gamut Highlight, Nit Map.
   - **Analysis → Scopes**: CIE Histogram (D3D11 Compute), CIE Chromaticity Plot (Pixel Shader). (Vectorscope and Waveform Monitor were removed in Phase 8 — they no longer ship.)
   - **Analysis → Statistics** (D3D11 Compute, data-only): Channel Statistics, Luminance Statistics, Chromaticity Statistics, Image Info.

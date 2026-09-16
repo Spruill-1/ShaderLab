@@ -329,6 +329,15 @@ void main(uint3 dtid : SV_DispatchThreadID)
         return node;
     }
 
+    // Default edge length for synthetic sources and diagram-style viewers.
+    // Held at 1024 rather than 512: two-input pixel-shader effects (Split
+    // Comparison et al.) render displaced when fed inputs <= 512px, so a
+    // smaller default silently breaks any A/B comparison built on these
+    // nodes. See the "Known issues" entry in CHANGELOG.md. The parameter
+    // minimums are deliberately left where they are -- a small diagram is
+    // still useful standalone, and cheap for the O(N)-per-pixel viewers.
+    static constexpr float kDefaultDiagramSize = 1024.0f;
+
     void ShaderLabEffects::RegisterAll()
     {
         const auto& colorMath = GetColorMathHLSL();
@@ -744,7 +753,7 @@ float4 main(
                 { L"ShowP3",       L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"ShowRec2020",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"Brightness",   L"float", 2.0f,  0.1f, 10.0f, 0.1f },
-                { L"DiagramSize",  L"float", 512.0f, 128.0f, 4096.0f, 64.0f },
+                { L"DiagramSize",  L"float", kDefaultDiagramSize, 128.0f, 4096.0f, 64.0f },
                 // Custom-primary triangle ("monitor" gamut). Bind these to
                 // `Working Space.RedPrimary` etc. for monitor-matched plotting.
                 { L"ShowMonitor",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
@@ -829,7 +838,7 @@ float4 main(
             desc.parameters = {
                 { L"Gamut",      L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020", L"Custom" } },
                 { L"Luminance",  L"float", 80.0f, 0.01f, 10000.0f, 10.0f },
-                { L"OutputSize", L"float", 512.0f, 128.0f, 4096.0f, 64.0f },
+                { L"OutputSize", L"float", kDefaultDiagramSize, 128.0f, 4096.0f, 64.0f },
                 { L"RedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"Gamut == 3" },
                 { L"GreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"Gamut == 3" },
                 { L"BluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"Gamut == 3" },
@@ -925,7 +934,7 @@ float4 main(
 
 cbuffer constants : register(b0) {
     float Frequency;   // default 0.5
-    float PlateSize;   // pixels (default 512)
+    float PlateSize;   // pixels (default 1024)
 };
 
 float4 main(
@@ -950,7 +959,7 @@ float4 main(
             desc.inputNames = {};
             desc.parameters = {
                 { L"Frequency", L"float", 0.5f, 0.01f, 5.0f, 0.01f },
-                { L"PlateSize", L"float", 512.0f, 64.0f, 2048.0f, 64.0f },
+                { L"PlateSize", L"float", kDefaultDiagramSize, 64.0f, 2048.0f, 64.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -969,7 +978,7 @@ cbuffer constants : register(b0) {
     float EndR;     // end color (scRGB)
     float EndG;
     float EndB;
-    float GradSize; // pixels (default 512)
+    float GradSize; // pixels (default 1024)
 };
 
 float4 main(
@@ -1011,7 +1020,7 @@ float4 main(
                 { L"EndR",         L"float", 1.0f, -1.0f, 125.0f, 0.01f },
                 { L"EndG",         L"float", 1.0f, -1.0f, 125.0f, 0.01f },
                 { L"EndB",         L"float", 1.0f, -1.0f, 125.0f, 0.01f },
-                { L"GradSize",     L"float", 512.0f, 64.0f, 2048.0f, 64.0f },
+                { L"GradSize",     L"float", kDefaultDiagramSize, 64.0f, 2048.0f, 64.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1023,7 +1032,7 @@ float4 main(
 // Source effect: no input required.
 
 cbuffer constants : register(b0) {
-    float PatternSize; // pixels (default 512)
+    float PatternSize; // pixels (default 1024)
 };
 
 float4 main(
@@ -1092,7 +1101,7 @@ float4 main(
             desc.hlslSource = colorMath + hdrTestHLSL;
             desc.inputNames = {};
             desc.parameters = {
-                { L"PatternSize", L"float", 512.0f, 256.0f, 2048.0f, 64.0f },
+                { L"PatternSize", L"float", kDefaultDiagramSize, 256.0f, 2048.0f, 64.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1102,7 +1111,13 @@ float4 main(
         {
             static const std::string deltaEHLSL = R"HLSL(
 // Delta E Comparator -- D3D11 compute, per-pixel color difference between
-// two inputs (Reference at t0, Test at t1). Supports CIE76, CIE94, CIEDE2000.
+// two inputs (Reference at t0, Test at t1). Supports CIE76, CIE94, CIEDE2000
+// and dE ITP (BT.2124).
+//
+// Prefer ITP for anything HDR or wide-gamut: the three Lab metrics were fit
+// to reflective samples under SDR viewing and degrade above ~100 nits and
+// outside sRGB. One unit is ~1 JND in all four, so the numbers stay
+// comparable when switching.
 
 Texture2D<float4>   Reference   : register(t0);
 Texture2D<float4>   Test        : register(t1);
@@ -1112,7 +1127,7 @@ cbuffer Constants : register(b0)
 {
     uint  Width;
     uint  Height;
-    uint  Method;        // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000
+    uint  Method;        // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000, 3 = dE ITP
     float Scale;         // visualization multiplier
     float MaxDeltaE;     // clamp for colormap (dE >= this = full red)
     uint  OutputMode;    // 0 = Heatmap (Turbo), 1 = Grayscale dE / MaxDeltaE
@@ -1222,14 +1237,21 @@ void main(uint3 dtid : SV_DispatchThreadID)
     float4 ref  = Reference.Load(int3(dtid.xy, 0));
     float4 test = Test.Load(int3(dtid.xy, 0));
 
-    float3 labRef  = ScRGBToLab(ref.rgb);
-    float3 labTest = ScRGBToLab(test.rgb);
-
     float dE;
     uint method = Method;
-    if (method == 1)      dE = DeltaE94(labRef, labTest);
-    else if (method == 2) dE = DeltaE2000(labRef, labTest);
-    else                  dE = DeltaE76(labRef, labTest);
+    if (method == 3)
+    {
+        // dE ITP works in PQ-encoded ICtCp, not Lab -- no XYZ->Lab hop.
+        dE = DeltaEITPFromScRGB(ref.rgb, test.rgb);
+    }
+    else
+    {
+        float3 labRef  = ScRGBToLab(ref.rgb);
+        float3 labTest = ScRGBToLab(test.rgb);
+        if (method == 1)      dE = DeltaE94(labRef, labTest);
+        else if (method == 2) dE = DeltaE2000(labRef, labTest);
+        else                  dE = DeltaE76(labRef, labTest);
+    }
 
     dE *= Scale;
     float mode = OutputMode;
@@ -1254,7 +1276,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Delta E Comparator";
-            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 6;
+            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 7;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -1265,7 +1287,10 @@ void main(uint3 dtid : SV_DispatchThreadID)
             desc.hlslSource = colorMath + deltaEHLSL;
             desc.inputNames = { L"Reference", L"Test" };
             desc.parameters = {
-                { L"Method",     L"float", 2.0f, 0.0f, 2.0f, 1.0f, { L"CIE76", L"CIE94", L"CIEDE2000" } },
+                // Default is dE ITP: this pipeline is HDR/WCG, where the three
+                // Lab metrics are out of their fitted domain. Saved graphs keep
+                // whatever Method they stored, so only new nodes pick it up.
+                { L"Method",     L"float", 3.0f, 0.0f, 3.0f, 1.0f, { L"CIE76", L"CIE94", L"CIEDE2000", L"dE ITP (BT.2124)" } },
                 { L"Scale",      L"float", 1.0f, 0.1f, 10.0f, 0.1f },
                 { L"MaxDeltaE",  L"float", 1.0f, 0.1f, 100.0f, 0.1f },
                 { L"OutputMode", L"float", 0.0f, 0.0f, 1.0f, 1.0f, { L"Heatmap", L"Grayscale dE" } },
@@ -1402,7 +1427,10 @@ void main(uint3 GTid : SV_GroupThreadID)
         uint py = pi / Width;
         float4 s = Source[int2(px, py)];
         if (s.a < 0.001) continue;
-        float3 xyz = ScRGBToXYZ(max(s.rgb, 0.0));
+        // Unclamped: negative scRGB components are wide-gamut chroma, and
+        // clamping them collapses those pixels onto the sRGB hull -- which
+        // is exactly the coverage this scatter exists to measure.
+        float3 xyz = ScRGBToXYZ(s.rgb);
         float sum = xyz.x + xyz.y + xyz.z;
         if (sum < 1e-6) continue;
         float cieX = xyz.x / sum;
@@ -1470,7 +1498,7 @@ void main(uint3 GTid : SV_GroupThreadID)
             desc.hlslSource = colorMath + gamutCoverageHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"DiagramSize",  L"float", 512.0f, 128.0f, 4096.0f, 64.0f },
+                { L"DiagramSize",  L"float", kDefaultDiagramSize, 128.0f, 4096.0f, 64.0f },
                 { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" } },
                 { L"RedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
                 { L"GreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
@@ -1745,7 +1773,7 @@ float4 main(
 
 cbuffer Constants : register(b0)
 {
-    uint Mode;          // 0=Nearest on Shell, 1=Compress to Neutral, 2=Fit to Shell
+    uint Mode;          // 0=Nearest on Shell, 1=Compress to Neutral, 2=Fit to Shell, 3=Soft Compress
     uint TargetGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
     float Strength;      // 0=bypass, 1=full
     uint SourceGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
@@ -1755,6 +1783,9 @@ cbuffer Constants : register(b0)
     float2 SourceRedPrimary;
     float2 SourceGreenPrimary;
     float2 SourceBluePrimary;
+    float SoftThreshold; // mode 3: fraction of boundary radius where compression starts
+    float SoftLimit;     // mode 3: source radius (x boundary) that maps onto the boundary
+    float KneeHardness;  // mode 3: ACES p. 1=Reinhard, higher=harder corner
 };
 
 Texture2D InputTexture : register(t0);
@@ -1833,6 +1864,27 @@ float2 CompressNeutral(float2 p, float2 poly[NBP])
     return result;
 }
 
+// Distance from the neutral axis (Ct=Cp=0) to the boundary polygon along
+// direction `dir` (unit length). Returns 0 if the ray never hits an edge
+// (degenerate polygon), which callers must guard.
+float BoundaryRadius(float2 dir, float2 poly[NBP])
+{
+    float bestT = 1e10;
+    for (uint i = 0; i < NBP; i++)
+    {
+        uint j = (i + 1) % NBP;
+        float2 a = poly[i];
+        float2 ab = poly[j] - a;
+        float denom = dir.x * ab.y - dir.y * ab.x;
+        if (abs(denom) < 1e-10) continue;
+        float t = (a.x * ab.y - a.y * ab.x) / denom;
+        float u = (a.x * dir.y - a.y * dir.x) / denom;
+        if (t > 0.0 && u >= 0.0 && u <= 1.0 && t < bestT)
+            bestT = t;
+    }
+    return (bestT < 1e9) ? bestT : 0.0;
+}
+
 // Compute uniform ICtCp scale factor: for each source boundary vertex,
 // find how far it extends beyond the target boundary (ray from neutral).
 float ComputeICtCpFitScale(float2 srcBnd[NBP], float2 tgtBnd[NBP])
@@ -1888,6 +1940,9 @@ float4 main(
     float2 csR = SourceRedPrimary;
     float2 csG = SourceGreenPrimary;
     float2 csB = SourceBluePrimary;
+    float softT = SoftThreshold;
+    float softL = SoftLimit;
+    float softP = KneeHardness;
 
     float2 gR, gG, gB;
     uint g = (uint)targetF;
@@ -1898,7 +1953,11 @@ float4 main(
 
     // Use CIE xy triangle test for reliable in/out-of-gamut detection,
     // then do the actual mapping in ICtCp for perceptual quality.
-    float3 xyz = ScRGBToXYZ(max(color.rgb, 0.0));
+    // Unclamped: clamping negatives first projects the colour onto the
+    // sRGB gamut surface, which makes every wide-gamut pixel test as
+    // *inside* the target and defeats the detection entirely. XYZ stays
+    // non-negative for real colours, so the xyzSum guard below still holds.
+    float3 xyz = ScRGBToXYZ(color.rgb);
     float xyzSum = xyz.x + xyz.y + xyz.z;
     if (xyzSum < 1e-6) return color;
     float2 cieXY = float2(xyz.x / xyzSum, xyz.y / xyzSum);
@@ -1915,7 +1974,7 @@ float4 main(
         else if (sg == 3) { sR = csR; sG = csG; sB = csB; }
         else              { sR = GAMUT_709_R; sG = GAMUT_709_G; sB = GAMUT_709_B; }
 
-        float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
+        float3 ictcp = ScRGBToICtCp(color.rgb);
         float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
 
         // Sample both source and target boundaries at this I level
@@ -1936,6 +1995,36 @@ float4 main(
             mappedRGB *= origY / mappedY;
         color.rgb = mappedRGB;
     }
+    else if (mode == 3)
+    {
+        // Soft Compress: unlike modes 0/1 this also touches *in-gamut*
+        // pixels whose chroma radius exceeds SoftThreshold x boundary,
+        // buying smooth gradients across the boundary at the cost of
+        // slightly desaturating legal near-boundary colors.
+        float3 ictcp = ScRGBToICtCp(color.rgb);
+        float2 ctcp = float2(ictcp.y, ictcp.z);
+        float r = length(ctcp);
+        if (r > 1e-6)
+        {
+            float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+            float2 bnd[NBP];
+            SampleBoundary(gR, gG, gB, ictcp.x, bnd);
+            float2 dir = ctcp / r;
+            float B = BoundaryRadius(dir, bnd);
+            if (B > 1e-6)
+            {
+                float d = r / B;
+                float dNew = SoftCompressDistance(d, softT, softL, softP);
+                float2 mapped = dir * (dNew * B);
+                ctcp = lerp(ctcp, mapped, Strength);
+                float3 mappedRGB = ICtCpToScRGB(float3(ictcp.x, ctcp.x, ctcp.y));
+                float mappedY = dot(max(mappedRGB, 0.0), float3(0.2126, 0.7152, 0.0722));
+                if (mappedY > 1e-6)
+                    mappedRGB *= origY / mappedY;
+                color.rgb = mappedRGB;
+            }
+        }
+    }
     else
     {
         // Modes 0 and 1: per-pixel nearest/compress (only out-of-gamut pixels).
@@ -1950,7 +2039,7 @@ float4 main(
         bool insideGamut = PointInTriangle(cieXY, iR, iG, iB);
         if (!insideGamut)
         {
-            float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
+            float3 ictcp = ScRGBToICtCp(color.rgb);
             float2 ctcp = float2(ictcp.y, ictcp.z);
             float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
 
@@ -1974,17 +2063,20 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Gamut Map";
-            desc.effectId = L"ICtCp Gamut Map"; desc.effectVersion = 10;
+            desc.effectId = L"ICtCp Gamut Map"; desc.effectVersion = 11;
             desc.category = L"Analysis";
             desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + perceptualGamutMapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"Mode",        L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Nearest on Shell", L"Compress to Neutral", L"Fit to Shell" } },
+                { L"Mode",        L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Nearest on Shell", L"Compress to Neutral", L"Fit to Shell", L"Soft Compress" } },
                 { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
                 { L"SourceGamut", L"float", 2.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" }, L"Mode == 2" },
+                { L"SoftThreshold", L"float", 0.75f, 0.0f, 0.99f, 0.01f, {}, L"Mode == 3" },
+                { L"SoftLimit",     L"float", 1.5f,  1.01f, 4.0f, 0.01f, {}, L"Mode == 3" },
+                { L"KneeHardness",  L"float", 1.2f,  1.0f,  4.0f, 0.05f, {}, L"Mode == 3" },
                 { L"TargetRedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
                 { L"TargetGreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
                 { L"TargetBluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
@@ -2111,12 +2203,196 @@ float4 main(
             desc.hlslSource = colorMath + ictcpBoundaryHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"DiagramSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
+                { L"DiagramSize", L"float", kDefaultDiagramSize, 128.0f, 2048.0f, 64.0f },
                 { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" } },
                 { L"Intensity",   L"float", 0.5f, 0.05f, 0.95f, 0.05f },
                 { L"RedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
                 { L"GreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
                 { L"BluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- HDR Screenshot Tonemap (8bpc) ----
+        // The screenshot pipeline's whole display-referred path in one pass:
+        // knee tone map -> chroma correction -> gamut compress to sRGB ->
+        // white-level normalize -> sRGB OETF -> dither -> 8-bit quantize.
+        //
+        // Target is a Desktop Duplication capture: fp16 scRGB of the composed
+        // desktop, mixed HDR and SDR, with SDR white sitting at W/80 because
+        // DWM composites it at W nits while scRGB defines 1.0 = 80 nits.
+        //
+        // Fused rather than chained because the product ships one shader over
+        // a 4K+ frame: the node-graph equivalent pays three ICtCp round trips
+        // where this pays one. It ends by DECODING the quantized 8-bit result
+        // back to linear scRGB, so the graph stays in its linear working
+        // space and downstream analysis (Delta E, statistics, heatmaps)
+        // measures exactly the damage the 8-bit handback would do.
+        {
+            static const std::string screenshotTonemapHLSL = R"HLSL(
+// HDR Screenshot Tonemap (8bpc target)
+
+cbuffer Constants : register(b0)
+{
+    float SdrWhiteNits;    // W: where DWM composited SDR white
+    float SourcePeakNits;  // content (or display) peak
+    float KneeRatio;       // identity below KneeRatio * W
+    float ChromaCorrect;   // 0 = none, 1 = hold saturation through the curve
+    float GamutStrength;   // 0 = bypass gamut compression
+    float GamutThreshold;  // soft-compress knee start, fraction of boundary
+    float GamutLimit;      // source radius mapping onto the boundary
+    float GamutHardness;   // ACES p
+    float DitherStrength;  // LSBs of TPDF dither, 0 = none
+    uint  Quantize;        // 0 = keep float, 1 = 8-bit round trip
+};
+
+Texture2D Source : register(t0);
+
+// Boundary sampling, duplicated from ICtCp Gamut Map rather than shared.
+// TODO: hoist into the colour-math library once the product's cheaper
+// sRGB-specific boundary (all channels within [0, peak]) replaces the
+// general polygon walk -- 48 points with a ray intersection per pixel is
+// the known hot spot at capture resolution.
+#define SNBP 48
+
+void SampleSrgbBoundary(float iVal, out float2 bnd[SNBP])
+{
+    float nits = PQ_EOTF(iVal);
+    float Ys = max(nits / 80.0, 0.0001);
+    uint ppe = SNBP / 3;
+    for (uint i = 0; i < SNBP; i++)
+    {
+        float2 xy;
+        uint e = i / ppe;
+        float t = (float)(i % ppe) / (float)ppe;
+        if (e == 0)      xy = lerp(GAMUT_709_R, GAMUT_709_G, t);
+        else if (e == 1) xy = lerp(GAMUT_709_G, GAMUT_709_B, t);
+        else             xy = lerp(GAMUT_709_B, GAMUT_709_R, t);
+        float X = (xy.y > 1e-6) ? xy.x * Ys / xy.y : 0;
+        float Z = (xy.y > 1e-6) ? (1.0 - xy.x - xy.y) * Ys / xy.y : 0;
+        float3 ic = ScRGBToICtCp(XYZToScRGB(float3(X, Ys, Z)));
+        bnd[i] = float2(ic.y, ic.z);
+    }
+}
+
+float SrgbBoundaryRadius(float2 dir, float2 poly[SNBP])
+{
+    float bestT = 1e10;
+    for (uint i = 0; i < SNBP; i++)
+    {
+        uint j = (i + 1) % SNBP;
+        float2 a = poly[i];
+        float2 ab = poly[j] - a;
+        float denom = dir.x * ab.y - dir.y * ab.x;
+        if (abs(denom) < 1e-10) continue;
+        float t = (a.x * ab.y - a.y * ab.x) / denom;
+        float u = (a.x * dir.y - a.y * dir.x) / denom;
+        if (t > 0.0 && u >= 0.0 && u <= 1.0 && t < bestT)
+            bestT = t;
+    }
+    return (bestT < 1e9) ? bestT : 0.0;
+}
+
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    float4 color = Source.Load(int3(uv0.xy, 0));
+    float W = max(SdrWhiteNits, 1.0);
+
+    float3 ictcp = ScRGBToICtCp(color.rgb);
+
+    // ---- 1. Knee tone map on I -------------------------------------------
+    // Identical shape to ICtCp Tone Map: identity at or below the knee, a
+    // shifted Reinhard above it with slope 1 at the join. Target peak is W,
+    // so the whole frame lands in [0, W] and step 4 can put white at 1.0.
+    // KneeRatio is a FRACTION of W, not absolute nits -- an absolute knee
+    // silently changes meaning the moment the SDR-brightness slider moves.
+    float peakIn  = NitsToI(max(SourcePeakNits, W));
+    float peakOut = NitsToI(W);
+    float kneeI   = NitsToI(clamp(KneeRatio, 0.0, 0.999) * W);
+    float Iout;
+    if (ictcp.x <= kneeI || peakIn <= peakOut)
+        Iout = ictcp.x;
+    else
+        Iout = kneeI + ReinhardCompressI(ictcp.x - kneeI, peakIn - kneeI, peakOut - kneeI);
+
+    // ---- 2. Chroma correction --------------------------------------------
+    // Lowering I while holding Ct/Cp raises saturation (chroma is unchanged
+    // but lightness dropped), which is what makes naive knee output look
+    // neon in the highlights. Scaling chroma by Iout/I holds saturation
+    // constant through the curve; ChromaCorrect blends between the two.
+    float2 ctcp = float2(ictcp.y, ictcp.z);
+    if (ictcp.x > 1e-5)
+        ctcp *= lerp(1.0, Iout / ictcp.x, saturate(ChromaCorrect));
+
+    // Luminance the chroma stage should preserve, captured before the gamut
+    // compressor perturbs it.
+    float3 preGamut = ICtCpToScRGB(float3(Iout, ctcp.x, ctcp.y));
+    float preY = dot(max(preGamut, 0.0), float3(0.2126, 0.7152, 0.0722));
+
+    // ---- 3. Soft gamut compression into sRGB ------------------------------
+    if (GamutStrength > 0.001)
+    {
+        float r = length(ctcp);
+        if (r > 1e-6)
+        {
+            float2 bnd[SNBP];
+            SampleSrgbBoundary(Iout, bnd);
+            float2 dir = ctcp / r;
+            float B = SrgbBoundaryRadius(dir, bnd);
+            if (B > 1e-6)
+            {
+                float dNew = SoftCompressDistance(r / B, GamutThreshold, GamutLimit, GamutHardness);
+                ctcp = lerp(ctcp, dir * (dNew * B), saturate(GamutStrength));
+            }
+        }
+    }
+
+    float3 mapped = ICtCpToScRGB(float3(Iout, ctcp.x, ctcp.y));
+    float mapY = dot(max(mapped, 0.0), float3(0.2126, 0.7152, 0.0722));
+    if (mapY > 1e-6)
+        mapped *= preY / mapY;
+
+    // ---- 4. White-level normalize ----------------------------------------
+    // scRGB 1.0 = 80 nits, SDR white sits at W/80, so this puts white at 1.0.
+    mapped *= 80.0 / W;
+
+    // ---- 5. Residue clamp + sRGB OETF ------------------------------------
+    // The soft compressor asymptotes slightly OUTSIDE the boundary by design
+    // (~1.07x at the default knee), so a clamp here is trimming a few percent
+    // of overshoot -- not, as before, destroying wide-gamut information.
+    // It must stay after the gamut stage for that to remain true.
+    float3 enc = LinearToSRGB(saturate(mapped));
+
+    // ---- 6. Dither + quantize --------------------------------------------
+    if (Quantize != 0)
+        enc = DitherQuantize(enc, uv0.xy, 256.0, DitherStrength);
+
+    // ---- 7. Back to linear so the graph keeps its working space ----------
+    return float4(SRGBToLinear(enc), color.a);
+}
+)HLSL";
+
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"HDR Screenshot Tonemap (8bpc)";
+            desc.effectId = L"HDR Screenshot Tonemap"; desc.effectVersion = 1;
+            desc.category = L"Analysis";
+            desc.subcategory = L"Tone Mapping";
+            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.hlslSource = colorMath + screenshotTonemapHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                { L"SdrWhiteNits",   L"float",  200.0f,  80.0f, 1000.0f,  1.0f },
+                { L"SourcePeakNits", L"float", 1000.0f,  80.0f, 10000.0f, 50.0f },
+                { L"KneeRatio",      L"float",    0.7f,   0.0f,   0.99f,  0.01f },
+                { L"ChromaCorrect",  L"float",    1.0f,   0.0f,    1.0f,  0.05f },
+                { L"GamutStrength",  L"float",    1.0f,   0.0f,    1.0f,  0.05f },
+                { L"GamutThreshold", L"float",   0.75f,   0.0f,   0.99f,  0.01f },
+                { L"GamutLimit",     L"float",    1.5f,  1.01f,    4.0f,  0.01f },
+                { L"GamutHardness",  L"float",    1.2f,   1.0f,    4.0f,  0.05f },
+                { L"DitherStrength", L"float",    1.0f,   0.0f,    2.0f,  0.05f },
+                { L"Quantize",       L"float",    1.0f,   0.0f,    1.0f,  1.0f, { L"Off (float)", L"8-bit" } },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2199,6 +2475,7 @@ cbuffer constants : register(b0) {
     SHADERLAB_PARAM(float, TargetPeakNits)        // SDR target peak (e.g. 80, 203)
     float  Strength;                              // 0..1 lerp from identity to compressed+lifted
     float  ToneLift;                              // 0..1 mid-tone lift
+    float  KneeNits;                              // identity below this; 0 = compress from black
 };
 
 [numthreads(8, 8, 1)]
@@ -2214,7 +2491,27 @@ void main(uint3 dtid : SV_DispatchThreadID)
 
     float peakIn  = NitsToI(SourcePeakNits);
     float peakOut = NitsToI(TargetPeakNits);
-    float compressed = ReinhardCompressI(ictcp.x, peakIn, peakOut);
+
+    // Optional knee (BT.2390-EETF-style): content at or below KneeNits
+    // passes through UNCHANGED; only [knee, SourcePeak] compresses into
+    // [knee, TargetPeak]. This is the mixed-content-safe shape for the
+    // primary screenshot workflow — an HDR capture of a mixed SDR/HDR
+    // desktop converts to SDR with the SDR windows kept at their
+    // presentation brightness while true-HDR highlights roll off into
+    // the remaining headroom. The shifted Reinhard has slope 1 at the
+    // knee (C1-continuous). KneeNits = 0 reproduces the classic
+    // compress-from-black curve exactly.
+    float kneeI = NitsToI(clamp(KneeNits, 0.0, TargetPeakNits * 0.999));
+    float compressed;
+    if (ictcp.x <= kneeI || peakIn <= peakOut)
+    {
+        compressed = ictcp.x;
+    }
+    else
+    {
+        compressed = kneeI + ReinhardCompressI(
+            ictcp.x - kneeI, peakIn - kneeI, peakOut - kneeI);
+    }
 
     // Anchored polynomial lift in I-space, applied AFTER compression.
     // Curve: f(x) = x + a*x*(1-x), evaluated in normalized [0, peakOut]
@@ -2236,7 +2533,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Tone Map (HDR -> SDR)";
-            desc.effectId = L"ICtCp Tone Map"; desc.effectVersion = 12;
+            desc.effectId = L"ICtCp Tone Map"; desc.effectVersion = 13;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -2255,6 +2552,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
                 Graph::ParameterDefinition{ L"TargetPeakNits", L"float",  203.0f,  80.0f,   500.0f,  1.0f, {}, L"", true },
                 Graph::ParameterDefinition{ L"Strength",       L"float",    1.0f,   0.0f,     1.0f, 0.05f },
                 Graph::ParameterDefinition{ L"ToneLift",       L"float",    0.0f,   0.0f,     1.0f, 0.05f },
+                Graph::ParameterDefinition{ L"KneeNits",       L"float",    0.0f,   0.0f,   500.0f,  1.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2281,6 +2579,7 @@ cbuffer constants : register(b0) {
     SHADERLAB_PARAM(float, TargetPeakNits)        // typical 1000-10000
     float  Strength;                              // 0..1 lerp from identity to expanded
     float  DiffuseWhiteNits;                      // shadow/mid anchor (HDR paper white)
+    float  KneeNits;                              // identity below this; 0 = expand from black
 };
 
 [numthreads(8, 8, 1)]
@@ -2300,17 +2599,43 @@ void main(uint3 dtid : SV_DispatchThreadID)
     // [0, sdrI] (SDR range); the helper returns I in [0, hdrI] (HDR).
     float sdrI = NitsToI(SourcePeakNits);
     float hdrI = NitsToI(TargetPeakNits);
-    float expanded = ReinhardExpandI(ictcp.x, hdrI, sdrI);
+
+    // Optional knee: content at or below KneeNits passes through
+    // UNCHANGED; only the range above expands toward the target peak.
+    // This is the mixed-content-safe shape (BT.2390-style): an image
+    // whose "SDR chunk" is already presentation-referenced (e.g. white
+    // level boosted, or a mixed SDR/HDR composite) keeps that region
+    // intact instead of blowing everything above SourcePeakNits to the
+    // peak. The shifted inverse-Reinhard has slope 1 at the knee, so
+    // the curve is C1-continuous there. KneeNits = 0 reproduces the
+    // classic expand-from-black curve exactly.
+    float kneeI = NitsToI(clamp(KneeNits, 0.0, SourcePeakNits * 0.999));
+    float expanded;
+    if (ictcp.x <= kneeI || hdrI <= sdrI)
+    {
+        expanded = ictcp.x;
+    }
+    else
+    {
+        expanded = kneeI + ReinhardExpandI(
+            ictcp.x - kneeI, hdrI - kneeI, sdrI - kneeI);
+    }
 
     // Shadow/mid anchor: the pure inverse-Reinhard has slope 1 at black
     // in I-space, so shadows keep their SDR nit levels while the rest of
     // the picture expands -- perceptually crushed blacks. Let the low end
     // instead scale like an SDR presentation at DiffuseWhiteNits paper
     // white (nits x D/S, the BT.2446-style lift), and let the expansion
-    // curve take over wherever it exceeds that.
-    float diffuseScale = max(DiffuseWhiteNits, 1.0) / max(SourcePeakNits, 1.0);
-    float lifted = NitsToI(IToNits(ictcp.x) * diffuseScale);
-    expanded = min(max(expanded, lifted), hdrI);
+    // curve take over wherever it exceeds that. Skipped when a knee is
+    // set -- the knee's contract is bit-exact identity below it, which
+    // a lift would violate.
+    if (KneeNits < 1.0)
+    {
+        float diffuseScale = max(DiffuseWhiteNits, 1.0) / max(SourcePeakNits, 1.0);
+        float lifted = NitsToI(IToNits(ictcp.x) * diffuseScale);
+        expanded = max(expanded, lifted);
+    }
+    expanded = min(expanded, hdrI);
 
     ictcp.x = lerp(ictcp.x, expanded, saturate(Strength));
 
@@ -2320,7 +2645,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Inverse Tone Map (SDR -> HDR)";
-            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 12;
+            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 13;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -2335,6 +2660,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
                 Graph::ParameterDefinition{ L"TargetPeakNits", L"float", 1000.0f,  100.0f, 10000.0f, 50.0f, {}, L"", true },
                 Graph::ParameterDefinition{ L"Strength",       L"float",    1.0f,    0.0f,     1.0f, 0.05f },
                 Graph::ParameterDefinition{ L"DiffuseWhiteNits", L"float",  203.0f,   80.0f,   400.0f, 1.0f },
+                Graph::ParameterDefinition{ L"KneeNits",       L"float",    0.0f,    0.0f,   500.0f,  1.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2469,15 +2795,15 @@ void main(uint3 dtid : SV_DispatchThreadID)
 //
 // LineWidth controls the dividing line thickness in pixels.
 //
-// Inputs of mismatched dimensions are stretched to the union output rect
-// via normalized-UV Sample() (linear-filtered) -- so feeding e.g. a
-// 4K source on ImageA and a 1080p tone-mapped result on ImageB still
-// fills both halves of the wipe, instead of returning black for any
-// out-of-bounds Load on the smaller input.
+// Both inputs are read at the output coordinate. The effect runs with
+// D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING, whose contract is that a pixel
+// shader reads its inputs 1:1 with the output; an input smaller than the
+// union output rect therefore covers only its own region and reads black
+// elsewhere. Put a Scale node upstream to compare branches of differing
+// size.
 
 Texture2D ImageA : register(t0);
 Texture2D ImageB : register(t1);
-SamplerState LinearSampler : register(s0);
 
 cbuffer Constants : register(b0)
 {
@@ -2488,15 +2814,6 @@ cbuffer Constants : register(b0)
                            // 45 = top-left-to-bottom-right diagonal
     float OutputW;         // host-injected: union of input *content* widths
     float OutputH;         // host-injected: union of input *content* heights
-    // Per-input content dimensions. D2D pixel-shader inputs live inside
-    // atlas allocations that are larger than the actual content rect (e.g.
-    // 1920x1080 content in a 4096x4096 atlas). [0,1] UV with Sample() maps
-    // to the full atlas, so we have to scale by content/atlas to land on
-    // the content sub-rect.
-    float ImageAW;
-    float ImageAH;
-    float ImageBW;
-    float ImageBH;
 };
 
 float4 main(
@@ -2510,28 +2827,9 @@ float4 main(
     float W = max(OutputW, 1.0);
     float H = max(OutputH, 1.0);
 
-    // Sample each input through its own atlas-aware UV. Logic:
-    //   uvNormOutput = uv0 / (W,H)              -> [0,1] across the wipe canvas
-    //   contentUV    = uvNormOutput * contentSize  -> pixel coords within
-    //                                                 the input's content rect
-    //   atlasUV      = contentUV / atlasSize    -> [0..content/atlas] within
-    //                                                 the actual D2D texture
-    // For exactly-sized inputs (compute outputs) atlas == content so atlasUV
-    // is the simple [0,1] mapping. For atlas-padded inputs (D2D pixel-shader
-    // outputs), atlas > content so atlasUV is < 1 and stays within content.
-    float2 atlasA, atlasB;
-    ImageA.GetDimensions(atlasA.x, atlasA.y);
-    ImageB.GetDimensions(atlasB.x, atlasB.y);
-    atlasA = max(atlasA, float2(1.0, 1.0));
-    atlasB = max(atlasB, float2(1.0, 1.0));
-
-    float2 uvA = uv0.xy * float2(max(ImageAW, 1.0), max(ImageAH, 1.0))
-               / (float2(W, H) * atlasA);
-    float2 uvB = uv0.xy * float2(max(ImageBW, 1.0), max(ImageBH, 1.0))
-               / (float2(W, H) * atlasB);
-
-    float4 a = ImageA.Sample(LinearSampler, uvA);
-    float4 b = ImageB.Sample(LinearSampler, uvB);
+    int3 texel = int3(uv0.xy, 0);
+    float4 a = ImageA.Load(texel);
+    float4 b = ImageB.Load(texel);
 
     // Direction vector along which we project pixel positions.
     float radians = Angle * 3.14159265 / 180.0;
@@ -2562,7 +2860,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Split Comparison";
-            desc.effectId = L"Split Comparison"; desc.effectVersion = 6;
+            desc.effectId = L"Split Comparison"; desc.effectVersion = 7;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2572,15 +2870,12 @@ float4 main(
                 { L"SplitPosition", L"float",   0.5f,    0.0f,   1.0f,  0.01f },
                 { L"LineWidth",     L"float",   2.0f,    0.0f,  10.0f,  0.5f },
                 { L"Angle",         L"float",   0.0f, -360.0f, 360.0f,  1.0f },
-                // Hidden: host writes actual output-rect dimensions and
-                // per-input content dimensions every frame (see
-                // GraphEvaluator's pixel-shader eval).
+                // Hidden: host writes the actual output-rect dimensions
+                // every frame (see GraphEvaluator's pixel-shader eval).
+                // The per-input ImageAW/AH/BW/BH pair dropped in v7 along
+                // with the atlas-compensating Sample() path.
                 Graph::ParameterDefinition{ L"OutputW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
                 Graph::ParameterDefinition{ L"OutputH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
-                Graph::ParameterDefinition{ L"ImageAW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
-                Graph::ParameterDefinition{ L"ImageAH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
-                Graph::ParameterDefinition{ L"ImageBW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
-                Graph::ParameterDefinition{ L"ImageBH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
             };
             m_effects.push_back(std::move(desc));
         }

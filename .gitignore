@@ -85,17 +85,31 @@ $RECYCLE.BIN/
 
 # macOS
 .DS_Store
-Screenshot_53.png
 
 # third_party/ holds git submodules (exprtk, miniz) plus the in-tree
 # miniz_export.h shim -- all tracked. Do NOT ignore it.
 
+# Visual Studio scratch
 enc_temp_folder/
-
 
 # MSIX build staging output (regenerated each build)
 AppX/
 
-# Stray test outputs
-output.jxr
+# Stray probe / capture output, REPO ROOT ONLY. ShaderLabHeadless picks its
+# encoder from the --output extension (.jxr / .wdp = JPEG XR, anything else
+# = PNG) and --pixels writes .bin / .raw, so ad-hoc probes land here easily.
+# Root-anchored deliberately: Assets/ and docs/ hold tracked images, and a
+# saved .effectgraph is a user document that must never be ignored.
+/*.png
+/*.jxr
+/*.wdp
+/*.bin
+/*.raw
 
+# Test harness scratch output
+Tests/output/
+
+# Claude Code: the project config and skills are shared; per-user state is
+# not. (.remember/ self-ignores via its own .gitignore.)
+.claude/settings.local.json
+.claude/.credentials.json

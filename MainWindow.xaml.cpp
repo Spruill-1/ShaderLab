@@ -332,7 +332,25 @@ namespace winrt::ShaderLab::implementation
         });
         NodeGraphContainer().IsTabStop(true);
 
-        SaveImageButton().Click({ this, &MainWindow::OnSaveImageClicked });
+        // Save flyout: the reference frame of the saved file is an
+        // explicit choice, not an inference — a heuristic would darken
+        // the plain image→PNG round trip or wash presentation-graded
+        // output (see SaveReference in the header).
+        {
+            winrt::Microsoft::UI::Xaml::Controls::MenuFlyout saveFlyout;
+            auto addSaveItem = [this, &saveFlyout](
+                winrt::hstring const& text, SaveReference ref)
+            {
+                winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutItem item;
+                item.Text(text);
+                item.Click([this, ref](auto&&, auto&&) { SaveImageAsync(ref); });
+                saveFlyout.Items().Append(item);
+            };
+            addSaveItem(L"PNG (SDR) — from presentation white", SaveReference::PresentationPng);
+            addSaveItem(L"PNG (SDR) — file-referenced as-is", SaveReference::FilePng);
+            addSaveItem(L"JPEG XR (HDR) — scene-referred", SaveReference::HdrJxr);
+            SaveImageButton().Flyout(saveFlyout);
+        }
         EffectDesignerButton().Click([this](auto&&, auto&&) { OpenEffectDesigner(); });
 
         // MCP server toggle.
@@ -4998,13 +5016,6 @@ namespace winrt::ShaderLab::implementation
         }
     }
 
-    void MainWindow::OnSaveImageClicked(
-        winrt::Windows::Foundation::IInspectable const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::RoutedEventArgs const& /*args*/)
-    {
-        SaveImageAsync();
-    }
-
     std::vector<uint8_t> MainWindow::CapturePreviewAsPng()
     {
         auto* image = ResolveDisplayImage(m_previewNodeId);
@@ -5267,9 +5278,10 @@ namespace winrt::ShaderLab::implementation
         m_nodeGraphController.SetPanOffset(panX, panY);
     }
 
-    winrt::fire_and_forget MainWindow::SaveImageAsync()
+    winrt::fire_and_forget MainWindow::SaveImageAsync(SaveReference ref)
     {
         auto strong = get_strong();
+        const bool isJxr = (ref == SaveReference::HdrJxr);
 
         winrt::Windows::Storage::Pickers::FileSavePicker picker;
         picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
@@ -5283,8 +5295,10 @@ namespace winrt::ShaderLab::implementation
             if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' || ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|')
                 ch = L'_';
         picker.SuggestedFileName(winrt::hstring(suggestedName));
-        picker.FileTypeChoices().Insert(L"JPEG XR (HDR)", winrt::single_threaded_vector<winrt::hstring>({ L".jxr" }));
-        picker.FileTypeChoices().Insert(L"PNG Image (SDR)", winrt::single_threaded_vector<winrt::hstring>({ L".png" }));
+        if (isJxr)
+            picker.FileTypeChoices().Insert(L"JPEG XR (HDR)", winrt::single_threaded_vector<winrt::hstring>({ L".jxr" }));
+        else
+            picker.FileTypeChoices().Insert(L"PNG Image (SDR)", winrt::single_threaded_vector<winrt::hstring>({ L".png" }));
 
         auto file = co_await picker.PickSaveFileAsync();
         if (!file) co_return;
@@ -5298,6 +5312,40 @@ namespace winrt::ShaderLab::implementation
 
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) co_return;
+
+        // Presentation→file re-referencing: the scene is linear scRGB
+        // where the OS presents SDR reference white at SdrWhiteNits.
+        // An SDR file's 1.0 must mean "SDR reference white", so scale by
+        // 80/SdrWhiteNits in linear space before the sRGB encode; DWM
+        // multiplies it back on display. Respects a simulated profile
+        // (CachedCapabilities prefers it).
+        float presentationScale = 1.0f;
+        if (ref == SaveReference::PresentationPng)
+        {
+            const float sdrWhite =
+                m_displayMonitor.CachedCapabilities().sdrWhiteLevelNits;
+            if (sdrWhite > 80.0f)
+                presentationScale = 80.0f / sdrWhite;
+        }
+        winrt::com_ptr<ID2D1Effect> scaleFx;
+        winrt::com_ptr<ID2D1Image> scaledImage;
+        ID2D1Image* imageToSave = previewImage;
+        if (presentationScale != 1.0f &&
+            SUCCEEDED(dc->CreateEffect(CLSID_D2D1ColorMatrix, scaleFx.put())))
+        {
+            scaleFx->SetInput(0, previewImage);
+            const float s = presentationScale;
+            D2D1_MATRIX_5X4_F m = D2D1::Matrix5x4F(
+                s, 0, 0, 0,
+                0, s, 0, 0,
+                0, 0, s, 0,
+                0, 0, 0, 1,
+                0, 0, 0, 0);
+            scaleFx->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, m);
+            scaleFx->GetOutput(scaledImage.put());
+            if (scaledImage)
+                imageToSave = scaledImage.get();
+        }
 
         try
         {
@@ -5316,14 +5364,15 @@ namespace winrt::ShaderLab::implementation
             dc->SetDpi(oldDpiX, oldDpiY);
             if (w == 0 || h == 0) co_return;
 
-            auto fileExt = std::wstring(file.FileType().c_str());
-            bool isJxr = (fileExt == L".jxr" || fileExt == L".wdp");
-
-            // JXR: render in FP16 scRGB for full HDR fidelity.
-            // PNG: render in 8-bit BGRA (SDR clamp).
+            // JXR: render in FP16 scRGB for full HDR fidelity (linear,
+            // scene-referred — no transfer encode wanted).
+            // PNG: render in 8-bit BGRA with the _SRGB variant so the
+            // scene's linear values are gamma-ENCODED on write; plain
+            // UNORM wrote linear bytes that viewers then sRGB-decoded,
+            // producing a crushed, far-too-dark image.
             DXGI_FORMAT renderFormat = isJxr
                 ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                : DXGI_FORMAT_B8G8R8A8_UNORM;
+                : DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
             D2D1_ALPHA_MODE alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
 
             winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
@@ -5337,7 +5386,7 @@ namespace winrt::ShaderLab::implementation
             dc->SetTarget(renderBitmap.get());
             dc->BeginDraw();
             dc->Clear(D2D1::ColorF(0, 0, 0, 1.0f));
-            dc->DrawImage(previewImage);
+            dc->DrawImage(imageToSave);
             dc->EndDraw();
             dc->SetTarget(oldTarget.get());
 

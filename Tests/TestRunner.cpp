@@ -20,6 +20,7 @@
 #include "Engine/Mcp/McpCrypto.h"
 #include "Engine/Mcp/McpPeerIdentity.h"
 #include "Engine/Mcp/McpChannel.h"
+#include "Engine/Mcp/McpSessionClient.h"
 
 #include <atomic>
 #include <thread>
@@ -160,6 +161,45 @@ namespace
             }
         }
         TEST("PropertyPreserved", propOk);
+    }
+
+    // Documentation drift guard.
+    //
+    // The ShaderLab effect count is quoted in six places outside the code
+    // (docs/effects/builtin-catalog.md, docs/README.md,
+    // docs/development/project-structure.md, docs/architecture/engine-host-split.md,
+    // and twice in .github/copilot-instructions.md). Those quotes drifted to
+    // 33 and 35 while the registry held 36. Adding or removing an effect
+    // should fail here, as a reminder to update the catalog table and the
+    // counts alongside it -- not silently desync the docs again.
+    void TestEffectCatalogCount()
+    {
+        printf("\n=== Effect Catalog Count (doc drift guard) ===\n");
+
+        // Bump this together with the catalog table + the counts listed above.
+        constexpr size_t kExpectedShaderLabEffects = 36;
+
+        const auto& all = ShaderLab::Effects::ShaderLabEffects::Instance().All();
+        if (all.size() != kExpectedShaderLabEffects)
+        {
+            printf("  registry holds %zu effects, expected %zu -- update "
+                   "docs/effects/builtin-catalog.md and the counts in "
+                   "docs/README.md, docs/development/project-structure.md, "
+                   "docs/architecture/engine-host-split.md and "
+                   ".github/copilot-instructions.md, then bump "
+                   "kExpectedShaderLabEffects.\n",
+                   all.size(), kExpectedShaderLabEffects);
+        }
+        TEST("ShaderLab effect count matches the documented catalog",
+             all.size() == kExpectedShaderLabEffects);
+
+        // effectId is the stable identity saved in graphs; a duplicate would
+        // make effectVersion upgrades ambiguous on load.
+        std::set<std::wstring> ids;
+        bool unique = true;
+        for (const auto& e : all)
+            if (!ids.insert(e.effectId).second) unique = false;
+        TEST("every effectId is unique", unique);
     }
 
     void TestSourceEffects()
@@ -553,6 +593,90 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
             macroPS, "test_param_gpu.hlsl", "main", "ps_5_0",
             { { "_SLPARAM_Exposure_GPU", "1" } });
         TEST("ShaderLabParamsHlsli_GpuMode", gpuMode.succeeded);
+
+        // ---- HDR Screenshot Tonemap: compiles + expected cbuffer ----------
+        // The fused 8bpc screenshot path. Compile the real registry
+        // descriptor exactly as graph-load does so a broken shader fails the
+        // suite rather than surfacing as a black node in the app.
+        {
+            using namespace ShaderLab::Effects;
+            const auto* desc = ShaderLabEffects::Instance().FindById(L"HDR Screenshot Tonemap");
+            TEST("ScreenshotTonemap_DescriptorExists", desc != nullptr);
+            if (desc)
+            {
+                std::string src(desc->hlslSource.begin(), desc->hlslSource.end());
+                auto compiled = ShaderCompiler::CompileFromString(
+                    src, "screenshot_tonemap.hlsl", "main", "ps_5_0");
+                if (!compiled.succeeded && compiled.errors)
+                {
+                    printf("  [info] compile errors: %.900s\n",
+                        static_cast<const char*>(compiled.errors->GetBufferPointer()));
+                }
+                TEST("ScreenshotTonemap_Compiles", compiled.succeeded);
+                if (compiled.succeeded)
+                {
+                    auto refl = ShaderCompiler::Reflect(compiled.bytecode.get());
+                    TEST("ScreenshotTonemap_HasCbuffer", !refl.constantBuffers.empty());
+                    if (!refl.constantBuffers.empty())
+                    {
+                        const auto& cb = refl.constantBuffers[0];
+                        auto has = [&](const wchar_t* n) {
+                            for (const auto& v : cb.variables) if (v.name == n) return true;
+                            return false;
+                        };
+                        TEST("ScreenshotTonemap_HasSdrWhiteNits",  has(L"SdrWhiteNits"));
+                        TEST("ScreenshotTonemap_HasKneeRatio",     has(L"KneeRatio"));
+                        TEST("ScreenshotTonemap_HasChromaCorrect", has(L"ChromaCorrect"));
+                        TEST("ScreenshotTonemap_HasDitherStrength",has(L"DitherStrength"));
+                        TEST("ScreenshotTonemap_HasQuantize",      has(L"Quantize"));
+                    }
+                }
+            }
+        }
+
+        // ---- ICtCp Gamut Map cbuffer layout (Soft Compress regression) -----
+        // The Soft Compress params are the first cbuffer payload past byte
+        // 64 in any ShaderLab effect. Compile the real registry descriptor
+        // exactly as graph-load does and assert the reflected layout, so a
+        // packing/reflection size bug can't silently zero them again.
+        {
+            using namespace ShaderLab::Effects;
+            const auto* desc = ShaderLabEffects::Instance().FindById(L"ICtCp Gamut Map");
+            TEST("ICtCpGamutMap_DescriptorExists", desc != nullptr);
+            if (desc)
+            {
+                std::string src(desc->hlslSource.begin(), desc->hlslSource.end());
+                auto compiled = ShaderCompiler::CompileFromString(
+                    src, "ictcp_gamut_map.hlsl", "main", "ps_5_0");
+                TEST("ICtCpGamutMap_Compiles", compiled.succeeded);
+                if (compiled.succeeded)
+                {
+                    auto refl = ShaderCompiler::Reflect(compiled.bytecode.get());
+                    TEST("ICtCpGamutMap_HasCbuffer", !refl.constantBuffers.empty());
+                    if (!refl.constantBuffers.empty())
+                    {
+                        const auto& cb = refl.constantBuffers[0];
+                        printf("  [info] cbuffer '%ls' sizeBytes=%u vars=%zu\n",
+                            cb.name.c_str(), cb.sizeBytes, cb.variables.size());
+                        auto findVar = [&](const wchar_t* n) -> const ShaderVariable* {
+                            for (const auto& v : cb.variables)
+                                if (v.name == n) return &v;
+                            return nullptr;
+                        };
+                        const auto* st = findVar(L"SoftThreshold");
+                        const auto* sl = findVar(L"SoftLimit");
+                        const auto* kh = findVar(L"KneeHardness");
+                        for (const auto& v : cb.variables)
+                            printf("  [info] var %ls offset=%u size=%u\n",
+                                v.name.c_str(), v.offset, v.size);
+                        TEST("ICtCpGamutMap_CbufferSize80", cb.sizeBytes == 80);
+                        TEST("ICtCpGamutMap_SoftThresholdAt64", st && st->offset == 64);
+                        TEST("ICtCpGamutMap_SoftLimitAt68",     sl && sl->offset == 68);
+                        TEST("ICtCpGamutMap_KneeHardnessAt72",  kh && kh->offset == 72);
+                    }
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -1715,6 +1839,128 @@ static void TestMcpJsonRpc()
 // McpFrame + McpCrypto (stdio-migration Step 4): wire codec and the
 // P-256 ECDH -> HKDF-SHA256 -> AES-256-GCM session stack, as pure units.
 // ============================================================================
+// Session-client start/stop lifecycle.
+//
+// Regression guard for the toolbar's "disable MCP" path. Stop() used to
+// CloseHandle() the pipe from the UI thread while the session thread was
+// inside a blocking ReadFile/WriteFile on that same handle -- undefined per
+// Win32 (a Debug build raises STATUS_INVALID_HANDLE, and a recycled handle
+// value lets the session thread write into an unrelated object). It now sets
+// the stop flag and calls CancelSynchronousIo on the session thread, leaving
+// the close to the thread that owns the handle.
+//
+// No hub is running here, so the client sits in its connect/backoff loop --
+// which is exactly the "freshly launched, not yet registered" window the
+// crash was reported in. What this pins: Stop() is safe before the pipe is
+// ever published, the duplicated thread handle is published and retired
+// correctly, and Run() returns promptly rather than hanging the caller's
+// join().
+static void TestMcpSessionClientLifecycle()
+{
+    using ShaderLab::Tests::TEST;
+    printf("\n=== McpSessionClient lifecycle ===\n");
+    using namespace ShaderLab::Mcp;
+
+    ShaderLab::McpRouter router;
+
+    // Point at a pipe name nothing is serving so CreateFileW fails fast and
+    // the client stays in the pre-registration window.
+    auto makeOpts = [] {
+        SessionClientOptions o;
+        o.pipeBaseName = L"ShaderLab.mcp.unittest.nohub." +
+            std::to_wstring(GetCurrentProcessId());
+        o.sessionId = L"{00000000-0000-0000-0000-00000000TEST}";
+        o.label = L"unit-test-session";
+        return o;
+    };
+
+    // Stop() immediately after launch, repeatedly. Any handle misuse here is
+    // what took the app down on a toggle click.
+    bool allJoined = true;
+    for (int i = 0; i < 25 && allJoined; ++i)
+    {
+        McpSessionClient client(router, makeOpts());
+        std::thread t([&client] { client.Run(); });
+        client.Stop();                       // races the connect attempt
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (t.joinable() && std::chrono::steady_clock::now() < deadline)
+        {
+            t.join();
+            break;
+        }
+        if (t.joinable()) { allJoined = false; t.detach(); }
+    }
+    TEST("Stop() during connect returns promptly (25x, no hang)", allJoined);
+
+    // Stop() before Run() ever starts, and Stop() called twice, must both be
+    // no-ops rather than touching a handle that was never published.
+    bool safeEdges = true;
+    try
+    {
+        McpSessionClient neverRan(router, makeOpts());
+        neverRan.Stop();
+        neverRan.Stop();
+
+        McpSessionClient client(router, makeOpts());
+        std::thread t([&client] { client.Run(); });
+        client.Stop();
+        client.Stop();                       // second Stop after the first
+        t.join();
+    }
+    catch (...) { safeEdges = false; }
+    TEST("Stop() is safe before Run() and when called twice", safeEdges);
+
+    // The discriminating case. The two checks above never publish a pipe
+    // handle (nothing is listening), so the old CloseHandle path would pass
+    // them too. Here a stub pipe server accepts the connection and then
+    // deliberately never answers the hello, leaving the session thread parked
+    // in a blocking synchronous ReadFile -- precisely the state the UI thread
+    // used to close the handle out from under.
+    {
+        auto opts = makeOpts();
+        opts.pipeBaseName = L"ShaderLab.mcp.unittest.stub." +
+            std::to_wstring(GetCurrentProcessId());
+        const std::wstring pipePath = L"\\\\.\\pipe\\" + opts.pipeBaseName;
+
+        std::atomic<bool> serverReady{ false };
+        std::atomic<bool> serverStop{ false };
+        std::thread server([&] {
+            HANDLE p = CreateNamedPipeW(pipePath.c_str(), PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1, 64 * 1024, 64 * 1024, 0, nullptr);
+            serverReady.store(true);
+            if (p == INVALID_HANDLE_VALUE) return;
+            ConnectNamedPipe(p, nullptr);
+            while (!serverStop.load()) Sleep(20);   // never reply
+            CloseHandle(p);
+        });
+        while (!serverReady.load()) Sleep(5);
+
+        McpSessionClient client(router, opts);
+        std::thread t([&client] { client.Run(); });
+        Sleep(400);   // connect + send hello + block reading the ack
+
+        const auto t0 = std::chrono::steady_clock::now();
+        client.Stop();
+        t.join();
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        serverStop.store(true);
+        // Release a server still parked in ConnectNamedPipe (only possible if
+        // the client never got there) so this join cannot hang the suite.
+        HANDLE poke = CreateFileW(pipePath.c_str(), GENERIC_READ | GENERIC_WRITE,
+            0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (poke != INVALID_HANDLE_VALUE) CloseHandle(poke);
+        server.join();
+
+        printf("  Stop() while blocked in ReadFile returned in %lld ms\n",
+               static_cast<long long>(elapsedMs));
+        TEST("Stop() unblocks a session parked in a synchronous read",
+             elapsedMs < 5000);
+    }
+}
+
 static void TestMcpFrameCrypto()
 {
     using ShaderLab::Tests::TEST;
@@ -2082,6 +2328,7 @@ int main(int argc, char* argv[])
     // Run tests.
     TestGraphOperations();
     TestSerialization();
+    TestEffectCatalogCount();
     TestSourceEffects();
     TestAnalysisEffects();
     TestBuiltInD2DEffects();
@@ -2099,6 +2346,7 @@ int main(int argc, char* argv[])
     TestRenderThreadDispatcher();
     TestMcpRouter();
     TestMcpJsonRpc();
+    TestMcpSessionClientLifecycle();
     TestMcpFrameCrypto();
     TestMcpPeerIdentity();
     TestMcpChannel();

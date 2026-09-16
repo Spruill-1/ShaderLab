@@ -95,6 +95,11 @@ namespace ShaderLab::Effects
         // Cached loaded bitmaps: nodeId → bitmap.
         std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Bitmap1>> m_bitmapCache;
 
+        // Path the cached bitmap was decoded from: nodeId → path. The decode
+        // is invalidated by the FILE changing, not by node.dirty -- see the
+        // image branch of PrepareSourceNode.
+        std::unordered_map<uint32_t, std::wstring> m_bitmapPathCache;
+
         // Cached flood effects: nodeId → flood effect.
         std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Effect>> m_floodCache;
 

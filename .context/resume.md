@@ -1,200 +1,274 @@
 # ShaderLab — Development Context (Resume Point)
 
-## Project Identity
+## How to use this file
 
-**ShaderLab** is a WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging Direct2D shader effects with full HDR and wide color gamut (WCG) support, with a particular focus on tone-mapping and color-correction R&D.
+A fast orientation to the **shape** of the project: what the pieces are, why they are
+split that way, and the hard-won rules that are expensive to rediscover.
 
-- **Location**: `C:\Users\david\source\ShaderLab\ShaderLab.slnx`
-- **Version**: **1.7.3** released. Current branch `user/daspr/mcp_migration_httptostdio`: the **MCP HTTP → stdio + broker migration is COMPLETE** (all 9 steps). The embedded HTTP listener is deleted; the broker (shim → hub → session over named pipes, bodies sealed) is the only MCP transport. Engine ABI **3**. Only the **manual verification sweep** at the end of [docs/development/mcp-stdio-migration.md](../docs/development/mcp-stdio-migration.md) remains before full sign-off (WinUI window lifecycle, packaged install/activation, a real MCP client, in-place upgrade).
-- **Graph format version**: **2** (unchanged).
-- **Engine ABI version**: **3** (`SHADERLAB_ENGINE_ABI_VERSION` in `EngineExport.h`; Step 2 re-typed `McpRouter`/`Mcp::Response`, Step 9 deleted the HTTP transport).
-- **Language**: C++/WinRT — direct COM access to `ID2D1EffectImpl`, `ID2D1DrawTransform`, `ID2D1ComputeTransform`. No C#.
+**It deliberately carries no counts, versions, or test totals.** Those rot between
+edits and made this the most drift-prone file in the repo — it once claimed engine ABI
+1 while three other lines in it said 3. Live numbers come from:
 
-> Authoritative sources of truth: [`docs/`](../docs/README.md) (architecture tree + per-file references) and especially [`docs/history/decision-log.md`](../docs/history/decision-log.md) (**70 entries**; #64–67 were never written — that stretch is covered by `CHANGELOG.md` §1.6.0), `CHANGELOG.md` (per-version diffs), `Version.h` (numeric version), `.github/copilot-instructions.md` (AI agent rules, including the graph-access threading rule). This file is a fast-orientation summary; it can drift — re-check the docs tree before relying on details.
+| Question | Authority |
+|---|---|
+| App / graph-format version | `Version.h` |
+| Engine ABI | `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` |
+| What changed, when, and why | [`CHANGELOG.md`](../CHANGELOG.md) |
+| Architectural decisions + rationale | [`docs/history/decision-log.md`](../docs/history/decision-log.md) |
+| Effect catalog | [`docs/effects/builtin-catalog.md`](../docs/effects/builtin-catalog.md) (a test pins the count) |
+| MCP tools / routes | [`docs/hosts/mcp-server.md`](../docs/hosts/mcp-server.md) |
+| Test totals | run the suite — it prints them |
+| Agent working rules | [`CLAUDE.md`](../CLAUDE.md), [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) |
+| Everything else, in depth | [`docs/`](../docs/README.md) |
+
+If you find yourself adding a number here, put it in one of those instead.
 
 ---
 
-## Solution Layout (4 projects)
+## Project Identity
+
+**ShaderLab** is a WinUI 3 desktop application (C++/WinRT) for developing, testing, and
+debugging Direct2D shader effects with full HDR and wide colour gamut (WCG) support,
+with a particular focus on tone-mapping and colour-correction R&D.
+
+- **Language**: C++/WinRT — direct COM access to `ID2D1EffectImpl`,
+  `ID2D1DrawTransform`, `ID2D1ComputeTransform`. No C#.
+- **Solution**: `ShaderLab.slnx` at the repo root.
+
+---
+
+## Solution Layout
 
 | Project | Output | Purpose |
 |--------|--------|---------|
-| `ShaderLabEngine.vcxproj` | `ShaderLabEngine.dll` | Host-agnostic engine: graph model + `GraphUiSnapshot`, evaluator, `RenderThreadDispatcher`, ICC reader, video + live-capture sources, ExprTk math, D3D11 compute runner + `CustomComputeBridgeEffect` + `BytecodeCache`, `IEngineComputeOutput` COM interface, MCP router (`McpRouter`, HTTP listener until migration Step 9) + JSON-RPC dispatcher + 39-tool catalog + **25 engine-pure routes**. Exported via `SHADERLAB_API`. |
-| `ShaderLab.vcxproj` | `ShaderLab.exe` (MSIX) | WinUI 3 packaged app. `RenderEngine` (app-only), all XAML, controllers, the render worker thread, `MainWindow.McpRoutes.cpp` (**18 app-side routes** + JSON-RPC dispatcher + `GuiEngineCommandSink`). Depends on the engine DLL. |
-| `ShaderLabTests.vcxproj` | `ShaderLabTests.exe` | Standalone console test runner — **244 tests** (graph/evaluator/bindings, BytecodeCache, GraphUiSnapshot, RenderThreadDispatcher, McpRouter + JSON-RPC dispatcher contracts, MCP frame codec + crypto + peer identity, GPU-binding + skip-readback matrices, 51-test HLSL math bench). CI uses `--adapter warp`. |
-| `ShaderLabHeadless.vcxproj` | `ShaderLabHeadless.exe` | Console host, no WinUI: PNG render, FP32 pixel readback (`--pixels`), JSON batch script mode (`--script`), **MCP session mode (`--mcp-session`, registers with the broker hub)**, bytecode-cache reap/clear ops, `--enable/--disable-gpu-bindings`. |
-| `ShaderLabMcpBroker.vcxproj` | `ShaderLabMcpBroker.exe` | MCP broker. `--hub`: singleton blind relay — first-instance election, per-peer pairing, session registry + channel relay (routes on channelId only; bodies sealed end-to-end). `--stdio`: the MCP client's front-end — owns initialize + list_sessions/use_session, pins a session, runs the initiator handshake, seals/forwards requests, splices tools/list. Does NOT link the engine — compiles the `McpFrame`/`McpCrypto`/`McpPeerIdentity`/`McpChannel` TUs directly. Packaged as the manifest's second `<Application Id="Hub">`. |
+| `ShaderLabEngine.vcxproj` | `ShaderLabEngine.dll` | Host-agnostic engine: graph model + `GraphUiSnapshot`, evaluator, `RenderThreadDispatcher`, ICC reader, video + live-capture sources, ExprTk math, D3D11 compute runner + `CustomComputeBridgeEffect` + `BytecodeCache`, `IEngineComputeOutput` COM interface, and the whole MCP protocol surface (router, JSON-RPC dispatcher, tool catalog, engine-pure routes, broker crypto). Exported via `SHADERLAB_API`. |
+| `ShaderLab.vcxproj` | `ShaderLab.exe` (MSIX) | WinUI 3 packaged app. `RenderEngine` (app-only), all XAML, controllers, the render worker thread, and the UI-coupled MCP routes in `MainWindow.McpRoutes.cpp` + `GuiEngineCommandSink`. Depends on the engine DLL. |
+| `ShaderLabTests.vcxproj` | `ShaderLabTests.exe` | Standalone console runner — graph/evaluator/bindings, bytecode cache, snapshot, dispatcher, MCP router + JSON-RPC contracts, broker frame codec / crypto / peer identity, GPU-binding matrices, and the HLSL math bench. No WinUI; CI runs it on `--adapter warp`. |
+| `ShaderLabHeadless.vcxproj` | `ShaderLabHeadless.exe` | Console host, no WinUI: image render (PNG or JPEG XR, chosen by output extension), `.effectgraph` ZIP + embedded media, FP32 pixel readback, JSON batch script mode, MCP session mode, bytecode-cache ops. |
+| `ShaderLabMcpBroker.vcxproj` | `ShaderLabMcpBroker.exe` | MCP transport. `--hub`: singleton blind relay — first-instance election, per-peer pairing, session registry, channel relay (routes on channelId only; bodies sealed end-to-end). `--stdio`: the client's front-end — owns initialize + `list_sessions`/`use_session`, pins a session, runs the initiator handshake, seals/forwards requests, splices `tools/list`. Does **not** link the engine; compiles the `Mcp*` plumbing TUs directly. Packaged as the manifest's second `<Application Id="Hub">`. |
 
-This split (decisions #41 + #58) keeps WinUI out of the test path, lets engine logic be exercised in isolation, and gives MCP agents a fully-functional logged-out host for parameter sweeps.
+This split (decisions #41 + #58) keeps WinUI out of the test path, lets engine logic be
+exercised in isolation, and gives MCP agents a fully-functional logged-out host for
+parameter sweeps.
 
 ---
 
-## Threading Model (v1.7.0, decisions #68 + #70)
+## Threading Model
 
-All D3D11/D2D graph work runs on a dedicated **render worker `std::jthread`**; the UI thread only blits a double-buffered offscreen into the `SwapChainPanel` swap chain and `Present1`s (presenting from the worker is impossible — XAML composition is STA-bound). The worker per tick: drain `RenderThreadDispatcher` closures → working-space sync → live-capture/clock/video tick → dirty-propagation BFS → `RenderFrameToOffscreen` → publish index + `GraphUiSnapshot`. A version-gated blit keeps the UI thread from vsync-blocking when the worker publishes slower than the UI ticks.
+All D3D11/D2D graph work runs on a dedicated **render worker `std::jthread`**; the UI
+thread only blits a double-buffered offscreen into the `SwapChainPanel` swap chain and
+`Present1`s (presenting from the worker is impossible — XAML composition is STA-bound).
+Per worker tick: drain `RenderThreadDispatcher` closures → working-space sync →
+live-capture/clock/video tick → dirty-propagation BFS → `RenderFrameToOffscreen` →
+publish index + `GraphUiSnapshot`. A version-gated blit keeps the UI thread from
+vsync-blocking when the worker publishes slower than the UI ticks.
 
-**Graph access rule** (the full text lives in `Controls/NodeGraphController.h` and `.github/copilot-instructions.md`; getting it wrong is an access violation inside `std::map`, not a compile error):
+**Graph access rule** — getting it wrong is an access violation inside `std::map`, not a
+compile error. Full text in `Controls/NodeGraphController.h`, `CLAUDE.md`, and
+`.github/copilot-instructions.md`:
 
 1. **UI-thread reads → the per-frame `GraphUiSnapshot`**, never live `m_graph`.
 2. **Writes (any thread) → `RenderThreadDispatcher::DispatchSync`.**
 3. **Layout computation → live graph, render thread only.**
 
-Two locks with a strict order (`m_graphMutex` → `m_visualsMutex`); never hold `m_visualsMutex` across a `DispatchSync`. See [docs/architecture/threading-model.md](../docs/architecture/threading-model.md) for the diagrams and the resource-ownership table.
+Two locks with a strict order (`m_graphMutex` → `m_visualsMutex`); never hold
+`m_visualsMutex` across a `DispatchSync`. Diagrams and the resource-ownership table:
+[docs/architecture/threading-model.md](../docs/architecture/threading-model.md).
 
 ---
 
-## Complete Feature Set (v1.7.3)
+## Feature Shape
 
 ### Core
 - Node-based DAG graph editor for D2D effect composition.
-- 40+ wrapped built-in D2D effects (`Effects/EffectRegistry.cpp`) across 9 categories.
-- ShaderLab built-in effect library with embedded HLSL (`Effects/ShaderLabEffects.cpp` + `Effects/ColorMath.cpp`) — current catalog table in [docs/effects/builtin-catalog.md](../docs/effects/builtin-catalog.md).
-- Custom pixel shader effects (`ID2D1DrawTransform`).
-- Custom D2D compute shader effects (`ID2D1ComputeTransform`, per-tile dispatch).
-- Custom **D3D11 compute shader effects** — routed through `CustomComputeBridgeEffect` (D2D wrapper) + `D3D11ComputeRunner`, which implements `IEngineComputeOutput` so downstream compute consumers can bind analysis SRVs directly (Phase 8, shipped in 1.6.0, feature flag default ON).
-- **`BytecodeCache`**: compile-once bytecode store with eager GPU-binding-variant precompile and disk persistence under `%LOCALAPPDATA%\ShaderLab\bytecode\`; reaper wired to the status-bar broom button and headless CLI flags.
+- Wrapped built-in D2D effects, grouped by category (`Effects/EffectRegistry.cpp`), plus
+  the ShaderLab effect library with embedded HLSL (`Effects/ShaderLabEffects.cpp` +
+  `Effects/ColorMath.cpp`).
+- Three custom-effect flavours: pixel (`ID2D1DrawTransform`), D2D compute
+  (`ID2D1ComputeTransform`, per-tile), and **D3D11 compute** — the last routed through
+  `CustomComputeBridgeEffect` + `D3D11ComputeRunner`, which implements
+  `IEngineComputeOutput` so downstream compute consumers can bind analysis SRVs directly.
+- **`BytecodeCache`**: compile-once store with eager GPU-binding-variant precompile and
+  disk persistence under `%LOCALAPPDATA%\ShaderLab\bytecode\`; reaper on the status-bar
+  broom button and headless CLI flags.
 - Live HLSL hot-reload with `D3DCompile` + `D3DReflect` auto-property discovery.
-- Effect Designer modal window for authoring custom pixel / D2D-compute / D3D11-compute effects with full parameter definition.
-- Graph JSON serialization with versioning (format version 2) — saved as `.effectgraph` zip files (DEFLATE via miniz) with optional **embedded media**.
+- Effect Designer modal for authoring custom effects of all three shader types.
+- Graph serialization as `.effectgraph` ZIP (DEFLATE via miniz) with optional embedded
+  media; `media://` tokens rewritten to extracted paths on load.
 
-### ShaderLab Built-in Effects (`Effects/ShaderLabEffects.cpp`)
+### Effect categories
+Grouped by `category` + optional `subcategory`, which drives the Add Node flyout.
+Members change; the structure doesn't — full table in
+[builtin-catalog.md](../docs/effects/builtin-catalog.md).
 
-Grouped by `category` + optional `subcategory` (Add Node flyout sub-grouping):
+- **Analysis → Highlights** — false-colour / heatmap views of where the energy is.
+- **Analysis → Scopes** — CIE histogram and chromaticity plot.
+- **Analysis → Comparison** — Delta E Comparator (Heatmap / Grayscale dE; prefer the
+  **ΔE ITP** method for HDR/WCG), Split Comparison.
+- **Analysis → Gamut Mapping** — Gamut Map, ICtCp Gamut Map, Gamut Coverage.
+- **Analysis → Tone Mapping (the ICtCp suite)** — forward/inverse tone map, saturation,
+  highlight desaturation, round-trip validator. Bind their nit parameters to the
+  `Working Space` node to track Display Settings or a simulated profile automatically.
+- **Analysis → Statistics** (compute, data-only) — channel / luminance / chromaticity.
+  Not architecturally special (decision #63): agents use `/graph/add-node` + `/analysis/<id>`.
+- **Source / Generators** — synthetic patterns and gamut sources.
+- **Live capture sources** — DXGI Desktop Duplication (per-output) and Windows Graphics
+  Capture; ticked per frame by `SourceNodeFactory::TickAndUploadLiveCaptures`.
+- **Data / Parameter nodes** (no shader, evaluator-handled) — Float / Integer / Toggle /
+  Gamut, Clock, Numeric Expression (ExprTk), Random, and **Working Space**.
 
-- **Analysis → Highlights**: Luminance Heatmap, Nit Map, Gamut Highlight, Luminance Highlight.
-- **Analysis → Scopes**: CIE Histogram (D3D11 compute), CIE Chromaticity Plot. (Vectorscope and Waveform Monitor were **removed in 1.6.0** — no clear use case after the compute-scatter migration.)
-- **Analysis → Comparison**: Delta E Comparator (CIEDE2000, `OutputMode` Heatmap / Grayscale dE), Split Comparison.
-- **Analysis → Gamut Mapping**: Gamut Map (Clip / Nearest / Compress / Fit), ICtCp Gamut Map, Gamut Coverage (single-group D3D11 compute scatter since 1.6.0).
-- **Analysis → Tone Mapping (ICtCp suite)**: ICtCp Round-Trip Validator, ICtCp Tone Map (HDR → SDR; D3D11 compute since 1.6.0, `SourcePeakNits`/`TargetPeakNits` gpuBindable), ICtCp Inverse Tone Map (SDR → HDR), ICtCp Saturation, ICtCp Highlight Desaturation. Bind their numeric peak/SDR-white parameters to the `Working Space` node's analysis outputs to track Display Settings or simulated profiles automatically.
-- **Analysis → Statistics** (D3D11 compute, data-only): Channel Statistics, Luminance Statistics, Chromaticity Statistics. Stats are not architecturally special (decision #63): agents use `/graph/add-node` + `/analysis/<id>`.
-- **Source / Generators**: Gamut Source, ICtCp Boundary, Color Checker, Zone Plate, Gradient Generator, HDR Test Pattern.
-- **Live capture sources**: DXGI Desktop Duplication (per-output enumerated), Windows Graphics Capture (WinUI picker). Per-frame ticking via `SourceNodeFactory::TickAndUploadLiveCaptures` on the render worker.
-- **Data / Parameter nodes** (no shader, evaluator-handled): Float, Integer, Toggle, Gamut, Clock, Numeric Expression (ExprTk, A..Z inputs), Random (deterministic seed → [0,1) hash), **Working Space** (mirrors active display profile into 14 typed analysis fields).
+Every effect carries a stable `effectId` + numeric `effectVersion`; saved graphs detect
+upgrades and offer per-node / batch upgrade in the Properties panel.
 
-Every effect carries a stable `effectId` + numeric `effectVersion`; saved graphs detect upgrades and offer per-node / batch upgrade in the Properties panel.
-
-### Property System
-- `PropertyValue` variant: `float`, `int32`, `uint32`, `bool`, `wstring`, `float2`, `float3`, `float4`, `D2D1_MATRIX_5X4_F`, `vector<float>`.
-- Per-component property bindings (Grasshopper-style data flow), with array (whole-vector) bindings for LUT-shaped fields. `gpuBindable` parameters + `gpuPublish` analysis fields route upstream compute SRVs directly to D3D11 compute consumers (CPU readback skipped when no CPU consumer needs the value).
-- Enum labels for named dropdown parameters; `bool` rendered as `ToggleSwitch`.
-- `visibleWhen` conditional visibility on parameters (`"Mode == 1"`, `"Strength > 0"`, etc.) — including conditionally-visible **input pins**, extended on the canvas after MCP or Properties-panel changes (1.7.3 fix).
-- Visual data pins (orange diamonds) on the node graph for binding connections.
+### Property system
+- `PropertyValue` variant: `float`, `int32`, `uint32`, `bool`, `wstring`, `float2/3/4`,
+  `D2D1_MATRIX_5X4_F`, `vector<float>`.
+- Per-component property bindings (Grasshopper-style data flow), plus whole-array
+  bindings for LUT-shaped fields. `gpuBindable` parameters + `gpuPublish` analysis
+  fields route upstream compute SRVs straight to D3D11 compute consumers, skipping CPU
+  readback when no CPU consumer needs the value.
+- Enum labels render as dropdowns; `bool` as a `ToggleSwitch`.
+- `visibleWhen` conditional visibility on parameters *and* input pins.
+- Visual data pins (orange diamonds) on the canvas for binding connections.
 
 ### Rendering
-- **Always scRGB FP16 pipeline** (`DXGI_FORMAT_R16G16B16A16_FLOAT`, `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`). DWM/ACM handles final display conversion.
-- **Render worker thread** (see Threading Model above); UI-thread Present cost is a sub-ms FP16 blit.
-- **Refresh-rate-driven loop** (60–240 Hz) — interval re-derived from `EnumDisplaySettings(dmDisplayFrequency)` on every display change.
-- Dirty-gated evaluation with dirty-propagation pre-pass; no built-in tone-mapping pass — users build tone mappers as graph effects (the ICtCp suite is the preferred path).
-- Display profile mocking (presets + ICC file loading via `mscms.dll`); monitor gamut from `DXGI_OUTPUT_DESC1` primaries; **OS-reported SDR white level** via `DisplayConfigGetDeviceInfo`, exposed to graphs as `working_space.SdrWhiteNits`.
-- **DXVA2 / Media Foundation video sources** with `ID3D10Multithread` protection.
-- `OutputWindow` system: each `Output` node gets its own OS window (cross-thread `OutputSinkRenderState`, worker renders native-size, UI fits + presents). Bidirectional sync (close window ↔ delete node); `OnNodeAdded` auto-spawns windows for MCP/file-load Output nodes.
-- D2D-rendered node graph canvas with pan/zoom, bezier edges (Alt+click delete), color-coded nodes, dot grid, dark theme; canvas paints from the `GraphUiSnapshot`.
+- **Always scRGB FP16** (`DXGI_FORMAT_R16G16B16A16_FLOAT`,
+  `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`). No format switching; DWM/ACM handles the
+  final display conversion.
+- **No built-in tone-mapping pass** — users compose tone mappers as graph effects, with
+  the ICtCp suite as the preferred path.
+- Refresh-rate-driven loop, re-derived from `EnumDisplaySettings` on every display
+  change. Dirty-gated evaluation with a dirty-propagation pre-pass.
+- Display profile mocking (presets + ICC via `mscms.dll`); monitor gamut from
+  `DXGI_OUTPUT_DESC1` primaries; OS-reported SDR white level via
+  `DisplayConfigGetDeviceInfo`, exposed to graphs as `working_space.SdrWhiteNits`.
+- DXVA2 / Media Foundation video sources with `ID3D10Multithread` protection.
+- `OutputWindow`: each `Output` node gets its own OS window, worker renders native-size,
+  UI fits + presents. Bidirectional sync (close window ↔ delete node).
+- D2D-rendered canvas with pan/zoom, bezier edges, colour-coded nodes; paints from the
+  `GraphUiSnapshot`.
 
-### MCP Server (stdio via the broker; HTTP deleted in migration Step 9)
-JSON-RPC 2.0 (protocol `2025-06-18`, batching rejected) over the broker — **no HTTP**. `Engine/Mcp/McpRouter.{h,cpp}` is now a pure route registry (`AddRoute`/`RouteRequest`/`HasRoute`, query split, `ActivityCallback` fired on top-level `POST /`); transport-neutral types in `McpTypes.h` (`Mcp::Response` + `noReply`); the JSON-RPC dispatcher + declarative 39-tool `McpToolCatalog` in `McpJsonRpc.{h,cpp}`. Enable/disable per window via the toolbar toggle, `--mcp` flag, or `config.json`; the toggle registers this window as a hub **session**.
+### MCP
+JSON-RPC 2.0 over **stdio via the broker** — there is no HTTP listener (deleted in
+stdio-migration Step 9). Enable per window via the toolbar toggle, `--mcp`, or
+`config.json`; the toggle registers that window as a hub **session**.
 
-- **Transport = broker** (`ShaderLabMcpBroker`): a client's unpackaged **shim** (`--stdio`, distributed to `%LOCALAPPDATA%\ShaderLab\bin\`, update-immune) activates the packaged **hub** (`--hub`, blind relay routing on `{channelId, seq}`; shim↔session bodies sealed P-256/HKDF/AES-GCM), lists **sessions** (GUID-identified per window), `use_session <id>` to pin one. `ShaderLabHeadless --mcp-session` registers a headless session.
-- **25 engine-pure routes** (`EngineMcpRoutes.cpp`) via `IEngineCommandSink` — `/graph/apply`, `/effects`, `/graph/overview`, `/display/info`, etc. In the GUI, `GuiEngineCommandSink::Dispatch` marshals to the **render thread** with `ctx.dc = RenderD2DContext()`, then fires the 8 event hooks so MCP mutations look native. **16 app-side routes** (`MainWindow.McpRoutes.cpp`): UI-coupled + `/context`/`/perf`/`/node/<id>/logs`. Tools whose backing route is absent on a host return isError "Tool not available" via `HasSpecificRoute`.
-- **39 tools** in `tools/list` (see [docs/hosts/mcp-server.md](../docs/hosts/mcp-server.md)). Pairing: strict PFN for sessions, role-relaxed for the shim; `DefaultPipeBaseName()` is the shared meeting point. Full design: [docs/development/mcp-stdio-migration.md](../docs/development/mcp-stdio-migration.md).
+Transport is **shim → hub → session**: a client's unpackaged shim
+(`ShaderLabMcpBroker --stdio`, copied to `%LOCALAPPDATA%\ShaderLab\bin\` by
+rename-then-write so it survives app updates) activates the singleton packaged hub,
+which relays blindly on a clear `{channelId, seq}` header while shim↔session bodies stay
+sealed (ephemeral P-256 ECDH → HKDF → AES-256-GCM). Sessions are GUID-identified, so
+`use_session` pins a stable graph across hub restarts.
 
-The **Working Space** parameter node — a strict sink with no input pins — mirrors the active display profile (live or simulated preset/ICC) into 14 typed analysis output fields. Bind any downstream property to drive an effect from the live working space. Updated by `Rendering::UpdateWorkingSpaceNodes` on the render worker.
+Engine-pure routes live in `EngineMcpRoutes.cpp` and reach the host through
+`IEngineCommandSink`; the GUI's sink marshals to the render worker and then fires event
+hooks so MCP mutations look native. UI-coupled routes stay in `MainWindow.McpRoutes.cpp`;
+a tool whose backing route is absent on the answering host returns an `isError`
+"Tool not available". Design: [mcp-server.md](../docs/hosts/mcp-server.md) and
+[mcp-stdio-migration.md](../docs/development/mcp-stdio-migration.md).
 
-### Effect Designer
-- Three shader types: pixel (`ps_5_0`), D2D compute (`cs_5_0`), **D3D11 compute** (`cs_5_0`, host-dispatched).
-- Parameter types: float, float2, float3, float4, int, uint, bool, enum; analysis output fields with typed declarations.
-- HLSL auto-formatting and scaffold generation per shader type (D3D11 scaffold injects auto `Width`/`Height` cbuffer + stride-reduction template).
-- "Edit in Effect Designer" opens any built-in effect for inspection / fork; Add to Graph / Update in Graph buttons.
-- Talks to `MainWindow` only through two `std::function` callbacks — no back-pointer.
+The **Working Space** node — a strict sink with no input pins — mirrors the active
+display profile (live or simulated) into typed analysis output fields, so any downstream
+property can be driven from the real working space. Updated by
+`Rendering::UpdateWorkingSpaceNodes` on the render worker.
 
-### Versioning
-- `Version.h`: App **1.7.3**, Graph format version **2**, plus `LibraryVersion()` (sum of all effect versions).
-- `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` = **1** (independent of app version; mismatch between header and DLL aborts startup with a friendly message box).
-- Saved graphs include `formatVersion` + `appVersion`; loading newer-format graphs shows an error dialog. Per-effect `effectId`/`effectVersion` round-trip and surface upgrade prompts.
-
-### UI / UX
-- Segoe Fluent Icons toolbar with tooltips; status bar shows pipeline / display / FPS; title bar shows app version + library version.
-- `.effectgraph` file-type association + Ctrl+S accelerators + unsaved-changes guard + async save/load with progress dialog.
-- Status-bar broom button runs both reapers (orphan graph media + bytecode-cache drift) and reports freed bytes.
-- Auto-arrange resets viewport; new nodes spawn at the center of the current viewport.
+### Judging HDR output
+An agent's vision input is 8-bit SDR, so a captured PNG of an HDR frame has already
+clipped everything above scRGB 1.0 and lost wide-gamut negatives — judging a tone mapper
+from a tone-mapped screenshot is circular. Prefer numbers (FP32 readback, analysis
+fields), then measured difference (Delta E Comparator with **ΔE ITP**), then diagnostic
+renders that encode HDR facts into SDR-visible form. Full rule in `CLAUDE.md`
+§*Looking at HDR output*.
 
 ---
 
 ## D2D Custom Effect Gotchas (Hard-Won Knowledge)
 
-These are critical lessons learned during development. Any AI agent or developer working on custom D2D effects **must** be aware of these:
+Stable, expensive to rediscover, and mirrored in `.github/copilot-instructions.md` —
+change one, check the other. Anyone touching custom D2D effects must know these:
 
-1. **Typed cbuffer pack (Phase 3+)**: `uint`, `int`, and `bool` cbuffer slots in HLSL are now packed correctly even when the corresponding `PropertyValue` is stored as `float` (the default for enum-style parameters). The `Effects::PackPropertyToCBuffer` helper reflects each cbuffer variable's `D3D_SHADER_VARIABLE_TYPE` and converts via `static_cast<uint32_t>` / `<int32_t>` / `BOOL` before writing. So you *can* declare `uint Mode` in HLSL and use clean `if (Mode == 1)` comparisons. **Pre-Phase-3 historical convention** (still works, used by all existing ShaderLab effects): declare enums as `float` in HLSL with `> 0.5` / `> 1.5` threshold comparisons.
-2. **HLSL compiler optimizes out cbuffer variables** not referenced on ALL code paths when `D3DCOMPILE_WARNINGS_ARE_ERRORS` is set. Read all cbuffer vars at top of `main()` before any branches.
-3. **D2D custom effects need TWO evaluation passes** for newly created effects — first creates/initializes, second produces correct output. The evaluator handles this with `m_justCreated` deferring analysis readback by one frame.
-4. **`RegisterWithInputCount` requires `inputCount >= 1`**. Zero-input source effects use a hidden dummy 1×1 bitmap input.
-5. **`MapInputRectsToOutputRect` with `SetFixedOutputSize`** must check fixed size FIRST, before input rect.
-6. **D2D `TEXCOORD` values are in pixel/scene space**, NOT normalized [0,1]. Use `GetDimensions()` and divide, or call `Source.Load(int3(uv, 0))` directly.
-7. **D2D custom effect transforms must NOT pass through infinite input rects** in `MapInputRectsToOutputRect`. Store the requested output rect from `MapOutputRectToInputRects` and return it.
-8. **`ForceUploadConstantBuffer()` uploads cbuffer but doesn't invalidate cached output**. Need input toggle trick (disconnect+reconnect dummy input) to force re-evaluation.
-9. **Variable-input D2D custom effects** (`<Inputs minimum='0' maximum='8'/>`) require BOTH `ID2D1Effect::SetInputCount(N)` (external) AND updating the transform node's internal count. Without the external call, `SetInput()` fails with `E_INVALIDARG`.
-10. **Monitor gamut from `DXGI_OUTPUT_DESC1` primaries** (`RedPrimary`, `GreenPrimary`, `BluePrimary`, `WhitePoint`). Always write primaries into the cbuffer on every evaluate (correct on first frame), only mark dirty on actual change (prevents feedback loops).
-11. **D2D → D3D11 texture handoff requires `dc->Flush()`** between `DrawImage` and any D3D11 read of the underlying texture. D2D batches commands until `EndDraw()` or `Flush()` — without an explicit flush, D3D11 reads zeros. Applied in `DispatchUserD3D11Compute`.
-12. **`ProcessDeferredCompute` requires an active D2D draw session** (decision #63). It calls `dc->DrawImage` internally to pre-render the upstream chain into an FP32 bitmap, and outside `BeginDraw`/`EndDraw` that DrawImage silently no-ops — the compute reads black input and emits Min/Max/Mean = 0. The GUI's render path, the headless host's `runEval` / `RunRender`, and the test bench all wrap accordingly.
-13. **D3D11 compute output → D2D bitmap interop**: `CreateBitmapFromDxgiSurface` must set `bp.dpiX/dpiY = 96.0f`. Default 0 DPI causes `GetImageLocalBounds` to return zero-size bounds.
-14. **D3D11 multithread protection** (`ID3D10Multithread::SetMultithreadProtected(TRUE)`) must be enabled when using DXVA2 video decode on background threads with `Lock2D` on GPU buffers.
-15. **D3D11 compute cbuffers**: when HLSL declares `uint`/`int`/`bool` but the property is stored as `float`, the pack code must reflect the declared `D3D_SHADER_VARIABLE_TYPE` and `static_cast` to the right type before writing — raw `memcpy` of a float bit-pattern produces nonsense ints/uints.
+1. **Typed cbuffer pack**: `uint` / `int` / `bool` cbuffer slots are packed correctly
+   even when the `PropertyValue` is stored as `float` (the default for enum-style
+   parameters) — `Effects::PackPropertyToCBuffer` reflects each variable's
+   `D3D_SHADER_VARIABLE_TYPE` and converts before writing. So `uint Mode` with clean
+   `if (Mode == 1)` works. The older convention (declare enums as `float`, compare with
+   `> 0.5` / `> 1.5`) still works and is what most existing effects use.
+2. **The HLSL compiler optimizes out cbuffer variables** not referenced on *all* code
+   paths under `D3DCOMPILE_WARNINGS_ARE_ERRORS`. Read every cbuffer var at the top of
+   `main()` before branching.
+3. **New D2D custom effects need TWO evaluation passes** — the first creates and
+   initializes, the second produces correct output. The evaluator handles this with
+   `m_justCreated` deferring analysis readback by one frame.
+4. **`RegisterWithInputCount` requires `inputCount >= 1`.** Zero-input source effects
+   use a hidden dummy 1×1 bitmap input.
+5. **`MapInputRectsToOutputRect` with `SetFixedOutputSize`** must check the fixed size
+   FIRST, before the input rect.
+6. **D2D `TEXCOORD` is pixel/scene space**, not normalized [0,1]. Use `GetDimensions()`
+   and divide, or `Source.Load(int3(uv, 0))` directly.
+7. **Transforms must NOT pass through infinite input rects** in
+   `MapInputRectsToOutputRect` — store the requested output rect from
+   `MapOutputRectToInputRects` and return that.
+8. **`ForceUploadConstantBuffer()` uploads the cbuffer but does not invalidate cached
+   output.** Forcing re-evaluation needs the input-toggle trick.
+9. **Variable-input custom effects** (`<Inputs minimum='0' maximum='8'/>`) need BOTH
+   `ID2D1Effect::SetInputCount(N)` externally AND the transform node's internal count
+   updated. Without the external call `SetInput()` fails `E_INVALIDARG`.
+10. **Monitor gamut comes from `DXGI_OUTPUT_DESC1` primaries.** Write them into the
+    cbuffer on every evaluate (so frame one is right), but only mark dirty on actual
+    change (or property writes and evaluation feed back into each other).
+11. **D2D → D3D11 texture handoff requires `dc->Flush()`** between `DrawImage` and any
+    D3D11 read. D2D batches until `EndDraw()` or `Flush()`; without it D3D11 reads zeros.
+12. **`ProcessDeferredCompute` requires an active D2D draw session** (decision #63). It
+    calls `dc->DrawImage` internally; outside `BeginDraw`/`EndDraw` that silently no-ops
+    and the compute reads black, emitting Min/Max/Mean = 0 with no error anywhere.
+13. **D3D11 compute output → D2D bitmap interop** must set `bp.dpiX/dpiY = 96.0f`.
+    Default 0 DPI makes `GetImageLocalBounds` return zero-size bounds.
+14. **`ID3D10Multithread::SetMultithreadProtected(TRUE)`** is required when DXVA2 video
+    decode runs on background threads with `Lock2D` on GPU buffers.
+15. **scRGB is signed on purpose.** Negative Rec.709 components are how wide-gamut colour
+    is expressed. A `max(rgb, 0)` or `saturate()` at the top of a colour transform is a
+    gamut clip, not a safety net — this silently sRGB-clipped the entire ICtCp suite
+    once. Use the signed PQ helpers in `Effects/ColorMath.cpp`.
 
 ---
 
 ## Build / Deploy / Launch
 
-### Prerequisites
-- Visual Studio 2022 17.8+ **or** VS 2026 (C++ Desktop + UWP workloads).
-- Windows App SDK 1.8; Windows 10 SDK 10.0.26100+; PowerShell 5.1+.
-- Git — `exprtk` + `miniz` are **submodules** (decision #69); clone with `--recurse-submodules` or run `git submodule update --init --recursive`. A clone without them fails fast via the `VerifySubmodules` MSBuild target. `third_party/miniz_export.h` is an in-tree shim, not part of the submodule.
+Commands and the platform traps live in [docs/development/build.md](../docs/development/build.md),
+`CLAUDE.md`, and the `.claude/skills/shaderlab-build` + `shaderlab-run` skills. The
+shape:
 
-### Build
-```pwsh
-# Via Visual Studio: open ShaderLab.slnx → Build (Debug | x64 or Debug | ARM64)
-
-# Via MSBuild (x64 host)
-msbuild ShaderLab.slnx /p:Configuration=Debug /p:Platform=x64
-
-# On an ARM64 host you MUST use the ARM64-native MSBuild — see the
-# "Building ARM64 on an ARM64 host" section of docs/development/build.md
-# for why the default 32-bit MSBuild fails with PCH out-of-memory errors.
-```
-
-`scripts\EnsureDevCert.ps1` runs automatically on first build (local `CN=ShaderLab` F5 cert). NuGet restores automatically (packages.config style).
-
-### Deploy (local F5)
-```pwsh
-Add-AppxPackage -Register "<Platform>\<Config>\ShaderLab\AppxManifest.xml"
-```
-**Never deploy from `AppX\`** — it accumulates stale artifacts that cause XAML 0xc000027b crashes. Close running instances before redeploying.
-
-### Verification
-```pwsh
-<Platform>\<Config>\ShaderLabTests\ShaderLabTests.exe --adapter warp   # 261 unit tests
-pwsh -NoProfile -File .\Tests\RunBrokerSmoke.ps1 -Platform ARM64        # broker smoke 26/26
-# MCP suite is shim-driven (no HTTP). Against a running GUI (shim activates the hub):
-pwsh -NoProfile -File .\Tests\RunTests.ps1 -HubAumid 'ShaderLab_9v3yd384n9j18!Hub'
-# or against a headless session (what CI does; GUI-only tests self-skip):
-#   $env:SHADERLAB_MCP_ALLOW_UNPACKAGED='1'
-#   ShaderLabMcpBroker.exe --hub --pipe P ; ShaderLabHeadless.exe --graph fixture --mcp-session --pipe P --adapter warp
-#   pwsh -NoProfile -File .\Tests\RunTests.ps1 -Pipe P
-.\Tests\RunHeadlessSmoke.ps1 -Configuration Debug -Platform x64        # headless smoke
-```
-
-### CI / Releases
-`.github/workflows/ci.yml`: `build-and-test` (Debug+Release x64, WARP unit tests) + `clean-clone-smoke` (checks out **without** submodules, runs the documented submodule-init command explicitly, builds, tests, headless smoke). `release.yml` runs an x64 + ARM64 matrix and injects the unsigned-namespace OID into the manifest just before MSBuild; end-user `Install.ps1` installs dependency MSIXes then ShaderLab.
+- **Prerequisites** — Visual Studio 2022 17.8+ or VS 2026 (C++ Desktop + UWP workloads),
+  Windows App SDK, a recent Windows SDK, PowerShell.
+- **Submodules** — `exprtk` + `miniz` (decision #69). Clone with `--recurse-submodules`
+  or run `git submodule update --init --recursive`; a clone without them fails fast via
+  the `VerifySubmodules` MSBuild target. `third_party/miniz_export.h` is an in-tree shim,
+  not part of the submodule.
+- **ARM64 hosts need the ARM64-native MSBuild.** The default is 32-bit and picks a
+  toolset that dies with misleading PCH out-of-memory errors. CI cross-compiles ARM64
+  from an x64 runner, so only the `native-arm64` job covers this.
+- **Deploy from the layout root, never `AppX\`** — `AppX\` accumulates stale artifacts
+  and produces XAML `0xc000027b` crashes. Close running instances first; the GUI locks
+  the engine DLL, and a lingering broker hub locks the broker copy.
+- **Launch by shell activation**, not the exe directly — a packaged app started
+  directly aborts in CRT dependency resolution.
+- **Verification** — unit runner (WARP), headless smoke, broker smoke, and the
+  shim-driven MCP suite. Each prints its own totals.
 
 ---
 
 ## Project Structure
 
-The annotated per-file tree lives in [docs/development/project-structure.md](../docs/development/project-structure.md) — maintained there, not here. Orientation summary:
+The annotated per-file tree is maintained in
+[docs/development/project-structure.md](../docs/development/project-structure.md), not
+here. Orientation only:
 
 ```
-ShaderLab\            4 vcxproj at repo root; MainWindow.xaml.cpp (~5000 lines) + sibling
-│                     partial TUs (WorkingSpace / GraphFileIo / RenderTick / McpRoutes)
-├── Engine\Mcp\       McpRouter + McpTypes + McpJsonRpc + McpToolCatalog + McpTimeouts + 25 engine routes;
-│                     broker plumbing: McpFrame + McpCrypto + McpPeerIdentity + McpChannel;
-│                     McpSessionClient (registers a session with the hub; used by headless + GUI)
+ShaderLab\            vcxproj files at repo root; MainWindow.xaml.cpp + sibling partial
+│                     TUs (WorkingSpace / GraphFileIo / RenderTick / McpRoutes)
+├── Engine\Mcp\       Router + types + JSON-RPC + tool catalog + timeouts + engine routes;
+│                     broker plumbing (frame codec, crypto, peer identity, channel);
+│                     McpSessionClient (registers a session with the hub; headless + GUI)
 ├── ShaderLabMcpBroker\  hub relay + stdio shim (Main.cpp); compiles the Mcp* plumbing directly
 ├── Graph\            EffectGraph DAG + GraphUiSnapshot (immutable per-frame UI copy)
 ├── Rendering\        Evaluator, RenderThreadDispatcher, display/ICC, readback, .effectgraph zip
@@ -206,23 +280,38 @@ ShaderLab\            4 vcxproj at repo root; MainWindow.xaml.cpp (~5000 lines) 
 
 ---
 
-## Active Development Focus
+## Product Thesis
 
-**MCP transport migration: HTTP → stdio + broker — COMPLETE** (branch `user/daspr/mcp_migration_httptostdio`; decision #71, supersedes #31/#58; engine ABI **3**). Full plan + the end-of-migration manual sweep: [docs/development/mcp-stdio-migration.md](../docs/development/mcp-stdio-migration.md).
+I (intensity) is decoupled from Ct/Cp in ICtCp, so manipulating I alone preserves hue
+and saturation *by construction*. That is why the tone-mapping work lives in ICtCp
+rather than linear RGB or xyY, where the same operations turn into hue shifts and gamut
+excursions.
 
-The embedded Winsock HTTP listener is deleted. The transport is now: a client's unpackaged **shim** (`ShaderLabMcpBroker --stdio`, copied to `%LOCALAPPDATA%\ShaderLab\bin\` via rename-then-write, so it survives ShaderLab updates) activates a singleton packaged **hub** (`--hub`, a blind relay routing on a clear `{channelId, seq}` frame header; shim↔session bodies sealed with ephemeral P-256 ECDH → HKDF → AES-256-GCM) which relays to per-window **sessions** (`McpSessionClient`, GUID-identified, so `use_session` pins a stable graph across hub restarts). This fixed the three original defects: multiple windows are now addressable, the unauthenticated loopback port is gone, and clients get the stdio transport they expect. The engine keeps the pure routing surface (`McpRouter::{AddRoute,RouteRequest,HasRoute}` + the `McpJsonRpc` dispatcher + the 39-tool `McpToolCatalog`); GUI tool calls still marshal to the render worker via `GuiEngineCommandSink::Dispatch` and fire the 8 event hooks. Along the way: `RenderThreadDispatcher` fails pending `DispatchSync` promises fast on shutdown/reset (no 30 s stall), the timeout ladder lives in `Engine/Mcp/McpTimeouts.h`, `SwitchAdapter` gates the sink to 503, pairing is role-aware (strict PFN for sessions, relaxed for the shim), and the dead pre-worker tick path was removed. Verified green: 261 unit tests, broker smoke 26/26, headless smoke, and the shim-driven `RunTests.ps1` at 40/40 (GUI) / 21/21 (headless) on WARP; grep for `47808`/`WSA` is clean. **Remaining before full sign-off:** the manual verification sweep (WinUI window lifecycle, packaged install/activation, a real MCP client, in-place upgrade) at the end of the migration doc.
+Around it sits the **empirical fidelity loop**: `Working Space` (the real display
+profile) + `Delta E Comparator` in Grayscale dE mode + `Luminance Statistics`, giving a
+live measured colour-difference readout while a parameter sweeps. Effects get tuned
+against measured difference, not visual impression — and for HDR/WCG that measurement
+must use **ΔE ITP**, since the CIE Lab metrics leave their fitted domain above roughly
+100 nits.
 
-Recently shipped context: **1.6.0** was the Phase 8 GPU-binding release (SRV routing between compute effects, bytecode cache + disk persistence, `CustomComputeBridgeEffect`, ICtCp Tone Map on compute, Vectorscope/Waveform removed); **1.7.0** was the render-worker-thread release (decision #68); **1.7.1–1.7.3** were targeted fixes (deferred-compute regression, Win2D removal, clock-controls-on-load + `visibleWhen` pin extension).
-
-The product thesis carries through: I (intensity) is decoupled from Ct/Cp in ICtCp, so manipulating I alone preserves hue and saturation by construction; the empirical fidelity loop (`Working Space` + `Delta E Comparator` Grayscale dE + `Luminance Statistics` live readout) tunes effect parameters against measured CIEDE2000 rather than visual impression. The MCP work is what lets agents drive that loop reliably across multiple sessions.
+The MCP work exists to let agents drive that loop reliably across multiple windows.
 
 ---
 
 ## Potential Future Work
 
-- **More tone-mapping operators** in the ICtCp subcategory (BT.2390, hue-preserving ACES, adaptive).
-- **Auto-bind affordances** so SDR-white / monitor-peak hidden defaults can be wired from any matching upstream output without manual binding.
-- **Effect Designer export** — emit standalone C++ header / module files for D3D11 compute effects.
-- **External binary import** — load pre-compiled D2D effect DLLs (`ID2D1EffectImpl`) and `.cso` compute binaries directly into the graph.
-- **Multi-dispatch GPU reduction pyramid** for images > ~33 MP (current `D3D11ComputeRunner` dispatches a single 1024-thread group).
-- **Hide `Prim*` data pins from OOG-style nodes** — host-managed hidden properties should never surface as connectable orange diamonds.
+- **More tone-mapping operators** in the ICtCp subcategory (BT.2390, hue-preserving
+  ACES, adaptive).
+- **Auto-bind affordances** so SDR-white / monitor-peak hidden defaults can be wired
+  from any matching upstream output without manual binding.
+- **Effect Designer export** — emit standalone C++ header / module files for D3D11
+  compute effects.
+- **External binary import** — load pre-compiled D2D effect DLLs (`ID2D1EffectImpl`) and
+  `.cso` compute binaries directly into the graph.
+- **Multi-dispatch GPU reduction pyramid** for images beyond what a single thread group
+  can reduce.
+- **Hide `Prim*` data pins from OOG-style nodes** — host-managed hidden properties should
+  never surface as connectable orange diamonds.
+- **Content-adaptive screenshot tone mapping** — drive the knee from a statistics pass
+  (fraction of frame above SDR white, percentile content peak) plus a bypass fast path
+  when nothing exceeds it, so pure-SDR captures stay bit-exact.

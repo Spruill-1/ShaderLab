@@ -150,20 +150,53 @@ namespace ShaderLab::Tests
                 !r.empty() && r[0].x < 5e-3f);
         }
 
-        // ---- Negative scRGB protection ------------------------------------
-        // ScRGBToICtCp clamps `max(rgb, 0)` before the XYZ matrix to keep
-        // the LMS path well-defined. Confirm: a slightly-negative input
-        // produces the same ICtCp as the all-zero input.
+        // ---- Wide-gamut (negative scRGB) survival --------------------------
+        // scRGB carries wide-gamut colour as negative Rec.709 components, so
+        // the ICtCp round trip must preserve them. It previously clamped
+        // `max(rgb, 0)` on entry, which silently sRGB-clipped every
+        // wide-gamut pixel *before* any tone/gamut mapping ran.
         {
+            // BT.2020 and DCI-P3 primaries at 80 nits, expressed in scRGB.
+            // Each has at least one strongly negative component.
             auto r = bench.Run(R"(
-                float3 a = ScRGBToICtCp(float3(-0.1, -0.1, -0.1));
-                float3 b = ScRGBToICtCp(float3( 0.0,  0.0,  0.0));
-                float3 d = abs(a - b);
-                float maxErr = max(max(d.x, d.y), d.z);
-                Result[0] = float4(maxErr, a.x, a.y, a.z);
+                float3 wide[4] = {
+                    float3(-0.8667,  1.0000,  0.0596),   // BT.2020 green-ish
+                    float3( 1.2484, -0.0479, -0.0184),   // BT.2020 red-ish
+                    float3(-0.1067,  1.0128,  0.0294),   // P3 green-ish
+                    float3( 1.0930, -0.2267,  0.0442)    // P3 red-ish
+                };
+                float maxErr = 0.0;
+                [unroll]
+                for (int i = 0; i < 4; ++i) {
+                    float3 rt = ICtCpToScRGB(ScRGBToICtCp(wide[i]));
+                    float3 d = abs(rt - wide[i]);
+                    maxErr = max(maxErr, max(max(d.x, d.y), d.z));
+                }
+                Result[0] = float4(maxErr, 0, 0, 0);
             )");
-            TEST("ScRGBToICtCp negative-input clamp matches zero (max err < 1e-5)",
-                !r.empty() && r[0].x < 1e-5f);
+            TEST("ICtCp round trip preserves wide-gamut negatives (max err < 5e-3)",
+                !r.empty() && r[0].x < 5e-3f);
+        }
+        {
+            // The specific regression: a negative component must NOT collapse
+            // to zero. Pin the sign and rough magnitude explicitly so a
+            // reintroduced clamp fails loudly rather than drifting.
+            auto r = bench.Run(R"(
+                float3 rt = ICtCpToScRGB(ScRGBToICtCp(float3(-0.8667, 1.0, 0.0596)));
+                Result[0] = float4(rt, 0);
+            )");
+            TEST("ICtCp round trip keeps R strongly negative (no sRGB clip on entry)",
+                !r.empty() && r[0].x < -0.80f && r[0].x > -0.93f);
+        }
+        {
+            // Signed PQ is symmetric about the origin, so below-black input
+            // round-trips rather than pinning to zero.
+            auto r = bench.Run(R"(
+                float3 rt = ICtCpToScRGB(ScRGBToICtCp(float3(-0.1, -0.1, -0.1)));
+                Result[0] = float4(rt, 0);
+            )");
+            TEST("ICtCp round trip preserves below-black neutral (-0.1 stays negative)",
+                !r.empty() && r[0].x < -0.09f && r[0].x > -0.11f);
         }
     }
 }

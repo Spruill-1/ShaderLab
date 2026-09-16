@@ -1344,7 +1344,20 @@ namespace ShaderLab::Controls
                                 }
                             }
                             if (valStr.empty())
-                                valStr = std::format(L"{:.4g}", val);
+                            {
+                                // Vector properties (e.g. bound gamut primaries)
+                                // previously fell through the float-only read
+                                // above and always displayed "= 0".
+                                using namespace winrt::Windows::Foundation::Numerics;
+                                if (auto* v2 = std::get_if<float2>(&propIt->second))
+                                    valStr = std::format(L"{:.3g}, {:.3g}", v2->x, v2->y);
+                                else if (auto* v3 = std::get_if<float3>(&propIt->second))
+                                    valStr = std::format(L"{:.3g}, {:.3g}, {:.3g}", v3->x, v3->y, v3->z);
+                                else if (auto* v4 = std::get_if<float4>(&propIt->second))
+                                    valStr = std::format(L"{:.3g}, {:.3g}, {:.3g}, {:.3g}", v4->x, v4->y, v4->z, v4->w);
+                                else
+                                    valStr = std::format(L"{:.4g}", val);
+                            }
                             label += L" = " + valStr;
                         }
                         D2D1_RECT_F labelRect = {

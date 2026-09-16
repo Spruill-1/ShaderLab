@@ -164,6 +164,8 @@ namespace ShaderLab::Controls
     {
         if (m_isOpen && m_window)
         {
+            // Deliberate swallow: teardown. Closing an already-closed window
+            // throws, and every field is nulled immediately below regardless.
             try { m_window.Close(); } catch (...) {}
         }
         m_isOpen = false;

@@ -1075,7 +1075,16 @@ namespace ShaderLab::Graph
                     if (!node.customEffect->analysisFields.empty())
                         node.customEffect->analysisOutputType = AnalysisOutputType::Typed;
                 }
-                catch (...) {} // Ignore malformed legacy data.
+                catch (...)
+                {
+                    // Malformed legacy data. Keep loading -- the rest of the
+                    // node is valid -- but say so: a silently dropped analysis
+                    // field otherwise shows up later as a binding that cannot
+                    // resolve, with nothing pointing back at the load.
+                    node.runtimeError =
+                        L"Legacy analysis-field metadata was malformed and "
+                        L"could not be migrated; re-save this graph.";
+                }
             }
 
             // Migrate legacy propertyBindings from string property.
@@ -1096,7 +1105,16 @@ namespace ShaderLab::Graph
                         node.propertyBindings[targetProp] = std::move(binding);
                     }
                 }
-                catch (...) {}
+                catch (...)
+                {
+                    // Partial migration: bindings parsed before the throw are
+                    // kept, the rest are lost. Record it -- dropping a user's
+                    // bindings silently on load is indistinguishable from
+                    // never having authored them.
+                    node.runtimeError =
+                        L"Legacy property bindings were malformed; some "
+                        L"bindings could not be migrated and must be re-made.";
+                }
             }
 
             node.dirty = true;

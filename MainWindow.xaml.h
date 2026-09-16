@@ -528,10 +528,19 @@ namespace winrt::ShaderLab::implementation
         winrt::fire_and_forget BrowseImageForSourceNode(uint32_t nodeId);
         winrt::fire_and_forget BrowseVideoForSourceNode();
         winrt::fire_and_forget BrowseVideoForExistingNode(uint32_t nodeId);
-        void OnSaveImageClicked(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
-        winrt::fire_and_forget SaveImageAsync();
+        // How saved pixel values relate to the working space's scene-
+        // referred scRGB (1.0 = 80 nits). The save path owns the
+        // re-referencing so any node saves correctly in any format:
+        //   PresentationPng — content's diffuse white sits at the OS SDR
+        //     white level (a graph output meant to be looked at on the
+        //     HDR desktop). Divides by SdrWhiteNits/80 in linear space,
+        //     then sRGB-encodes: the file's 1.0 = SDR reference white,
+        //     and DWM re-boosts it on display like any SDR file.
+        //   FilePng — content is already file-referenced (white at 1.0,
+        //     e.g. a pass-through of a loaded image). Encode only.
+        //   HdrJxr — scene-referred FP16 scRGB, written as-is.
+        enum class SaveReference { PresentationPng, FilePng, HdrJxr };
+        winrt::fire_and_forget SaveImageAsync(SaveReference ref);
 
         // Capture the current preview as a PNG byte buffer.
         // Returns empty vector on failure.

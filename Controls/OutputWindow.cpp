@@ -340,7 +340,19 @@ namespace ShaderLab::Controls
             OutputDebugStringW(std::format(L"[OutputWindow] Present failed: {}\n",
                 std::wstring_view(ex.message())).c_str());
         }
-        catch (...) {}
+        catch (...)
+        {
+            // Non-COM exception on a per-frame path: report once rather than
+            // every frame, so it is discoverable without flooding the log.
+            static bool reported = false;
+            if (!reported)
+            {
+                reported = true;
+                OutputDebugStringW(
+                    L"[OutputWindow] Present failed (non-hresult exception; "
+                    L"reported once per process)\n");
+            }
+        }
     }
 
     void OutputWindow::Close()
@@ -367,7 +379,12 @@ namespace ShaderLab::Controls
                     m_panel.SizeChanged(m_sizeChangedToken);
                 m_window.Close();
             }
-            catch (...) {}
+            catch (...)
+            {
+                // Deliberate swallow: teardown. Revoking a token or closing a
+                // window that XAML already tore down throws, and every field
+                // this method clears is nulled immediately below either way.
+            }
             m_window = nullptr;
         }
 
@@ -543,9 +560,12 @@ namespace ShaderLab::Controls
             auto fileExt = std::wstring(file.FileType().c_str());
             bool isJxr = (fileExt == L".jxr" || fileExt == L".wdp");
 
+            // PNG uses the _SRGB variant: encode the linear scene on
+            // write (plain UNORM wrote linear bytes -> dark in viewers).
+            // JXR stays FP16 linear scRGB.
             DXGI_FORMAT renderFormat = isJxr
                 ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                : DXGI_FORMAT_B8G8R8A8_UNORM;
+                : DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 
             winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
             D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
@@ -621,7 +641,22 @@ namespace ShaderLab::Controls
             if (m_fpsText)
                 m_fpsText.Text(L"Saved: " + file.Name());
         }
-        catch (...) {}
+        catch (const winrt::hresult_error& ex)
+        {
+            // Every step above is check_hresult'd, so a WIC/D2D failure lands
+            // here. Report it where the success message goes -- silently doing
+            // nothing after the user picked a file reads as a no-op UI bug.
+            OutputDebugStringW(std::format(L"[OutputWindow] Save failed: {}\n",
+                std::wstring_view(ex.message())).c_str());
+            if (m_fpsText)
+                m_fpsText.Text(L"Save failed: " + ex.message());
+        }
+        catch (...)
+        {
+            OutputDebugStringW(L"[OutputWindow] Save failed (non-hresult exception)\n");
+            if (m_fpsText)
+                m_fpsText.Text(L"Save failed");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -682,7 +717,12 @@ namespace ShaderLab::Controls
                     m_needsFit = true;
                 }
             }
-            catch (...) {}
+            catch (...)
+            {
+                // Deliberate swallow: reading XAML layout properties races
+                // window teardown. Leaving m_needsResize alone just means the
+                // next tick re-reads the size, which is the desired behavior.
+            }
         }
 
         // Handle pending swap-chain resize before consuming a frame.

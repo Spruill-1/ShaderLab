@@ -83,4 +83,17 @@ namespace ShaderLab::Performance
     // Internal: bumped by the evaluator when a binding is detected as
     // GPU-routable. Exported for engine-side use only.
     SHADERLAB_API void IncrementGpuBindingDetection();
+
+    // Clean-subgraph output caching: when enabled, the evaluator sets
+    // D2D1_PROPERTY_CACHED on per-node effect outputs so re-drawing the
+    // terminal does not re-execute pixel passes whose subtree is
+    // unchanged, and invalidates those caches off the dirty walk (the
+    // D2D-invisible in-place texture updates: compute re-dispatch, video
+    // and live-capture uploads). Costs one GPU intermediate per cached
+    // node at its output resolution.
+    //
+    // Default ON; the flag exists as a kill switch if a stale-frame
+    // regression is suspected.
+    SHADERLAB_API bool IsEffectOutputCachingEnabled();
+    SHADERLAB_API void SetEffectOutputCachingEnabled(bool enabled);
 }

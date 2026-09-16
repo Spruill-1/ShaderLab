@@ -188,3 +188,87 @@ jobs:
         shell: pwsh
         run: .\Tests\RunHeadlessSmoke.ps1 -Configuration Debug -Platform x64
 
+
+  native-arm64:
+    name: Native ARM64 build & test
+    runs-on: windows-11-arm
+    # The x64 jobs above CROSS-compile ARM64 from an x64 runner, so the two
+    # traps that only bite when building ARM64 *on* an ARM64 host never surface
+    # there -- and they fail in misleading ways (see docs/development/build.md).
+    # This job is the regression guard for the toolset-selection trap.
+    #
+    # Scope is the three non-packaged projects (engine + test runner + both
+    # console hosts). The MSIX-packaged WinUI app additionally needs the
+    # Microsoft.VisualStudio.Component.UWP.VC.ARM64 component, which is not
+    # guaranteed on the hosted image; add ShaderLab.vcxproj here once that is
+    # confirmed present.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: NuGet restore
+        run: nuget restore ShaderLab.slnx -SolutionDirectory .
+
+      - name: Resolve the ARM64-native MSBuild
+        shell: pwsh
+        # Deliberately NOT microsoft/setup-msbuild: that puts
+        # MSBuild\Current\Bin\MSBuild.exe on PATH, which is 32-bit and reports
+        # PROCESSOR_ARCHITECTURE=x86 under emulation. Toolset selection in
+        # Microsoft.Cpp.ToolsetLocation.props then never matches its ARM64
+        # branch and falls through to the 32-bit bin\HostX86\arm64\cl.exe, which
+        # exhausts its ~3 GB address space on the large generated translation
+        # units and dies with "C3859: Failed to create virtual memory for PCH"
+        # + C1076. /p:PreferredToolArchitecture=x64 does NOT help -- that props
+        # file declares TreatAsLocalProperty and demotes it straight back to x86.
+        # Fail loudly rather than silently building with the wrong toolset.
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $root = & $vswhere -latest -products * `
+            -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $root) { Write-Error "vswhere found no VS installation"; exit 1 }
+          $msbuild = Join-Path $root 'MSBuild\Current\Bin\arm64\MSBuild.exe'
+          if (-not (Test-Path $msbuild)) {
+            Write-Error "ARM64-native MSBuild not found at $msbuild. Building with the default (32-bit) MSBuild would fail with misleading C3859/C1076 PCH errors -- see docs/development/build.md."
+            exit 1
+          }
+          & $msbuild -version
+          "MSBUILD_ARM64=$msbuild" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build (Debug | ARM64)
+        shell: pwsh
+        run: |
+          foreach ($proj in 'ShaderLabTests.vcxproj',
+                            'ShaderLabHeadless.vcxproj',
+                            'ShaderLabMcpBroker.vcxproj') {
+            & $env:MSBUILD_ARM64 $proj /p:Configuration=Debug /p:Platform=ARM64 /m /nologo /v:minimal
+            if ($LASTEXITCODE -ne 0) { Write-Error "MSBuild failed for $proj"; exit $LASTEXITCODE }
+          }
+
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          $exe = "$env:GITHUB_WORKSPACE\ARM64\Debug\ShaderLabTests\ShaderLabTests.exe"
+          if (-not (Test-Path $exe)) { Write-Error "Test runner not found at $exe"; exit 1 }
+          & $exe --adapter warp
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "ShaderLabTests reported $LASTEXITCODE failure(s)"
+            exit $LASTEXITCODE
+          }
+
+      - name: Headless smoke
+        shell: pwsh
+        run: .\Tests\RunHeadlessSmoke.ps1 -Configuration Debug -Platform ARM64
+
+      - name: Broker smoke
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File Tests\RunBrokerSmoke.ps1 -Configuration Debug -Platform ARM64
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "RunBrokerSmoke.ps1 reported $LASTEXITCODE failure(s)"
+            exit $LASTEXITCODE
+          }

@@ -3,8 +3,11 @@
 #include "Engine/Mcp/McpRouter.h"
 #include "Engine/Mcp/McpJsonRpc.h"
 #include "Engine/Mcp/McpTimeouts.h"
+#include "Engine/Mcp/McpPeerIdentity.h"
 #include <appmodel.h>
 #include <shlobj.h>
+#include <shobjidl_core.h>
+#include <winrt/Windows.ApplicationModel.h>
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
 #include "Effects/ShaderLabEffects.h"
@@ -193,6 +196,39 @@ namespace winrt::ShaderLab::implementation
         // it gets this build, while any shim an MCP client already has open
         // keeps running (update-immune by design, stdio-migration Step 8).
         EnsureShimDistributed();
+
+        // Summon the hub BEFORE the session client's first connect. The
+        // client only CONNECTS (capped ≤4 s backoff) — it never activates
+        // a hub. When no hub is running at app start (e.g. a dev rebuild
+        // killed it), this window's session sat unregistered until an
+        // external shim call happened to activate one — minutes of "no
+        // sessions" for MCP clients. Activation is idempotent: the hub is
+        // a singleton and a second activation is a no-op. Best-effort —
+        // on failure the old behavior (wait for a shim to summon the hub)
+        // still applies.
+        try
+        {
+            std::wstring pipeBase;
+            {
+                wchar_t env[256]{};
+                if (GetEnvironmentVariableW(L"SHADERLAB_MCP_PIPE", env, ARRAYSIZE(env)) > 0)
+                    pipeBase = env;
+                else
+                    pipeBase = ::ShaderLab::Mcp::DefaultPipeBaseName();
+            }
+            const std::wstring aumid =
+                std::wstring(winrt::Windows::ApplicationModel::Package::Current().Id().FamilyName())
+                + L"!Hub";
+            winrt::com_ptr<IApplicationActivationManager> mgr;
+            if (SUCCEEDED(CoCreateInstance(CLSID_ApplicationActivationManager, nullptr,
+                    CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(mgr.put()))))
+            {
+                const std::wstring args = std::format(L"--hub --pipe {}", pipeBase);
+                DWORD pid = 0;
+                mgr->ActivateApplication(aumid.c_str(), args.c_str(), AO_NONE, &pid);
+            }
+        }
+        catch (...) { /* unpackaged/dev edge — session client still retries */ }
 
         if (m_mcpSessionId.empty())
         {
@@ -762,14 +798,17 @@ namespace winrt::ShaderLab::implementation
                 "\"endDrawFlushMs\":{:.2f},"
                 "\"uiTickMs\":{:.2f},\"outputWindowsMs\":{:.2f},\"traceMs\":{:.2f},"
                 "\"computeDispatches\":{},"
-                "\"framesSampled\":{},\"endDrawFailed\":{}}}",
+                "\"framesSampled\":{},\"endDrawFailed\":{},"
+                "\"cachedEffects\":{},\"cacheInvalidations\":{}}}",
                 fps, t.totalUs / 1000.0,
                 t.sourcesPrepUs / 1000.0, t.evaluateUs / 1000.0,
                 t.deferredComputeUs / 1000.0, t.drawUs / 1000.0,
                 t.endDrawFlushUs / 1000.0,
                 t.uiTickUs / 1000.0, t.outputWindowsUs / 1000.0, t.traceUs / 1000.0,
                 t.computeDispatches,
-                t.framesSampled, t.endDrawFailed) };
+                t.framesSampled, t.endDrawFailed,
+                m_graphEvaluator.CachedEffectCount(),
+                m_graphEvaluator.CacheInvalidations()) };
         });
 
         // =====================================================================

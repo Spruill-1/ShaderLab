@@ -133,6 +133,84 @@ float DeltaE2000(float3 lab1, float3 lab2) {
                 !r.empty() && Near(r[0].x, 11.180f, 1e-2f));
         }
 
+        // ---- Delta E ITP (BT.2124) ----------------------------------------
+        // DeltaEITP / DeltaEITPFromScRGB live in the SHARED colour-math
+        // library (unlike the Lab metrics above), so the bench gets them
+        // without kDeltaEHelpers.
+        {
+            auto r = bench.Run(R"(
+                float3 c = float3(0.5, 0.02, -0.03);
+                float3 a = float3(0.5, 0.02, -0.03);
+                float3 b = float3(0.4, -0.01, 0.05);
+                float ident = DeltaEITP(c, c);
+                float dab = DeltaEITP(a, b);
+                float dba = DeltaEITP(b, a);
+                Result[0] = float4(ident, dab, dba, abs(dab - dba));
+            )", 1);
+            TEST("DeltaEITP(c, c) == 0", !r.empty() && Near(r[0].x, 0.0f, 1e-6f));
+            TEST("DeltaEITP is symmetric", !r.empty() && Near(r[0].w, 0.0f, 1e-5f));
+        }
+        {
+            // The 720 scale factor, isolated: a pure I difference of 0.001
+            // must read 0.72 by definition of the metric.
+            auto r = bench.Run(R"(
+                float d = DeltaEITP(float3(0.0, 0.0, 0.0), float3(0.001, 0.0, 0.0));
+                Result[0] = float4(d, 0, 0, 0);
+            )", 1);
+            TEST("DeltaEITP scale: dI=0.001 -> 0.72", !r.empty() && Near(r[0].x, 0.72f, 1e-4f));
+        }
+        {
+            // BT.2124's defining asymmetry: T = 0.5*Ct while P = Cp, so an
+            // identical numeric step in Cp counts DOUBLE the same step in Ct.
+            // Dropping the 0.5 (or applying it to Cp) is the easy bug.
+            auto r = bench.Run(R"(
+                float dCt = DeltaEITP(float3(0,0,0), float3(0, 0.01, 0));
+                float dCp = DeltaEITP(float3(0,0,0), float3(0, 0, 0.01));
+                Result[0] = float4(dCt, dCp, dCp / max(dCt, 1e-9), 0);
+            )", 1);
+            TEST("DeltaEITP weights Ct at half of Cp (ratio == 2)",
+                !r.empty() && Near(r[0].z, 2.0f, 1e-4f));
+            TEST("DeltaEITP Ct step: 0.01 -> 3.6",
+                !r.empty() && Near(r[0].x, 3.6f, 1e-3f));
+        }
+        {
+            // Grounds the scale against a metric that IS valid in the SDR
+            // sRGB domain: for a small near-neutral step both are in their
+            // fitted range and ~1 unit = ~1 JND, so they must agree within a
+            // small factor. This is what would catch a wrong constant
+            // (720 vs 100 vs 1) that the pure-formula checks accept happily.
+            auto r = bench.Run(R"(
+                float3 rgbA = float3(0.5, 0.5, 0.5);
+                float3 rgbB = float3(0.52, 0.5, 0.5);
+                float itp  = DeltaEITPFromScRGB(rgbA, rgbB);
+                float lab  = DeltaE2000(ScRGBToLab(rgbA), ScRGBToLab(rgbB));
+                Result[0] = float4(itp, lab, itp / max(lab, 1e-6), 0);
+            )", 1, kDeltaEHelpers);
+            bool sane = !r.empty() && r[0].x > 0.0f && r[0].y > 0.0f &&
+                        r[0].z > 0.2f && r[0].z < 5.0f;
+            if (!r.empty())
+                std::printf("  dE ITP %.3f vs dE2000 %.3f (ratio %.2f) on a small SDR step\n",
+                            r[0].x, r[0].y, r[0].z);
+            TEST("DeltaEITP magnitude agrees with dE2000 within 5x on a small SDR step", sane);
+        }
+        {
+            // Monotonic in separation, and meaningful where the Lab metrics
+            // are out of their domain: bright HDR neutrals.
+            // (scRGB 1.0 = 80 nits, so 12.5 = 1000 nits.)
+            auto r = bench.Run(R"(
+                float3 a = float3(12.5, 12.5, 12.5);
+                float3 b = float3(13.75, 13.75, 13.75);
+                float3 c = float3(25.0, 25.0, 25.0);
+                float dNear = DeltaEITPFromScRGB(a, b);
+                float dFar  = DeltaEITPFromScRGB(a, c);
+                Result[0] = float4(dNear, dFar, dFar - dNear, 0);
+            )", 1);
+            TEST("DeltaEITP is non-zero at HDR levels (1000 vs 1100 nits)",
+                !r.empty() && r[0].x > 0.5f);
+            TEST("DeltaEITP grows with separation at HDR levels",
+                !r.empty() && r[0].z > 0.0f);
+        }
+
         // ---- DeltaE2000 Sharma reference pairs ----------------------------
         // From Sharma, Wu, Dalal: "The CIEDE2000 Color-Difference Formula:
         // Implementation Notes, Supplementary Test Data, and Mathematical
