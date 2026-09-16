@@ -36,6 +36,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $script:TestResults = @()
+# Server -> client notifications seen while waiting for responses (see Rpc).
+$script:Notifications = @()
 $script:TestDir = $PSScriptRoot
 $script:RepoRoot = Split-Path $script:TestDir -Parent
 $script:FixturesDir = Join-Path $script:TestDir "fixtures"
@@ -84,14 +86,37 @@ function Stop-Shim {
     }
 }
 
-# One JSON-RPC round-trip over the shim's stdio (serial: send then read the
-# single response line -- notifications aside, the shim answers one line per
-# request, so correlation is positional).
+# One JSON-RPC round-trip over the shim's stdio.
+#
+# Correlates on "id" and skips server -> client notifications. It used to read
+# exactly one line per request and treat position as correlation -- but the
+# shim advertises tools.listChanged in initialize and emits
+# notifications/tools/list_changed right after the use_session reply, once the
+# pinned session's catalog is spliced in. That single unsolicited line shifted
+# every later read by one and cascaded into ~18 bogus failures whose messages
+# were simply the PREVIOUS call's response ("Unknown tool: image_stats" landing
+# on a test that never asked for it). Correlate, never count.
+#
+# A mismatched id is raised rather than tolerated: it means the stream has
+# desynced, and every later read would be silently wrong.
 function Rpc($obj, $timeoutMs = 35000) {
+    $expectedId = $obj['id']
     $script:Shim.StandardInput.WriteLine(($obj | ConvertTo-Json -Depth 8 -Compress))
-    $t = $script:Shim.StandardOutput.ReadLineAsync()
-    if (-not $t.Wait($timeoutMs)) { throw "shim did not respond in ${timeoutMs}ms" }
-    return ($t.Result | ConvertFrom-Json)
+    for ($i = 0; $i -lt 16; $i++) {
+        $t = $script:Shim.StandardOutput.ReadLineAsync()
+        if (-not $t.Wait($timeoutMs)) { throw "shim did not respond in ${timeoutMs}ms" }
+        $msg = $t.Result | ConvertFrom-Json
+        if ($null -eq $msg.PSObject.Properties['id']) {
+            # Notification: record it (some tests assert on these) and read on.
+            $script:Notifications += @($msg.method)
+            continue
+        }
+        if ($null -ne $expectedId -and $msg.id -ne $expectedId) {
+            throw "stream desync: got response id $($msg.id), expected $expectedId"
+        }
+        return $msg
+    }
+    throw "no response after 16 lines (notifications only?)"
 }
 
 function McpCall($toolName, $arguments = @{}) {
