@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -72,6 +74,51 @@ jobs:
             exit $LASTEXITCODE
           }
 
+      # Broker smoke (stdio-migration Step 5): election, framing, idle
+      # exit, stdout hygiene, no-session shim protocol. The script
+      # PRE-LAUNCHES an unpackaged hub -- no unpackaged activation path
+      # exists, so IApplicationActivationManager-based election of the
+      # PACKAGED hub is NOT covered here (documented gap; manual test).
+      - name: Broker smoke
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File Tests\RunBrokerSmoke.ps1 -Configuration ${{ env.Configuration }} -Platform ${{ env.Platform }}
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "RunBrokerSmoke.ps1 reported $LASTEXITCODE failure(s)"
+            exit $LASTEXITCODE
+          }
+
+      # MCP suite vs a real headless session over the broker (stdio-migration
+      # Step 9: HTTP is gone, so the suite drives shim -> hub -> session).
+      # Pre-launch a hub + a headless --mcp-session on an isolated pipe, then
+      # RunTests.ps1 starts a shim and pins that session. GUI-only tests
+      # self-skip (the pinned session's label is "headless"). CI is unpackaged,
+      # so SHADERLAB_MCP_ALLOW_UNPACKAGED=1 enables the same-build-tree pairing.
+      - name: MCP suite vs headless session
+        shell: pwsh
+        env:
+          SHADERLAB_MCP_ALLOW_UNPACKAGED: '1'
+        run: |
+          $bin = "$env:GITHUB_WORKSPACE\${{ env.Platform }}\${{ env.Configuration }}"
+          $broker   = "$bin\ShaderLabMcpBroker\ShaderLabMcpBroker.exe"
+          $headless = "$bin\ShaderLabHeadless\ShaderLabHeadless.exe"
+          $pipe = "ShaderLab.mcp.ci.$([guid]::NewGuid().ToString('N'))"
+          $hub = Start-Process $broker -ArgumentList '--hub','--pipe',$pipe,'--idle-exit-sec','600' -PassThru
+          $sess = Start-Process $headless -ArgumentList `
+            '--graph','Tests\fixtures\test_cli_basic.json', `
+            '--mcp-session','--pipe',$pipe,'--session-label','ci-headless','--adapter','warp' -PassThru
+          try {
+            pwsh -NoProfile -File Tests\RunTests.ps1 -Pipe $pipe -Adapter warp
+            $suiteExit = $LASTEXITCODE
+          } finally {
+            Stop-Process -Id $sess.Id -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $hub.Id -Force -ErrorAction SilentlyContinue
+          }
+          if ($suiteExit -ne 0) {
+            Write-Error "RunTests.ps1 reported $suiteExit failure(s) against the headless session"
+            exit $suiteExit
+          }
+
       - name: Upload AppX layout artifact
         if: matrix.configuration == 'Release'
         uses: actions/upload-artifact@v4
@@ -92,15 +139,21 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  bootstrap-smoke:
-    name: Bootstrap.ps1 smoke (clean clone)
+  clean-clone-smoke:
+    name: Clean-clone smoke (submodules + build)
     runs-on: windows-latest
-    # Catches onboarding-cliff regressions: a fresh clone must build via
-    # the documented one-command setup. Only runs Debug|x64 -- the full
-    # matrix is build-and-test above.
+    # Catches onboarding-cliff regressions: a fresh clone must build with
+    # nothing but `git submodule update --init --recursive` + restore +
+    # msbuild. Only runs Debug|x64 -- the full matrix is build-and-test above.
     steps:
-      - name: Checkout (clean)
+      - name: Checkout (clean, no submodules)
         uses: actions/checkout@v4
+
+      - name: Initialize submodules
+        # Done explicitly rather than via checkout's `submodules:` input so
+        # this job exercises the exact command the README tells contributors
+        # to run on a fresh clone.
+        run: git submodule update --init --recursive
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -108,9 +161,18 @@ jobs:
       - name: Setup NuGet
         uses: NuGet/setup-nuget@v2
 
-      - name: Run Bootstrap.ps1 (cert + ExprTk + restore + smoke build)
+      - name: NuGet restore
+        run: nuget restore ShaderLab.slnx -SolutionDirectory .
+
+      - name: Build (Debug | x64)
         shell: pwsh
-        run: .\Bootstrap.ps1 -Build -Configuration Debug -Platform x64
+        run: |
+          msbuild ShaderLab.slnx `
+            /p:Configuration=Debug `
+            /p:Platform=x64 `
+            /p:AppxBundle=Never `
+            /p:AppxPackageSigningEnabled=false `
+            /m /nologo /v:minimal
 
       - name: Run unit tests
         shell: pwsh
@@ -126,3 +188,87 @@ jobs:
         shell: pwsh
         run: .\Tests\RunHeadlessSmoke.ps1 -Configuration Debug -Platform x64
 
+
+  native-arm64:
+    name: Native ARM64 build & test
+    runs-on: windows-11-arm
+    # The x64 jobs above CROSS-compile ARM64 from an x64 runner, so the two
+    # traps that only bite when building ARM64 *on* an ARM64 host never surface
+    # there -- and they fail in misleading ways (see docs/development/build.md).
+    # This job is the regression guard for the toolset-selection trap.
+    #
+    # Scope is the three non-packaged projects (engine + test runner + both
+    # console hosts). The MSIX-packaged WinUI app additionally needs the
+    # Microsoft.VisualStudio.Component.UWP.VC.ARM64 component, which is not
+    # guaranteed on the hosted image; add ShaderLab.vcxproj here once that is
+    # confirmed present.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: NuGet restore
+        run: nuget restore ShaderLab.slnx -SolutionDirectory .
+
+      - name: Resolve the ARM64-native MSBuild
+        shell: pwsh
+        # Deliberately NOT microsoft/setup-msbuild: that puts
+        # MSBuild\Current\Bin\MSBuild.exe on PATH, which is 32-bit and reports
+        # PROCESSOR_ARCHITECTURE=x86 under emulation. Toolset selection in
+        # Microsoft.Cpp.ToolsetLocation.props then never matches its ARM64
+        # branch and falls through to the 32-bit bin\HostX86\arm64\cl.exe, which
+        # exhausts its ~3 GB address space on the large generated translation
+        # units and dies with "C3859: Failed to create virtual memory for PCH"
+        # + C1076. /p:PreferredToolArchitecture=x64 does NOT help -- that props
+        # file declares TreatAsLocalProperty and demotes it straight back to x86.
+        # Fail loudly rather than silently building with the wrong toolset.
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $root = & $vswhere -latest -products * `
+            -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $root) { Write-Error "vswhere found no VS installation"; exit 1 }
+          $msbuild = Join-Path $root 'MSBuild\Current\Bin\arm64\MSBuild.exe'
+          if (-not (Test-Path $msbuild)) {
+            Write-Error "ARM64-native MSBuild not found at $msbuild. Building with the default (32-bit) MSBuild would fail with misleading C3859/C1076 PCH errors -- see docs/development/build.md."
+            exit 1
+          }
+          & $msbuild -version
+          "MSBUILD_ARM64=$msbuild" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build (Debug | ARM64)
+        shell: pwsh
+        run: |
+          foreach ($proj in 'ShaderLabTests.vcxproj',
+                            'ShaderLabHeadless.vcxproj',
+                            'ShaderLabMcpBroker.vcxproj') {
+            & $env:MSBUILD_ARM64 $proj /p:Configuration=Debug /p:Platform=ARM64 /m /nologo /v:minimal
+            if ($LASTEXITCODE -ne 0) { Write-Error "MSBuild failed for $proj"; exit $LASTEXITCODE }
+          }
+
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          $exe = "$env:GITHUB_WORKSPACE\ARM64\Debug\ShaderLabTests\ShaderLabTests.exe"
+          if (-not (Test-Path $exe)) { Write-Error "Test runner not found at $exe"; exit 1 }
+          & $exe --adapter warp
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "ShaderLabTests reported $LASTEXITCODE failure(s)"
+            exit $LASTEXITCODE
+          }
+
+      - name: Headless smoke
+        shell: pwsh
+        run: .\Tests\RunHeadlessSmoke.ps1 -Configuration Debug -Platform ARM64
+
+      - name: Broker smoke
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File Tests\RunBrokerSmoke.ps1 -Configuration Debug -Platform ARM64
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "RunBrokerSmoke.ps1 reported $LASTEXITCODE failure(s)"
+            exit $LASTEXITCODE
+          }

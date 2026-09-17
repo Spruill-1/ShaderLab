@@ -16,6 +16,9 @@
 #include <microsoft.ui.xaml.media.dxinterop.h>
 #include <shlobj.h>
 #include <KnownFolders.h>
+#include <DispatcherQueue.h>
+
+#pragma comment(lib, "CoreMessaging.lib")
 
 using namespace winrt;
 using namespace Microsoft::UI::Xaml;
@@ -319,7 +322,7 @@ namespace winrt::ShaderLab::implementation
                 {
                     if (n.type == ::ShaderLab::Graph::NodeType::Output)
                     {
-                        m_previewNodeId = n.id;
+                        SelectPreviewNode(n.id);
                         break;
                     }
                 }
@@ -329,7 +332,25 @@ namespace winrt::ShaderLab::implementation
         });
         NodeGraphContainer().IsTabStop(true);
 
-        SaveImageButton().Click({ this, &MainWindow::OnSaveImageClicked });
+        // Save flyout: the reference frame of the saved file is an
+        // explicit choice, not an inference — a heuristic would darken
+        // the plain image→PNG round trip or wash presentation-graded
+        // output (see SaveReference in the header).
+        {
+            winrt::Microsoft::UI::Xaml::Controls::MenuFlyout saveFlyout;
+            auto addSaveItem = [this, &saveFlyout](
+                winrt::hstring const& text, SaveReference ref)
+            {
+                winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutItem item;
+                item.Text(text);
+                item.Click([this, ref](auto&&, auto&&) { SaveImageAsync(ref); });
+                saveFlyout.Items().Append(item);
+            };
+            addSaveItem(L"PNG (SDR) — from presentation white", SaveReference::PresentationPng);
+            addSaveItem(L"PNG (SDR) — file-referenced as-is", SaveReference::FilePng);
+            addSaveItem(L"JPEG XR (HDR) — scene-referred", SaveReference::HdrJxr);
+            SaveImageButton().Flyout(saveFlyout);
+        }
         EffectDesignerButton().Click([this](auto&&, auto&&) { OpenEffectDesigner(); });
 
         // MCP server toggle.
@@ -340,21 +361,19 @@ namespace winrt::ShaderLab::implementation
             {
                 if (!m_mcpServer)
                     SetupMcpRoutes();
-                if (m_mcpServer && !m_mcpServer->IsRunning())
-                    m_mcpServer->Start(47808);
-                // Wait briefly for the listener thread to bind and set the port.
-                Sleep(100);
-                uint16_t actualPort = m_mcpServer ? m_mcpServer->Port() : 47808;
-                McpServerLabel().Text(std::format(L"MCP Server :{}", actualPort));
+                // Expose this window to MCP as a hub session. The HTTP
+                // listener was removed in stdio-migration Step 9 — the broker
+                // (shim → hub → session) is the only transport now.
+                StartMcpSession();
+                UpdateMcpStatusLabel();
                 McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
                 ResetMcpActivityState();
                 UpdateMcpActivityIndicator();
             }
             else
             {
-                if (m_mcpServer)
-                    m_mcpServer->Stop();
-                McpServerLabel().Text(L"MCP Server");
+                StopMcpSession();
+                McpServerLabel().Text(L"MCP: off");
                 McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
                 ResetMcpActivityState();
                 UpdateMcpActivityIndicator();
@@ -363,20 +382,50 @@ namespace winrt::ShaderLab::implementation
 
         McpExportConfigButton().Click([this](auto&&, auto&&)
         {
-            uint16_t port = m_mcpServer ? m_mcpServer->Port() : 47808;
             namespace DP = winrt::Windows::ApplicationModel::DataTransfer;
-            auto pkg = DP::DataPackage();
-            std::wstring config = std::format(
-                L"{{\n"
-                L"  \"mcpServers\": {{\n"
-                L"    \"shaderlab\": {{\n"
-                L"      \"url\": \"http://localhost:{}/\"\n"
-                L"    }}\n"
-                L"  }}\n"
-                L"}}", port);
-            pkg.SetText(config);
-            DP::Clipboard::SetContent(pkg);
-            PipelineFormatText().Text(std::format(L"MCP config copied to clipboard (http://localhost:{})", port));
+            auto jsonEsc = [](const std::wstring& s) {
+                std::wstring o;
+                for (wchar_t c : s) { if (c == L'\\' || c == L'"') o += L'\\'; o += c; }
+                return o;
+            };
+
+            std::wstring config, note;
+            auto shim = EnsureShimDistributed();
+            if (!shim.empty())
+            {
+                // Preferred: stdio config pointing at the stable unpackaged
+                // shim copy. The --hub-aumid lets the shim activate the
+                // packaged hub on demand (client-driven bootstrap).
+                auto aumid = HubAumid();
+                std::wstring argsJson = aumid.empty()
+                    ? L"\"--stdio\""
+                    : std::format(L"\"--stdio\", \"--hub-aumid\", \"{}\"", jsonEsc(aumid));
+                config = std::format(
+                    L"{{\n"
+                    L"  \"mcpServers\": {{\n"
+                    L"    \"shaderlab\": {{\n"
+                    L"      \"command\": \"{}\",\n"
+                    L"      \"args\": [{}]\n"
+                    L"    }}\n"
+                    L"  }}\n"
+                    L"}}", jsonEsc(shim), argsJson);
+                note = L"MCP stdio config copied to clipboard";
+            }
+            else
+            {
+                // No broker payload found (unexpected in a real build). There
+                // is no HTTP fallback any more — the listener is gone (Step 9).
+                config.clear();
+                note = L"MCP shim not found — reinstall or rebuild ShaderLab.";
+            }
+
+            if (!config.empty())
+            {
+                auto pkg = DP::DataPackage();
+                pkg.SetText(config);
+                DP::Clipboard::SetContent(pkg);
+            }
+            PipelineFormatText().Text(note);
         });
     }
 
@@ -385,9 +434,11 @@ namespace winrt::ShaderLab::implementation
         m_isShuttingDown = true;
         m_renderShouldStop.store(true, std::memory_order_release);
 
-        // Stop MCP server before tearing down resources.
-        if (m_mcpServer)
-            m_mcpServer->Stop();
+        // Stop the MCP session FIRST, while the render worker is still alive,
+        // so an in-flight session request drains rather than stranding on a
+        // joined worker (the 30 s stall the migration plan warns about).
+        // Then (below) the render dispatcher + worker.
+        StopMcpSession();
 
         if (m_renderTimer)
         {
@@ -430,6 +481,25 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::InitializeRendering()
     {
+        // DisplayInformation::GetForWindow requires a running
+        // Windows.System.DispatcherQueue on this thread. WinUI 3 threads
+        // run Microsoft.UI.Dispatching.DispatcherQueue — a distinct type —
+        // so create the system one if absent (same pattern system-backdrop
+        // controllers use). It pumps via this thread's existing message
+        // loop; the controller must outlive the queue's consumers.
+        if (!m_systemDqController &&
+            !winrt::Windows::System::DispatcherQueue::GetForCurrentThread())
+        {
+            DispatcherQueueOptions options{
+                sizeof(DispatcherQueueOptions),
+                DQTYPE_THREAD_CURRENT,
+                DQTAT_COM_NONE };
+            ABI::Windows::System::IDispatcherQueueController* controller{ nullptr };
+            if (SUCCEEDED(::CreateDispatcherQueueController(options, &controller)))
+                m_systemDqController.attach(
+                    reinterpret_cast<::IUnknown*>(controller));
+        }
+
         // Query display capabilities and pick a default pipeline format.
         m_displayMonitor.Initialize(m_hwnd);
         auto caps = m_displayMonitor.CachedCapabilities();
@@ -447,28 +517,29 @@ namespace winrt::ShaderLab::implementation
         // always return fresh values regardless of selection.
         ::ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(true);
 
-        // Now that we have a DXGI factory, register adapter-change monitoring.
-        if (m_renderEngine.DXGIFactory())
-        {
-            m_displayMonitor.Shutdown();
-            m_displayMonitor.Initialize(m_hwnd, m_renderEngine.DXGIFactory());
-        }
-
-        // Subscribe to display changes so we can update the status bar.
+        // Subscribe to display changes (AdvancedColorInfoChanged: HDR
+        // toggle, SDR-brightness slider, monitor move, profile sim).
+        // NO graph work here: the render worker's per-tick
+        // UpdateWorkingSpaceNodes reads ActiveProfile() and dirties the
+        // Working Space node when a field really moved — that dirty is
+        // the designed propagation to binding consumers, and nothing
+        // else in the graph depends on display state ("bind, don't
+        // hide"). Displays with adaptive color fire this event at
+        // sensor rate (several Hz, sub-nit deltas), so the UI refresh
+        // is coalesced behind a pending flag — an event storm results
+        // in at most one queued refresh at a time. A MarkAllDirty here
+        // previously turned that storm into a continuous full-graph
+        // re-eval that froze the app.
         m_displayMonitor.SetCallback([this](const ::ShaderLab::Rendering::DisplayCapabilities& /*newCaps*/)
         {
+            if (m_displayUiRefreshPending.exchange(true))
+                return;
             this->DispatcherQueue().TryEnqueue([this]()
             {
-                // Re-evaluate graph so effects using monitor gamut
-                // pick up the new primaries.
-                m_graph.MarkAllDirty();
-                m_forceRender = true;
+                m_displayUiRefreshPending = false;
                 // Pick up new refresh rate (e.g. user changed displays
                 // or switched modes from 60 Hz to 144 Hz).
                 UpdateRenderTimerInterval();
-                // Push the new capabilities into any Working Space nodes
-                // so downstream binders see the live values immediately.
-                UpdateWorkingSpaceNodes();
                 UpdateStatusBar();
             });
         });
@@ -513,13 +584,11 @@ namespace winrt::ShaderLab::implementation
         SetupMcpRoutes();
         if (m_autoStartMcp && m_mcpServer)
         {
-            m_mcpServer->Start(47808);
+            StartMcpSession();
             McpServerToggle().IsChecked(true);
-            // Delay slightly to let the listener thread bind.
             DispatcherQueue().TryEnqueue([this]()
             {
-                uint16_t actualPort = m_mcpServer ? m_mcpServer->Port() : 47808;
-                McpServerLabel().Text(std::format(L"MCP Server :{}", actualPort));
+                UpdateMcpStatusLabel();
                 McpExportConfigButton().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);
                 ResetMcpActivityState();
                 UpdateMcpActivityIndicator();
@@ -534,6 +603,11 @@ namespace winrt::ShaderLab::implementation
 
         m_nodeGraphController.SetGraph(&m_graph);
         m_nodeGraphController.SetDispatcher(&m_renderDispatcher);
+        // UI-thread reads in the controller go through the per-frame snapshot
+        // the render worker publishes, never the live graph. See the THREADING
+        // RULE block in NodeGraphController.h.
+        m_nodeGraphController.SetSnapshotProvider(
+            [this] { return CurrentGraphSnapshot(); });
         m_nodeGraphController.SetConnectionCallback(
             [this](uint32_t srcId, uint32_t srcPin, uint32_t dstId, uint32_t dstPin, bool isData) {
                 auto* srcNode = m_graph.FindNode(srcId);
@@ -644,12 +718,12 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::UpdateMcpActivityIndicator()
     {
-        // Hide the dot entirely when the server is off.
-        if (!m_mcpServer || !m_mcpServer->IsRunning())
+        // Hide the dot entirely when this window isn't exposed as a session.
+        if (!m_sessionClient)
         {
             McpActivityDot().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
             Controls::ToolTipService::SetToolTip(McpServerToggle(),
-                winrt::box_value(winrt::hstring(L"Start/stop MCP server for AI assistant integration")));
+                winrt::box_value(winrt::hstring(L"Expose this window to MCP (AI assistant integration)")));
             return;
         }
 
@@ -702,10 +776,9 @@ namespace winrt::ShaderLab::implementation
             return;
         m_mcpLastUiUpdateSeq = seq;
         std::wstring tooltip;
-        uint16_t port = m_mcpServer->Port();
         if (totalCount == 0)
         {
-            tooltip = std::format(L"MCP Server :{} \u2014 listening (no requests yet)", port);
+            tooltip = L"MCP session \u2014 registered (no requests yet)";
         }
         else
         {
@@ -736,10 +809,10 @@ namespace winrt::ShaderLab::implementation
             else                     ageStr = std::format(L"{}m ago", ageMs / 60000);
 
             tooltip = std::format(
-                L"MCP Server :{} \u2014 {} request{}\n"
+                L"MCP session \u2014 {} request{}\n"
                 L"Last: {} {} \u2192 {} ({})\n"
                 L"From: {}{}",
-                port, totalCount, (totalCount == 1 ? L"" : L"s"),
+                totalCount, (totalCount == 1 ? L"" : L"s"),
                 methodW, pathW, status, ageStr,
                 peerW.empty() ? L"(unknown)" : peerW.c_str(),
                 peerCount > 1 ? std::format(L"  (\u00d7{} distinct clients)", peerCount).c_str() : L"");
@@ -838,6 +911,11 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::SwitchAdapter(
         ::ShaderLab::Rendering::DevicePreference pref, LUID adapterLuid)
     {
+        // Gate MCP session/HTTP requests to 503 for the whole teardown +
+        // rebuild window (GuiEngineCommandSink::Dispatch checks this). Reset
+        // in the exit paths below.
+        m_adapterSwitchInProgress.store(true, std::memory_order_release);
+
         // Stop UI render timer.
         if (m_renderTimer) m_renderTimer.Stop();
 
@@ -907,6 +985,7 @@ namespace winrt::ShaderLab::implementation
             catch (...) {
                 // Total failure — restart timer and bail.
                 if (m_renderTimer) m_renderTimer.Start();
+                m_adapterSwitchInProgress.store(false, std::memory_order_release);
                 return;
             }
         }
@@ -1027,6 +1106,10 @@ namespace winrt::ShaderLab::implementation
                 }
                 m_forceRender = true;
             });
+
+        // Switch complete: the worker is back on the new device and the
+        // engine is usable again, so let MCP requests through.
+        m_adapterSwitchInProgress.store(false, std::memory_order_release);
     }
 
     // -----------------------------------------------------------------------
@@ -1170,13 +1253,12 @@ namespace winrt::ShaderLab::implementation
 
             int32_t count = static_cast<int32_t>(m_topoOrder.size());
             if (key == vkOpenBracket && curIdx > 0)
-                m_previewNodeId = m_topoOrder[curIdx - 1];
+                SelectPreviewNode(m_topoOrder[curIdx - 1]);
             else if (key == vkCloseBracket && curIdx < count - 1)
-                m_previewNodeId = m_topoOrder[curIdx + 1];
+                SelectPreviewNode(m_topoOrder[curIdx + 1]);
 
             UpdatePreviewOverlay();
             m_forceRender = true;
-            FitPreviewToView();
             args.Handled(true);
         }
     }
@@ -2456,6 +2538,12 @@ namespace winrt::ShaderLab::implementation
         auto* dc = m_uiD2dContext.get();
         if (!dc) return;
 
+        // No graph lock here: NodeGraphController now paints from the per-frame
+        // GraphUiSnapshot rather than live EffectNode pointers, so this thread
+        // touches no mutable graph state. Taking m_graphMutex here would stall
+        // the canvas behind the render worker's tick, which reaches ~50ms on a
+        // heavy graph (measured: 4K source + 2K compute) versus ~0.6ms idle.
+
         float graphDpiX = 96.0f * (std::max)(1.0f, static_cast<float>(NodeGraphPanel().CompositionScaleX()));
         float graphDpiY = 96.0f * (std::max)(1.0f, static_cast<float>(NodeGraphPanel().CompositionScaleY()));
         dc->SetDpi(graphDpiX, graphDpiY);
@@ -2631,15 +2719,9 @@ namespace winrt::ShaderLab::implementation
             bool isDataOnly = clickedNode && clickedNode->outputPins.empty();
 
             if (!isAnalysisEffect && !isParamNode && !isDataOnly)
-                m_previewNodeId = hitNodeId;
+                SelectPreviewNode(hitNodeId);   // fit on first view, else restore this node's pan/zoom
 
             m_forceRender = true;
-            // Defer the fit until the next eval populates cachedOutput. On
-            // the very first selection of a node (before its first eval),
-            // GetPreviewImageBounds() returns an empty rect, so an immediate
-            // FitPreviewToView() lands on the wrong zoom. The deferred path
-            // in OnRenderTick re-fits once bounds are available.
-            m_needsFitPreview = true;
             UpdatePreviewOverlay();
         }
         else
@@ -4934,13 +5016,6 @@ namespace winrt::ShaderLab::implementation
         }
     }
 
-    void MainWindow::OnSaveImageClicked(
-        winrt::Windows::Foundation::IInspectable const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::RoutedEventArgs const& /*args*/)
-    {
-        SaveImageAsync();
-    }
-
     std::vector<uint8_t> MainWindow::CapturePreviewAsPng()
     {
         auto* image = ResolveDisplayImage(m_previewNodeId);
@@ -4977,9 +5052,12 @@ namespace winrt::ShaderLab::implementation
         try
         {
             winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
+            // _SRGB: encode the linear scRGB scene on write so the saved
+            // PNG is correctly gamma-encoded (pairs with the ImageLoader's
+            // decode-on-sample).
             D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_TARGET,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, D2D1_ALPHA_MODE_PREMULTIPLIED));
             winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bmpProps, renderBitmap.put()));
 
             winrt::com_ptr<ID2D1Image> oldTarget;
@@ -4995,7 +5073,7 @@ namespace winrt::ShaderLab::implementation
             winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
             D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, D2D1_ALPHA_MODE_PREMULTIPLIED));
             winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, cpuProps, cpuBitmap.put()));
             D2D1_POINT_2U destPt = { 0, 0 };
             D2D1_RECT_U srcRc = { 0, 0, w, h };
@@ -5039,72 +5117,12 @@ namespace winrt::ShaderLab::implementation
         catch (...) { return {}; }
     }
 
-    std::vector<uint8_t> MainWindow::CaptureNodeAsPng(uint32_t nodeId,
-                                                     bool& outNotFound,
-                                                     bool& outNotReady)
-    {
-        outNotFound = false;
-        outNotReady = false;
-
-        // Force a render frame so dirty downstream nodes evaluate before we
-        // try to resolve the output.  Same convention as /render/capture.
-        RenderFrame();
-
-        auto* image = ResolveDisplayImage(nodeId);
-        if (!image)
-        {
-            // Disambiguate "no such node" vs "node exists but isn't ready".
-            auto* node = m_graph.FindNode(nodeId);
-            if (!node) { outNotFound = true; return {}; }
-            outNotReady = true;
-            return {};
-        }
-        return CaptureImageAsPng(image);
-    }
-
-    bool MainWindow::ReadPixelRegion(uint32_t nodeId,
-                                     int32_t x, int32_t y, uint32_t w, uint32_t h,
-                                     std::vector<float>& outPixels,
-                                     uint32_t& outActualW, uint32_t& outActualH,
-                                     bool& outNotFound, bool& outNotReady)
-    {
-        outPixels.clear();
-        outActualW = 0;
-        outActualH = 0;
-        outNotFound = false;
-        outNotReady = false;
-
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) return false;
-
-        // Force a fresh frame so dirty nodes evaluate before readback.
-        // The engine helper (Rendering::ReadPixelRegion) is otherwise
-        // pure -- doesn't drive eval -- so the host has to ensure the
-        // graph is up-to-date.
-        RenderFrame();
-
-        auto result = ::ShaderLab::Rendering::ReadPixelRegion(
-            m_graph, nodeId, x, y, w, h, dc);
-
-        switch (result.status)
-        {
-        case ::ShaderLab::Rendering::ReadPixelRegionStatus::Success:
-            outPixels = std::move(result.pixels);
-            outActualW = result.actualWidth;
-            outActualH = result.actualHeight;
-            return true;
-        case ::ShaderLab::Rendering::ReadPixelRegionStatus::NotFound:
-            outNotFound = true;
-            return false;
-        case ::ShaderLab::Rendering::ReadPixelRegionStatus::NotReady:
-            outNotReady = true;
-            return false;
-        case ::ShaderLab::Rendering::ReadPixelRegionStatus::InvalidRegion:
-        case ::ShaderLab::Rendering::ReadPixelRegionStatus::D2DError:
-        default:
-            return false;
-        }
-    }
+    // MainWindow::CaptureNodeAsPng and MainWindow::ReadPixelRegion were
+    // removed in the stdio-migration Step 7 residual sweep. They were
+    // pre-worker MCP shims (each calling the dead MainWindow::RenderFrame on
+    // the UI D2D context) with no remaining callers -- the render_capture_node
+    // and read_pixel_region routes are engine-side now, driving the render
+    // worker and using Rendering::CaptureNodeAsPng / Rendering::ReadPixelRegion.
 
     std::vector<uint8_t> MainWindow::CaptureGraphAsPng()
     {
@@ -5260,9 +5278,10 @@ namespace winrt::ShaderLab::implementation
         m_nodeGraphController.SetPanOffset(panX, panY);
     }
 
-    winrt::fire_and_forget MainWindow::SaveImageAsync()
+    winrt::fire_and_forget MainWindow::SaveImageAsync(SaveReference ref)
     {
         auto strong = get_strong();
+        const bool isJxr = (ref == SaveReference::HdrJxr);
 
         winrt::Windows::Storage::Pickers::FileSavePicker picker;
         picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
@@ -5276,8 +5295,10 @@ namespace winrt::ShaderLab::implementation
             if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' || ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|')
                 ch = L'_';
         picker.SuggestedFileName(winrt::hstring(suggestedName));
-        picker.FileTypeChoices().Insert(L"JPEG XR (HDR)", winrt::single_threaded_vector<winrt::hstring>({ L".jxr" }));
-        picker.FileTypeChoices().Insert(L"PNG Image (SDR)", winrt::single_threaded_vector<winrt::hstring>({ L".png" }));
+        if (isJxr)
+            picker.FileTypeChoices().Insert(L"JPEG XR (HDR)", winrt::single_threaded_vector<winrt::hstring>({ L".jxr" }));
+        else
+            picker.FileTypeChoices().Insert(L"PNG Image (SDR)", winrt::single_threaded_vector<winrt::hstring>({ L".png" }));
 
         auto file = co_await picker.PickSaveFileAsync();
         if (!file) co_return;
@@ -5291,6 +5312,40 @@ namespace winrt::ShaderLab::implementation
 
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) co_return;
+
+        // Presentation→file re-referencing: the scene is linear scRGB
+        // where the OS presents SDR reference white at SdrWhiteNits.
+        // An SDR file's 1.0 must mean "SDR reference white", so scale by
+        // 80/SdrWhiteNits in linear space before the sRGB encode; DWM
+        // multiplies it back on display. Respects a simulated profile
+        // (CachedCapabilities prefers it).
+        float presentationScale = 1.0f;
+        if (ref == SaveReference::PresentationPng)
+        {
+            const float sdrWhite =
+                m_displayMonitor.CachedCapabilities().sdrWhiteLevelNits;
+            if (sdrWhite > 80.0f)
+                presentationScale = 80.0f / sdrWhite;
+        }
+        winrt::com_ptr<ID2D1Effect> scaleFx;
+        winrt::com_ptr<ID2D1Image> scaledImage;
+        ID2D1Image* imageToSave = previewImage;
+        if (presentationScale != 1.0f &&
+            SUCCEEDED(dc->CreateEffect(CLSID_D2D1ColorMatrix, scaleFx.put())))
+        {
+            scaleFx->SetInput(0, previewImage);
+            const float s = presentationScale;
+            D2D1_MATRIX_5X4_F m = D2D1::Matrix5x4F(
+                s, 0, 0, 0,
+                0, s, 0, 0,
+                0, 0, s, 0,
+                0, 0, 0, 1,
+                0, 0, 0, 0);
+            scaleFx->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, m);
+            scaleFx->GetOutput(scaledImage.put());
+            if (scaledImage)
+                imageToSave = scaledImage.get();
+        }
 
         try
         {
@@ -5309,14 +5364,15 @@ namespace winrt::ShaderLab::implementation
             dc->SetDpi(oldDpiX, oldDpiY);
             if (w == 0 || h == 0) co_return;
 
-            auto fileExt = std::wstring(file.FileType().c_str());
-            bool isJxr = (fileExt == L".jxr" || fileExt == L".wdp");
-
-            // JXR: render in FP16 scRGB for full HDR fidelity.
-            // PNG: render in 8-bit BGRA (SDR clamp).
+            // JXR: render in FP16 scRGB for full HDR fidelity (linear,
+            // scene-referred — no transfer encode wanted).
+            // PNG: render in 8-bit BGRA with the _SRGB variant so the
+            // scene's linear values are gamma-ENCODED on write; plain
+            // UNORM wrote linear bytes that viewers then sRGB-decoded,
+            // producing a crushed, far-too-dark image.
             DXGI_FORMAT renderFormat = isJxr
                 ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                : DXGI_FORMAT_B8G8R8A8_UNORM;
+                : DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
             D2D1_ALPHA_MODE alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
 
             winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
@@ -5330,7 +5386,7 @@ namespace winrt::ShaderLab::implementation
             dc->SetTarget(renderBitmap.get());
             dc->BeginDraw();
             dc->Clear(D2D1::ColorF(0, 0, 0, 1.0f));
-            dc->DrawImage(previewImage);
+            dc->DrawImage(imageToSave);
             dc->EndDraw();
             dc->SetTarget(oldTarget.get());
 
@@ -5419,30 +5475,33 @@ namespace winrt::ShaderLab::implementation
     // Preview pan/zoom
     // -----------------------------------------------------------------------
 
-    void MainWindow::FitPreviewToView()
+    // Returns true if a real fit was applied (viewport + evaluated image bounds
+    // both valid, or a permanent default for an infinite source); false if
+    // bounds/viewport aren't ready yet, so callers can defer and retry. Reads
+    // the UI-cached viewport (m_previewViewportW/H), so it is safe to call from
+    // the render worker right after an eval -- not only from the UI thread.
+    bool MainWindow::FitPreviewToView()
     {
-        auto vp = PreviewViewportDips();
-        float vpW = vp.width;
-        float vpH = vp.height;
+        float vpW = m_previewViewportW;
+        float vpH = m_previewViewportH;
         if (vpW <= 0 || vpH <= 0)
-        {
-            m_previewZoom = 1.0f;
-            m_previewPanX = 0.0f;
-            m_previewPanY = 0.0f;
-            return;
-        }
+            return false;   // viewport not measured yet -- defer
 
         auto bounds = GetPreviewImageBounds();
         float imgW = bounds.right - bounds.left;
         float imgH = bounds.bottom - bounds.top;
 
-        // For infinite or very large images (e.g., Flood), use a default view.
-        if (imgW <= 0 || imgH <= 0 || imgW > 100000.0f || imgH > 100000.0f)
+        if (imgW <= 0 || imgH <= 0)
+            return false;   // node not evaluated yet -- defer, leave view as-is
+
+        // For infinite / very large images (e.g., Flood), settle on a default
+        // view and report it as fitted so the pending-fit flag clears.
+        if (imgW > 100000.0f || imgH > 100000.0f)
         {
             m_previewZoom = 1.0f;
             m_previewPanX = 0.0f;
             m_previewPanY = 0.0f;
-            return;
+            return true;
         }
 
         // Scale to fit with some padding.
@@ -5453,6 +5512,32 @@ namespace winrt::ShaderLab::implementation
         // Center the image.
         m_previewPanX = (vpW - imgW * m_previewZoom) * 0.5f - bounds.left * m_previewZoom;
         m_previewPanY = (vpH - imgH * m_previewZoom) * 0.5f - bounds.top * m_previewZoom;
+        return true;
+    }
+
+    // Change which node the preview shows, remembering per-node pan/zoom.
+    // The outgoing node's current view is saved; the incoming node's saved
+    // view is restored, or -- if it's never been examined -- we request a fit
+    // (deferred until its bounds exist; the OnRenderTick path applies it).
+    void MainWindow::SelectPreviewNode(uint32_t nodeId)
+    {
+        if (nodeId == m_previewNodeId)
+            return;
+        if (m_previewNodeId != 0)
+            m_previewViews[m_previewNodeId] = { m_previewZoom, m_previewPanX, m_previewPanY };
+        m_previewNodeId = nodeId;
+        auto it = (nodeId != 0) ? m_previewViews.find(nodeId) : m_previewViews.end();
+        if (it != m_previewViews.end())
+        {
+            m_previewZoom = it->second.zoom;
+            m_previewPanX = it->second.panX;
+            m_previewPanY = it->second.panY;
+            m_needsFitPreview = false;
+        }
+        else
+        {
+            m_needsFitPreview = true;
+        }
     }
 
     // -----------------------------------------------------------------------

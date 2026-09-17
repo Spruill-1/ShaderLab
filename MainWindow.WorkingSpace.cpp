@@ -51,19 +51,17 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::ApplyDisplayProfile(const ::ShaderLab::Rendering::DisplayProfile& profile)
     {
+        // Fires the display-change callback synchronously, which sets
+        // m_displayCapsDirty + m_forceRender; the render worker (the only
+        // graph writer) MarkAllDirty()s and re-syncs Working Space nodes
+        // on its next tick. Only the status bar needs a direct poke.
         m_displayMonitor.SetSimulatedProfile(profile);
-        m_graph.MarkAllDirty();
-        m_forceRender = true;
-        UpdateWorkingSpaceNodes();
         UpdateStatusBar();
     }
 
     void MainWindow::RevertToLiveDisplay()
     {
         m_displayMonitor.ClearSimulatedProfile();
-        m_graph.MarkAllDirty();
-        m_forceRender = true;
-        UpdateWorkingSpaceNodes();
         UpdateStatusBar();
     }
 

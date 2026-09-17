@@ -2,6 +2,7 @@
 
 #include "pch.h"
 #include "../Graph/EffectGraph.h"
+#include "../Graph/GraphUiSnapshot.h"
 #include "../Effects/EffectRegistry.h"
 #include "../Rendering/RenderThreadDispatcher.h"
 
@@ -83,6 +84,44 @@ namespace ShaderLab::Controls
         // calling m_graph->X() directly. Setting nullptr falls back to the
         // direct-call path (e.g. tests that don't have a dispatcher).
         void SetDispatcher(::ShaderLab::Rendering::RenderThreadDispatcher* d) { m_dispatcher = d; }
+
+        // ---- THREADING RULE: how this controller may touch graph data ----
+        //
+        // Three access paths exist. Picking the wrong one is a data race that
+        // shows up as an access violation deep inside std::map, not as a
+        // compile error -- so read this before adding any new graph access.
+        //
+        //  1. READS on the UI thread  -> ALWAYS via Snapshot().
+        //     The render worker mutates the live EffectGraph continuously
+        //     (clock properties every tick, plus every MCP closure). Reading
+        //     m_graph directly from the UI thread races those writes: a paint
+        //     landing mid-mutation walks a std::map being rebalanced, or a node
+        //     graph_clear just destroyed. Snapshot() returns an immutable
+        //     per-frame value copy published by the render thread, so it is
+        //     always safe and at most one frame stale -- fine for display and
+        //     hit-testing. Hold the returned shared_ptr for the whole read.
+        //
+        //  2. WRITES (from any thread) -> ALWAYS through m_dispatcher.
+        //     See SetDispatcher above. Never mutate m_graph directly from a
+        //     pointer/interaction handler.
+        //
+        //  3. Layout computation (RebuildLayout/AutoLayout/ComputeNodeVisual)
+        //     -> live m_graph, but ONLY on the render thread. These must see
+        //     post-mutation state immediately (a snapshot would be a frame
+        //     stale and a just-added node would be missing), so they read the
+        //     live graph and callers are responsible for being on the render
+        //     thread -- UI-side callers go through
+        //     MainWindow::RunLayoutOnRenderThread or m_dispatcher.
+        //
+        // Supplies the latest published GraphUiSnapshot (MainWindow owns it).
+        // May return nullptr before the first frame is published, in which case
+        // read paths fall back to the live graph -- safe only because the render
+        // worker has not spawned yet at that point.
+        void SetSnapshotProvider(
+            std::function<std::shared_ptr<const Graph::GraphUiSnapshot>()> p)
+        {
+            m_snapshotProvider = std::move(p);
+        }
 
         // ---- Layout ----
 
@@ -222,6 +261,38 @@ namespace ShaderLab::Controls
 
         Graph::EffectGraph* m_graph{ nullptr };
         ::ShaderLab::Rendering::RenderThreadDispatcher* m_dispatcher{ nullptr };
+        std::function<std::shared_ptr<const Graph::GraphUiSnapshot>()> m_snapshotProvider;
+
+        // UI-thread read accessor -- see the THREADING RULE above. Returns the
+        // latest published snapshot, or nullptr when none exists yet.
+        std::shared_ptr<const Graph::GraphUiSnapshot> Snapshot() const
+        {
+            return m_snapshotProvider ? m_snapshotProvider() : nullptr;
+        }
+
+        // Snapshot held for the duration of one Render() call. Acquired once so
+        // edges and nodes within a single paint always come from the same
+        // frame, and so pointers into it stay valid for the whole paint.
+        std::shared_ptr<const Graph::GraphUiSnapshot> m_paintSnapshot;
+
+        // Guards m_visuals. Separate from the graph: m_visuals is written from
+        // BOTH threads -- RebuildLayout runs on the render thread (from the
+        // engine-sink event hooks) while AddNode/DeleteSelected/UpdateDragNodes
+        // write it on the UI thread after dispatching their graph mutation --
+        // and it is read by every paint and hit-test on the UI thread.
+        //
+        // Kept deliberately fine-grained. The obvious alternative, reusing
+        // MainWindow::m_graphMutex, couples the canvas to the render worker's
+        // whole tick (~50ms on a heavy graph) and stalls painting.
+        //
+        // LOCK ORDER RULE: never hold this across a RenderThreadDispatcher
+        // DispatchSync. The render thread takes m_graphMutex then (via
+        // RebuildLayout) this one; a UI thread holding this while waiting on the
+        // render thread inverts that order and deadlocks. Always dispatch the
+        // graph write FIRST, release, then take this to update visuals.
+        // For the same reason no lock-holder may call RebuildLayout, which
+        // acquires it itself (std::shared_mutex is not recursive).
+        mutable std::shared_mutex m_visualsMutex;
         ConnectionCallback m_connectionCallback;
 
         // Cached visual layout.

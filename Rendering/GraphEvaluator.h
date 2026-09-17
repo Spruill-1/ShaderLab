@@ -82,6 +82,15 @@ namespace ShaderLab::Rendering
         // Performance::CpuAnalysisHintThrottleMs (default 2000 ms,
         // 0.5 Hz). Re-selecting a node after it left interest treats
         // it as fresh.
+        // Clean-subgraph caching telemetry (see UpdateEffectCachePolicy).
+        size_t   CachedEffectCount() const
+        {
+            size_t n = 0;
+            for (const auto& [id, on] : m_cacheEnabled) if (on) ++n;
+            return n;
+        }
+        uint64_t CacheInvalidations() const { return m_cacheInvalidations; }
+
         void SetCpuAnalysisInterest(std::unordered_set<uint32_t> ids)
         {
             // Drop the throttle timestamp for any node that left the
@@ -136,6 +145,33 @@ namespace ShaderLab::Rendering
         // Per-node effect cache: nodeId → D2D effect.
         // Effects are reused across frames; only properties are updated.
         std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Effect>> m_effectCache;
+
+        // Clean-subgraph output caching (D2D1_PROPERTY_CACHED).
+        //
+        // Enables D2D's per-effect output cache on every effect-backed
+        // node so that pulling the terminal image does NOT re-execute
+        // pixel passes whose subtree is unchanged. D2D auto-invalidates
+        // on property/topology changes it can see, but our two hidden
+        // mutation channels — custom-effect cbuffer uploads (bypass the
+        // D2D property system entirely) and in-place texture updates
+        // (compute re-dispatch, video / live-capture uploads) — need the
+        // manual invalidation in UpdateEffectCachePolicy, keyed off the
+        // same wasDirty signal that gates property re-apply.
+        //
+        // m_cacheEnabled tracks the last state WE set so SetValue only
+        // fires on transitions (a redundant SetValue may itself count as
+        // a property change and drop the cache).
+        void UpdateEffectCachePolicy(ID2D1Effect* effect, uint32_t nodeId,
+                                     bool contentDirty);
+        std::unordered_map<uint32_t, bool> m_cacheEnabled;
+        uint64_t m_cacheInvalidations{ 0 };
+
+        // Compute nodes queued for dispatch in the current eval cycle.
+        // Used to chain GPU-binding freshness: a compute consumer whose
+        // binding SOURCE is queued must redispatch too (its dispatch
+        // reads the source's analysis SRV). Mirrors m_deferredCompute's
+        // lifetime — cleared where it is cleared.
+        std::unordered_set<uint32_t> m_queuedComputeThisEval;
 
         // Per-node owning reference to each effect's output image.
         // ID2D1Effect::GetOutput() returns an AddRef'd pointer; if we only stash

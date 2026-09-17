@@ -63,4 +63,16 @@ namespace ShaderLab::Performance
     {
         g_hintThrottleMs.store(ms, std::memory_order_relaxed);
     }
+
+    namespace { std::atomic<bool> g_outputCaching{ true }; }
+
+    bool IsEffectOutputCachingEnabled()
+    {
+        return g_outputCaching.load(std::memory_order_relaxed);
+    }
+
+    void SetEffectOutputCachingEnabled(bool enabled)
+    {
+        g_outputCaching.store(enabled, std::memory_order_relaxed);
+    }
 }

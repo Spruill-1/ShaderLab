@@ -1,6 +1,6 @@
 # ShaderLab Built-in Effects
 
-ShaderLab ships with **33 built-in ShaderLab effects** implemented in `Effects/ShaderLabEffects.h/.cpp`, on top of the **40+ wrapped built-in D2D effects** in `Effects/EffectRegistry.cpp`. Each ShaderLab effect has its HLSL embedded as a string constant, compiled at first use via `ShaderCompiler` (and cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` so subsequent sessions reuse the bytecode), and shares a common color math library (BT.709 / BT.2020 / DCI-P3 matrices, PQ / HLG transfer functions, CIE xy conversions, ICtCp). Every effect is versioned with `effectId` and `effectVersion` so saved graphs can be upgraded in place — see [Effect Versioning System](effect-versioning.md).
+ShaderLab ships with **36 built-in ShaderLab effects** implemented in `Effects/ShaderLabEffects.h/.cpp`, on top of the **40+ wrapped built-in D2D effects** in `Effects/EffectRegistry.cpp`. Each ShaderLab effect has its HLSL embedded as a string constant, compiled at first use via `ShaderCompiler` (and cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` so subsequent sessions reuse the bytecode), and shares a common color math library (BT.709 / BT.2020 / DCI-P3 matrices, PQ / HLG transfer functions, CIE xy conversions, ICtCp). Every effect is versioned with `effectId` and `effectVersion` so saved graphs can be upgraded in place — see [Effect Versioning System](effect-versioning.md).
 
 The **Type** column below uses these abbreviations:
 
@@ -17,7 +17,7 @@ False-color overlays on the input image.
 |--------|------|-------------|
 | Luminance Heatmap | CS-Img | False-color BT.709 luminance overlay (Turbo / Inferno gradients). |
 | Luminance Highlight | CS-Img | Highlights luminance bands above/below configurable thresholds. |
-| Delta E Comparator | CS-Img | Two-input CIEDE2000 perceptual difference map (Heatmap or Grayscale dE). |
+| Delta E Comparator | CS-Img | Two-input perceptual difference map (Heatmap or Grayscale dE). `Method` selects CIE76 / CIE94 / CIEDE2000 / **ΔE ITP (BT.2124)** — ITP is the default and the right choice for anything HDR or wide-gamut; the three Lab metrics were fit to reflective samples under SDR viewing and leave their domain above ~100 nits. Measured on a 1100 vs 1000 nit step: ITP 7.47, CIEDE2000 118.09, CIE76 253.26. One unit ≈ 1 JND in all four, so the numbers stay comparable when switching. |
 | Gamut Highlight | PS | Highlights pixels outside a target gamut (sRGB / P3 / BT.2020 / current monitor). |
 | Nit Map | PS | Display-referred nit visualization with configurable luminance bands. |
 
@@ -52,6 +52,7 @@ HDR ↔ SDR operators built around BT.2100 ICtCp. The key property: I (intensity
 | ICtCp Inverse Tone Map (SDR → HDR) | CS-Img | Mirror of the above; inverse Reinhard expands SDR-anchored content into the HDR peak. |
 | ICtCp Saturation | PS | Per-pixel saturation gain in ICtCp (scales Ct/Cp around the I-axis). |
 | ICtCp Highlight Desaturation | CS-Img | Smoothly reduces saturation above a configurable I threshold (counteracts tone-map hue shifts at clipping). |
+| HDR Screenshot Tonemap (8bpc) | PS | The display-referred screenshot path fused into one pass: knee tone map → chroma correction → soft gamut compression into sRGB → white-level normalise → sRGB OETF → TPDF dither → 8-bit quantize, then **decode back to linear scRGB** so downstream analysis measures exactly the damage the 8-bit handback would do. `KneeRatio` is a fraction of the SDR white level `W`, not absolute nits, so it keeps its meaning when the OS brightness slider moves. Fused rather than chained because the chained equivalent pays three ICtCp round trips over a 4K frame where this pays one. Known trade: the knee darkens SDR white by 15–20% whenever it engages. |
 
 ## Analysis → Gamut
 

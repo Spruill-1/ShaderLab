@@ -47,7 +47,12 @@ namespace ShaderLab::Rendering
                 auto panelNative = m_panel.as<ISwapChainPanelNative>();
                 if (panelNative) panelNative->SetSwapChain(nullptr);
             }
-            catch (...) {}
+            catch (...)
+            {
+                // Deliberate swallow: teardown. The panel may already be torn
+                // down by XAML, and there is nothing useful to do about it --
+                // we are releasing the swap chain on the next line regardless.
+            }
         }
 
         m_swapChain = nullptr;
@@ -278,13 +283,17 @@ namespace ShaderLab::Rendering
         m_renderTarget = std::move(targetBitmap);
         m_d2dDeviceContext->SetTarget(m_renderTarget.get());
 
-        // Set DPI to match the panel's composition scale.
-        float dpi = 96.0f;
-        if (m_panel)
-        {
-            dpi = 96.0f * m_panel.CompositionScaleX();
-        }
-        m_d2dDeviceContext->SetDpi(dpi, dpi);
+        // The render context runs at a FIXED 96 DPI. It used to be set to
+        // the panel's composition scale (96 * CompositionScaleX, e.g. 144
+        // at 150% display scaling), but post-P7 every render-side consumer
+        // — the offscreen preview draw, evaluator bounds math, captures,
+        // output sinks — immediately flipped it to 96 for its work and
+        // restored afterwards. Those per-frame DPI changes invalidated
+        // every D2D1_PROPERTY_CACHED effect intermediate in the context
+        // (caches are DPI-referenced), silently defeating clean-subgraph
+        // caching. Pixel-exact sizing is handled with explicit transforms,
+        // not context DPI; the UI thread blits through its own context.
+        m_d2dDeviceContext->SetDpi(96.0f, 96.0f);
     }
 
     void RenderEngine::ReleaseRenderTarget()

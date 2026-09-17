@@ -881,6 +881,7 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::ResetAfterGraphLoad(bool reopenOutputWindows)
     {
         m_previewNodeId = 0;
+        m_previewViews.clear();
         m_traceActive = false;
         m_lastTraceTopologyHash = 0;
         m_traceRowCache.clear();

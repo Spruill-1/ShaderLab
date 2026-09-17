@@ -15,20 +15,29 @@ namespace ShaderLab::Rendering
         const auto& caps = profile.caps;
         const bool isSim = monitor.IsSimulated();
 
-        struct ScalarField { const wchar_t* name; float value; };
+        // Per-field change epsilons. Displays with adaptive color / auto
+        // brightness re-report luminance continuously (sub-nit sensor
+        // jitter at several Hz); without a dead-band every drift dirties
+        // the node and re-evaluates every binding consumer — measured as
+        // a full-pipeline eval storm on a 4K graph. 1 nit is invisible
+        // while slider drags (multi-nit steps) still propagate instantly.
+        // Flags/mode use 0 (exact); MinNits values sit near 0.0005 so it
+        // gets a proportionally tiny band.
+        struct ScalarField { const wchar_t* name; float value; float eps; };
         const ScalarField scalars[] = {
-            { L"ActiveColorMode",  static_cast<float>(caps.activeColorMode) },
-            { L"HdrSupported",     caps.hdrSupported    ? 1.0f : 0.0f },
-            { L"HdrUserEnabled",   caps.hdrUserEnabled  ? 1.0f : 0.0f },
-            { L"WcgSupported",     caps.wcgSupported    ? 1.0f : 0.0f },
-            { L"WcgUserEnabled",   caps.wcgUserEnabled  ? 1.0f : 0.0f },
-            { L"IsSimulated",      isSim ? 1.0f : 0.0f },
-            { L"SdrWhiteNits",     caps.sdrWhiteLevelNits },
-            { L"PeakNits",         caps.maxLuminanceNits },
-            { L"MinNits",          caps.minLuminanceNits },
-            { L"MaxFullFrameNits", caps.maxFullFrameLuminanceNits },
+            { L"ActiveColorMode",  static_cast<float>(caps.activeColorMode), 0.0f },
+            { L"HdrSupported",     caps.hdrSupported    ? 1.0f : 0.0f,       0.0f },
+            { L"HdrUserEnabled",   caps.hdrUserEnabled  ? 1.0f : 0.0f,       0.0f },
+            { L"WcgSupported",     caps.wcgSupported    ? 1.0f : 0.0f,       0.0f },
+            { L"WcgUserEnabled",   caps.wcgUserEnabled  ? 1.0f : 0.0f,       0.0f },
+            { L"IsSimulated",      isSim ? 1.0f : 0.0f,                      0.0f },
+            { L"SdrWhiteNits",     caps.sdrWhiteLevelNits,                   1.0f },
+            { L"PeakNits",         caps.maxLuminanceNits,                    1.0f },
+            { L"MinNits",          caps.minLuminanceNits,                    0.0001f },
+            { L"MaxFullFrameNits", caps.maxFullFrameLuminanceNits,           1.0f },
         };
 
+        constexpr float kChromaEps = 0.0005f;
         struct VectorField { const wchar_t* name; float2 value; };
         const VectorField vectors[] = {
             { L"RedPrimary",   float2{ profile.primaryRed.x,   profile.primaryRed.y   } },
@@ -59,7 +68,7 @@ namespace ShaderLab::Rendering
                 }
                 if (auto* cur = std::get_if<float>(&it->second))
                 {
-                    if (*cur != f.value)
+                    if (std::abs(*cur - f.value) > f.eps)
                     {
                         *cur = f.value;
                         nodeChanged = true;
@@ -83,7 +92,8 @@ namespace ShaderLab::Rendering
                 }
                 if (auto* cur = std::get_if<float2>(&it->second))
                 {
-                    if (cur->x != f.value.x || cur->y != f.value.y)
+                    if (std::abs(cur->x - f.value.x) > kChromaEps ||
+                        std::abs(cur->y - f.value.y) > kChromaEps)
                     {
                         *cur = f.value;
                         nodeChanged = true;

@@ -307,18 +307,31 @@ namespace ShaderLab::Effects
         // --- Image source ---
         if (node.shaderPath.has_value() && !node.effectClsid.has_value())
         {
+            // Reuse the decoded bitmap unless the FILE changed. `node.dirty`
+            // means "re-evaluate downstream", not "reload from disk":
+            // MarkAllDirty() fires on node add/remove, preview switch,
+            // display-profile change and every capture, and the render tick
+            // only calls in here when the node is dirty -- so keying the
+            // decode on that flag re-ran a full WIC decode + colour-
+            // management pass on each of those events (~98 ms on a 4K JPEG,
+            // and it dominated the frame).
+            const auto& path = node.shaderPath.value();
             auto it = m_bitmapCache.find(node.id);
-            if (it != m_bitmapCache.end() && !node.dirty)
+            auto pathIt = m_bitmapPathCache.find(node.id);
+            if (it != m_bitmapCache.end() && it->second &&
+                pathIt != m_bitmapPathCache.end() && pathIt->second == path)
             {
                 node.cachedOutput = it->second.get();
+                node.dirty = false;
                 return;
             }
 
-            auto bitmap = m_imageLoader.LoadFromFile(node.shaderPath.value(), dc);
+            auto bitmap = m_imageLoader.LoadFromFile(path, dc);
             if (bitmap)
             {
                 node.cachedOutput = bitmap.get();
                 m_bitmapCache[node.id] = std::move(bitmap);
+                m_bitmapPathCache[node.id] = path;
                 node.dirty = false;
             }
             return;
@@ -368,6 +381,7 @@ namespace ShaderLab::Effects
     void SourceNodeFactory::ReleaseCache()
     {
         m_bitmapCache.clear();
+        m_bitmapPathCache.clear();
         m_floodCache.clear();
         m_videoCache.clear();
         m_dxgiCaptureCache.clear();

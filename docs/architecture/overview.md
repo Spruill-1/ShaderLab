@@ -13,8 +13,8 @@ graph TB
         EV[GraphEvaluator / FalseColorOverlay]
         FX[EffectRegistry / ShaderLabEffects / SourceNodeFactory]
         IO[ImageLoader / VideoSourceProvider / ShaderCompiler]
-        MON[DisplayMonitor / ICC / GPU reduction]
-        MCP[Engine/Mcp: McpHttpServer + EngineMcpRoutes]
+        MON[DisplayMonitor / ICC]
+        MCP[Engine/Mcp: McpRouter + EngineMcpRoutes]
     end
 
     subgraph Tests["ShaderLabTests.exe"]

@@ -226,38 +226,86 @@ static const float3x3 ICTCP_TO_PQLMS = float3x3(
     1.0,  0.560031336, -0.320627175
 );
 
+// PQ with a signed extension, mirroring the curve through the origin the
+// same way LabF does for CIE Lab. PQ itself is only defined for
+// non-negative light, but scRGB expresses wide-gamut colors as negative
+// Rec.709 components -- a BT.2020 green is (-0.87, +1.0, +0.06)-ish. A
+// hard clamp there is not a safety net, it is an sRGB gamut clip applied
+// before any colour science runs. Mirroring keeps the excursion
+// representable so the round trip is lossless.
+float PQ_InvEOTF_Signed(float L) {
+    float v = PQ_InvEOTF(abs(L));
+    return (L < 0.0) ? -v : v;
+}
+
+float PQ_EOTF_Signed(float N) {
+    float v = PQ_EOTF(abs(N));
+    return (N < 0.0) ? -v : v;
+}
+
 // scRGB -> ICtCp
 float3 ScRGBToICtCp(float3 rgb) {
-    // scRGB (1.0 = 80 nits) -> absolute luminance XYZ
-    float3 xyz = ScRGBToXYZ(max(rgb, 0.0));
+    // scRGB (1.0 = 80 nits) -> absolute luminance XYZ. No clamp: negative
+    // components carry wide-gamut chroma, and the LMS mixing below is
+    // non-negative for every physically realizable colour anyway (the
+    // BT.2124 cone primaries enclose the visible locus), so the signed PQ
+    // only engages on genuinely out-of-locus or below-black input.
+    float3 xyz = ScRGBToXYZ(rgb);
     // Scale to absolute nits for PQ (XYZ Y=1 = 80 nits in scRGB)
     xyz *= 80.0;
     float3 lms = mul(XYZ_TO_LMS_ICTCP, xyz);
-    lms = max(lms, 0.0);
-    // PQ encode each LMS component (input in nits, output [0,1])
+    // PQ encode each LMS component (input in nits, output [-1,1])
     float3 pqLms = float3(
-        PQ_InvEOTF(lms.x),
-        PQ_InvEOTF(lms.y),
-        PQ_InvEOTF(lms.z));
+        PQ_InvEOTF_Signed(lms.x),
+        PQ_InvEOTF_Signed(lms.y),
+        PQ_InvEOTF_Signed(lms.z));
     return mul(PQLMS_TO_ICTCP, pqLms);
 }
 
 // ICtCp -> scRGB
 float3 ICtCpToScRGB(float3 ictcp) {
     float3 pqLms = mul(ICTCP_TO_PQLMS, ictcp);
-    // Defensive clamp: PQ_EOTF is only defined for V in [0, 1]. Out-of-range
-    // pqLms (which can happen when callers modify I-channel without rescaling
-    // Ct/Cp, or with out-of-gamut chroma) produce NaN/Inf via the EOTF.
-    pqLms = saturate(pqLms);
+    // Magnitude clamp: PQ_EOTF's rational form goes singular past |V| = 1
+    // (the denominator crosses zero) and yields NaN/Inf, which callers can
+    // reach by moving I without rescaling Ct/Cp. Clamp the magnitude and
+    // keep the sign so wide-gamut excursions survive.
+    pqLms = clamp(pqLms, -1.0, 1.0);
     // PQ decode to nits
     float3 lms = float3(
-        PQ_EOTF(pqLms.x),
-        PQ_EOTF(pqLms.y),
-        PQ_EOTF(pqLms.z));
+        PQ_EOTF_Signed(pqLms.x),
+        PQ_EOTF_Signed(pqLms.y),
+        PQ_EOTF_Signed(pqLms.z));
     float3 xyz = mul(LMS_TO_XYZ_ICTCP, lms);
     // Scale back from nits to scRGB (80 nits = 1.0)
     xyz /= 80.0;
     return XYZToScRGB(xyz);
+}
+
+// ---- Delta E ITP (ITU-R BT.2124) ----
+//
+// The HDR/WCG colour-difference metric. CIE Lab's dE76/94/2000 were derived
+// from reflective samples under SDR viewing and lose meaning above roughly
+// 100 nits and outside sRGB -- exactly where this pipeline operates -- so
+// dE ITP is the correct ruler for tone-mapping and gamut work here.
+//
+//   dE_ITP = 720 * sqrt( dI^2 + dT^2 + dP^2 ),  T = 0.5 * Ct,  P = Cp
+//
+// The 0.5 on Ct converts BT.2100 ICtCp into the "ITP" difference space
+// (Ct's range is twice Cp's); the 720 scales one unit to approximately one
+// JND, so it is directly comparable to a dE2000 of 1.
+//
+// BT.2124 is defined on PQ-encoded ICtCp, which is what ScRGBToICtCp
+// produces. Takes ICtCp triples, not scRGB -- convert first.
+float DeltaEITP(float3 ictcp1, float3 ictcp2) {
+    float dI = ictcp1.x - ictcp2.x;
+    float dT = 0.5 * (ictcp1.y - ictcp2.y);
+    float dP = ictcp1.z - ictcp2.z;
+    return 720.0 * sqrt(dI * dI + dT * dT + dP * dP);
+}
+
+// Convenience: dE ITP straight from two scRGB colours.
+float DeltaEITPFromScRGB(float3 rgb1, float3 rgb2) {
+    return DeltaEITP(ScRGBToICtCp(rgb1), ScRGBToICtCp(rgb2));
 }
 
 // OKLab: linear sRGB -> OKLab
@@ -318,6 +366,66 @@ float ReinhardExpandI(float I, float peakIn_I, float peakOut_I) {
     float Ic = clamp(I, 0.0, peakOut_I);
     float denom = pp - Ic * (peakIn_I - peakOut_I);
     return Ic * pp / max(denom, 1e-12);
+}
+
+// Soft gamut-distance compression (1D). `d` is a pixel's chroma radius
+// normalized so the gamut boundary sits at 1.0 (d < 1 in-gamut, d > 1
+// out). Returns the remapped radius. Contract:
+//   - d <= threshold        -> returned unchanged (identity zone)
+//   - d == limit            -> maps exactly to 1.0 (the boundary)
+//   - monotone increasing, C1 at d == threshold (slope 1 where the
+//     curve meets the identity segment, so gradients don't kink)
+//   - d > limit             -> may exceed 1.0 slightly (ACES-style;
+//     callers pick `limit` to cover their expected source range)
+// threshold in [0, 1): where compression starts, e.g. 0.75.
+// limit > 1: the source radius that lands exactly on the boundary.
+// power >= 1: knee hardness. 1 reduces exactly to Reinhard; higher
+//   values track identity longer and turn harder near the boundary
+//   (less desaturation of legal colors, more crowding of illegal ones).
+//   ACES RGC ships 1.2.
+// ---- 8-bit display-referred output helpers -----------------------------
+// These exist for the screenshot path, where the handback is 8bpc sRGB and
+// we therefore own the quantizer. The above-white band survives the tone
+// curve inside a very small number of codes (a 0.7*W knee leaves roughly 33
+// of 256 after the sRGB OETF), so quantizing without dither bands visibly
+// in exactly the smooth HDR gradients the feature exists to preserve.
+
+// Interleaved Gradient Noise (Jimenez 2014). Cheap, deterministic, and
+// spectrally much better behaved than a hash-based white noise, which makes
+// it a reasonable dither source when a blue-noise texture isn't available.
+// Expects integer pixel coordinates; returns [0, 1).
+float InterleavedGradientNoise(float2 p) {
+    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+// Triangular-PDF dither, [-1, 1] LSB. The sum of two independent uniforms
+// decorrelates the quantization error from the signal; plain uniform dither
+// leaves a residual pattern modulated by the signal itself.
+float TriangularDither(float2 p) {
+    float n1 = InterleavedGradientNoise(p);
+    float n2 = InterleavedGradientNoise(p + 5.588238);
+    return n1 + n2 - 1.0;
+}
+
+// Quantize an already-encoded [0,1] value to `levels` steps with dither.
+// `strength` scales the dither in LSBs (1.0 = standard TPDF, 0 = none).
+float3 DitherQuantize(float3 encoded, float2 p, float levels, float strength) {
+    float maxCode = max(levels - 1.0, 1.0);
+    float3 d = TriangularDither(p) * 0.5 * strength;
+    return saturate(round(saturate(encoded) * maxCode + d) / maxCode);
+}
+
+float SoftCompressDistance(float d, float threshold, float limit, float power) {
+    float t = clamp(threshold, 0.0, 0.99);
+    float l = max(limit, 1.01);
+    float p = clamp(power, 1.0, 8.0);
+    if (d <= t) return d;
+    // ACES-RGC-style power curve y = t + x / (1 + (x/s)^p)^(1/p), with
+    // the scale s solved from the anchor f(l - t) == 1 - t, so d == l
+    // lands exactly on the boundary. f'(0) == 1 keeps the join C1.
+    float x = d - t;
+    float s = (l - t) / pow(pow((l - t) / (1.0 - t), p) - 1.0, 1.0 / p);
+    return t + x / pow(1.0 + pow(x / s, p), 1.0 / p);
 }
 )HLSL";
 

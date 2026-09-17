@@ -13,23 +13,33 @@
 //     ShaderLabHeadless --graph PATH --node ID --output PNG_PATH [options]
 //
 // Required arguments:
-//     --graph PATH    .effectgraph JSON file (zip/embedded media not yet supported)
+//     --graph PATH    .effectgraph archive or bare graph JSON. A ZIP archive
+//                     has its embedded media/ extracted to a temp directory
+//                     and "media://" tokens rewritten, then cleaned up on exit.
 //     --node ID       Numeric node id from the graph to render
-//     --output PATH   PNG output path
+//     --output PATH   Output image path. The extension picks the encoder:
+//                     .jxr / .wdp -> JPEG XR, 64bpp RGBA half, lossless, HDR
+//                     preserved (no clamp, no transfer encoding);
+//                     anything else -> PNG, 8-bit sRGB, clamped to [0,1].
 //
 // Options:
 //     --width N       Output width in pixels (default: 1024)
 //     --height N      Output height in pixels (default: 1024)
 //     --adapter X     'warp' or 'default' (default: 'default'; CI uses warp)
-//     --port N        MCP port (reserved for the full Phase 7 MCP migration; not yet active)
+//     --pixels        FP32 RGBA readback to stdout instead of a PNG
+//
+// Batch / MCP modes (mutually exclusive with a plain --output render):
+//     --script PATH --script-output PATH
+//                     JSON batch script of MCP-shaped ops; results written as JSON.
+//     --mcp-session [--pipe NAME] [--session-id ID] [--session-label TEXT]
+//                     Register with the broker hub as an MCP session and serve
+//                     requests until terminated.
+//
+// Other flags: --input-peak-nits / --output-peak-nits, --no-tonemap,
+// --enable-gpu-bindings / --disable-gpu-bindings, --reap-shader-cache
+// [--reap-shader-cache-stale-sec N], --clear-shader-cache, --help.
 //
 // Exit code: 0 on success, non-zero on any failure.
-//
-// **Not yet implemented (queued for future work):**
-//   * .effectgraph zip archives with embedded media (only plain JSON for v1)
-//   * MCP HTTP server (the full move from MainWindow.McpRoutes.cpp is queued)
-//   * --script JSON file for batch parameter sweeps
-//   * HDR-preserving JXR output (PNG truncates above 1.0 scRGB)
 //
 // What it DOES prove: the engine, graph evaluator, custom-effect cache,
 // and pixel readback path all work without any UI thread or swap chain.
@@ -45,7 +55,14 @@
 #include "Effects/BytecodeCache.h"
 #include "Effects/Performance.h"
 #include "Rendering/PixelReadback.h"
-#include "Engine/Mcp/McpHttpServer.h"
+#include "Rendering/PipelineFormat.h"
+#include "Rendering/EffectGraphFile.h"
+
+// XMConvertFloatToHalf for the JXR (64bpp RGBA half) encode path.
+#include <DirectXPackedVector.h>
+#include "Engine/Mcp/McpRouter.h"
+#include "Engine/Mcp/McpJsonRpc.h"
+#include "Engine/Mcp/McpSessionClient.h"
 #include "Engine/Mcp/EngineMcpRoutes.h"
 
 #include <winrt/Windows.Data.Json.h>
@@ -69,7 +86,6 @@ namespace
         uint32_t     width{ 1024 };
         uint32_t     height{ 1024 };
         bool         useWarp{ false };
-        uint16_t     mcpPort{ 47809 };  // q-p7-mcp-port-conflict default
         // D2D HdrToneMap parameters: InputMaxLuminance is the peak nit
         // value of the source content; OutputMaxLuminance is the peak
         // nit value the SDR PNG can represent (80 == scRGB 1.0). The
@@ -82,6 +98,12 @@ namespace
         // when the graph already produced SDR-range output and we
         // don't want HdrToneMap's mid-tone lift muddying the result.
         bool         skipToneMap{ false };
+        // Set when --input-peak-nits / --output-peak-nits was passed. A JXR
+        // output skips the tone map by default (see RunRender), but an
+        // explicit peak request means the caller wants tone mapping and is
+        // choosing the target peak -- e.g. 4000-nit content into a 1000-nit
+        // HDR deliverable -- so it must win over that default.
+        bool         toneMapExplicit{ false };
         // FP32 RGBA pixel-region readback (alternate output mode).
         // When set, --output is interpreted as a raw FP32 binary blob
         // (extension .bin / .raw) or a CSV file (extension .csv). No
@@ -102,6 +124,17 @@ namespace
         std::wstring scriptPath;
         std::wstring scriptOutputPath;  // empty -> stdout
 
+        // MCP session mode (stdio-migration Step 6). Registers with the
+        // broker hub as a session so a shim-fronted MCP client can select
+        // it with use_session. --session-id is a persisted per-window
+        // GUID (a fresh one is generated when omitted); --session-label
+        // is the human name list_sessions surfaces; --pipe overrides the
+        // broker pipe base (dev/CI isolation).
+        bool         mcpSessionMode{ false };
+        std::wstring sessionId;
+        std::wstring sessionLabel;
+        std::wstring pipeName;
+
         // p8-cache-reaper: bytecode-cache management modes. When set,
         // the headless host runs the requested op then exits without
         // loading a graph or starting MCP. Useful for CI / cleanup.
@@ -118,18 +151,22 @@ namespace
     void PrintUsage(const wchar_t* exeName)
     {
         std::wprintf(
-L"Usage: %ls --graph PATH --node ID --output PNG_PATH [options]\n"
+L"Usage: %ls --graph PATH --node ID --output IMAGE_PATH [options]\n"
 L"\n"
 L"Required:\n"
-L"  --graph PATH    .effectgraph JSON file\n"
+L"  --graph PATH    .effectgraph archive (ZIP; embedded media supported)\n"
+L"                  or a bare graph JSON file\n"
 L"  --node ID       Numeric node id to render\n"
-L"  --output PATH   PNG output path\n"
+L"  --output PATH   Output image. The extension picks the encoder:\n"
+L"                    .jxr/.wdp  JPEG XR, 64bpp RGBA half, lossless, HDR\n"
+L"                               preserved (implies --no-tonemap unless a\n"
+L"                               peak is named explicitly)\n"
+L"                    otherwise  PNG, 8-bit sRGB, clamped to [0,1]\n"
 L"\n"
 L"Options:\n"
 L"  --width N                Output width (default: 1024)\n"
 L"  --height N               Output height (default: 1024)\n"
 L"  --adapter X              'warp' or 'default' (default: default)\n"
-L"  --port N                 Reserved for MCP server (default: 47809)\n"
 L"  --input-peak-nits N      D2D HdrToneMap input peak (default: 1000)\n"
 L"  --output-peak-nits N     D2D HdrToneMap output peak (default: 80 = SDR)\n"
 L"  --no-tonemap             Skip HdrToneMap, raw scRGB -> sRGB clamp\n"
@@ -200,9 +237,8 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
             else if (a == L"--width")   { auto v = needNext(L"--width"); if (!v) return false; out.width = static_cast<uint32_t>(std::wcstoul(v, nullptr, 10)); }
             else if (a == L"--height")  { auto v = needNext(L"--height"); if (!v) return false; out.height = static_cast<uint32_t>(std::wcstoul(v, nullptr, 10)); }
             else if (a == L"--adapter") { auto v = needNext(L"--adapter"); if (!v) return false; out.useWarp = (std::wstring_view{v} == L"warp"); }
-            else if (a == L"--port")    { auto v = needNext(L"--port"); if (!v) return false; out.mcpPort = static_cast<uint16_t>(std::wcstoul(v, nullptr, 10)); }
-            else if (a == L"--input-peak-nits")  { auto v = needNext(L"--input-peak-nits"); if (!v) return false; out.inputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); }
-            else if (a == L"--output-peak-nits") { auto v = needNext(L"--output-peak-nits"); if (!v) return false; out.outputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); }
+            else if (a == L"--input-peak-nits")  { auto v = needNext(L"--input-peak-nits"); if (!v) return false; out.inputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); out.toneMapExplicit = true; }
+            else if (a == L"--output-peak-nits") { auto v = needNext(L"--output-peak-nits"); if (!v) return false; out.outputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); out.toneMapExplicit = true; }
             else if (a == L"--no-tonemap") { out.skipToneMap = true; }
             else if (a == L"--pixels")
             {
@@ -238,6 +274,10 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
             }
             else if (a == L"--script")        { auto v = needNext(L"--script"); if (!v) return false; out.scriptPath = v; }
             else if (a == L"--script-output") { auto v = needNext(L"--script-output"); if (!v) return false; out.scriptOutputPath = v; }
+            else if (a == L"--mcp-session")   { out.mcpSessionMode = true; }
+            else if (a == L"--session-id")    { auto v = needNext(L"--session-id"); if (!v) return false; out.sessionId = v; }
+            else if (a == L"--session-label") { auto v = needNext(L"--session-label"); if (!v) return false; out.sessionLabel = v; }
+            else if (a == L"--pipe")          { auto v = needNext(L"--pipe"); if (!v) return false; out.pipeName = v; }
             else if (a == L"--reap-shader-cache")   { out.reapShaderCache = true; }
             else if (a == L"--clear-shader-cache")  { out.clearShaderCache = true; }
             else if (a == L"--reap-shader-cache-stale-sec")
@@ -258,10 +298,10 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
         {
             // No further validation -- cache modes don't need a graph.
         }
-        else if (!out.scriptPath.empty())
+        else if (!out.scriptPath.empty() || out.mcpSessionMode)
         {
             if (out.graphPath.empty()) {
-                std::wprintf(L"ERROR: --graph is required (script mode)\n");
+                std::wprintf(L"ERROR: --graph is required (script / mcp-session mode)\n");
                 return false;
             }
         }
@@ -294,10 +334,127 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
         return s;
     }
 
+    // Result of loading a graph from either container form.
+    struct LoadedGraph
+    {
+        ShaderLab::Graph::EffectGraph graph;
+        // Non-empty when the source was a zip: the temp directory holding
+        // extracted media. The graph's source-node paths point into it, so it
+        // must outlive rendering; RemoveExtractDir() clears it afterwards.
+        std::wstring extractDir;
+        bool ok{ false };
+        int  exitCode{ 0 };     // meaningful only when !ok
+    };
+
+    void RemoveExtractDir(const std::wstring& dir)
+    {
+        if (dir.empty()) return;
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);   // best effort: temp dir
+    }
+
+    // Deletes the extracted-media temp directory on every exit path.
+    // Declare it BEFORE the evaluator / source factory so it destructs AFTER
+    // them -- those hold file handles into the directory while rendering.
+    struct ExtractDirGuard
+    {
+        std::wstring dir;
+        explicit ExtractDirGuard(std::wstring d) : dir(std::move(d)) {}
+        ~ExtractDirGuard() { RemoveExtractDir(dir); }
+        ExtractDirGuard(const ExtractDirGuard&) = delete;
+        ExtractDirGuard& operator=(const ExtractDirGuard&) = delete;
+    };
+
+    // Load a graph from either container form:
+    //   * a .effectgraph ZIP (what the GUI's Save produces) -- graph.json plus
+    //     optional embedded media under media/, and
+    //   * a bare .json graph (what the test fixtures and older files are).
+    //
+    // Detected by the PKZIP local-file-header magic rather than by extension,
+    // because .effectgraph is used for both forms historically.
+    //
+    // Media handling mirrors MainWindow.GraphFileIo.cpp: source nodes carry a
+    // "media://<name>" token which is rewritten to the extracted temp path, in
+    // BOTH shaderPath and the mirrored "shaderPath" property, so the existing
+    // image / video pipeline resolves them with no further special-casing.
+    LoadedGraph LoadGraphFromPath(const std::wstring& path)
+    {
+        LoadedGraph result;
+
+        std::string raw = ReadFileUtf8(path);
+        if (raw.empty())
+        {
+            std::wprintf(L"FATAL: could not read graph file '%ls'\n", path.c_str());
+            result.exitCode = 4;
+            return result;
+        }
+
+        std::wstring graphJsonW;
+        std::map<std::wstring, std::wstring> mediaMap;
+
+        const bool isZip = raw.size() >= 4 && raw[0] == 'P' && raw[1] == 'K' &&
+                           raw[2] == '\x03' && raw[3] == '\x04';
+        if (isZip)
+        {
+            wchar_t tempRoot[MAX_PATH]{};
+            GetTempPathW(MAX_PATH, tempRoot);
+            auto loaded = ShaderLab::Rendering::EffectGraphFile::Load(path, tempRoot);
+            if (!loaded.has_value())
+            {
+                std::wprintf(L"FATAL: could not read graph from .effectgraph archive '%ls'\n",
+                    path.c_str());
+                result.exitCode = 4;
+                return result;
+            }
+            graphJsonW         = loaded->graphJson;
+            mediaMap           = std::move(loaded->mediaMap);
+            result.extractDir  = loaded->extractDir;
+        }
+        else
+        {
+            int wcCount = MultiByteToWideChar(CP_UTF8, 0, raw.data(),
+                static_cast<int>(raw.size()), nullptr, 0);
+            graphJsonW.resize(wcCount, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, raw.data(),
+                static_cast<int>(raw.size()), graphJsonW.data(), wcCount);
+        }
+
+        try {
+            result.graph = ShaderLab::Graph::EffectGraph::FromJson(winrt::hstring(graphJsonW));
+        } catch (winrt::hresult_error const& e) {
+            std::wprintf(L"FATAL: graph JSON parse failed (0x%08X): %ls\n",
+                static_cast<uint32_t>(e.code()), e.message().c_str());
+            RemoveExtractDir(result.extractDir);
+            result.extractDir.clear();
+            result.exitCode = 5;
+            return result;
+        }
+
+        if (!mediaMap.empty())
+        {
+            auto& nodes = const_cast<std::vector<ShaderLab::Graph::EffectNode>&>(
+                result.graph.Nodes());
+            for (auto& n : nodes)
+            {
+                if (n.type != ShaderLab::Graph::NodeType::Source) continue;
+                if (!n.shaderPath.has_value()) continue;
+                auto it = mediaMap.find(*n.shaderPath);
+                if (it == mediaMap.end()) continue;
+                n.shaderPath = it->second;
+                auto pit = n.properties.find(L"shaderPath");
+                if (pit != n.properties.end())
+                    pit->second = it->second;
+            }
+        }
+
+        result.ok = true;
+        return result;
+    }
+
     // Encode an FP32 RGBA buffer as PNG via WIC. PNG is 8-bit per channel;
     // values are gamma-encoded sRGB after a clamp to [0, 1]. This is lossy
-    // for HDR scRGB output (anything above 1.0 saturates to 255). For HDR
-    // fidelity, switch to JXR (D2D's native FP16 path) -- queued.
+    // for HDR scRGB output (anything above 1.0 saturates to 255) -- use a
+    // .jxr output path for HDR fidelity (SaveFp32AsJxr below).
     HRESULT SaveFp32AsPng(IWICImagingFactory* wic,
         const float* rgba, uint32_t w, uint32_t h, uint32_t pitchBytes,
         const std::wstring& path)
@@ -356,6 +513,105 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
         if (FAILED(hr)) return hr;
         return encoder->Commit();
     }
+
+    // Encode an FP32 RGBA buffer as JPEG XR (.jxr / .wdp) via WIC, preserving
+    // HDR. Unlike the PNG path there is NO clamp and NO transfer encoding: the
+    // pipeline's scRGB linear values are written as-is into a 64bpp RGBA-half
+    // frame, so values above 1.0 (above SDR white) and the negative components
+    // that express wide-gamut colour both survive the round trip.
+    //
+    // FP32 -> FP16 is not a precision loss in practice: the pipeline is
+    // R16G16B16A16_FLOAT, so these values originated as halves.
+    //
+    // Mirrors the GUI's OutputWindow::SaveImageAsync JXR branch
+    // (GUID_ContainerFormatWmp + Lossless), so a node saved from an output
+    // window and the same node captured headless produce the same file.
+    HRESULT SaveFp32AsJxr(IWICImagingFactory* wic,
+        const float* rgba, uint32_t w, uint32_t h, uint32_t pitchBytes,
+        const std::wstring& path)
+    {
+        using DirectX::PackedVector::XMConvertFloatToHalf;
+
+        // 64bpp RGBA half, tightly packed.
+        std::vector<uint16_t> halfRgba(static_cast<size_t>(w) * h * 4);
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            const float* srcRow = reinterpret_cast<const float*>(
+                reinterpret_cast<const uint8_t*>(rgba) + y * pitchBytes);
+            uint16_t* dstRow = halfRgba.data() + static_cast<size_t>(y) * w * 4;
+            for (uint32_t x = 0; x < w * 4; ++x)
+                dstRow[x] = XMConvertFloatToHalf(srcRow[x]);
+        }
+
+        winrt::com_ptr<IWICStream> stream;
+        HRESULT hr = wic->CreateStream(stream.put());
+        if (FAILED(hr)) return hr;
+        hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+        if (FAILED(hr)) return hr;
+
+        winrt::com_ptr<IWICBitmapEncoder> encoder;
+        hr = wic->CreateEncoder(GUID_ContainerFormatWmp, nullptr, encoder.put());
+        if (FAILED(hr)) return hr;
+        hr = encoder->Initialize(stream.get(), WICBitmapEncoderNoCache);
+        if (FAILED(hr)) return hr;
+
+        winrt::com_ptr<IWICBitmapFrameEncode> frame;
+        winrt::com_ptr<IPropertyBag2> encoderOptions;
+        hr = encoder->CreateNewFrame(frame.put(), encoderOptions.put());
+        if (FAILED(hr)) return hr;
+
+        // Lossless: the point of this path is fidelity, not file size.
+        if (encoderOptions)
+        {
+            PROPBAG2 option{};
+            option.pstrName = const_cast<LPOLESTR>(L"Lossless");
+            VARIANT val{};
+            val.vt = VT_BOOL;
+            val.boolVal = VARIANT_TRUE;
+            encoderOptions->Write(1, &option, &val);
+        }
+
+        hr = frame->Initialize(encoderOptions.get());
+        if (FAILED(hr)) return hr;
+        hr = frame->SetSize(w, h);
+        if (FAILED(hr)) return hr;
+
+        WICPixelFormatGUID fmt = GUID_WICPixelFormat64bppRGBAHalf;
+        hr = frame->SetPixelFormat(&fmt);
+        if (FAILED(hr)) return hr;
+        // WIC may negotiate a different format; refuse rather than silently
+        // writing something that is not the half-float data we promised.
+        if (fmt != GUID_WICPixelFormat64bppRGBAHalf) return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
+
+        const uint32_t stride = w * 4 * sizeof(uint16_t);
+        hr = frame->WritePixels(h, stride, stride * h,
+            reinterpret_cast<BYTE*>(halfRgba.data()));
+        if (FAILED(hr)) return hr;
+        hr = frame->Commit();
+        if (FAILED(hr)) return hr;
+        return encoder->Commit();
+    }
+
+    // True when the output path asks for the HDR-preserving encoder.
+    bool IsHdrOutputPath(const std::wstring& path)
+    {
+        auto dot = path.rfind(L'.');
+        if (dot == std::wstring::npos) return false;
+        std::wstring ext = path.substr(dot);
+        for (auto& c : ext) c = static_cast<wchar_t>(towlower(c));
+        return ext == L".jxr" || ext == L".wdp";
+    }
+
+    // Pick the encoder from the output file's extension. PNG is the default
+    // for anything unrecognized, matching the historical behavior.
+    HRESULT SaveFp32Image(IWICImagingFactory* wic,
+        const float* rgba, uint32_t w, uint32_t h, uint32_t pitchBytes,
+        const std::wstring& path)
+    {
+        if (IsHdrOutputPath(path))
+            return SaveFp32AsJxr(wic, rgba, w, h, pitchBytes, path);
+        return SaveFp32AsPng(wic, rgba, w, h, pitchBytes, path);
+    }
 }
 
 int wmain(int argc, wchar_t* argv[]);
@@ -411,26 +667,12 @@ int RunRender(const Args& args)
     ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
 
     // ---- Load the graph ----------------------------------------------------
-    auto graphJson = ReadFileUtf8(args.graphPath);
-    if (graphJson.empty()) {
-        std::wprintf(L"FATAL: could not read graph file '%ls'\n", args.graphPath.c_str());
-        return 4;
-    }
-    // Convert UTF-8 to UTF-16 for FromJson (winrt::hstring).
-    int wcCount = MultiByteToWideChar(CP_UTF8, 0, graphJson.data(),
-        static_cast<int>(graphJson.size()), nullptr, 0);
-    std::wstring graphJsonW(wcCount, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, graphJson.data(),
-        static_cast<int>(graphJson.size()), graphJsonW.data(), wcCount);
-
-    ShaderLab::Graph::EffectGraph graph;
-    try {
-        graph = ShaderLab::Graph::EffectGraph::FromJson(winrt::hstring(graphJsonW));
-    } catch (winrt::hresult_error const& e) {
-        std::wprintf(L"FATAL: graph JSON parse failed (0x%08X): %ls\n",
-            static_cast<uint32_t>(e.code()), e.message().c_str());
-        return 5;
-    }
+    // Handles both a .effectgraph ZIP (media extracted to a temp dir, which
+    // must survive until rendering is done) and a bare JSON graph.
+    auto loaded = LoadGraphFromPath(args.graphPath);
+    if (!loaded.ok) return loaded.exitCode;
+    auto& graph = loaded.graph;
+    ExtractDirGuard extractGuard{ loaded.extractDir };
 
     if (!graph.FindNode(args.nodeId)) {
         std::wprintf(L"FATAL: node id %u not found in graph\n", args.nodeId);
@@ -589,10 +831,24 @@ int RunRender(const Args& args)
     // visual-inspection output we want the lift; for raw scRGB pixel
     // sampling use --no-tonemap (or, future work, the FP16 readback
     // path tracked as p7-headless-fp16-pixel-readback).
+    // A .jxr / .wdp output exists to preserve HDR, so tone mapping to SDR
+    // would defeat it: the default HdrToneMap (OUTPUT_MAX_LUMINANCE = 80)
+    // maps a 800-nit source down to ~1.0 scRGB, and the encoder would then
+    // faithfully store an SDR image in an HDR container. So HDR output
+    // implies --no-tonemap, UNLESS the caller named a peak explicitly --
+    // tone mapping INTO an HDR deliverable (e.g. 4000-nit source to a
+    // 1000-nit target) is a legitimate request and must still win.
+    const bool hdrOutput = IsHdrOutputPath(args.outputPath);
+    const bool skipToneMap = args.skipToneMap || (hdrOutput && !args.toneMapExplicit);
+    if (hdrOutput && !args.skipToneMap && !args.toneMapExplicit)
+        std::wprintf(L"NOTE: HDR output (%ls) -- skipping HdrToneMap to preserve "
+                     L"values above 1.0. Pass --output-peak-nits to tone map anyway.\n",
+                     args.outputPath.c_str());
+
     winrt::com_ptr<ID2D1Effect> toneMap;
     winrt::com_ptr<ID2D1Image> toneMappedOut;
     ID2D1Image* renderInput = node->cachedOutput;
-    if (!args.skipToneMap)
+    if (!skipToneMap)
     {
         hr = dc->CreateEffect(CLSID_D2D1HdrToneMap, toneMap.put());
         if (FAILED(hr)) {
@@ -650,13 +906,13 @@ int RunRender(const Args& args)
         return 13;
     }
 
-    hr = SaveFp32AsPng(wic.get(),
+    hr = SaveFp32Image(wic.get(),
         reinterpret_cast<const float*>(mapped.bits),
         args.width, args.height, mapped.pitch,
         args.outputPath);
     staging->Unmap();
     if (FAILED(hr)) {
-        std::wprintf(L"FATAL: SaveFp32AsPng failed 0x%08X\n", static_cast<uint32_t>(hr));
+        std::wprintf(L"FATAL: image encode failed 0x%08X\n", static_cast<uint32_t>(hr));
         return 14;
     }
 
@@ -692,8 +948,8 @@ struct HeadlessSink : ShaderLab::Mcp::IEngineCommandSink
 {
     std::function<void(ShaderLab::Mcp::EngineContext&)> populateContext;
 
-    ShaderLab::McpHttpServer::Response Dispatch(
-        std::function<ShaderLab::McpHttpServer::Response(
+    ShaderLab::Mcp::Response Dispatch(
+        std::function<ShaderLab::Mcp::Response(
             ShaderLab::Mcp::EngineContext&)> closure) override
     {
         ShaderLab::Mcp::EngineContext ctx{};
@@ -762,29 +1018,19 @@ int RunScript(const Args& args)
     ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
 
     // ---- Load graph -------------------------------------------------------
-    auto graphJson = ReadFileUtf8(args.graphPath);
-    if (graphJson.empty()) {
-        std::wprintf(L"FATAL: could not read graph file '%ls'\n", args.graphPath.c_str());
-        return 4;
-    }
-    int wcCount = MultiByteToWideChar(CP_UTF8, 0, graphJson.data(),
-        static_cast<int>(graphJson.size()), nullptr, 0);
-    std::wstring graphJsonW(wcCount, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, graphJson.data(),
-        static_cast<int>(graphJson.size()), graphJsonW.data(), wcCount);
-
-    ShaderLab::Graph::EffectGraph graph;
-    try {
-        graph = ShaderLab::Graph::EffectGraph::FromJson(winrt::hstring(graphJsonW));
-    } catch (winrt::hresult_error const& e) {
-        std::wprintf(L"FATAL: graph JSON parse failed (0x%08X): %ls\n",
-            static_cast<uint32_t>(e.code()), e.message().c_str());
-        return 5;
-    }
+    // Same dual-form loader as RunRender: .effectgraph ZIP or bare JSON.
+    auto loaded = LoadGraphFromPath(args.graphPath);
+    if (!loaded.ok) return loaded.exitCode;
+    auto& graph = loaded.graph;
+    ExtractDirGuard extractGuard{ loaded.extractDir };
 
     ShaderLab::Effects::SourceNodeFactory sourceFactory;
     ShaderLab::Rendering::GraphEvaluator evaluator;
-    ShaderLab::Rendering::DisplayMonitor displayMonitor;  // headless: live caps default
+    // Snapshot the primary monitor's real advanced-color caps (no change
+    // events — headless runs no DispatcherQueue). Falls back to struct
+    // defaults when no display is reachable (CI, session 0).
+    ShaderLab::Rendering::DisplayMonitor displayMonitor;
+    displayMonitor.InitializeForPrimaryMonitor();
 
     // Prep source nodes once (loads media off disk). Properties on
     // source nodes are typically static (file path); set-property on
@@ -858,10 +1104,50 @@ int RunScript(const Args& args)
         ctx.d3dDevice      = d3dDevice.get();
         ctx.d3dContext     = d3dContext.get();
         ctx.renderFrame    = runEval;  // routes that need fresh eval call this
+        // Headless always renders scRGB FP16 (there is no swap chain or
+        // RenderEngine to ask); /display/info reports this name.
+        ctx.getPipelineFormatName = [] {
+            return ShaderLab::Rendering::FormatScRgbFP16.name;
+        };
     };
 
-    ShaderLab::McpHttpServer server;
+    ShaderLab::McpRouter server;
     ShaderLab::Mcp::RegisterEngineRoutes(server, sink);
+
+    // ---- MCP session mode (stdio-migration Step 6) ------------------------
+    // Register with the broker hub as a session; the McpSessionClient
+    // serves incoming channel requests by routing sealed JSON-RPC through
+    // this same `server` router (its POST / dispatcher), so a shim-fronted
+    // MCP client drives the graph. (The old --serve HTTP mode was removed in
+    // Step 9 with the rest of the HTTP transport; this is the only MCP host
+    // mode now, and what CI drives via a shim.)
+    if (args.mcpSessionMode)
+    {
+        ShaderLab::Mcp::JsonRpcOptions rpcOptions;
+        rpcOptions.hostKind = "headless";
+        ShaderLab::Mcp::RegisterJsonRpcEndpoint(server, std::move(rpcOptions));
+
+        ShaderLab::Mcp::SessionClientOptions sopts;
+        sopts.pipeBaseName = args.pipeName;
+        sopts.sessionId = args.sessionId;
+        if (sopts.sessionId.empty())
+        {
+            GUID g{};
+            CoCreateGuid(&g);
+            wchar_t buf[64]{};
+            StringFromGUID2(g, buf, ARRAYSIZE(buf));
+            sopts.sessionId = buf;   // {....} form
+        }
+        sopts.label = args.sessionLabel.empty()
+            ? std::format(L"headless {}", GetCurrentProcessId())
+            : args.sessionLabel;
+
+        std::wprintf(L"MCP session %ls (%ls). Kill the process to stop.\n",
+            sopts.sessionId.c_str(), sopts.label.c_str());
+        ShaderLab::Mcp::McpSessionClient client(server, std::move(sopts));
+        client.Run();   // blocks until killed (reconnects with backoff)
+        return 0;
+    }
 
     // ---- Read script JSON -------------------------------------------------
     auto scriptText = ReadFileUtf8(args.scriptPath);
@@ -1153,7 +1439,8 @@ int wmain(int argc, wchar_t* argv[])
     // and other engine objects destruct before MFShutdown / apartment
     // teardown. (GraphEvaluator owns com_ptrs to D2D effects that need
     // the factory alive at destruction time.)
-    int rc = !args.scriptPath.empty() ? RunScript(args) : RunRender(args);
+    int rc = (!args.scriptPath.empty() || args.mcpSessionMode)
+        ? RunScript(args) : RunRender(args);
 
     ::MFShutdown();
     winrt::uninit_apartment();

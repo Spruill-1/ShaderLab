@@ -150,30 +150,8 @@ namespace
 		return {};
 	}
 
-	GamutId DetectGamut(const ChromaticityXY& r, const ChromaticityXY& g, const ChromaticityXY& b) noexcept
-	{
-		auto close = [](float a, float b, float tol = 0.02f) { return std::abs(a - b) < tol; };
-
-		// sRGB / BT.709
-		if (close(r.x, 0.64f) && close(r.y, 0.33f) &&
-			close(g.x, 0.30f) && close(g.y, 0.60f) &&
-			close(b.x, 0.15f) && close(b.y, 0.06f))
-			return GamutId::sRGB;
-
-		// DCI-P3 / Display P3
-		if (close(r.x, 0.680f) && close(r.y, 0.320f) &&
-			close(g.x, 0.265f) && close(g.y, 0.690f) &&
-			close(b.x, 0.150f) && close(b.y, 0.060f))
-			return GamutId::DCI_P3;
-
-		// BT.2020
-		if (close(r.x, 0.708f) && close(r.y, 0.292f) &&
-			close(g.x, 0.170f) && close(g.y, 0.797f) &&
-			close(b.x, 0.131f) && close(b.y, 0.046f))
-			return GamutId::BT2020;
-
-		return GamutId::Custom;
-	}
+	// DetectGamut now lives in DisplayProfile.h so the live-display path in
+	// DisplayMonitor can classify with the identical thresholds.
 }
 
 namespace ShaderLab::Rendering
@@ -238,17 +216,9 @@ namespace ShaderLab::Rendering
 
 		p.caps.maxLuminanceNits = lum;
 		p.caps.hdrEnabled = (lum > 400.0f);
-		p.caps.bitsPerColor = p.caps.hdrEnabled ? 10u : 8u;
-		p.caps.colorSpace = p.caps.hdrEnabled
-			? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-			: DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 		p.caps.sdrWhiteLevelNits = 80.0f;
 		p.caps.minLuminanceNits = p.caps.hdrEnabled ? 0.05f : 0.5f;
 		p.caps.maxFullFrameLuminanceNits = (std::min)(lum, lum * 0.8f + 100.0f);
-
-		// Reuse the preset helper to stamp coherent ACM/WCG/activeColorMode
-		// flags into the simulated caps, derived from hdrEnabled.
-		StampSimulatedColorMode(p.caps);
 
 		p.primaryRed   = icc.primaryRed;
 		p.primaryGreen = icc.primaryGreen;
@@ -256,6 +226,10 @@ namespace ShaderLab::Rendering
 		p.whitePoint   = icc.whitePoint;
 
 		p.gamut = DetectGamut(icc.primaryRed, icc.primaryGreen, icc.primaryBlue);
+
+		// Reuse the preset helper to stamp coherent ACM/WCG/activeColorMode
+		// flags + bits-per-channel, derived from hdrEnabled and the gamut.
+		StampSimulatedColorMode(p);
 		p.profileName = icc.description.empty() ? L"ICC Profile" : icc.description;
 		p.isSimulated = true;
 

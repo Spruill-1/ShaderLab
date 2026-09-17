@@ -18,8 +18,9 @@
 #include "Controls/LogWindow.h"
 #include "Controls/NodeLog.h"
 #include "EffectDesignerWindow.xaml.h"
-#include "Engine/Mcp/McpHttpServer.h"
+#include "Engine/Mcp/McpRouter.h"
 #include "Engine/Mcp/EngineMcpRoutes.h"
+#include "Engine/Mcp/McpSessionClient.h"
 #include "Rendering/RenderThreadDispatcher.h"
 
 namespace winrt::ShaderLab::implementation
@@ -210,13 +211,12 @@ namespace winrt::ShaderLab::implementation
 
         // Render loop. UI-only work runs on the m_renderTimer DispatcherQueueTimer
         // (XAML reads/writes, FPS panel updates, RenderNodeGraph against the UI
-        // D2D context). RenderTickBody runs on the dedicated render-worker
-        // thread (or, in synchronous mode, inline from OnRenderTick).
+        // D2D context). The render-worker frame body is RenderFrameToOffscreen
+        // (below); the pre-worker RenderTickBody / RenderFrame were removed in
+        // the stdio-migration Step 7 residual sweep (dead since v1.7.0).
         void OnRenderTick(
             winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer const& sender,
             winrt::Windows::Foundation::IInspectable const& args);
-        void RenderTickBody(double deltaSec);
-        void RenderFrame(double deltaSeconds = 0.0);
 
         // Render-thread frame body. Walks the graph, runs eval + deferred
         // compute, draws the preview image into one of the offscreen
@@ -243,6 +243,12 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Rendering::RenderEngine       m_renderEngine;
         ::ShaderLab::Rendering::DisplayMonitor     m_displayMonitor;
         ::ShaderLab::Rendering::GraphEvaluator     m_graphEvaluator;
+
+        // Keeps the Windows.System.DispatcherQueue we create for the UI
+        // thread alive (WinUI 3 threads only run the Microsoft.UI variant;
+        // DisplayInformation::GetForWindow needs the system one). Held as
+        // IUnknown so the ABI type stays out of this header.
+        winrt::com_ptr<::IUnknown>                 m_systemDqController;
 
         // Render-thread plumbing. The dispatcher carries closures from UI /
         // MCP / NodeGraphController producers to whichever thread owns
@@ -283,10 +289,14 @@ namespace winrt::ShaderLab::implementation
 
         // Generation counters. graphGeneration bumps every time the render
         // path observes a graph mutation (HasDirtyNodes etc.); frameGeneration
-        // bumps once per render tick. Both are written only from the render
-        // path so a non-atomic uint64 is fine.
-        uint64_t m_graphGeneration{ 0 };
-        uint64_t m_frameGeneration{ 0 };
+        // bumps once per render tick. graphGeneration is render-path-only, so
+        // a plain uint64 is fine. frameGeneration is WRITTEN by the render
+        // worker but READ on the UI thread (OnRenderTick, to gate canvas
+        // redraws), so it is atomic — a torn read is practically impossible
+        // for an aligned 64-bit word but this is a formal data race otherwise
+        // (stdio-migration Step 7 residual sweep).
+        uint64_t              m_graphGeneration{ 0 };
+        std::atomic<uint64_t> m_frameGeneration{ 0 };
 
         // UI-thread cached value of the last snapshot frameGeneration we
         // observed in OnRenderTick. When the worker thread bumps
@@ -319,6 +329,26 @@ namespace winrt::ShaderLab::implementation
 
         // Effect graph.
         ::ShaderLab::Graph::EffectGraph         m_graph;
+
+        // Guards m_graph against the UI thread reading it while the render
+        // worker mutates it.
+        //
+        // The render worker is the single WRITER (clock-property inserts every
+        // tick, plus every MCP closure drained from m_renderDispatcher), but the
+        // UI thread is a concurrent READER: RenderNodeGraph paints the canvas
+        // from live EffectNode pointers via NodeGraphController. With no lock,
+        // a canvas paint that lands during a graph mutation walks a std::map
+        // that is being rebalanced -- or a node that has just been destroyed by
+        // graph_clear -- and access-violates inside _Tree::_Find. Diagnosed from
+        // two distinct WER fault offsets that both resolved into
+        // NodeGraphController::RenderNodes' node->properties.find() calls.
+        //
+        // Writers take it exclusively on the render thread; the UI canvas paint
+        // takes it shared. Lock at the Drain()/tick-body level rather than
+        // per-closure, so a nested inline DispatchSync (which
+        // RenderThreadDispatcher permits on the consumer thread) cannot
+        // self-deadlock on a non-recursive mutex.
+        mutable std::shared_mutex             m_graphMutex;
         ::ShaderLab::Effects::SourceNodeFactory m_sourceFactory;
 
         // Controllers.
@@ -498,40 +528,31 @@ namespace winrt::ShaderLab::implementation
         winrt::fire_and_forget BrowseImageForSourceNode(uint32_t nodeId);
         winrt::fire_and_forget BrowseVideoForSourceNode();
         winrt::fire_and_forget BrowseVideoForExistingNode(uint32_t nodeId);
-        void OnSaveImageClicked(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
-        winrt::fire_and_forget SaveImageAsync();
+        // How saved pixel values relate to the working space's scene-
+        // referred scRGB (1.0 = 80 nits). The save path owns the
+        // re-referencing so any node saves correctly in any format:
+        //   PresentationPng — content's diffuse white sits at the OS SDR
+        //     white level (a graph output meant to be looked at on the
+        //     HDR desktop). Divides by SdrWhiteNits/80 in linear space,
+        //     then sRGB-encodes: the file's 1.0 = SDR reference white,
+        //     and DWM re-boosts it on display like any SDR file.
+        //   FilePng — content is already file-referenced (white at 1.0,
+        //     e.g. a pass-through of a loaded image). Encode only.
+        //   HdrJxr — scene-referred FP16 scRGB, written as-is.
+        enum class SaveReference { PresentationPng, FilePng, HdrJxr };
+        winrt::fire_and_forget SaveImageAsync(SaveReference ref);
 
         // Capture the current preview as a PNG byte buffer.
         // Returns empty vector on failure.
         std::vector<uint8_t> CapturePreviewAsPng();
 
         // Encode a D2D image as a PNG byte buffer (BGRA8 via WIC).  Used by
-        // CapturePreviewAsPng and CaptureNodeAsPng to share the encoder path.
-        // Caps each axis at maxDim pixels to keep responses bounded.
+        // CapturePreviewAsPng to share the encoder path. Caps each axis at
+        // maxDim pixels to keep responses bounded.
+        // (The node-capture / pixel-region MCP shims that also used this were
+        // removed in Step 7 — those routes are engine-side now, via
+        // Rendering::CaptureNodeAsPng / Rendering::ReadPixelRegion.)
         std::vector<uint8_t> CaptureImageAsPng(ID2D1Image* image, uint32_t maxDim = 2048);
-
-        // Capture an arbitrary node's resolved output as a PNG byte buffer.
-        // Forces a render frame first so dirty downstream nodes evaluate.
-        // Returns:
-        //   - empty + outNotFound=true  when the node ID doesn't exist.
-        //   - empty + outNotReady=true  when the node exists but isn't yet ready.
-        //   - empty + neither flag set  on encode failure.
-        std::vector<uint8_t> CaptureNodeAsPng(uint32_t nodeId,
-                                              bool& outNotFound,
-                                              bool& outNotReady);
-
-        // Read a w x h pixel region from a node's resolved output as scRGB
-        // FP32 RGBA values (one float4 per pixel, row-major from top-left).
-        // Forces a render frame first.  Region is clipped to image bounds.
-        // Returns true on success and populates `outPixels` with w*h*4 floats.
-        // outActualW/H reflect the (clipped) region actually read.
-        bool ReadPixelRegion(uint32_t nodeId,
-                             int32_t x, int32_t y, uint32_t w, uint32_t h,
-                             std::vector<float>& outPixels,
-                             uint32_t& outActualW, uint32_t& outActualH,
-                             bool& outNotFound, bool& outNotReady);
 
         // Capture the live node-graph view (current pan/zoom, sized to the
         // graph swap-chain panel) as a PNG byte buffer.  Renders into an
@@ -559,8 +580,29 @@ namespace winrt::ShaderLab::implementation
         // Effect Designer window.
         winrt::ShaderLab::EffectDesignerWindow m_designerWindow{ nullptr };
 
-        // MCP HTTP server for AI agent integration.
-        std::unique_ptr<::ShaderLab::McpHttpServer> m_mcpServer;
+        // MCP route registry + HTTP listener for AI agent integration
+        // (McpRouter; the HTTP transport goes away in stdio-mig. Step 9).
+        std::unique_ptr<::ShaderLab::McpRouter> m_mcpServer;
+
+        // stdio-migration Step 7: this window as an MCP session registered
+        // with the broker hub. The client serves sealed requests by routing
+        // through m_mcpServer (same routes/dispatcher as the HTTP path), so
+        // both transports coexist until Step 9 deletes HTTP. Stopped FIRST
+        // in shutdown (reject-new -> bye -> cancel -> join) before the render
+        // dispatcher, so no session request is stranded on a joined worker.
+        std::unique_ptr<::ShaderLab::Mcp::McpSessionClient> m_sessionClient;
+        std::thread  m_sessionThread;
+        std::wstring m_mcpSessionId;   // persisted per-window GUID (not an ordinal)
+        void StartMcpSession();
+        void StopMcpSession();
+        void UpdateMcpStatusLabel();
+        std::wstring HubAumid();               // packaged hub AUMID (empty if unpackaged)
+        std::wstring EnsureShimDistributed();  // copy shim to %LOCALAPPDATA%\ShaderLab\bin\, return path
+
+        // Set while SwitchAdapter tears down + rebuilds the device stack.
+        // GuiEngineCommandSink::Dispatch returns 503 during the window so a
+        // request never marshals into a joined worker / dead D2D context.
+        std::atomic<bool> m_adapterSwitchInProgress{ false };
         // TEMP (Phase 8 perf debugging): default ON so the MCP-driven
         // graph-building loop doesn't require a manual toggle every
         // restart. Revert to false once the crash repro is sorted.
@@ -580,8 +622,8 @@ namespace winrt::ShaderLab::implementation
         {
             MainWindow* window{ nullptr };
             explicit GuiEngineCommandSink(MainWindow* w) : window(w) {}
-            ::ShaderLab::McpHttpServer::Response Dispatch(
-                std::function<::ShaderLab::McpHttpServer::Response(
+            ::ShaderLab::Mcp::Response Dispatch(
+                std::function<::ShaderLab::Mcp::Response(
                     ::ShaderLab::Mcp::EngineContext&)> closure) override;
 
             // ---- Event hooks ---------------------------------------------
@@ -631,8 +673,22 @@ namespace winrt::ShaderLab::implementation
         float m_previewPanX{ 0.0f };
         float m_previewPanY{ 0.0f };
         float m_previewZoom{ 1.0f };
-        bool  m_needsFitPreview{ false };
-        bool  m_forceRender{ true }; // Force first render + after pan/zoom changes
+        std::atomic<bool> m_needsFitPreview{ false };  // set on UI/dispatch, read+cleared on worker
+        // Per-node preview view memory: returning to a previously-examined node
+        // restores its pan/zoom; a node examined for the first time fits.
+        struct PreviewView { float zoom{ 1.0f }; float panX{ 0.0f }; float panY{ 0.0f }; };
+        std::unordered_map<uint32_t, PreviewView> m_previewViews;
+        // Preview panel size, cached on the UI thread (OnRenderTick) so the
+        // render worker can fit-to-view after an eval without touching XAML.
+        float m_previewViewportW{ 0.0f };
+        float m_previewViewportH{ 0.0f };
+        // Written from the UI thread, the render worker, and MCP dispatch
+        // closures — atomic for cross-thread visibility.
+        std::atomic<bool> m_forceRender{ true }; // Force first render + after pan/zoom changes
+        // Coalesces display-change UI refreshes: adaptive-color displays
+        // raise AdvancedColorInfoChanged at sensor rate, and only one
+        // status-bar/timer refresh may be queued at a time.
+        std::atomic<bool> m_displayUiRefreshPending{ false };
         bool m_isPreviewPanning{ false };
         float m_previewPanStartX{ 0.0f };
         float m_previewPanStartY{ 0.0f };
@@ -646,7 +702,8 @@ namespace winrt::ShaderLab::implementation
         float m_traceClickZoom{ 1.0f };
         bool m_traceOutOfBounds{ false };
         void UpdateCrosshairOverlay();
-        void FitPreviewToView();
+        bool FitPreviewToView();   // true if a real fit applied; false = defer (bounds/viewport not ready)
+        void SelectPreviewNode(uint32_t nodeId);
 
         // Trace swatch HDR swap chain.
         winrt::com_ptr<IDXGISwapChain1>   m_traceSwapChain;

@@ -204,11 +204,18 @@ namespace ShaderLab::Rendering
                         }
                     }
 
-                    if (node->dirty || bindingsChanged)
+                    const bool wasDirty = node->dirty || bindingsChanged;
+                    if (wasDirty)
                     {
                         ApplyProperties(effect, *node, effectiveProps);
                         node->dirty = false;
                     }
+
+                    // Clean-subgraph caching: enable D2D's output cache;
+                    // drop it when content changed (upstream in-place
+                    // texture updates arrive as node->dirty via the dirty
+                    // walks, which D2D itself cannot see).
+                    UpdateEffectCachePolicy(effect, nodeId, wasDirty);
 
                     // The effect's output is an ID2D1Image. Take ownership so the
                     // image survives D2D's internal pipeline churn (input toggles,
@@ -287,26 +294,43 @@ namespace ShaderLab::Rendering
                     // Image-producing compute: recompute when dirty or no cached output.
                     // Analysis-only compute: also recompute if no analysis fields yet.
                     //
-                    // Phase 8c regression fix: when skip-readback is on, ALL
-                    // compute nodes must redispatch every frame regardless
-                    // of dirty state. Pre-skip-readback the per-frame
-                    // upstream dirty-propagation in OnRenderTick lit up
-                    // compute consumers via image edges, but inside this
-                    // EvaluateNode the upstream's `dirty` has already been
-                    // cleared (Source case clears it before downstream eval
-                    // runs) so we can't use it here. The host's upstream
-                    // propagation does set node->dirty for us when Source
-                    // ticks, but ResolveBindings on the consumer of an
-                    // analysis source (e.g. ICtCp <- LumStats.Mean) only
-                    // dirties the consumer when CPU value changes -- which
-                    // never happens when LumStats's Map() was throttled.
-                    // Force redispatch for every compute node so the GPU
-                    // dispatch fires and the structured-buffer / image-
-                    // output texture are kept fresh.
-                    const bool skipReadbackForcesRedispatch =
-                        Performance::IsSkipUnneededCpuReadbackEnabled();
+                    // GPU-binding freshness chain (replaces the Phase 8c
+                    // redispatch-every-frame-under-skip-readback rule): a
+                    // compute consumer must redispatch when one of its
+                    // binding SOURCES is queued for dispatch this cycle —
+                    // its dispatch reads the source's analysis SRV, whose
+                    // content is about to change. When no source is
+                    // dispatching, the SRV retains last cycle's values and
+                    // an identical redispatch would produce identical
+                    // output, so dirty-gating is safe. (The old rule
+                    // redispatched EVERY compute node EVERY frame, which
+                    // both burned GPU on static graphs and — because each
+                    // image-producing dispatch transitively dirties its
+                    // downstream — permanently defeated clean-subgraph
+                    // output caching.) The topological order includes
+                    // binding dependencies, so sources are visited before
+                    // their consumers.
+                    bool bindingSourceQueued = false;
+                    for (const auto& [bpName, b] : node->propertyBindings)
+                    {
+                        if (b.wholeArray)
+                        {
+                            if (m_queuedComputeThisEval.count(b.wholeArraySourceNodeId))
+                            { bindingSourceQueued = true; break; }
+                        }
+                        else
+                        {
+                            for (const auto& s : b.sources)
+                            {
+                                if (s.has_value() &&
+                                    m_queuedComputeThisEval.count(s->sourceNodeId))
+                                { bindingSourceQueued = true; break; }
+                            }
+                        }
+                        if (bindingSourceQueued) break;
+                    }
                     bool needsCompute = node->dirty ||
-                        skipReadbackForcesRedispatch ||
+                        bindingSourceQueued ||
                         (hasImageOutput && !node->cachedOutput) ||
                         (!hasImageOutput && node->analysisOutput.fields.empty());
                     if (primaryInput && needsCompute && !m_deferredComputeFrozen)
@@ -331,6 +355,7 @@ namespace ShaderLab::Rendering
                             }
                         }
                         m_deferredCompute.push_back({ nodeId, std::move(inputImages), std::move(preRendered) });
+                        m_queuedComputeThisEval.insert(nodeId);
                     }
                     node->dirty = false;
                     if (!hasImageOutput)
@@ -627,9 +652,19 @@ namespace ShaderLab::Rendering
                             // bitmap may live inside e.g. a 4096x4096 atlas
                             // even when its content rect is only 1920x1080.
                             // Sampling [0,1] would otherwise read the padding.
+                            // Only flip DPI when the context isn't already
+                            // at 96 — a real DPI change here invalidates
+                            // every D2D1_PROPERTY_CACHED intermediate in
+                            // the context (caches are DPI-referenced), and
+                            // this block runs per-eval for dims-declaring
+                            // nodes. The render context is pinned at 96
+                            // (RenderEngine), so this is normally a no-op.
                             float oldDpiX = 0, oldDpiY = 0;
                             dc->GetDpi(&oldDpiX, &oldDpiY);
-                            dc->SetDpi(96.0f, 96.0f);
+                            const bool dpiFlip =
+                                (oldDpiX != 96.0f || oldDpiY != 96.0f);
+                            if (dpiFlip)
+                                dc->SetDpi(96.0f, 96.0f);
                             float unionLeft = (std::numeric_limits<float>::max)();
                             float unionTop = (std::numeric_limits<float>::max)();
                             float unionRight = -(std::numeric_limits<float>::max)();
@@ -659,7 +694,8 @@ namespace ShaderLab::Rendering
                                 if (edge->destPin < perInputWH.size())
                                     perInputWH[edge->destPin] = { bw, bh };
                             }
-                            dc->SetDpi(oldDpiX, oldDpiY);
+                            if (dpiFlip)
+                                dc->SetDpi(oldDpiX, oldDpiY);
                             if (anyValid)
                             {
                                 float w = unionRight - unionLeft;
@@ -771,7 +807,23 @@ namespace ShaderLab::Rendering
                             effect->SetInput(0, m_dummySourceBitmap.get());
                     }
 
-                    // Force D2D to re-render by toggling input 0.
+                    // Custom effects upload their cbuffer directly to the
+                    // GPU (bypassing the D2D property system), so D2D has
+                    // no idea a re-render is needed when one changes. Two
+                    // manual invalidation mechanisms, by mode:
+                    //   * caching ON: UpdateEffectCachePolicy drops this
+                    //     node's D2D1_PROPERTY_CACHED intermediate on
+                    //     wasDirty — the next pull finds no cache and must
+                    //     re-execute, picking up the fresh cbuffer. This
+                    //     touches ONLY this node's cache.
+                    //   * caching OFF: legacy input-0 detach/reattach
+                    //     toggle. NOT used when caching is on because
+                    //     detaching the consumer of an upstream effect's
+                    //     output releases that upstream's cached
+                    //     intermediate as collateral — one dirty custom
+                    //     node per frame (any animated graph) then defeats
+                    //     caching for its whole input chain.
+                    if (wasDirty && !Performance::IsEffectOutputCachingEnabled())
                     {
                         winrt::com_ptr<ID2D1Image> savedInput;
                         effect->GetInput(0, savedInput.put());
@@ -781,6 +833,8 @@ namespace ShaderLab::Rendering
                             effect->SetInput(0, savedInput.get());
                         }
                     }
+
+                    UpdateEffectCachePolicy(effect, nodeId, wasDirty);
 
                     winrt::com_ptr<ID2D1Image> output;
                     effect->GetOutput(output.put());
@@ -810,11 +864,13 @@ namespace ShaderLab::Rendering
                     else
                     {
                         WireInputs(effect, *node, graph);
-                        if (node->dirty)
+                        const bool wasDirtyFallback = node->dirty;
+                        if (wasDirtyFallback)
                         {
                             ApplyProperties(effect, *node, node->properties);
                             node->dirty = false;
                         }
+                        UpdateEffectCachePolicy(effect, nodeId, wasDirtyFallback);
                         winrt::com_ptr<ID2D1Image> output;
                         effect->GetOutput(output.put());
                         m_outputCache[nodeId] = output;
@@ -879,6 +935,7 @@ namespace ShaderLab::Rendering
             if (n.type == NodeType::Source && !n.cachedOutput)
             {
                 m_deferredCompute.clear();
+                m_queuedComputeThisEval.clear();
                 return false;
             }
         }
@@ -1093,6 +1150,7 @@ namespace ShaderLab::Rendering
         }
 
         m_deferredCompute.clear();
+        m_queuedComputeThisEval.clear();
         return true;
     }
 
@@ -1690,6 +1748,8 @@ namespace ShaderLab::Rendering
         m_bridgeImplCache.clear();
         m_sharedPreRenderCache.clear();
         m_lastHintReadbackTime.clear();
+        m_cacheEnabled.clear();
+        m_queuedComputeThisEval.clear();
         m_dummySourceBitmap = nullptr;
 
         // P7: also drop any deferred-compute entries that the previous
@@ -1720,6 +1780,7 @@ namespace ShaderLab::Rendering
         m_outputCache.erase(nodeId);
         m_customImplCache.erase(nodeId);
         m_bridgeImplCache.erase(nodeId);
+        m_cacheEnabled.erase(nodeId);
         // Note: caller must also clear EffectNode::cachedOutput on the node
         // (the raw pointer it holds is now dangling). Prefer the graph-aware
         // overload below.
@@ -1770,6 +1831,7 @@ namespace ShaderLab::Rendering
         {
             m_effectCache.erase(nodeId);
             m_bridgeImplCache.erase(nodeId);
+            m_cacheEnabled.erase(nodeId);
             return;
         }
         auto implIt = m_customImplCache.find(nodeId);
@@ -1806,6 +1868,20 @@ namespace ShaderLab::Rendering
                 static_cast<UINT32>(def.compiledBytecode.size()));
             implIt->second.computeImpl->SetThreadGroupSize(
                 def.threadGroupX, def.threadGroupY, def.threadGroupZ);
+        }
+
+        // The effect instance survives the bytecode swap, so any cached
+        // output intermediate is now stale — drop it. The next Evaluate
+        // re-enables caching after the fresh render.
+        if (effectIt != m_effectCache.end())
+        {
+            auto cacheIt = m_cacheEnabled.find(nodeId);
+            if (cacheIt != m_cacheEnabled.end() && cacheIt->second)
+            {
+                effectIt->second->SetValue(D2D1_PROPERTY_CACHED, FALSE);
+                cacheIt->second = false;
+                ++m_cacheInvalidations;
+            }
         }
     }
 
@@ -2090,6 +2166,17 @@ namespace ShaderLab::Rendering
         UINT32 totalInputs = effect->GetInputCount();
         std::vector<bool> connected(totalInputs, false);
 
+        // Re-setting an input D2D already holds may count as a topology
+        // change and drop the effect's D2D1_PROPERTY_CACHED intermediate,
+        // so only call SetInput when the pointer actually differs.
+        auto setInputIfChanged = [effect](UINT32 pin, ID2D1Image* desired)
+        {
+            winrt::com_ptr<ID2D1Image> current;
+            effect->GetInput(pin, current.put());
+            if (current.get() != desired)
+                effect->SetInput(pin, desired);
+        };
+
         for (const auto* edge : inputEdges)
         {
             if (edge->destPin >= totalInputs)
@@ -2098,7 +2185,7 @@ namespace ShaderLab::Rendering
             const EffectNode* srcNode = graph.FindNode(edge->sourceNodeId);
             if (srcNode && srcNode->cachedOutput)
             {
-                effect->SetInput(edge->destPin, srcNode->cachedOutput);
+                setInputIfChanged(edge->destPin, srcNode->cachedOutput);
                 connected[edge->destPin] = true;
             }
         }
@@ -2107,13 +2194,95 @@ namespace ShaderLab::Rendering
         for (UINT32 i = 0; i < totalInputs; ++i)
         {
             if (!connected[i])
-                effect->SetInput(i, nullptr);
+                setInputIfChanged(i, nullptr);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Clean-subgraph output caching policy
+    // -----------------------------------------------------------------------
+
+    void GraphEvaluator::UpdateEffectCachePolicy(
+        ID2D1Effect* effect, uint32_t nodeId, bool contentDirty)
+    {
+        if (!effect)
+            return;
+
+        bool& enabled = m_cacheEnabled[nodeId];   // default-inserts false
+
+        if (!Performance::IsEffectOutputCachingEnabled())
+        {
+            // Kill switch: release any held intermediate and stop caching.
+            if (enabled)
+            {
+                effect->SetValue(D2D1_PROPERTY_CACHED, FALSE);
+                enabled = false;
+            }
+            return;
+        }
+
+        if (contentDirty)
+        {
+            // Content changed through a channel D2D can't see (in-place
+            // texture update or direct cbuffer upload). Drop the cache and
+            // STAY uncached while dirty: an uncached effect re-executes on
+            // every pull, which both picks up the fresh cbuffer and — the
+            // hysteresis part — avoids touching the CACHED property again
+            // next frame. Measured: any per-frame property transition on a
+            // consumer (input toggle OR the CACHED off->on poke) causes
+            // D2D to drop its PRODUCERS' cached intermediates as
+            // collateral, so a per-frame-dirty node (an animated split)
+            // must generate ZERO property traffic to let its upstream
+            // caches survive. Cache re-enables one frame after the node
+            // goes clean.
+            if (enabled)
+            {
+                effect->SetValue(D2D1_PROPERTY_CACHED, FALSE);
+                enabled = false;
+                ++m_cacheInvalidations;
+            }
+            return;
+        }
+
+        if (!enabled)
+        {
+            effect->SetValue(D2D1_PROPERTY_CACHED, TRUE);
+            enabled = true;
         }
     }
 
     // -----------------------------------------------------------------------
     // Property binding resolution
     // -----------------------------------------------------------------------
+
+    // Exact-equality compare for PropertyValue. std::variant's operator==
+    // is unusable here because D2D1_MATRIX_5X4_F has no operator==; the
+    // WinRT numerics are compared componentwise for the same reason.
+    // Exact float compare is intentional: binding sources are
+    // deterministic frame to frame, so "unchanged" means bit-identical.
+    static bool PropertyValuesEqual(
+        const Graph::PropertyValue& a, const Graph::PropertyValue& b)
+    {
+        namespace num = winrt::Windows::Foundation::Numerics;
+        if (a.index() != b.index()) return false;
+        return std::visit([&b](const auto& av) -> bool
+        {
+            using T = std::decay_t<decltype(av)>;
+            const T* bv = std::get_if<T>(&b);
+            if (!bv) return false;
+            if constexpr (std::is_same_v<T, D2D1_MATRIX_5X4_F>)
+                return std::memcmp(&av, bv, sizeof(T)) == 0;
+            else if constexpr (std::is_same_v<T, num::float2>)
+                return av.x == bv->x && av.y == bv->y;
+            else if constexpr (std::is_same_v<T, num::float3>)
+                return av.x == bv->x && av.y == bv->y && av.z == bv->z;
+            else if constexpr (std::is_same_v<T, num::float4>)
+                return av.x == bv->x && av.y == bv->y &&
+                       av.z == bv->z && av.w == bv->w;
+            else
+                return av == *bv;
+        }, a);
+    }
 
     // Helper: resolve a single ComponentSource to a float value.
     static bool ResolveComponentSource(
@@ -2219,8 +2388,17 @@ namespace ShaderLab::Rendering
                 {
                     if (fv.name == binding.wholeArraySourceFieldName && AnalysisFieldIsArray(fv.type))
                     {
-                        effectiveProps[propName] = fv.arrayData;
-                        anyChanged = true;
+                        // Only report a change when the resolved value
+                        // actually differs — "resolved every frame" used
+                        // to mean "changed every frame", which re-applied
+                        // properties and defeated output caching on every
+                        // binding consumer even for static values.
+                        PropertyValue resolvedArr = fv.arrayData;
+                        if (!PropertyValuesEqual(propIt->second, resolvedArr))
+                        {
+                            effectiveProps[propName] = std::move(resolvedArr);
+                            anyChanged = true;
+                        }
                         break;
                     }
                 }
@@ -2313,8 +2491,15 @@ namespace ShaderLab::Rendering
 
             if (resolved)
             {
-                effectiveProps[propName] = newVal;
-                anyChanged = true;
+                // Value-compare before reporting change (see whole-array
+                // note above): the resolved value equals the stored one on
+                // every frame where the source didn't move, and reporting
+                // "changed" then would dirty the consumer needlessly.
+                if (!PropertyValuesEqual(propIt->second, newVal))
+                {
+                    effectiveProps[propName] = newVal;
+                    anyChanged = true;
+                }
             }
         }
 
@@ -2385,31 +2570,19 @@ namespace ShaderLab::Rendering
                     std::wstring(var.name.begin(), var.name.end()));
                 if (propIt == effectiveProps.end()) continue;
 
-                std::visit([&](const auto& v)
+                // Typed pack: converts float-stored enum properties to the
+                // declared uint/int/bool HLSL slot type. The previous raw
+                // memcpy here wrote float bit patterns into uint slots, so
+                // `uint Mode` read 3.0f as 1077936128 and every uint-enum
+                // switch on the D2D pixel/compute-shader path silently fell
+                // through to its default branch for any non-zero value.
+                if (var.offset < cbData.size())
                 {
-                    using T = std::decay_t<decltype(v)>;
-                    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, int32_t> ||
-                                  std::is_same_v<T, uint32_t> || std::is_same_v<T, bool>)
-                    {
-                        if (var.offset + sizeof(T) <= cbData.size())
-                            memcpy(cbData.data() + var.offset, &v, sizeof(T));
-                    }
-                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
-                    {
-                        if (var.offset + sizeof(float) * 2 <= cbData.size())
-                            memcpy(cbData.data() + var.offset, &v, sizeof(float) * 2);
-                    }
-                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
-                    {
-                        if (var.offset + sizeof(float) * 3 <= cbData.size())
-                            memcpy(cbData.data() + var.offset, &v, sizeof(float) * 3);
-                    }
-                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
-                    {
-                        if (var.offset + sizeof(float) * 4 <= cbData.size())
-                            memcpy(cbData.data() + var.offset, &v, sizeof(float) * 4);
-                    }
-                }, propIt->second);
+                    Effects::PackPropertyToCBuffer(
+                        cbData.data() + var.offset,
+                        static_cast<uint32_t>(cbData.size()) - var.offset,
+                        var.type, var.columns, propIt->second);
+                }
             }
 
             // Set the packed cbuffer on the concrete impl.

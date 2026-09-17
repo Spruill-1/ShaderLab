@@ -423,9 +423,10 @@ namespace winrt::ShaderLab::implementation
                 if (w == 0 || h == 0 || w > 8192 || h > 8192) continue;
 
                 winrt::com_ptr<ID2D1Bitmap1> renderBmp;
+                // _SRGB: encode the linear scene on write (see ImageLoader).
                 D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
                     D2D1_BITMAP_OPTIONS_TARGET,
-                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, D2D1_ALPHA_MODE_PREMULTIPLIED));
                 dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bmpProps, renderBmp.put());
                 if (!renderBmp) continue;
 
@@ -442,7 +443,7 @@ namespace winrt::ShaderLab::implementation
                 winrt::com_ptr<ID2D1Bitmap1> cpuBmp;
                 D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
                     D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, D2D1_ALPHA_MODE_PREMULTIPLIED));
                 dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, cpuProps, cpuBmp.put());
                 if (!cpuBmp) continue;
                 cpuBmp->CopyFromBitmap(nullptr, renderBmp.get(), nullptr);

@@ -17,7 +17,16 @@
 //
 // **History** (compatibility-breaking changes):
 //   1: Initial. Phase 6.
-#define SHADERLAB_ENGINE_ABI_VERSION 1
+//   2: stdio-migration Step 2 — McpHttpServer renamed McpRouter,
+//      Response extracted to ShaderLab::Mcp::Response (McpTypes.h) with
+//      a noReply discriminator, Handler gains a query argument,
+//      IEngineCommandSink::Dispatch re-typed accordingly, EngineContext
+//      gains getPipelineFormatName.
+//   3: stdio-migration Step 9 — the HTTP transport is deleted. McpRouter
+//      loses Start/Stop/Port/IsRunning + the Winsock listener (keeps
+//      AddRoute/RouteRequest/HasRoute); the broker (shim → hub → session)
+//      is the only transport. ActivityCallback's peer arg becomes clientId.
+#define SHADERLAB_ENGINE_ABI_VERSION 3
 
 // C-linkage entry so it can be GetProcAddress'd if a host wants to do a
 // version check before dynamically loading the DLL.

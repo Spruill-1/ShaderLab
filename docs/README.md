@@ -15,7 +15,7 @@ Reference for "how does ShaderLab work under the hood".
 - [Pipeline Format Strategy](architecture/pipeline-format.md) — why the pipeline is always scRGB FP16 and how DWM/ACM handles the final display conversion.
 - [Effect Graph Model](architecture/effect-graph-model.md) — `EffectGraph` / `EffectNode` / `EffectEdge` / `PropertyValue`, JSON serialization, dirty tracking.
 - [Topological Evaluation](architecture/topological-evaluation.md) — Kahn's algorithm, evaluation order, cycle detection.
-- [Display Monitoring](architecture/display-monitoring.md) — DXGI adapter-change events, `WM_DISPLAYCHANGE`, ICC profile parsing, SDR white level.
+- [Display Monitoring](architecture/display-monitoring.md) — WinRT `AdvancedColorInfo` + `AdvancedColorInfoChanged` event, ICC profile parsing, SDR white level.
 - [Display Profile Mocking](architecture/display-profile-mocking.md) — simulated SDR/HDR/WCG environments and the testing harness.
 - [Compute Shader Analysis Pipeline](architecture/compute-analysis-pipeline.md) — D2D compute conventions, CPU readback, analysis output schema.
 - [D2D / D3D11 Hybrid Compute System](architecture/d2d-d3d11-hybrid-compute.md) — `CustomComputeBridgeEffect`, `D3D11ComputeRunner`, GPU-binding routing, COM class hierarchy.
@@ -25,7 +25,7 @@ Reference for "how does ShaderLab work under the hood".
 
 Reference for the effect catalog and per-effect mechanics.
 
-- [Built-in Effect Catalog](effects/builtin-catalog.md) — the ~35 ShaderLab effects (Analysis, Color, Source, Tone Mapping, Parameter).
+- [Built-in Effect Catalog](effects/builtin-catalog.md) — the 36 ShaderLab effects (Analysis, Color, Source, Tone Mapping, Parameter).
 - [Effect Versioning System](effects/effect-versioning.md) — how `effectVersion` bumps are detected on graph load.
 - [Effect Designer](effects/effect-designer.md) — the modal window for authoring custom pixel/compute shaders.
 - [Numeric Expression Node (ExprTk)](effects/numeric-expression.md) — single-input math expression parameter node.
@@ -50,10 +50,11 @@ Reference for the effect catalog and per-effect mechanics.
 
 - [Build Instructions](development/build.md) — prerequisites, configurations, dependency map.
 - [Project Structure](development/project-structure.md) — full file tree with per-file descriptions.
+- [MCP Migration: HTTP → stdio](development/mcp-stdio-migration.md) — **complete** (all 9 steps; decision #71, engine ABI 3). The implementation plan and rationale for replacing the embedded HTTP MCP server with stdio + a broker relay, kept as the reference for how the transport works.
 
 ## History
 
-- [Decision Log](history/decision-log.md) — chronological architectural decisions with rationale (60+ entries).
+- [Decision Log](history/decision-log.md) — chronological architectural decisions with rationale (68 entries, ids up to #72).
 
 ---
 

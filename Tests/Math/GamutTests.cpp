@@ -196,5 +196,134 @@ namespace ShaderLab::Tests
                 && Near(r[0].y, 0.0f,   1.0f)
                 && Near(r[0].z, 0.0f,   1.0f));
         }
+
+        // ---- SoftCompressDistance (gamut soft roll-off) -------------------
+        // Contract tests: these hold for any hardness p >= 1 of the ACES
+        // power curve (p=1 is exactly Reinhard). threshold=0.75,
+        // limit=1.5, power=1.2 (the ACES RGC default) unless stated.
+        {
+            // Identity zone: d <= threshold returns d exactly.
+            auto r = bench.Run(R"(
+                float a = SoftCompressDistance(0.30, 0.75, 1.5, 1.2);
+                float b = SoftCompressDistance(0.75, 0.75, 1.5, 1.2);
+                Result[0] = float4(a, b, 0, 0);
+            )");
+            TEST("SoftCompressDistance: identity below threshold",
+                !r.empty()
+                && Near(r[0].x, 0.30f, 1e-6f)
+                && Near(r[0].y, 0.75f, 1e-5f));
+        }
+        {
+            // Anchor: d == limit lands exactly on the boundary (1.0).
+            auto r = bench.Run(R"(
+                Result[0] = float4(SoftCompressDistance(1.5, 0.75, 1.5, 1.2), 0, 0, 0);
+            )");
+            TEST("SoftCompressDistance: limit maps onto boundary (== 1.0)",
+                !r.empty() && Near(r[0].x, 1.0f, 1e-3f));
+        }
+        {
+            // C1 join: slope ~= 1 just above threshold, so gradients
+            // crossing the knee don't kink. Central-difference slope over
+            // [t, t + 0.02] must be within 15% of 1.
+            auto r = bench.Run(R"(
+                float y0 = SoftCompressDistance(0.75, 0.75, 1.5, 1.2);
+                float y1 = SoftCompressDistance(0.77, 0.75, 1.5, 1.2);
+                Result[0] = float4((y1 - y0) / 0.02, 0, 0, 0);
+            )");
+            TEST("SoftCompressDistance: slope ~= 1 entering the knee (C1)",
+                !r.empty() && Near(r[0].x, 1.0f, 0.15f));
+        }
+        {
+            // Monotone + compressive: outputs strictly increase with d,
+            // and never exceed the input above the threshold.
+            auto r = bench.Run(R"(
+                float d[5] = { 0.8, 1.0, 1.2, 1.4, 1.5 };
+                float prev = -1.0;
+                float mono = 1.0, comp = 1.0;
+                [unroll]
+                for (int i = 0; i < 5; ++i) {
+                    float y = SoftCompressDistance(d[i], 0.75, 1.5, 1.2);
+                    if (y <= prev)  mono = 0.0;
+                    if (y > d[i] + 1e-5) comp = 0.0;
+                    prev = y;
+                }
+                Result[0] = float4(mono, comp, 0, 0);
+            )");
+            TEST("SoftCompressDistance: monotone increasing and compressive",
+                !r.empty()
+                && Near(r[0].x, 1.0f, 1e-6f)
+                && Near(r[0].y, 1.0f, 1e-6f));
+        }
+        {
+            // Softness proper: a point between threshold and limit must map
+            // strictly BELOW the hard boundary (that's the whole feature —
+            // headroom is reserved so d in (1, limit] stays ordered instead
+            // of flattening onto the shell).
+            auto r = bench.Run(R"(
+                Result[0] = float4(SoftCompressDistance(1.2, 0.75, 1.5, 1.2), 0, 0, 0);
+            )");
+            TEST("SoftCompressDistance: interior of knee stays below boundary (soft, not clip)",
+                !r.empty() && r[0].x < 0.999f && r[0].x > 0.75f);
+        }
+        {
+            // Hardness ordering: higher power tracks identity longer, so at
+            // a fixed d inside the knee it must compress LESS than p=1
+            // (Reinhard). Also pins p=1 == Reinhard closed form:
+            // s = (1-t)(l-t)/(l-1) = 0.375; y(1.0) = t + s*x/(s+x) = 0.90.
+            auto r = bench.Run(R"(
+                float soft = SoftCompressDistance(1.0, 0.75, 1.5, 1.0);
+                float hard = SoftCompressDistance(1.0, 0.75, 1.5, 3.0);
+                Result[0] = float4(soft, hard, 0, 0);
+            )");
+            TEST("SoftCompressDistance: p=1 matches Reinhard; higher hardness compresses less",
+                !r.empty()
+                && Near(r[0].x, 0.90f, 1e-3f)
+                && r[0].y > r[0].x + 0.01f);
+        }
+
+        // ---- 8-bit dither / quantize (screenshot output path) --------------
+        {
+            // Zero strength must land exactly on the 8-bit grid.
+            auto r = bench.Run(R"(
+                float3 q = DitherQuantize(float3(0.5, 0.25, 0.75), float2(3, 7), 256.0, 0.0);
+                float3 grid = round(float3(0.5, 0.25, 0.75) * 255.0) / 255.0;
+                Result[0] = float4(abs(q - grid), 0);
+            )");
+            TEST("DitherQuantize(strength 0) lands exactly on the 8-bit grid",
+                !r.empty() && r[0].x < 1e-6f && r[0].y < 1e-6f && r[0].z < 1e-6f);
+        }
+        {
+            // Triangular dither stays inside +-1 LSB across a pixel sweep.
+            auto r = bench.Run(R"(
+                float lo = 1e9, hi = -1e9;
+                [unroll]
+                for (int i = 0; i < 32; ++i) {
+                    float d = TriangularDither(float2(i, i * 3 + 1));
+                    lo = min(lo, d); hi = max(hi, d);
+                }
+                Result[0] = float4(lo, hi, 0, 0);
+            )");
+            TEST("TriangularDither stays within [-1, 1]",
+                !r.empty() && r[0].x >= -1.0f && r[0].y <= 1.0f && r[0].y > r[0].x);
+        }
+        {
+            // A value sitting between two codes must resolve to BOTH codes
+            // across pixels -- that is the whole mechanism by which dither
+            // trades banding for noise. 0.5 encodes to ~187.5/255.
+            auto r = bench.Run(R"(
+                float v = 187.5 / 255.0;
+                float lo = 1e9, hi = -1e9;
+                [unroll]
+                for (int i = 0; i < 32; ++i) {
+                    float q = DitherQuantize(float3(v, v, v), float2(i, i * 5 + 2), 256.0, 1.0).x;
+                    lo = min(lo, q); hi = max(hi, q);
+                }
+                Result[0] = float4(lo * 255.0, hi * 255.0, 0, 0);
+            )");
+            TEST("DitherQuantize spreads a between-codes value across both codes",
+                !r.empty()
+                && Near(r[0].x, 187.0f, 0.51f)
+                && Near(r[0].y, 188.0f, 0.51f));
+        }
     }
 }
