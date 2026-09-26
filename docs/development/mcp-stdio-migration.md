@@ -14,7 +14,7 @@ deleted; the broker (shim → hub → session over named pipes, bodies sealed) i
 MCP transport. Engine ABI **3**. What remains before the migration can be called fully
 signed-off is the **manual verification sweep** at the end of this doc (WinUI window
 lifecycle, packaged install/activation, a real MCP client, the in-place-upgrade
-sequence) — everything automatable is green: 261 unit tests, broker smoke 26/26,
+sequence) — everything automatable is green: 292 unit tests, broker smoke 27/27,
 headless smoke, and the shim-driven `RunTests.ps1` at 40/40 (GUI) / 21/21 (headless)
 on WARP. Two throwaway spikes have already settled the platform questions; their
 results are recorded in [Settled by spike](#settled-by-spike) so they are not
@@ -293,7 +293,7 @@ pinned session's catalog, merged as real JSON values). `ShaderLabHeadless
 --mcp-session [--session-id GUID] [--session-label] [--pipe]` wires it to the
 existing `HeadlessSink`; the session id is a persisted per-window GUID (generated
 when omitted), never an ordinal. Verified: 256 unit tests (+12 channel + pairing),
-`RunBrokerSmoke` **26/26** now driving a real WARP headless session end-to-end
+`RunBrokerSmoke` **27/27** now driving a real WARP headless session end-to-end
 (register → `use_session` → spliced `tools/list` → `graph_overview` +
 `graph_add_node` through the sealed relay → `session_gone` on session kill).
 
@@ -443,7 +443,7 @@ Substitute your `<Platform>` (`ARM64` / `x64`) and `<Config>` (`Debug` / `Releas
 Suites 1–4 need **no packaging and no desktop** — this is what CI runs:
 
 ```pwsh
-# 1. Unit suite — 261 tests on WARP; self-contained (routing, crypto, frame codec,
+# 1. Unit suite — 289 tests on WARP (the runner prints the total); self-contained (routing, crypto, frame codec,
 #    per-channel handshake, dispatcher fail-fast, peer pairing, HLSL math bench).
 <Platform>\<Config>\ShaderLabTests\ShaderLabTests.exe --adapter warp
 
@@ -792,7 +792,7 @@ routes. This retires election, framing, crypto and reconnect risk. It does **not
 retire GUI integration risk: `HeadlessSink::Dispatch` is a direct synchronous call with
 no DispatcherQueue, no render dispatcher, no XAML, and all 8 event hooks are no-ops.
 
-> **Done.** `RunBrokerSmoke.ps1` 26/26 (13 new session checks incl. the sealed
+> **Done.** `RunBrokerSmoke.ps1` 27/27 (13 new session checks incl. the sealed
 > `graph_overview`/`graph_add_node` round-trips and `session_gone`), in CI on WARP.
 > As the plan predicts, this retires transport risk but NOT GUI-integration risk —
 > Step 7 wires the same `McpSessionClient` into `MainWindow` where `Dispatch`
@@ -867,7 +867,7 @@ switch mid-request, clean shutdown, and every tool exercised.
 > shim keeps running (update-immune); (3) with **no hub running**, the distributed
 > shim activates the packaged hub, the GUI session then registers, and
 > `use_session` + `graph_add_node` drive end-to-end through the render worker;
-> broker smoke 26/26 and the HTTP suite 40/40 unregressed.
+> broker smoke 27/27 and the HTTP suite 40/40 unregressed.
 
 Note the shim IS `ShaderLabMcpBroker.exe --stdio` (one binary, two modes — Step 5);
 "the shim" below means a copy of that exe placed on a stable unpackaged path.

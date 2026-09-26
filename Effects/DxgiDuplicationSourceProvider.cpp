@@ -278,6 +278,19 @@ namespace ShaderLab::Effects
 			return false;
 		}
 
+		// AcquireNextFrame also succeeds when only the mouse pointer moved or
+		// changed shape. The pointer is not composited into the duplicated
+		// surface, so such a frame carries no new desktop image -- the tell is
+		// LastPresentTime == 0. Treating it as a frame copied the whole desktop
+		// and re-evaluated the entire graph on every mouse move over a static
+		// screen. Only once a real frame is in hand: the first acquire must
+		// always be taken.
+		if (frameInfo.LastPresentTime.QuadPart == 0 && m_frameCount > 0)
+		{
+			m_duplication->ReleaseFrame();
+			return false;
+		}
+
 		bool copied = false;
 		winrt::com_ptr<ID3D11Texture2D> frameTexture;
 		hr = resource->QueryInterface(IID_PPV_ARGS(frameTexture.put()));

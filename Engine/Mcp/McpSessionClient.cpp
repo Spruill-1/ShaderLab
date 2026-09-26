@@ -68,7 +68,27 @@ namespace ShaderLab::Mcp
         McpRouter&           router;
         SessionClientOptions opts;
         std::atomic<bool>    stop{ false };
-        std::atomic<HANDLE>  pipe{ INVALID_HANDLE_VALUE };
+
+        // `pipe` and `runnerThread` are guarded by ioMutex.
+        //
+        // The pipe is opened WITHOUT FILE_FLAG_OVERLAPPED, so every read and
+        // write on it is synchronous. Per the Win32 cancellation rules that
+        // means Stop() must unblock the session thread with
+        // CancelSynchronousIo(<that thread>) -- CancelIo/CancelIoEx only
+        // cancel ASYNCHRONOUS operations -- and it must NOT close the handle,
+        // because the session thread is concurrently inside ReadFile /
+        // WriteFile on it. Closing a handle out from under in-flight I/O is
+        // undefined: a Debug build raises STATUS_INVALID_HANDLE (0xC0000008),
+        // and once the value is recycled by any other thread in the process
+        // the session thread can write MCP bytes into an unrelated object.
+        // ServeOnce (the owning thread) does the close.
+        //
+        // ioMutex is only ever held around publishing / cancelling / closing
+        // these handles -- never across blocking I/O -- so Stop() cannot be
+        // delayed by an in-flight request.
+        std::mutex           ioMutex;
+        HANDLE               pipe{ INVALID_HANDLE_VALUE };
+        HANDLE               runnerThread{ nullptr };   // owned duplicate
 
         // Per-channel acceptor state.
         struct Channel
@@ -92,13 +112,29 @@ namespace ShaderLab::Mcp
                 0, nullptr, OPEN_EXISTING, 0, nullptr);
             if (h == INVALID_HANDLE_VALUE)
                 return;
-            pipe.store(h);
+            {
+                // Publish under the lock, and bail if Stop() fired while we
+                // were connecting -- otherwise this handle is one Stop() never
+                // saw and the session keeps serving after being disabled.
+                std::lock_guard lock(ioMutex);
+                if (stop.load())
+                {
+                    CloseHandle(h);
+                    return;
+                }
+                pipe = h;
+            }
 
             // Verify hub identity + pairing before registering.
             auto self = ResolveProcessIdentity(GetCurrentProcessId());
             auto hub = ResolvePipeServerIdentity(h);
             uint64_t outSeq = 1;
-            bool ok = self && hub;
+            // `stop` is checked at each handshake step, not just in the serve
+            // loop below. Disabling MCP on a freshly launched window lands
+            // here -- the client is still connecting / exchanging hello -- and
+            // without these checks the handshake ran to completion against a
+            // cancelled pipe before anyone noticed the toggle.
+            bool ok = self && hub && !stop.load();
             if (ok)
             {
                 auto myBuild = WideToUtf8(LocalBuildId());
@@ -110,7 +146,7 @@ namespace ShaderLab::Mcp
             }
 
             std::vector<uint8_t> acc;
-            if (ok)
+            if (ok && !stop.load())
             {
                 Frame ack;
                 if (ReadFrameBlocking(h, acc, ack) && ack.header.channelId == 0)
@@ -135,7 +171,13 @@ namespace ShaderLab::Mcp
                 }
             }
 
-            HANDLE cur = pipe.exchange(INVALID_HANDLE_VALUE);
+            // This thread owns the close -- see the ioMutex note above.
+            HANDLE cur = INVALID_HANDLE_VALUE;
+            {
+                std::lock_guard lock(ioMutex);
+                cur = pipe;
+                pipe = INVALID_HANDLE_VALUE;
+            }
             if (cur != INVALID_HANDLE_VALUE)
                 CloseHandle(cur);
         }
@@ -229,6 +271,23 @@ namespace ShaderLab::Mcp
 
     void McpSessionClient::Run()
     {
+        // Publish a real handle to this thread so Stop() can cancel our
+        // blocking synchronous pipe I/O. GetCurrentThread() is a pseudo-handle
+        // that only means "me" in the thread that calls it, so it has to be
+        // duplicated into something another thread can pass to
+        // CancelSynchronousIo (which needs THREAD_TERMINATE access --
+        // DUPLICATE_SAME_ACCESS on the pseudo-handle grants it).
+        {
+            HANDLE dup = nullptr;
+            if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                                GetCurrentProcess(), &dup,
+                                0, FALSE, DUPLICATE_SAME_ACCESS))
+            {
+                std::lock_guard lock(m_impl->ioMutex);
+                m_impl->runnerThread = dup;
+            }
+        }
+
         uint32_t backoffMs = 250;
         while (!m_impl->stop.load())
         {
@@ -239,13 +298,36 @@ namespace ShaderLab::Mcp
             Sleep(backoffMs);
             backoffMs = std::min<uint32_t>(backoffMs * 2, 4000);
         }
+
+        // Retire the thread handle before returning: once we are gone a
+        // late Stop() must not hand a dead thread to CancelSynchronousIo.
+        HANDLE dup = nullptr;
+        {
+            std::lock_guard lock(m_impl->ioMutex);
+            dup = m_impl->runnerThread;
+            m_impl->runnerThread = nullptr;
+        }
+        if (dup)
+            CloseHandle(dup);
     }
 
     void McpSessionClient::Stop()
     {
         m_impl->stop.store(true);
-        HANDLE h = m_impl->pipe.exchange(INVALID_HANDLE_VALUE);
-        if (h != INVALID_HANDLE_VALUE)
-            CloseHandle(h);   // unblocks a pending blocking ReadFile
+
+        // Unblock the session thread's pending SYNCHRONOUS pipe I/O. The pipe
+        // is opened without FILE_FLAG_OVERLAPPED, so CancelIo / CancelIoEx do
+        // not apply -- those cancel asynchronous operations. CancelSynchronousIo
+        // takes the handle of the *blocked thread*, which Run() publishes.
+        //
+        // We deliberately do NOT close the pipe here: the session thread is
+        // concurrently inside ReadFile / WriteFile on that handle. See the
+        // ioMutex note on Impl for why closing it from this thread is a crash.
+        //
+        // A 0 return with ERROR_NOT_FOUND just means nothing was pending --
+        // the thread will observe `stop` at its next check either way.
+        std::lock_guard lock(m_impl->ioMutex);
+        if (m_impl->runnerThread)
+            CancelSynchronousIo(m_impl->runnerThread);
     }
 }

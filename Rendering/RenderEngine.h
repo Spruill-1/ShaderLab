@@ -2,6 +2,7 @@
 
 #include "pch.h"
 #include "PipelineFormat.h"
+#include "GpuTimer.h"
 #include "DisplayInfo.h"
 
 namespace ShaderLab::Rendering
@@ -57,6 +58,13 @@ namespace ShaderLab::Rendering
         // Respond to SwapChainPanel size changes.
         void Resize(uint32_t widthPixels, uint32_t heightPixels);
 
+        // The preview swap chain is sized in PHYSICAL pixels; a SwapChainPanel
+        // composes its buffer in DIPs, so without an inverse matrix it shows
+        // the buffer magnified by the display scale from the top-left. Call
+        // with the panel's CompositionScaleX/Y (UI thread) whenever it
+        // changes; the engine re-applies it after every ResizeBuffers.
+        void SetCompositionScale(float scaleX, float scaleY);
+
         // Switch the entire pipeline to a new format (recreates swap chain + RT).
         void SetPipelineFormat(const PipelineFormat& format);
 
@@ -77,6 +85,13 @@ namespace ShaderLab::Rendering
         bool IsInitialized() const { return m_d3dDevice != nullptr; }
 
         ID3D11Device5*          D3DDevice()       const { return m_d3dDevice.get(); }
+        // GPU-side span timer, off by default. Owned here because this is
+        // where the D3D11 device is created; the render worker drives it.
+        // Every other timing in this app is CPU wall-clock around an
+        // asynchronous API and therefore cannot see shader cost -- see
+        // GpuTimer.h for what that cost us.
+        GpuTimer&               Timer()                  { return m_gpuTimer; }
+        const GpuTimer&         Timer()            const { return m_gpuTimer; }
         ID3D11DeviceContext4*   D3DContext()       const { return m_d3dContext.get(); }
         ID2D1Factory7*          D2DFactory()       const { return m_d2dFactory.get(); }
         ID2D1Device6*           D2DDevice()        const { return m_d2dDevice.get(); }
@@ -147,6 +162,7 @@ namespace ShaderLab::Rendering
 
         // Device stack
         winrt::com_ptr<IDXGIFactory7>           m_dxgiFactory;
+        GpuTimer                                m_gpuTimer;
         winrt::com_ptr<ID3D11Device5>           m_d3dDevice;
         winrt::com_ptr<ID3D11DeviceContext4>     m_d3dContext;
         winrt::com_ptr<ID2D1Factory7>           m_d2dFactory;
@@ -156,6 +172,9 @@ namespace ShaderLab::Rendering
 
         // Swap chain
         winrt::com_ptr<IDXGISwapChain3>         m_swapChain;
+        float m_compositionScaleX{ 1.0f };
+        float m_compositionScaleY{ 1.0f };
+        void ApplyCompositionScaleMatrix();
         winrt::com_ptr<ID2D1Bitmap1>            m_renderTarget;
 
         // Offscreen target pair (Phase 7). Render thread renders into one,

@@ -47,6 +47,11 @@ namespace ShaderLab::Effects
 
     uint64_t IncludeLibraryHash()
     {
+        // The library is compiled into the binary and never changes at run
+        // time, so hash it once. This ran on every CompileViaCache call --
+        // a ~4 KB string copy plus a byte-wise hash per dispatch.
+        static const uint64_t s_hash = []
+        {
         // Cache schema version: bump when the cache layout, key fields,
         // or any embedded include changes in a way that should invalidate
         // existing entries (in-memory and on disk).
@@ -63,6 +68,8 @@ namespace ShaderLab::Effects
         buf.append(reinterpret_cast<const char*>(&kCacheSchemaVersion), sizeof(kCacheSchemaVersion));
         if (libPtr) buf.append(libPtr, libLen);
         return FNV1a64(buf.data(), buf.size());
+        }();
+        return s_hash;
     }
 
     static std::string CanonicalizeImpl(const char* src, size_t len)
@@ -917,10 +924,17 @@ namespace ShaderLab::Effects
         std::vector<std::string> defValues;
         defNames.reserve(req.gpuBindableParamNames.size());
         defValues.reserve(req.gpuBindableParamNames.size());
-        for (size_t i = 0; i < req.gpuBindableParamNames.size() && i < 32; ++i)
+        // TWO bits per parameter, not one: the binding mode is 0 (cbuffer),
+        // 1 (StructuredBuffer SRV) or 2 (Texture2D effect input). Mode 2 is
+        // the only GPU-resident route open to a Direct2D PIXEL shader, which
+        // cannot bind an arbitrary SRV. 16 gpu-bindable params per effect fit
+        // in the uint32; beyond that the tail stays cbuffer-bound, which is
+        // always correct if slower.
+        for (size_t i = 0; i < req.gpuBindableParamNames.size() && i < 16; ++i)
         {
+            const uint32_t mode = (req.key.macroBitset >> (2u * i)) & 3u;
             defNames.push_back("_SLPARAM_" + req.gpuBindableParamNames[i] + "_GPU");
-            defValues.push_back(((req.key.macroBitset >> i) & 1u) ? "1" : "0");
+            defValues.push_back(mode == 2u ? "2" : (mode == 1u ? "1" : "0"));
         }
         std::vector<ShaderCompiler::MacroDef> macros;
         macros.reserve(defNames.size());

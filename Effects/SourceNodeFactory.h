@@ -95,6 +95,11 @@ namespace ShaderLab::Effects
         // Cached loaded bitmaps: nodeId → bitmap.
         std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Bitmap1>> m_bitmapCache;
 
+        // Path the cached bitmap was decoded from: nodeId → path. The decode
+        // is invalidated by the FILE changing, not by node.dirty -- see the
+        // image branch of PrepareSourceNode.
+        std::unordered_map<uint32_t, std::wstring> m_bitmapPathCache;
+
         // Cached flood effects: nodeId → flood effect.
         std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Effect>> m_floodCache;
 
@@ -109,5 +114,15 @@ namespace ShaderLab::Effects
         // Clock so the video doesn't free-run when the bound Time stops
         // advancing. NaN means "no prior sample".
         std::unordered_map<uint32_t, double> m_lastClockTime;
+
+        // Drop every cached provider / bitmap whose node is gone or is no
+        // longer that kind of source. Everything above is keyed by node id and
+        // used to be evicted only on device loss, so a deleted Desktop
+        // Duplication node kept copying every desktop present and forcing
+        // renders, a deleted video kept decoding, and a node id reused by a
+        // loaded graph was taken over by the old provider. Run at the top of
+        // each per-tick loop, which makes it cover every removal path --
+        // delete, clear, load, file open -- without each one remembering to.
+        void PruneOrphans(const std::vector<Graph::EffectNode>& nodes);
     };
 }

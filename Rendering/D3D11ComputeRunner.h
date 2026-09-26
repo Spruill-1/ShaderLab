@@ -1,7 +1,9 @@
 #pragma once
 
 #include "pch_engine.h"
+#include "../EngineExport.h"
 #include "../Effects/IEngineComputeOutput.h"
+#include "../Effects/IEngineComputeTexture.h"
 
 namespace ShaderLab::Rendering
 {
@@ -21,7 +23,9 @@ namespace ShaderLab::Rendering
     // avoiding the Map() round-trip. The COM impl is no-op-refcounted
     // -- the runner's lifetime is owned by the GraphEvaluator's
     // unique_ptr cache, callers are not allowed to AddRef beyond that.
-    class D3D11ComputeRunner : public Effects::IEngineComputeOutput
+    class SHADERLAB_API D3D11ComputeRunner
+        : public Effects::IEngineComputeOutput
+        , public Effects::IEngineComputeTexture
     {
     public:
         D3D11ComputeRunner() = default;
@@ -84,6 +88,15 @@ namespace ShaderLab::Rendering
         // IEngineComputeOutput SRVs into a consumer's
         // SHADERLAB_GPU_BUFFER slots without a CPU readback round-trip.
         // Pass empty vectors for the no-binding case.
+        //
+        // readback: None leaves the values GPU-only (the SRV still sees them).
+        // Blocking copies and Maps immediately -- the Map waits for the GPU to
+        // finish EVERYTHING queued on the immediate context, including the
+        // upstream D2D pre-render, so it drains the pipeline (2-10 ms per call
+        // measured on this project's graphs). Async queues the copy into a
+        // small staging ring and returns nothing; PollReadback collects the
+        // values on a later frame without waiting.
+        enum class Readback { None, Blocking, Async };
         std::vector<float> DispatchWithImageOutput(
             const std::vector<ID3D11Texture2D*>& inputTextures,
             const std::vector<BYTE>& cbufferData,
@@ -92,7 +105,17 @@ namespace ShaderLab::Rendering
             uint32_t dispatchX = 1, uint32_t dispatchY = 1, uint32_t dispatchZ = 1,
             const std::vector<ID3D11ShaderResourceView*>& extraSrvs = {},
             const std::vector<uint32_t>& extraSrvSlots = {},
-            bool readbackToCpu = true);
+            Readback readback = Readback::Blocking);
+
+        // Newest async readback that has completed, without waiting. Returns
+        // false when nothing new has landed. Older completed copies are
+        // discarded in favour of the newest.
+        bool PollReadback(std::vector<float>& out);
+        bool HasPendingReadback() const
+        {
+            for (const auto& s : m_staging) if (s.pending) return true;
+            return false;
+        }
 
         bool IsInitialized() const { return m_device != nullptr; }
         bool HasShader() const { return m_shader != nullptr; }
@@ -119,28 +142,90 @@ namespace ShaderLab::Rendering
         HRESULT __stdcall GetAnalysisSrv(ID3D11ShaderResourceView** out) override;
         UINT64  __stdcall GetLastEvaluatedFrame() override { return m_lastEvaluatedFrame; }
 
+        // ---- IEngineComputeTexture (lane 3) ------------------------------
+        HRESULT __stdcall RequestAnalysisTexture() override;
+        HRESULT __stdcall GetAnalysisTexture(ID3D11Texture2D** out) override;
+        HRESULT __stdcall GetAnalysisTextureSrv(ID3D11ShaderResourceView** out) override;
+        // True once a consumer has asked for lane 3. Read by Dispatch to
+        // decide whether to run the copy pass at all.
+        bool AnalysisTextureRequested() const { return m_analysisTexWanted; }
+
         // Called by the evaluator immediately after a successful Dispatch
         // so consumers can detect freshness via GetLastEvaluatedFrame.
         void SetLastEvaluatedFrame(uint64_t frame) { m_lastEvaluatedFrame = frame; }
 
     private:
         winrt::com_ptr<ID3D11Device> m_device;
+        // The context every command is RECORDED on: a deferred context owned
+        // by this runner alone. Nothing here is issued on the device's shared
+        // immediate context -- a whole dispatch is recorded, closed into a
+        // command list, and handed over with one ExecuteCommandList. See
+        // SubmitRecorded().
         winrt::com_ptr<ID3D11DeviceContext> m_context;
+        // The shared immediate context. Touched for exactly two single calls:
+        // ExecuteCommandList, and the CPU readback Map (which a deferred
+        // context cannot do).
+        winrt::com_ptr<ID3D11DeviceContext> m_immediate;
+        // The runner's private deferred context (null if the device refused
+        // one). m_context points at it or at m_immediate, chosen per dispatch.
+        winrt::com_ptr<ID3D11DeviceContext> m_deferredCtx;
+        bool m_deferred{ false };
+
+        // Close what has been recorded on m_context into a command list and
+        // execute it on the immediate context. No-op in immediate mode.
+        void SubmitRecorded();
         winrt::com_ptr<ID3D11ComputeShader> m_shader;
         std::vector<uint8_t> m_bytecode;
 
         // Result buffer (RWStructuredBuffer<float4>) -- bound as both
         // UAV (writer) and SRV (downstream Phase 8 consumer).
         winrt::com_ptr<ID3D11Buffer> m_resultBuffer;
-        winrt::com_ptr<ID3D11Buffer> m_stagingBuffer;
+        // Staging ring. Blocking reads use any slot and Map at once; async
+        // reads rotate through the ring so a copy can be in flight while
+        // earlier ones are collected. Three covers the usual 1-2 frame GPU
+        // latency; a fourth outstanding copy overwrites the oldest.
+        struct StagingSlot
+        {
+            winrt::com_ptr<ID3D11Buffer> buffer;
+            bool     pending{ false };
+            uint64_t seq{ 0 };
+        };
+        static constexpr size_t kStagingSlots = 3;
+        std::array<StagingSlot, kStagingSlots> m_staging{};
+        uint64_t m_stagingSeq{ 0 };
         winrt::com_ptr<ID3D11Buffer> m_cbuffer;
         winrt::com_ptr<ID3D11UnorderedAccessView> m_resultUAV;
         winrt::com_ptr<ID3D11ShaderResourceView>  m_resultSRV;
         uint32_t m_resultCount{ 0 };
         uint64_t m_lastEvaluatedFrame{ 0 };
 
+        // Lane 3: Result[] copied into a 1 x N RGBA32F texture so a Direct2D
+        // PIXEL shader can consume it as an effect input. Nothing here is
+        // created until RequestAnalysisTexture() is called -- a graph with no
+        // pixel-shader consumer pays nothing for the lane.
+        bool m_analysisTexWanted{ false };
+        winrt::com_ptr<ID3D11Texture2D>           m_analysisTex;
+        winrt::com_ptr<ID3D11UnorderedAccessView> m_analysisTexUAV;
+        winrt::com_ptr<ID3D11ShaderResourceView>  m_analysisTexSRV;
+        winrt::com_ptr<ID3D11ComputeShader>       m_analysisCopyShader;
+        bool m_analysisTexFilled{ false };
+
         std::wstring m_compileError;
 
+        // Multi-group reduction scratch (see ShaderLabParamsHlsl.h). Created
+        // on first use by a shader that declares `_SLScratch`.
+        bool m_usesScratch{ false };
+        winrt::com_ptr<ID3D11Buffer>              m_scratch;
+        winrt::com_ptr<ID3D11UnorderedAccessView> m_scratchUAV;       // whole buffer
+        winrt::com_ptr<ID3D11UnorderedAccessView> m_scratchHeadUAV;   // cleared head
+        bool EnsureScratch();
+
         void EnsureBuffers(uint32_t resultCount);
+        // Creates the lane-3 texture + copy shader on demand. Safe to call
+        // every dispatch; returns false if the lane is unavailable.
+        bool EnsureAnalysisTexture();
+        // Buffer -> texture copy dispatch. Runs only when the lane is
+        // wanted AND available.
+        void PublishAnalysisTexture();
     };
 }

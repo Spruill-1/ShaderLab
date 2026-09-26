@@ -160,6 +160,86 @@ try {
     Write-Host "PASS: script batch ratio $('{0:N3}' -f $ratio) ~ 2.5 (graph-node analysis end-to-end)"
     Remove-Item $scriptPath, $scriptOut
 
+    # ---- JPEG XR (HDR-preserving) output ---------------------------------
+    # The fixture's Gamut Source emits Luminance nits / 80 as scRGB, so at
+    # 800 nits every in-gamut pixel lands near 10.0 -- far above the [0,1]
+    # PNG clamps to. A .jxr output must carry those values through: that is
+    # the entire reason the encoder exists, and it also pins the rule that
+    # HDR output skips the default SDR HdrToneMap.
+    $hdrGraph = Join-Path $env:TEMP "shaderlab_smoke_hdr_$([guid]::NewGuid().ToString('N')).json"
+    $g = Get-Content $fixture -Raw | ConvertFrom-Json
+    foreach ($p in $g.nodes[0].properties) {
+        if ($p.name -eq 'Luminance')  { $p.value = 800.0 }
+        if ($p.name -eq 'OutputSize') { $p.value = 256.0 }
+    }
+    $g | ConvertTo-Json -Depth 64 | Set-Content $hdrGraph -Encoding UTF8
+
+    $jxrOut = Join-Path $env:TEMP "shaderlab_smoke_$([guid]::NewGuid().ToString('N')).jxr"
+    & $exe --graph $hdrGraph --node 1 --output $jxrOut --width 256 --height 256 --adapter warp
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item $hdrGraph, $jxrOut -ErrorAction SilentlyContinue
+        Write-Error "JXR render failed with exit code $LASTEXITCODE"
+        exit $LASTEXITCODE
+    }
+    $jb = [System.IO.File]::ReadAllBytes($jxrOut)
+    # JPEG XR container magic: 'II' + 0xBC 0x01.
+    if ($jb.Length -lt 4 -or $jb[0] -ne 0x49 -or $jb[1] -ne 0x49 -or $jb[2] -ne 0xBC -or $jb[3] -ne 0x01) {
+        Remove-Item $hdrGraph, $jxrOut -ErrorAction SilentlyContinue
+        Write-Error "Output is not a JPEG XR file (magic bytes wrong)"
+        exit 1
+    }
+
+    Add-Type -AssemblyName PresentationCore
+    $st = [System.IO.File]::OpenRead($jxrOut)
+    $fr = ([System.Windows.Media.Imaging.BitmapDecoder]::Create(
+             $st, 'PreservePixelFormat', 'OnLoad')).Frames[0]
+    if ($fr.Format.BitsPerPixel -ne 64) {
+        $st.Close(); Remove-Item $hdrGraph, $jxrOut -ErrorAction SilentlyContinue
+        Write-Error "JXR is $($fr.Format.BitsPerPixel)bpp, expected 64 (RGBA half)"
+        exit 1
+    }
+    $raw = New-Object 'ushort[]' ($fr.PixelWidth * $fr.PixelHeight * 4)
+    $fr.CopyPixels($raw, $fr.PixelWidth * 8, 0)
+    $st.Close()
+    # Decode the red half at the image centre (inside the gamut triangle).
+    $i = (128 * $fr.PixelWidth + 128) * 4
+    $hb = $raw[$i]; $e = ($hb -shr 10) -band 0x1F; $m = $hb -band 0x3FF
+    $red = if ($e -eq 0) { [math]::Pow(2, -14) * ($m / 1024) }
+           else          { [math]::Pow(2, $e - 15) * (1 + $m / 1024) }
+    Remove-Item $hdrGraph, $jxrOut -ErrorAction SilentlyContinue
+    if ($red -lt 2.0) {
+        Write-Error "JXR centre red = $red; expected ~10 (HDR clamped or tone mapped away)"
+        exit 1
+    }
+    Write-Host "PASS: JXR 64bpp half, centre red $('{0:N3}' -f $red) > 1.0 (HDR preserved)"
+
+    # ---- .effectgraph ZIP container --------------------------------------
+    # The GUI's Save writes a ZIP (graph.json + optional media/). Headless
+    # must read that form, not just bare JSON.
+    $zipGraph = Join-Path $env:TEMP "shaderlab_smoke_$([guid]::NewGuid().ToString('N')).effectgraph"
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $zs = [System.IO.File]::Open($zipGraph, 'Create')
+    $za = New-Object System.IO.Compression.ZipArchive($zs, 'Create')
+    $entry = $za.CreateEntry('graph.json')
+    $sw = New-Object System.IO.StreamWriter($entry.Open())
+    $sw.Write((Get-Content $fixture -Raw)); $sw.Dispose()
+    $za.Dispose(); $zs.Dispose()
+
+    $zipOut = Join-Path $env:TEMP "shaderlab_smoke_$([guid]::NewGuid().ToString('N')).png"
+    & $exe --graph $zipGraph --node 1 --output $zipOut --width 128 --height 128 --adapter warp
+    $zipExit = $LASTEXITCODE
+    $zipOk = ($zipExit -eq 0) -and (Test-Path $zipOut)
+    if ($zipOk) {
+        $zb = [System.IO.File]::ReadAllBytes($zipOut)
+        $zipOk = $zb.Length -gt 8 -and $zb[0] -eq 0x89 -and $zb[1] -eq 0x50
+    }
+    Remove-Item $zipGraph, $zipOut -ErrorAction SilentlyContinue
+    if (-not $zipOk) {
+        Write-Error ".effectgraph ZIP load failed (exit $zipExit) or produced no valid PNG"
+        exit 1
+    }
+    Write-Host "PASS: .effectgraph ZIP container loaded and rendered"
+
     exit 0
 }
 finally {

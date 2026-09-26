@@ -1,5 +1,7 @@
 #include "pch_engine.h"
 #include "ShaderLabEffects.h"
+#include "ColorMathCpu.h"
+#include "../Graph/EffectGraph.h"
 #include "BytecodeCache.h"
 #include "CustomComputeShaderEffect.h"
 #include "CustomComputeBridgeEffect.h"
@@ -86,6 +88,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
 //                   `Working Space.RedPrimary` etc. for monitor-matched
 //                   analysis, or set them manually.)
 Texture2D Source : register(t0);
+SamplerState InputSampler : register(s0);
 
 cbuffer constants : register(b0) {
     uint TargetGamut;
@@ -100,10 +103,16 @@ cbuffer constants : register(b0) {
 };
 
 float4 main(
-    float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+    float4 pos      : SV_POSITION,
+    float4 scenePos : SCENE_POSITION,
+    float4 uv0      : TEXCOORD0) : SV_TARGET
 {
-    float4 color = Source.Load(int3(uv0.xy, 0));
+    // SCENE_POSITION is NOT optional -- D2D's pixel-shader input signature is
+    // (SV_POSITION, SCENE_POSITION, TEXCOORD0..N), and omitting the middle one
+    // binds the SCENE coordinate to the parameter named uv0 (see "D2D Custom
+    // Effect Gotchas" in .github/copilot-instructions.md). uv0 is NORMALIZED once the signature
+    // is right, so the input is read with Sample(), not Load(int3(...)).
+    float4 color = Source.Sample(InputSampler, uv0.xy);
     if (color.a < 0.001) return color;
 
     // Skip near-black pixels where chromaticity is numerically unstable.
@@ -236,6 +245,196 @@ void main(uint3 dtid : SV_DispatchThreadID)
         return instance;
     }
 
+    // Gamut boundary table geometry, shared by the LUT generator's hidden
+    // OutputWidth/Height and -- via GAMUT_LUT_W/H in GamutBoundaryHLSL() -- by
+    // whatever consumer reads it. 256 hue columns (1.4 degrees each) by
+    // 128 I rows = 32K entries, 512 KB as FP32 RGBA.
+    static constexpr uint32_t kGamutLutW = 256;
+    static constexpr uint32_t kGamutLutH = 128;
+    static_assert((kGamutLutW & (kGamutLutW - 1)) == 0,
+                  "GamutLutBoundaryRadius wraps hue with a mask");
+
+    // The exact gamut boundary search, plus the table reader. A consumer
+    // prepends this same source (running the search as its fallback) that the
+    // LUT generator bakes, so a table can only ever be a sampled copy of the
+    // exact answer -- never a second implementation that drifts.
+    // Tests/Math/GamutTests.cpp slices it back out of the LUT's assembled
+    // source, from `#define CUBE_EPS` up to the generator's own header.
+    static const std::string& GamutBoundaryHLSL()
+    {
+        static const std::string s = []
+        {
+            std::string t = R"HLSL(
+// Gamut boundary at a given I, solved against the target RGB cube.
+//
+// Replaces a 48-point walk of the xy PRIMARIES TRIANGLE. That walk was both
+// slow and WRONG: the chromaticity triangle is the projection of the gamut
+// over ALL luminances, but the set reachable at one luminance is the
+// constant-Y slice of the cube, which is strictly smaller and shrinks to the
+// white point as Y approaches peak. sRGB red at full intensity carries only
+// 0.2126 of peak luminance, so against a 280-nit white there is no saturated
+// red above ~60 nits at all -- yet the walk happily returned one. Measured
+// overshoot of the old boundary: 1.5x at 92 nits, 3.4x at 202, 6.6x at 390.
+//
+// The consequence was that B came back too large, r/B too small, and the
+// compressor concluded out-of-gamut colours were fine -- leaving the residue
+// clamp in step 5 as the de-facto gamut mapper. That is what the comment on
+// the luminance-restore cap was describing.
+//
+// Bisection, not a closed form: the ray from neutral passes through
+// PQ per-channel, so the in-gamut set is not an analytic interval. It IS a
+// single interval in practice -- 17,280 rays across sRGB/P3/BT.2020 found one
+// apparent re-entry, and inspecting it showed a ray running along the R = 0
+// face with R oscillating at the 1e-5 level from FP error in the PQ round
+// trip, the real exit being G at -1.45e-3.
+#define CUBE_EPS    1e-4
+#define CUBE_COARSE 20
+#define CUBE_REFINE 7
+
+// Gamut boundary table geometry. Injected from kGamutLutW/H in C++ so the
+// table generator, its hidden OutputWidth/Height and this reader cannot
+// disagree. W must stay a power of two: the hue wrap below is a mask.
+#define GAMUT_LUT_W @LUTW@
+#define GAMUT_LUT_H @LUTH@
+
+// Row spacing on the I axis. Rows sit at I = peakOutI * (1 - (1 - s)^K) for
+// s = row / (H - 1), which concentrates them toward I(W) -- where B collapses
+// from ~0.3 to exactly 0 (at peak white only neutral is in gamut), and where
+// the knee lands every bright pixel. Uniform spacing gave that band ~4 rows.
+// The generator and the reader both go through these two functions.
+// K = 2, measured (LUT vs exact, dE ITP, float output, stats pinned): on a
+// saturated BT.2020 gradient -- 99.8% of pixels at 0.95-0.98 of I(W) -- sRGB
+// mean 0.42 -> 0.18, max 6.1 -> 3.3 (P3 max 3.2 -> 1.1) against uniform rows;
+// real HDR content unchanged (bird mean 0.0036 -> 0.0034). K = 3 bought little
+// more on the gradient and cost the bird's max (2.2 -> 3.0) as low rows thinned.
+#define GAMUT_LUT_WARP_K 2.0
+float GamutLutRowToI(float s, float peakOutI) { return peakOutI * (1.0 - pow(1.0 - saturate(s), GAMUT_LUT_WARP_K)); }
+float GamutLutIToRow(float I, float peakOutI) { return 1.0 - pow(1.0 - saturate(I / max(peakOutI, 1e-6)), 1.0 / GAMUT_LUT_WARP_K); }
+
+// True when this ICtCp coordinate reconstructs inside [0, peak] in the target
+// RGB cube.
+bool InTargetCube(float I, float2 ctcp, float peak, TargetXf t)
+{
+    // Tolerance scales with peak: it is absorbing FP error in the ICtCp round
+    // trip, which is proportional to the magnitude being round-tripped. A flat
+    // 1e-4 let pure blue miss by its own round-trip residue (G = -1.3e-4 at
+    // peak 2.5) and read as out of gamut.
+    float eps = max(1e-4, peak * 5e-4);
+    float3 rgb = ScRGBToTarget(t, ICtCpToScRGB(float3(I, ctcp.x, ctcp.y)));
+    return all(rgb >= -eps) && all(rgb <= peak + eps);
+}
+
+// The same test, also handing back the reconstructed scRGB, for a caller that
+// needs that colour afterwards and should not rebuild it.
+bool InTargetCubeRgb(float I, float2 ctcp, float peak, TargetXf t, out float3 scRGB)
+{
+    float eps = max(1e-4, peak * 5e-4);
+    scRGB = ICtCpToScRGB(float3(I, ctcp.x, ctcp.y));
+    float3 rgb = ScRGBToTarget(t, scRGB);
+    return all(rgb >= -eps) && all(rgb <= peak + eps);
+}
+
+// Largest chroma radius along `dir` that stays inside the target cube.
+//
+// Finds the LAST inside sample, not the first exit, because the in-gamut set
+// along a ray is NOT always a single interval. A straight line in (Ct, Cp) at
+// constant I can leave the cube and come back: constant-I is not constant-Y,
+// and the cube's image under PQ is not convex in this parameterisation. The
+// excursions are shallow but they sit exactly on the cube VERTICES, which is
+// where the common saturated UI colours live. Measured dip as a fraction of
+// peak, and the resulting error if you stop at the first exit:
+//     blue     0.073% -> 0.187% of peak   d = 1.14 .. 1.24   (worst)
+//     yellow   0.047%                     d = 1.04 .. 1.07
+//     green/cyan 0.046%                   d = 1.001
+//     magenta  0.001%                     d = 1.000
+// Plain bisection therefore reported B ~18% short for pure blue, which drove
+// a legal sRGB blue 35% dark with a green cast (23.8 dE, 74 deg hue shift).
+//
+// A larger epsilon cannot fix it: near a grazing face crossing dC/dr is only
+// ~0.26, so a tolerance deep enough to cover blue's dip admits ~18% of extra
+// radius everywhere else.
+//
+// Coarse scan then refine: ~27 reconstructions, still below the 48-point
+// polygon walk this replaced. It is also the argument for hoisting this into
+// a cached LUT -- a re-entry-robust search is too expensive to want per pixel,
+// and B depends only on (I, hue, gamut, peak), all of which are stable for the
+// life of a capture.
+float CubeBoundaryRadius(float I, float2 dir, float peak, TargetXf t)
+{
+    if (!InTargetCube(I, float2(0.0, 0.0), peak, t))
+        return 0.0;   // above the peak's own I even neutral is out of range
+
+    // 0.45 comfortably exceeds the presets' boundaries: widest measured is
+    // BT.2020 at 0.44, sRGB at 0.32. A Custom target wider than BT.2020 would
+    // be under-reported here (over-compressed, never out of gamut); no display
+    // primaries come close.
+    const float kMaxR = 0.45;
+    const float step  = kMaxR / CUBE_COARSE;
+
+    float last = 0.0;
+    [unroll]
+    for (int i = 1; i <= CUBE_COARSE; ++i)
+    {
+        float r = step * i;
+        if (InTargetCube(I, dir * r, peak, t)) last = r;
+    }
+
+    float lo = last;
+    float hi = min(last + step, kMaxR);
+    [unroll]
+    for (int k = 0; k < CUBE_REFINE; ++k)
+    {
+        float mid = 0.5 * (lo + hi);
+        if (InTargetCube(I, dir * mid, peak, t)) lo = mid;
+        else                                  hi = mid;
+    }
+    return lo;
+}
+
+// B(I, hue) read back from a table built by CubeBoundaryRadius above.
+//
+// u = hue (wraps), v = I / peakOutI (clamps). The generator writes column x at
+// hue ((x + 0.5) / W) * 2pi - pi and row y at I = y / (H - 1) * peakOutI, so a
+// hue landing exactly on a column centre reads that column with no blend.
+//
+// Load at integer texels, not Sample: this is read at coordinates COMPUTED
+// here, not at this pixel's own texcoord, and D2D is free to place an input
+// inside a larger intermediate. Integer Load from the origin is the same
+// addressing the lane-3 analysis textures already rely on. The texture is a
+// parameter rather than a global so this function can be shared -- and so the
+// guard test that slices the boundary helpers out of the LUT's source
+// compiles without dragging a register binding along.
+float GamutLutBoundaryRadius(Texture2D<float4> lut, float I, float2 dir, float peakOutI)
+{
+    const float kTwoPi = 6.28318530718;
+    float fx  = (atan2(dir.y, dir.x) / kTwoPi + 0.5) * GAMUT_LUT_W - 0.5;
+    float fy  = GamutLutIToRow(I, peakOutI) * (GAMUT_LUT_H - 1);
+    float x0f = floor(fx);
+    float tx  = fx - x0f;
+    int   x0  = ((int)x0f) & (GAMUT_LUT_W - 1);   // -1 wraps to W-1
+    int   x1  = (x0 + 1)   & (GAMUT_LUT_W - 1);
+    int   y0  = min((int)fy, GAMUT_LUT_H - 2);
+    float ty  = fy - y0;
+    float b00 = lut.Load(int3(x0, y0,     0)).r;
+    float b10 = lut.Load(int3(x1, y0,     0)).r;
+    float b01 = lut.Load(int3(x0, y0 + 1, 0)).r;
+    float b11 = lut.Load(int3(x1, y0 + 1, 0)).r;
+    return lerp(lerp(b00, b10, tx), lerp(b01, b11, tx), ty);
+}
+
+)HLSL";
+            auto put = [&t](const char* key, uint32_t v)
+            {
+                auto at = t.find(key);
+                t.replace(at, std::strlen(key), std::to_string(v));
+            };
+            put("@LUTW@", kGamutLutW);
+            put("@LUTH@", kGamutLutH);
+            return t;
+        }();
+        return s;
+    }
+
     ShaderLabEffects::ShaderLabEffects()
     {
         RegisterAll();
@@ -301,6 +500,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
         def.shaderType = desc.shaderType;
         def.hlslSource = std::wstring(desc.hlslSource.begin(), desc.hlslSource.end());
         def.inputNames = desc.inputNames;
+        def.lookupInputCount = desc.lookupInputCount;
         def.parameters = desc.parameters;
         def.analysisFields = desc.analysisFields;
         def.analysisOutputType = desc.analysisOutputType;
@@ -327,6 +527,193 @@ void main(uint3 dtid : SV_DispatchThreadID)
         node.customEffect = std::move(def);
         node.isClock = desc.isClock;
         return node;
+    }
+
+    void ShaderLabEffects::RestoreRuntimeFlags(Graph::EffectGraph& graph)
+    {
+        auto& lib = Instance();
+        for (auto& node : const_cast<std::vector<Graph::EffectNode>&>(graph.Nodes()))
+        {
+            if (!node.customEffect.has_value() || node.customEffect->shaderLabEffectId.empty())
+                continue;
+            if (const auto* desc = lib.FindById(node.customEffect->shaderLabEffectId))
+                node.isClock = desc->isClock;
+        }
+    }
+
+    // Default edge length for synthetic sources and diagram-style viewers.
+    // Held at 1024 rather than 512: two-input pixel-shader effects (Split
+    // Comparison et al.) render displaced when fed inputs <= 512px, so a
+    // smaller default silently breaks any A/B comparison built on these
+    // nodes. See the "Known issues" entry in CHANGELOG.md. The parameter
+    // minimums are deliberately left where they are -- a small diagram is
+    // still useful standalone, and cheap for the O(N)-per-pixel viewers.
+    static constexpr float kDefaultDiagramSize = 1024.0f;
+
+    // ---- Derived constants (see ShaderLabEffectDescriptor::deriveConstants) --
+    namespace
+    {
+        using PropMap = std::map<std::wstring, Graph::PropertyValue>;
+        namespace CM = ColorMathCpu;
+
+        double PropNumber(const PropMap& p, const wchar_t* name, double fallback)
+        {
+            auto it = p.find(name);
+            if (it == p.end()) return fallback;
+            if (auto* f = std::get_if<float>(&it->second)) return *f;
+            if (auto* u = std::get_if<uint32_t>(&it->second)) return *u;
+            if (auto* i = std::get_if<int32_t>(&it->second)) return *i;
+            return fallback;
+        }
+        CM::V2 PropV2(const PropMap& p, const wchar_t* name, CM::V2 fallback)
+        {
+            auto it = p.find(name);
+            if (it == p.end()) return fallback;
+            if (auto* v = std::get_if<winrt::Windows::Foundation::Numerics::float2>(&it->second))
+                return { v->x, v->y };
+            return fallback;
+        }
+
+        // A handful of recently used tables, keyed by every input that shapes
+        // them. The evaluator re-applies a node on every frame its upstream
+        // changes, so without this a video under the effect would rebuild the
+        // tables per frame for nothing.
+        struct DerivedMemo
+        {
+            std::map<std::vector<double>, std::vector<float>> entries;
+            const std::vector<float>& Get(const std::vector<double>& key,
+                                          const std::function<std::vector<float>()>& build)
+            {
+                auto it = entries.find(key);
+                if (it != entries.end()) return it->second;
+                if (entries.size() >= 16) entries.clear();
+                return entries.emplace(key, build()).first->second;
+            }
+        };
+
+        // ComputeICtCpFitScale from the HLSL: the uniform Ct/Cp scale that
+        // brings every source-boundary vertex inside the target boundary.
+        template <size_t N>
+        double FitScale(const std::array<CM::V2, N>& src, const std::array<CM::V2, N>& tgt)
+        {
+            double maxRatio = 1.0;
+            for (size_t i = 0; i < N; ++i)
+            {
+                const CM::V2 dir = src[i];
+                if (std::hypot(dir.x, dir.y) < 1e-8) continue;
+                double bestT = 1e10;
+                for (size_t j = 0; j < N; ++j)
+                {
+                    const CM::V2 a = tgt[j];
+                    const CM::V2 b = tgt[(j + 1) % N];
+                    const CM::V2 ab{ b.x - a.x, b.y - a.y };
+                    const double denom = dir.x * ab.y - dir.y * ab.x;
+                    if (std::abs(denom) < 1e-10) continue;
+                    const double t = (a.x * ab.y - a.y * ab.x) / denom;
+                    const double u = (a.x * dir.y - a.y * dir.x) / denom;
+                    if (t > 0.0 && u >= 0.0 && u <= 1.0 && t < bestT) bestT = t;
+                }
+                if (bestT > 0.0 && bestT < 1e9) maxRatio = (std::max)(maxRatio, 1.0 / bestT);
+            }
+            return (maxRatio > 1.0) ? 1.0 / maxRatio : 1.0;
+        }
+
+        ShaderLabEffectDescriptor::DerivedConstantsFn MakeIctcpGamutMapDerived()
+        {
+            auto memo = std::make_shared<DerivedMemo>();
+            return [memo](const PropMap& p, const ShaderLabEffectDescriptor::DerivedConstantWriter& write)
+            {
+                const int mode = static_cast<int>(PropNumber(p, L"Mode", 0.0));
+                const int tg = static_cast<int>(PropNumber(p, L"TargetGamut", 0.0));
+                const auto tgt = CM::GamutPrimaries(tg,
+                    PropV2(p, L"TargetRedPrimary",   { 0.64, 0.33 }),
+                    PropV2(p, L"TargetGreenPrimary", { 0.30, 0.60 }),
+                    PropV2(p, L"TargetBluePrimary",  { 0.15, 0.06 }));
+                if (mode == 2)
+                {
+                    const int sg = static_cast<int>(PropNumber(p, L"SourceGamut", 2.0));
+                    const auto src = CM::GamutPrimaries(sg,
+                        PropV2(p, L"SourceRedPrimary",   { 0.708, 0.292 }),
+                        PropV2(p, L"SourceGreenPrimary", { 0.170, 0.797 }),
+                        PropV2(p, L"SourceBluePrimary",  { 0.131, 0.046 }));
+                    std::vector<double> key{ 2.0 };
+                    for (const auto& v : tgt) { key.push_back(v.x); key.push_back(v.y); }
+                    for (const auto& v : src) { key.push_back(v.x); key.push_back(v.y); }
+                    const auto& lut = memo->Get(key, [&]
+                    {
+                        std::vector<float> out(256);
+                        std::array<CM::V2, 48> sb{}, tb{};
+                        for (size_t k = 0; k < out.size(); ++k)
+                        {
+                            const double I = static_cast<double>(k) / 255.0;
+                            CM::SampleBoundary(src, I, sb);
+                            CM::SampleBoundary(tgt, I, tb);
+                            out[k] = static_cast<float>(FitScale(sb, tb));
+                        }
+                        return out;
+                    });
+                    write(L"FitScaleLut", lut.data(), lut.size());
+                }
+                else
+                {
+                    std::vector<double> key{ 0.0 };
+                    for (const auto& v : tgt) { key.push_back(v.x); key.push_back(v.y); }
+                    const auto& lut = memo->Get(key, [&]
+                    {
+                        constexpr size_t kLevels = 64;   // POLY_LEVELS in the HLSL
+                        std::vector<float> out;
+                        out.reserve(kLevels * 48 * 2);
+                        std::array<CM::V2, 48> b{};
+                        for (size_t lv = 0; lv < kLevels; ++lv)
+                        {
+                            CM::SampleBoundary(tgt, static_cast<double>(lv) / (kLevels - 1), b);
+                            for (const auto& v : b)
+                            {
+                                out.push_back(static_cast<float>(v.x));
+                                out.push_back(static_cast<float>(v.y));
+                            }
+                        }
+                        return out;
+                    });
+                    write(L"TgtPolyLut", lut.data(), lut.size());
+                }
+            };
+        }
+
+        ShaderLabEffectDescriptor::DerivedConstantsFn MakeIctcpBoundaryDerived()
+        {
+            auto memo = std::make_shared<DerivedMemo>();
+            return [memo](const PropMap& p, const ShaderLabEffectDescriptor::DerivedConstantWriter& write)
+            {
+                const int tg = static_cast<int>(PropNumber(p, L"TargetGamut", 0.0));
+                const auto g = CM::GamutPrimaries(tg,
+                    PropV2(p, L"RedPrimary",   { 0.64, 0.33 }),
+                    PropV2(p, L"GreenPrimary", { 0.30, 0.60 }),
+                    PropV2(p, L"BluePrimary",  { 0.15, 0.06 }));
+                const double intensity = PropNumber(p, L"Intensity", 0.5);
+                std::vector<double> key{ intensity };
+                for (const auto& v : g) { key.push_back(v.x); key.push_back(v.y); }
+                const auto& pts = memo->Get(key, [&]
+                {
+                    // Must match the level order the HLSL colours them in.
+                    const double levels[6] = { 0.15, 0.3, 0.45, 0.6, 0.75, intensity };
+                    std::vector<float> out;
+                    out.reserve(6 * 24 * 2);
+                    std::array<CM::V2, 24> b{};
+                    for (double lv : levels)
+                    {
+                        CM::SampleBoundary(g, lv, b);
+                        for (const auto& v : b)
+                        {
+                            out.push_back(static_cast<float>(v.x));
+                            out.push_back(static_cast<float>(v.y));
+                        }
+                    }
+                    return out;
+                });
+                write(L"BndPts", pts.data(), pts.size());
+            };
+        }
     }
 
     void ShaderLabEffects::RegisterAll()
@@ -360,7 +747,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Highlight";
-            desc.effectId = L"Gamut Highlight"; desc.effectVersion = 4;
+            desc.effectId = L"Gamut Highlight"; desc.effectVersion = 5;
             desc.category = L"Analysis";
             desc.subcategory = L"Highlights";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -431,9 +818,17 @@ void main(uint3 dtid : SV_DispatchThreadID)
 // CIE xy Histogram: scatter source pixels into a 2D CIE xy histogram.
 // Uses groupshared tiled accumulation to avoid data races.
 // Output R: log-scaled density, G: avg luminance / 10000, A: 1 if hit.
+//
+// Multi-group (SHADERLAB_REDUCE_SCRATCH): SHADERLAB_REDUCE_GROUPS groups each
+// scatter a share of the pixels into their own groupshared tile and write it
+// to scratch as a partial; the last group to finish sums the partials and
+// renders the diagram. It used to be one group scattering the whole frame.
+
+#include "shaderlab_params.hlsli"
 
 Texture2D<float4> Source : register(t0);
 RWTexture2D<float4> Output : register(u1);
+SHADERLAB_REDUCE_SCRATCH
 
 cbuffer Constants : register(b0) {
     uint Width;
@@ -455,32 +850,32 @@ static const float HALF_EXTENT = 0.50;
 // Tile-based groupshared histogram.
 // 48x48 = 2304 bins, well within 32KB groupshared limit.
 #define TILE_SIZE 48
-groupshared uint gs_counts[TILE_SIZE * TILE_SIZE];
-groupshared float gs_lumSum[TILE_SIZE * TILE_SIZE];
+#define TILE_BINS (TILE_SIZE * TILE_SIZE)
+// Scratch words: per-group [counts | lumSum] blocks.
+#define PART_BASE   SHADERLAB_REDUCE_CLEARED
+#define PART_STRIDE (2 * TILE_BINS)
+groupshared uint gs_counts[TILE_BINS];
+groupshared float gs_lumSum[TILE_BINS];
 groupshared uint gs_maxCount;
 
 [numthreads(32, 32, 1)]
-void main(uint3 GTid : SV_GroupThreadID) {
+void main(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID) {
     uint tid = GTid.x + GTid.y * 32;
+    uint g = Gid.x;
     uint totalThreads = 1024;
     uint totalPixels = Width * Height;
     uint outSize = max(OutputSize, 64u);
 
-    // Clear output texture.
-    for (uint ci = tid; ci < outSize * outSize; ci += totalThreads) {
-        Output[int2(ci % outSize, ci / outSize)] = float4(0, 0, 0, 0);
-    }
-
     // Clear groupshared tile.
-    for (uint ti = tid; ti < TILE_SIZE * TILE_SIZE; ti += totalThreads) {
+    for (uint ti = tid; ti < TILE_BINS; ti += totalThreads) {
         gs_counts[ti] = 0;
         gs_lumSum[ti] = 0.0;
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Process all source pixels, scatter into groupshared tile.
-    // The tile covers the full output range at reduced resolution.
-    for (uint pi = tid; pi < totalPixels; pi += totalThreads) {
+    // This group's share of the source pixels, scattered into its tile.
+    for (uint pi = g * totalThreads + tid; pi < totalPixels;
+         pi += totalThreads * SHADERLAB_REDUCE_GROUPS) {
         uint px = pi % Width;
         uint py = pi / Width;
         float4 src = Source[int2(px, py)];
@@ -507,39 +902,61 @@ void main(uint3 GTid : SV_GroupThreadID) {
     }
     GroupMemoryBarrierWithGroupSync();
 
+    uint pb = PART_BASE + g * PART_STRIDE;
+    for (uint wi = tid; wi < TILE_BINS; wi += totalThreads) {
+        ShaderLabScratchStore(pb + wi, gs_counts[wi]);
+        ShaderLabScratchStore(pb + TILE_BINS + wi, asuint(gs_lumSum[wi]));
+    }
+
+    if (!ShaderLabReduceIsLastGroup(tid))
+        return;
+
+    // Last group: sum every group's tile.
+    for (uint si = tid; si < TILE_BINS; si += totalThreads) {
+        uint c = 0;
+        float l = 0.0;
+        for (uint gg = 0; gg < SHADERLAB_REDUCE_GROUPS; ++gg) {
+            uint b2 = PART_BASE + gg * PART_STRIDE;
+            c += ShaderLabScratchLoad(b2 + si);
+            l += asfloat(ShaderLabScratchLoad(b2 + TILE_BINS + si));
+        }
+        gs_counts[si] = c;
+        gs_lumSum[si] = l;
+    }
+
     // Find max count for log normalization.
     if (tid == 0) gs_maxCount = 1;
     GroupMemoryBarrierWithGroupSync();
-    for (uint mi = tid; mi < TILE_SIZE * TILE_SIZE; mi += totalThreads) {
+    for (uint mi = tid; mi < TILE_BINS; mi += totalThreads) {
         InterlockedMax(gs_maxCount, gs_counts[mi]);
     }
     GroupMemoryBarrierWithGroupSync();
 
     float logMax = log2(float(gs_maxCount) + 1.0);
 
-    // Write groupshared tile to output texture, upscaling to full resolution.
-    // Each tile bin maps to a block of (outSize/TILE_SIZE) x (outSize/TILE_SIZE) pixels.
+    // Write every output pixel (empty bins as 0), upscaling the tile.
     float scale = float(outSize) / float(TILE_SIZE);
     for (uint oi = tid; oi < outSize * outSize; oi += totalThreads) {
         uint ox = oi % outSize;
         uint oy = oi / outSize;
-        // Map output pixel back to tile bin.
         uint tx = min((uint)(float(ox) / scale), TILE_SIZE - 1);
         uint ty = min((uint)(float(oy) / scale), TILE_SIZE - 1);
         uint idx = ty * TILE_SIZE + tx;
         uint cnt = gs_counts[idx];
+        float4 o = float4(0, 0, 0, 0);
         if (cnt > 0) {
             float logDensity = log2(float(cnt) + 1.0) / logMax;
             float avgLum = gs_lumSum[idx] / float(cnt);
-            Output[int2(ox, oy)] = float4(logDensity, avgLum, 0, 1.0);
+            o = float4(logDensity, avgLum, 0, 1.0);
         }
+        Output[int2(ox, oy)] = o;
     }
 }
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"CIE Histogram";
-            desc.effectId = L"CIE Histogram"; desc.effectVersion = 2;
+            desc.effectId = L"CIE Histogram"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.subcategory = L"Scopes";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -658,9 +1075,12 @@ float GamutTriangle(float2 uv, float2 r, float2 g, float2 b, float thickness) {
     return smoothstep(thickness, 0.0, edge);
 }
 
+// Uses the scene coordinate for diagram geometry and derives its own histogram
+// texel coords via GetDimensions(), so it never wants TEXCOORD0. Declared
+// explicitly rather than relying on the missing-SCENE_POSITION accident.
 float4 main(
     float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+    float4 uv0 : SCENE_POSITION) : SV_TARGET
 {
     // Map pixel position to CIE xy space
     // x: 0 to 0.8, y: 0 to 0.9 (standard diagram range)
@@ -733,7 +1153,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"CIE Chromaticity Plot";
-            desc.effectId = L"CIE Chromaticity Plot"; desc.effectVersion = 5;
+            desc.effectId = L"CIE Chromaticity Plot"; desc.effectVersion = 6;
             desc.category = L"Analysis";
             desc.subcategory = L"Scopes";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -744,7 +1164,7 @@ float4 main(
                 { L"ShowP3",       L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"ShowRec2020",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
                 { L"Brightness",   L"float", 2.0f,  0.1f, 10.0f, 0.1f },
-                { L"DiagramSize",  L"float", 512.0f, 128.0f, 4096.0f, 64.0f },
+                { L"DiagramSize",  L"float", kDefaultDiagramSize, 128.0f, 4096.0f, 64.0f },
                 // Custom-primary triangle ("monitor" gamut). Bind these to
                 // `Working Space.RedPrimary` etc. for monitor-matched plotting.
                 { L"ShowMonitor",  L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Hide", L"Show" } },
@@ -780,9 +1200,13 @@ cbuffer constants : register(b0) {
     float2 BluePrimary;
 };
 
+// Source generator: no input to sample, so what this shader wants IS the
+// scene coordinate. Declared explicitly -- it previously got the same value
+// by omitting SCENE_POSITION and letting it bind to a parameter labelled
+// TEXCOORD0, which is the trap that displaced every input-sampling effect.
 float4 main(
     float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+    float4 uv0 : SCENE_POSITION) : SV_TARGET
 {
     float size = max(OutputSize, 128.0);
 
@@ -821,7 +1245,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Source";
-            desc.effectId = L"Gamut Source"; desc.effectVersion = 3;
+            desc.effectId = L"Gamut Source"; desc.effectVersion = 4;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gamutSourceHLSL;
@@ -829,7 +1253,7 @@ float4 main(
             desc.parameters = {
                 { L"Gamut",      L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Rec.709", L"DCI-P3", L"Rec.2020", L"Custom" } },
                 { L"Luminance",  L"float", 80.0f, 0.01f, 10000.0f, 10.0f },
-                { L"OutputSize", L"float", 512.0f, 128.0f, 4096.0f, 64.0f },
+                { L"OutputSize", L"float", kDefaultDiagramSize, 128.0f, 4096.0f, 64.0f },
                 { L"RedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"Gamut == 3" },
                 { L"GreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"Gamut == 3" },
                 { L"BluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"Gamut == 3" },
@@ -879,9 +1303,13 @@ static const float3 PATCHES[24] = {
     float3(0.0210, 0.0210, 0.0210),  // Black
 };
 
+// Source generator: no input to sample, so what this shader wants IS the
+// scene coordinate. Declared explicitly -- it previously got the same value
+// by omitting SCENE_POSITION and letting it bind to a parameter labelled
+// TEXCOORD0, which is the trap that displaced every input-sampling effect.
 float4 main(
     float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+    float4 uv0 : SCENE_POSITION) : SV_TARGET
 {
     float ps = max(PatchSize, 16.0);
     float2 pixPos = uv0.xy;
@@ -906,7 +1334,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Color Checker";
-            desc.effectId = L"Color Checker"; desc.effectVersion = 1;
+            desc.effectId = L"Color Checker"; desc.effectVersion = 2;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + colorCheckerHLSL;
@@ -925,12 +1353,16 @@ float4 main(
 
 cbuffer constants : register(b0) {
     float Frequency;   // default 0.5
-    float PlateSize;   // pixels (default 512)
+    float PlateSize;   // pixels (default 1024)
 };
 
+// Source generator: no input to sample, so what this shader wants IS the
+// scene coordinate. Declared explicitly -- it previously got the same value
+// by omitting SCENE_POSITION and letting it bind to a parameter labelled
+// TEXCOORD0, which is the trap that displaced every input-sampling effect.
 float4 main(
     float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+    float4 uv0 : SCENE_POSITION) : SV_TARGET
 {
     float size = max(PlateSize, 64.0);
     float2 center = float2(size * 0.5, size * 0.5);
@@ -943,14 +1375,14 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Zone Plate";
-            desc.effectId = L"Zone Plate"; desc.effectVersion = 1;
+            desc.effectId = L"Zone Plate"; desc.effectVersion = 2;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + zonePlateHLSL;
             desc.inputNames = {};
             desc.parameters = {
                 { L"Frequency", L"float", 0.5f, 0.01f, 5.0f, 0.01f },
-                { L"PlateSize", L"float", 512.0f, 64.0f, 2048.0f, 64.0f },
+                { L"PlateSize", L"float", kDefaultDiagramSize, 64.0f, 2048.0f, 64.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -969,12 +1401,16 @@ cbuffer constants : register(b0) {
     float EndR;     // end color (scRGB)
     float EndG;
     float EndB;
-    float GradSize; // pixels (default 512)
+    float GradSize; // pixels (default 1024)
 };
 
+// Source generator: no input to sample, so what this shader wants IS the
+// scene coordinate. Declared explicitly -- it previously got the same value
+// by omitting SCENE_POSITION and letting it bind to a parameter labelled
+// TEXCOORD0, which is the trap that displaced every input-sampling effect.
 float4 main(
     float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+    float4 uv0 : SCENE_POSITION) : SV_TARGET
 {
     float size = max(GradSize, 64.0);
     float t = 0;
@@ -998,7 +1434,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gradient Generator";
-            desc.effectId = L"Gradient Generator"; desc.effectVersion = 2;
+            desc.effectId = L"Gradient Generator"; desc.effectVersion = 3;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + gradientHLSL;
@@ -1011,7 +1447,7 @@ float4 main(
                 { L"EndR",         L"float", 1.0f, -1.0f, 125.0f, 0.01f },
                 { L"EndG",         L"float", 1.0f, -1.0f, 125.0f, 0.01f },
                 { L"EndB",         L"float", 1.0f, -1.0f, 125.0f, 0.01f },
-                { L"GradSize",     L"float", 512.0f, 64.0f, 2048.0f, 64.0f },
+                { L"GradSize",     L"float", kDefaultDiagramSize, 64.0f, 2048.0f, 64.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1023,12 +1459,16 @@ float4 main(
 // Source effect: no input required.
 
 cbuffer constants : register(b0) {
-    float PatternSize; // pixels (default 512)
+    float PatternSize; // pixels (default 1024)
 };
 
+// Source generator: no input to sample, so what this shader wants IS the
+// scene coordinate. Declared explicitly -- it previously got the same value
+// by omitting SCENE_POSITION and letting it bind to a parameter labelled
+// TEXCOORD0, which is the trap that displaced every input-sampling effect.
 float4 main(
     float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+    float4 uv0 : SCENE_POSITION) : SV_TARGET
 {
     float size = max(PatternSize, 256.0);
     float2 uv = uv0.xy / size;
@@ -1086,13 +1526,13 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"HDR Test Pattern";
-            desc.effectId = L"HDR Test Pattern"; desc.effectVersion = 1;
+            desc.effectId = L"HDR Test Pattern"; desc.effectVersion = 2;
             desc.category = L"Source";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + hdrTestHLSL;
             desc.inputNames = {};
             desc.parameters = {
-                { L"PatternSize", L"float", 512.0f, 256.0f, 2048.0f, 64.0f },
+                { L"PatternSize", L"float", kDefaultDiagramSize, 256.0f, 2048.0f, 64.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -1102,7 +1542,13 @@ float4 main(
         {
             static const std::string deltaEHLSL = R"HLSL(
 // Delta E Comparator -- D3D11 compute, per-pixel color difference between
-// two inputs (Reference at t0, Test at t1). Supports CIE76, CIE94, CIEDE2000.
+// two inputs (Reference at t0, Test at t1). Supports CIE76, CIE94, CIEDE2000
+// and dE ITP (BT.2124).
+//
+// Prefer ITP for anything HDR or wide-gamut: the three Lab metrics were fit
+// to reflective samples under SDR viewing and degrade above ~100 nits and
+// outside sRGB. One unit is ~1 JND in all four, so the numbers stay
+// comparable when switching.
 
 Texture2D<float4>   Reference   : register(t0);
 Texture2D<float4>   Test        : register(t1);
@@ -1112,7 +1558,7 @@ cbuffer Constants : register(b0)
 {
     uint  Width;
     uint  Height;
-    uint  Method;        // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000
+    uint  Method;        // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000, 3 = dE ITP
     float Scale;         // visualization multiplier
     float MaxDeltaE;     // clamp for colormap (dE >= this = full red)
     uint  OutputMode;    // 0 = Heatmap (Turbo), 1 = Grayscale dE / MaxDeltaE
@@ -1222,14 +1668,21 @@ void main(uint3 dtid : SV_DispatchThreadID)
     float4 ref  = Reference.Load(int3(dtid.xy, 0));
     float4 test = Test.Load(int3(dtid.xy, 0));
 
-    float3 labRef  = ScRGBToLab(ref.rgb);
-    float3 labTest = ScRGBToLab(test.rgb);
-
     float dE;
     uint method = Method;
-    if (method == 1)      dE = DeltaE94(labRef, labTest);
-    else if (method == 2) dE = DeltaE2000(labRef, labTest);
-    else                  dE = DeltaE76(labRef, labTest);
+    if (method == 3)
+    {
+        // dE ITP works in PQ-encoded ICtCp, not Lab -- no XYZ->Lab hop.
+        dE = DeltaEITPFromScRGB(ref.rgb, test.rgb);
+    }
+    else
+    {
+        float3 labRef  = ScRGBToLab(ref.rgb);
+        float3 labTest = ScRGBToLab(test.rgb);
+        if (method == 1)      dE = DeltaE94(labRef, labTest);
+        else if (method == 2) dE = DeltaE2000(labRef, labTest);
+        else                  dE = DeltaE76(labRef, labTest);
+    }
 
     dE *= Scale;
     float mode = OutputMode;
@@ -1254,7 +1707,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Delta E Comparator";
-            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 6;
+            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 7;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -1265,7 +1718,10 @@ void main(uint3 dtid : SV_DispatchThreadID)
             desc.hlslSource = colorMath + deltaEHLSL;
             desc.inputNames = { L"Reference", L"Test" };
             desc.parameters = {
-                { L"Method",     L"float", 2.0f, 0.0f, 2.0f, 1.0f, { L"CIE76", L"CIE94", L"CIEDE2000" } },
+                // Default is dE ITP: this pipeline is HDR/WCG, where the three
+                // Lab metrics are out of their fitted domain. Saved graphs keep
+                // whatever Method they stored, so only new nodes pick it up.
+                { L"Method",     L"float", 3.0f, 0.0f, 3.0f, 1.0f, { L"CIE76", L"CIE94", L"CIEDE2000", L"dE ITP (BT.2124)" } },
                 { L"Scale",      L"float", 1.0f, 0.1f, 10.0f, 0.1f },
                 { L"MaxDeltaE",  L"float", 1.0f, 0.1f, 100.0f, 0.1f },
                 { L"OutputMode", L"float", 0.0f, 0.0f, 1.0f, 1.0f, { L"Heatmap", L"Grayscale dE" } },
@@ -1284,6 +1740,7 @@ cbuffer Constants : register(b0)
 };
 
 Texture2D Source : register(t0);
+SamplerState InputSampler : register(s0);
 
 float3 FalseColor(float nits) {
     // Purple < 0.5 < Blue < 5 < Cyan < 20 < Green < 100 < Yellow < 400 < Orange < 1000 < Red < 4000 < White
@@ -1298,11 +1755,17 @@ float3 FalseColor(float nits) {
 }
 
 float4 main(
-    float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0
+    float4 pos      : SV_POSITION,
+    float4 scenePos : SCENE_POSITION,
+    float4 uv0      : TEXCOORD0
 ) : SV_Target
 {
-    float4 color = Source.Load(int3(uv0.xy, 0));
+    // SCENE_POSITION is NOT optional -- D2D's pixel-shader input signature is
+    // (SV_POSITION, SCENE_POSITION, TEXCOORD0..N), and omitting the middle one
+    // binds the SCENE coordinate to the parameter named uv0 (see "D2D Custom
+    // Effect Gotchas" in .github/copilot-instructions.md). uv0 is NORMALIZED once the signature
+    // is right, so the input is read with Sample(), not Load(int3(...)).
+    float4 color = Source.Sample(InputSampler, uv0.xy);
     float nits = ScRGBLuminanceNits(color.rgb);
     float3 fc = FalseColor(nits);
     float3 result = lerp(color.rgb, fc, Opacity);
@@ -1312,7 +1775,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Nit Map";
-            desc.effectId = L"Nit Map"; desc.effectVersion = 1;
+            desc.effectId = L"Nit Map"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.subcategory = L"Highlights";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -1336,8 +1799,16 @@ float4 main(
 // source -- vs the previous pixel-shader gather's O(srcSamples * outW*outH)
 // which was ~17B ops at the same input.
 
+// Multi-group (SHADERLAB_REDUCE_SCRATCH): SHADERLAB_REDUCE_GROUPS groups each
+// scatter a share of the pixels into their groupshared bins, then add them
+// into global counters in the scratch head; the last group to finish renders
+// the diagram from the totals. Counts only, so global atomics are exact.
+
+#include "shaderlab_params.hlsli"
+
 Texture2D<float4>    Source : register(t0);
 RWTexture2D<float4>  Output : register(u1);
+SHADERLAB_REDUCE_SCRATCH
 
 cbuffer Constants : register(b0)
 {
@@ -1360,13 +1831,18 @@ float TriangleEdge(float2 p, float2 a, float2 b, float lineW) {
 
 // 64x64 chromaticity histogram. 4096 bins x 4 bytes x 2 buffers = 32 KB.
 #define BINS 64
+// Global counters in the cleared scratch head: word 0 is the reduction's
+// completion counter, so the bins start at 16.
+#define GLOBAL_IN   16
+#define GLOBAL_OUT  (GLOBAL_IN + BINS * BINS)
 groupshared uint gs_inGamut[BINS * BINS];
 groupshared uint gs_outGamut[BINS * BINS];
 
 [numthreads(32, 32, 1)]
-void main(uint3 GTid : SV_GroupThreadID)
+void main(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
 {
     uint tid = GTid.x + GTid.y * 32;
+    uint g = Gid.x;
     const uint totalThreads = 1024;
 
     uint outSize = max((uint)DiagramSize, 64u);
@@ -1394,15 +1870,19 @@ void main(uint3 GTid : SV_GroupThreadID)
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Phase 2: scatter every source pixel into chromaticity bins.
+    // Phase 2: scatter this group's share of the source pixels.
     uint totalPixels = Width * Height;
-    for (uint pi = tid; pi < totalPixels; pi += totalThreads)
+    for (uint pi = g * totalThreads + tid; pi < totalPixels;
+         pi += totalThreads * SHADERLAB_REDUCE_GROUPS)
     {
         uint px = pi % Width;
         uint py = pi / Width;
         float4 s = Source[int2(px, py)];
         if (s.a < 0.001) continue;
-        float3 xyz = ScRGBToXYZ(max(s.rgb, 0.0));
+        // Unclamped: negative scRGB components are wide-gamut chroma, and
+        // clamping them collapses those pixels onto the sRGB hull -- which
+        // is exactly the coverage this scatter exists to measure.
+        float3 xyz = ScRGBToXYZ(s.rgb);
         float sum = xyz.x + xyz.y + xyz.z;
         if (sum < 1e-6) continue;
         float cieX = xyz.x / sum;
@@ -1420,6 +1900,23 @@ void main(uint3 GTid : SV_GroupThreadID)
         bool inGamut = PointInTriangle(float2(cieX, cieY), tR, tG, tB);
         if (inGamut) InterlockedAdd(gs_inGamut[binIdx],  1u);
         else         InterlockedAdd(gs_outGamut[binIdx], 1u);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Fold this group's bins into the global totals (non-empty bins only).
+    for (uint fi = tid; fi < BINS * BINS; fi += totalThreads)
+    {
+        if (gs_inGamut[fi])  _SLScratch.InterlockedAdd((GLOBAL_IN  + fi) * 4, gs_inGamut[fi]);
+        if (gs_outGamut[fi]) _SLScratch.InterlockedAdd((GLOBAL_OUT + fi) * 4, gs_outGamut[fi]);
+    }
+
+    if (!ShaderLabReduceIsLastGroup(tid))
+        return;
+
+    for (uint li = tid; li < BINS * BINS; li += totalThreads)
+    {
+        gs_inGamut[li]  = ShaderLabScratchLoad(GLOBAL_IN + li);
+        gs_outGamut[li] = ShaderLabScratchLoad(GLOBAL_OUT + li);
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -1460,7 +1957,7 @@ void main(uint3 GTid : SV_GroupThreadID)
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Coverage";
-            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 6;
+            desc.effectId = L"Gamut Coverage"; desc.effectVersion = 7;
             desc.category = L"Analysis";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
             desc.hasImageOutput = true;
@@ -1470,7 +1967,7 @@ void main(uint3 GTid : SV_GroupThreadID)
             desc.hlslSource = colorMath + gamutCoverageHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"DiagramSize",  L"float", 512.0f, 128.0f, 4096.0f, 64.0f },
+                { L"DiagramSize",  L"float", kDefaultDiagramSize, 128.0f, 4096.0f, 64.0f },
                 { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" } },
                 { L"RedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
                 { L"GreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
@@ -1484,7 +1981,8 @@ void main(uint3 GTid : SV_GroupThreadID)
             static const std::string gamutMapHLSL = R"HLSL(
 // Gamut Map - constrains input colors to a target gamut.
 // Four modes:
-//   0: Clip - hard clamp RGB components to [0,1] in target space
+//   0: Clip - clamp NEGATIVE target-space components to 0 (a chromaticity
+//      clip; values above 1 are HDR range and are kept)
 //   1: Nearest - project out-of-gamut CIE xy to nearest point on gamut triangle
 //   2: Compress to White - move out-of-gamut xy toward D65 white until inside
 //   3: Fit Gamut - uniformly scale all chromaticities to fit source gamut inside target
@@ -1636,6 +2134,17 @@ float4 main(
             float3 result = XYZToScRGB(xyzBack);
             color.rgb = lerp(rgb, result, Strength);
         }
+        else if (gamut == 3) {
+            // Custom: the target's own primaries (D65 white, as the other
+            // modes assume). Until effectVersion 6 this fell through to the
+            // BT.2020 branch below, so a Custom target -- e.g. a panel's
+            // primaries bound from Working Space -- silently clipped to
+            // BT.2020 in Clip mode while every other mode honoured it.
+            TargetXf t = MakeTargetXf(3, ctR, ctG, ctB, D65_WHITE);
+            float3 clamped = max(ScRGBToTarget(t, rgb), 0.0);
+            float3 result = TargetToScRGB(t, clamped);
+            color.rgb = lerp(rgb, result, Strength);
+        }
         else {
             // scRGB -> XYZ -> BT.2020 -> clamp -> XYZ -> scRGB
             float3 xyz = ScRGBToXYZ(rgb);
@@ -1708,7 +2217,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Map";
-            desc.effectId = L"Gamut Map"; desc.effectVersion = 5;
+            desc.effectId = L"Gamut Map"; desc.effectVersion = 6;
             desc.category = L"Analysis";
             desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -1745,7 +2254,7 @@ float4 main(
 
 cbuffer Constants : register(b0)
 {
-    uint Mode;          // 0=Nearest on Shell, 1=Compress to Neutral, 2=Fit to Shell
+    uint Mode;          // 0=Nearest on Shell, 1=Compress to Neutral, 2=Fit to Shell, 3=Soft Compress
     uint TargetGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
     float Strength;      // 0=bypass, 1=full
     uint SourceGamut;   // 0=sRGB, 1=DCI-P3, 2=BT.2020, 3=Custom
@@ -1755,12 +2264,52 @@ cbuffer Constants : register(b0)
     float2 SourceRedPrimary;
     float2 SourceGreenPrimary;
     float2 SourceBluePrimary;
+    float SoftThreshold; // mode 3: fraction of boundary radius where compression starts
+    float SoftLimit;     // mode 3: source radius (x boundary) that maps onto the boundary
+    float KneeHardness;  // mode 3: ACES p. 1=Reinhard, higher=harder corner
+    // Host-computed (derived constants, ShaderLabEffects.cpp). Both depend on
+    // the parameters alone, and rebuilding them per pixel is what made this
+    // effect slow -- Fit to Shell measured 1.9 s per frame at 1 Mpx.
+    //   FitScaleLut  mode 2: the fit scale at I = k/255, four per float4.
+    //   TgtPolyLut   modes 0/1/3: the target boundary polygon at
+    //                I = level/(POLY_LEVELS-1), two (Ct,Cp) vertices per float4.
+    float4 FitScaleLut[64];
+    float4 TgtPolyLut[1536];
 };
 
 Texture2D InputTexture : register(t0);
 SamplerState InputSampler : register(s0);
 
 #define NBP 48
+#define POLY_LEVELS 64
+
+float FitScaleAt(float I)
+{
+    float t = saturate(I) * 255.0;
+    uint  k = min((uint)t, 254u);
+    float f = t - (float)k;
+    float a = FitScaleLut[k >> 2][k & 3];
+    float b = FitScaleLut[(k + 1) >> 2][(k + 1) & 3];
+    return lerp(a, b, f);
+}
+
+float2 PolyVertex(uint idx)
+{
+    float4 q = TgtPolyLut[idx >> 1];
+    return (idx & 1) ? q.zw : q.xy;
+}
+
+// The target boundary at intensity I, interpolated between the two
+// precomputed levels that bracket it.
+void TargetBoundaryAt(float I, out float2 bnd[NBP])
+{
+    float t = saturate(I) * (POLY_LEVELS - 1);
+    uint  k = min((uint)t, (uint)(POLY_LEVELS - 2));
+    float f = t - (float)k;
+    [unroll]
+    for (uint i = 0; i < NBP; i++)
+        bnd[i] = lerp(PolyVertex(k * NBP + i), PolyVertex((k + 1) * NBP + i), f);
+}
 
 void SampleBoundary(float2 gR, float2 gG, float2 gB, float iVal, out float2 bnd[NBP])
 {
@@ -1833,6 +2382,27 @@ float2 CompressNeutral(float2 p, float2 poly[NBP])
     return result;
 }
 
+// Distance from the neutral axis (Ct=Cp=0) to the boundary polygon along
+// direction `dir` (unit length). Returns 0 if the ray never hits an edge
+// (degenerate polygon), which callers must guard.
+float BoundaryRadius(float2 dir, float2 poly[NBP])
+{
+    float bestT = 1e10;
+    for (uint i = 0; i < NBP; i++)
+    {
+        uint j = (i + 1) % NBP;
+        float2 a = poly[i];
+        float2 ab = poly[j] - a;
+        float denom = dir.x * ab.y - dir.y * ab.x;
+        if (abs(denom) < 1e-10) continue;
+        float t = (a.x * ab.y - a.y * ab.x) / denom;
+        float u = (a.x * dir.y - a.y * dir.x) / denom;
+        if (t > 0.0 && u >= 0.0 && u <= 1.0 && t < bestT)
+            bestT = t;
+    }
+    return (bestT < 1e9) ? bestT : 0.0;
+}
+
 // Compute uniform ICtCp scale factor: for each source boundary vertex,
 // find how far it extends beyond the target boundary (ray from neutral).
 float ComputeICtCpFitScale(float2 srcBnd[NBP], float2 tgtBnd[NBP])
@@ -1888,6 +2458,9 @@ float4 main(
     float2 csR = SourceRedPrimary;
     float2 csG = SourceGreenPrimary;
     float2 csB = SourceBluePrimary;
+    float softT = SoftThreshold;
+    float softL = SoftLimit;
+    float softP = KneeHardness;
 
     float2 gR, gG, gB;
     uint g = (uint)targetF;
@@ -1898,7 +2471,11 @@ float4 main(
 
     // Use CIE xy triangle test for reliable in/out-of-gamut detection,
     // then do the actual mapping in ICtCp for perceptual quality.
-    float3 xyz = ScRGBToXYZ(max(color.rgb, 0.0));
+    // Unclamped: clamping negatives first projects the colour onto the
+    // sRGB gamut surface, which makes every wide-gamut pixel test as
+    // *inside* the target and defeats the detection entirely. XYZ stays
+    // non-negative for real colours, so the xyzSum guard below still holds.
+    float3 xyz = ScRGBToXYZ(color.rgb);
     float xyzSum = xyz.x + xyz.y + xyz.z;
     if (xyzSum < 1e-6) return color;
     float2 cieXY = float2(xyz.x / xyzSum, xyz.y / xyzSum);
@@ -1915,15 +2492,13 @@ float4 main(
         else if (sg == 3) { sR = csR; sG = csG; sB = csB; }
         else              { sR = GAMUT_709_R; sG = GAMUT_709_G; sB = GAMUT_709_B; }
 
-        float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
+        float3 ictcp = ScRGBToICtCp(color.rgb);
         float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
 
-        // Sample both source and target boundaries at this I level
-        float2 srcBnd[NBP], tgtBnd[NBP];
-        SampleBoundary(sR, sG, sB, ictcp.x, srcBnd);
-        SampleBoundary(gR, gG, gB, ictcp.x, tgtBnd);
-
-        float scale = ComputeICtCpFitScale(srcBnd, tgtBnd);
+        // The fit scale depends only on I (and the gamuts), so it is read from
+        // the host-built table instead of sampling two 48-point boundaries
+        // and running a 48x48 ray test here.
+        float scale = FitScaleAt(ictcp.x);
         if (scale >= 1.0) return color;
 
         float2 ctcp = float2(ictcp.y, ictcp.z);
@@ -1935,6 +2510,45 @@ float4 main(
         if (mappedY > 1e-6)
             mappedRGB *= origY / mappedY;
         color.rgb = mappedRGB;
+    }
+    else if (mode == 3)
+    {
+        // Soft Compress: unlike modes 0/1 this also touches *in-gamut*
+        // pixels whose chroma radius exceeds SoftThreshold x boundary,
+        // buying smooth gradients across the boundary at the cost of
+        // slightly desaturating legal near-boundary colors.
+        float3 ictcp = ScRGBToICtCp(color.rgb);
+        float2 ctcp = float2(ictcp.y, ictcp.z);
+        float r = length(ctcp);
+        // 1e-3, not 1e-6. This guard exists to skip the boundary walk for
+        // achromatic pixels, but a neutral's residual chroma after the scRGB
+        // -> ICtCp round trip is 3.4e-6 to 2.9e-5 -- above 1e-6 -- so the
+        // early-out never fired and every neutral pixel paid a 48-point
+        // polygon walk with a ray intersection per segment. The boundary
+        // radius is O(0.1), so 1e-3 is still ~1% of it: nothing that could be
+        // meaningfully compressed is skipped. Verified bit-exact across
+        // neutral, near-neutral, in-gamut saturated and wide-gamut (negative
+        // component) probes.
+        if (r > 1e-3)
+        {
+            float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+            float2 bnd[NBP];
+            TargetBoundaryAt(ictcp.x, bnd);
+            float2 dir = ctcp / r;
+            float B = BoundaryRadius(dir, bnd);
+            if (B > 1e-6)
+            {
+                float d = r / B;
+                float dNew = SoftCompressDistance(d, softT, softL, softP);
+                float2 mapped = dir * (dNew * B);
+                ctcp = lerp(ctcp, mapped, Strength);
+                float3 mappedRGB = ICtCpToScRGB(float3(ictcp.x, ctcp.x, ctcp.y));
+                float mappedY = dot(max(mappedRGB, 0.0), float3(0.2126, 0.7152, 0.0722));
+                if (mappedY > 1e-6)
+                    mappedRGB *= origY / mappedY;
+                color.rgb = mappedRGB;
+            }
+        }
     }
     else
     {
@@ -1950,12 +2564,12 @@ float4 main(
         bool insideGamut = PointInTriangle(cieXY, iR, iG, iB);
         if (!insideGamut)
         {
-            float3 ictcp = ScRGBToICtCp(max(color.rgb, 0.0));
+            float3 ictcp = ScRGBToICtCp(color.rgb);
             float2 ctcp = float2(ictcp.y, ictcp.z);
             float origY = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
 
             float2 bnd[NBP];
-            SampleBoundary(gR, gG, gB, ictcp.x, bnd);
+            TargetBoundaryAt(ictcp.x, bnd);
 
             float2 mapped = (mode == 1)
                 ? CompressNeutral(ctcp, bnd)
@@ -1974,17 +2588,20 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Gamut Map";
-            desc.effectId = L"ICtCp Gamut Map"; desc.effectVersion = 10;
+            desc.effectId = L"ICtCp Gamut Map"; desc.effectVersion = 13;
             desc.category = L"Analysis";
             desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + perceptualGamutMapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"Mode",        L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Nearest on Shell", L"Compress to Neutral", L"Fit to Shell" } },
+                { L"Mode",        L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"Nearest on Shell", L"Compress to Neutral", L"Fit to Shell", L"Soft Compress" } },
                 { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" } },
                 { L"Strength",    L"float", 1.0f, 0.0f, 1.0f, 0.05f },
                 { L"SourceGamut", L"float", 2.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" }, L"Mode == 2" },
+                { L"SoftThreshold", L"float", 0.75f, 0.0f, 0.99f, 0.01f, {}, L"Mode == 3" },
+                { L"SoftLimit",     L"float", 1.5f,  1.01f, 4.0f, 0.01f, {}, L"Mode == 3" },
+                { L"KneeHardness",  L"float", 1.2f,  1.0f,  4.0f, 0.05f, {}, L"Mode == 3" },
                 { L"TargetRedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
                 { L"TargetGreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
                 { L"TargetBluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
@@ -1992,6 +2609,7 @@ float4 main(
                 { L"SourceGreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.170f, 0.797f }, 0.0f, 1.0f, 0.001f, {}, L"SourceGamut == 3" },
                 { L"SourceBluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.131f, 0.046f }, 0.0f, 1.0f, 0.001f, {}, L"SourceGamut == 3" },
             };
+            desc.deriveConstants = MakeIctcpGamutMapDerived();
             m_effects.push_back(std::move(desc));
         }
 
@@ -2009,6 +2627,12 @@ cbuffer Constants : register(b0)
     float2 RedPrimary;
     float2 GreenPrimary;
     float2 BluePrimary;
+    // Host-computed (derived constants, ShaderLabEffects.cpp): the boundary
+    // polygon at each of the 6 drawn I levels -- 0.15, 0.3, 0.45, 0.6, 0.75
+    // and Intensity -- 24 vertices each, two (Ct,Cp) pairs per float4. They
+    // depend on the parameters alone; building them here cost 144 colour
+    // conversions per output pixel.
+    float4 BndPts[72];
 };
 
 Texture2D InputTexture : register(t0);
@@ -2016,24 +2640,10 @@ SamplerState InputSampler : register(s0);
 
 #define NBP 24
 
-void SampleBnd(float2 gR, float2 gG, float2 gB, float iVal, out float2 bnd[NBP])
+float2 BndVertex(uint idx)
 {
-    float nits = PQ_EOTF(iVal);
-    float Ys = max(nits / 80.0, 0.0001);
-    uint ppe = NBP / 3;
-    for (uint i = 0; i < NBP; i++)
-    {
-        float2 xy;
-        uint e = i / ppe;
-        float t = (float)(i % ppe) / (float)ppe;
-        if (e == 0)      xy = lerp(gR, gG, t);
-        else if (e == 1) xy = lerp(gG, gB, t);
-        else             xy = lerp(gB, gR, t);
-        float X = (xy.y > 1e-6) ? xy.x * Ys / xy.y : 0;
-        float Z = (xy.y > 1e-6) ? (1.0 - xy.x - xy.y) * Ys / xy.y : 0;
-        float3 ic = ScRGBToICtCp(XYZToScRGB(float3(X, Ys, Z)));
-        bnd[i] = float2(ic.y, ic.z);
-    }
+    float4 q = BndPts[idx >> 1];
+    return (idx & 1) ? q.zw : q.xy;
 }
 
 float4 main(
@@ -2060,8 +2670,7 @@ float4 main(
     float lineW = 1.5 / size;
     float dotR = 3.0 / size;
 
-    // Draw boundaries at 5 fixed I levels + the user-selected one
-    float iLevels[6] = { 0.15, 0.3, 0.45, 0.6, 0.75, Intensity };
+    // Boundaries at 5 fixed I levels + the user-selected one (host-built).
     float3 lColors[6] = {
         float3(0.15, 0.05, 0.05),
         float3(0.15, 0.1, 0.05),
@@ -2071,21 +2680,19 @@ float4 main(
         float3(0.4, 0.4, 0.0)   // User-selected level in yellow
     };
 
-    for (int lv = 0; lv < 6; lv++)
+    for (uint lv = 0; lv < 6; lv++)
     {
-        float2 bnd[NBP];
-        SampleBnd(gR, gG, gB, iLevels[lv], bnd);
-
         for (uint i = 0; i < NBP; i++)
         {
-            uint j = (i + 1) % NBP;
-            float2 ab = bnd[j] - bnd[i];
-            float t = saturate(dot(ctcp - bnd[i], ab) / max(dot(ab, ab), 1e-10));
-            float d = length(ctcp - bnd[i] - ab * t);
+            float2 a = BndVertex(lv * NBP + i);
+            float2 b = BndVertex(lv * NBP + (i + 1) % NBP);
+            float2 ab = b - a;
+            float t = saturate(dot(ctcp - a, ab) / max(dot(ab, ab), 1e-10));
+            float d = length(ctcp - a - ab * t);
             if (d < lineW)
                 color = max(color, lColors[lv] * (1.0 - d / lineW));
 
-            if (length(ctcp - bnd[i]) < dotR)
+            if (length(ctcp - a) < dotR)
                 color = max(color, lColors[lv] * 1.5);
         }
     }
@@ -2104,19 +2711,124 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Boundary";
-            desc.effectId = L"ICtCp Boundary"; desc.effectVersion = 4;
+            desc.effectId = L"ICtCp Boundary"; desc.effectVersion = 5;
             desc.category = L"Analysis";
             desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.hlslSource = colorMath + ictcpBoundaryHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"DiagramSize", L"float", 512.0f, 128.0f, 2048.0f, 64.0f },
+                { L"DiagramSize", L"float", kDefaultDiagramSize, 128.0f, 2048.0f, 64.0f },
                 { L"TargetGamut", L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"DCI-P3", L"BT.2020", L"Custom" } },
                 { L"Intensity",   L"float", 0.5f, 0.05f, 0.95f, 0.05f },
                 { L"RedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f, 0.33f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
                 { L"GreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f, 0.60f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
                 { L"BluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f, 0.06f }, 0.0f, 1.0f, 0.001f, {}, L"TargetGamut == 3" },
+            };
+            desc.deriveConstants = MakeIctcpBoundaryDerived();
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- ICtCp Gamut Boundary LUT ----
+        // Generator for a tone mapper's gamut-boundary lookup input. Give it
+        // the same SdrWhiteNits and TargetGamut as its consumer (bind both to
+        // the same source): a consumer should refuse a table built for a
+        // different peak or gamut and fall back to the exact search.
+        {
+            static const std::string gamutLutMainHLSL = R"HLSL(
+// ICtCp Gamut Boundary LUT - D3D11 Compute Shader (generator)
+//
+// Precomputes B(I, hue) = CubeBoundaryRadius(I, dir(hue), peak, target) into a
+// GAMUT_LUT_W x GAMUT_LUT_H table, read by a consumer on a lookup input.
+//
+// Why this pays: a gamut-compressing tone mapper runs that search dozens of
+// times per out-of-gamut pixel, and on real wide-gamut HDR content the
+// searches dominate its cost. B depends on (I, hue, peak, target gamut) and on NOTHING in the image,
+// so it can be built once and reused for every frame until the display's SDR
+// white or the target gamut changes -- 32K entries instead of millions of
+// pixels. One table is ONE target: an sRGB and a P3 consumer each want
+// their own LUT node (a rebuild is ~0.04 ms of GPU, so the graph is the cache).
+//
+// A generator: no image input. The host feeds a 1x1 placeholder at t0 only to
+// satisfy the compute path, and since that placeholder is never dirty this
+// re-dispatches only when SdrWhiteNits or the target moves.
+Texture2D<float4>   Source      : register(t0);   // placeholder, unused
+RWTexture2D<float4> ImageOutput : register(u1);
+
+cbuffer constants : register(b0)
+{
+    uint  Width;          // auto-injected from input #0 (the 1x1 placeholder)
+    uint  Height;
+    uint  OutputWidth;    // hidden default == GAMUT_LUT_W
+    uint  OutputHeight;   // hidden default == GAMUT_LUT_H
+    float SdrWhiteNits;   // MUST match the consumer's, or it refuses the table
+    uint   TargetGamut;   // likewise -- same meaning as the consumer's
+    float2 RedPrimary;    // Custom only
+    float2 GreenPrimary;
+    float2 BluePrimary;
+    float2 WhitePoint;
+};
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    // Every cbuffer member is read before any branch: the compiler strips
+    // members not referenced on all paths (see CLAUDE.md). But the bounds
+    // come from GAMUT_LUT_W/H -- the constants the READER indexes with --
+    // not from the packed OutputWidth/Height. Whether a texel gets written
+    // must not depend on a cbuffer value: the runner clears this texture
+    // before every dispatch, so a dispatch that skips its writes leaves a
+    // blank table behind. With the bounds fixed, the only cbuffer-dependent
+    // output is the stamp, which the consumer checks anyway.
+    uint  sizeTouch = OutputWidth + OutputHeight + Width + Height;
+    float W         = max(SdrWhiteNits, 1.0);
+    TargetXf tg     = MakeTargetXf(TargetGamut, RedPrimary, GreenPrimary, BluePrimary, WhitePoint);
+    if (id.x >= GAMUT_LUT_W || id.y >= GAMUT_LUT_H) return;
+
+    float peakCh  = W / 80.0;
+    float peakOut = NitsToI(W);
+    float hue = ((id.x + 0.5) / GAMUT_LUT_W) * 6.28318530718 - 3.14159265359;
+    float I   = GamutLutRowToI(id.y / float(GAMUT_LUT_H - 1), peakOut);
+    float B   = CubeBoundaryRadius(I, float2(cos(hue), sin(hue)), peakCh, tg);
+
+    // .g / .b / .a are the stamp a consumer checks before trusting this:
+    // .a is the target's fingerprint, computed by the same MakeTargetXf the
+    // consumer runs, so a table for another gamut is refused.
+    // sizeTouch * 0 keeps the size members referenced without affecting it.
+    ImageOutput[id.xy] = float4(B, peakCh + sizeTouch * 0.0, peakOut, tg.fingerprint);
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"ICtCp Gamut Boundary LUT";
+            desc.effectId = L"ICtCp Gamut Boundary LUT"; desc.effectVersion = 2;
+            desc.category = L"Analysis";
+            desc.subcategory = L"Tone Mapping";
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            // 8x8, so the evaluator tiles the dispatch across the table rather
+            // than running it as a single group.
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
+            desc.hlslSource = colorMath + GamutBoundaryHLSL() + gamutLutMainHLSL;
+            desc.inputNames = {};   // a generator
+            desc.parameters = {
+                { L"SdrWhiteNits", L"float", 200.0f, 80.0f, 1000.0f, 1.0f },
+                // Target gamut. Custom takes primaries + white point -- bind
+                // them to Working Space.RedPrimary / GreenPrimary / BluePrimary
+                // / WhitePoint to fit a specific panel. A non-D65 white is
+                // reached by Bradford adaptation (see MakeTargetXf).
+                { L"TargetGamut",  L"float", 0.0f, 0.0f, 3.0f, 1.0f, { L"sRGB", L"Display P3", L"BT.2020", L"Custom" } },
+                { L"RedPrimary",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.64f,   0.33f   }, 0.0f, 1.0f, 0.0001f, {}, L"TargetGamut == 3" },
+                { L"GreenPrimary", L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.30f,   0.60f   }, 0.0f, 1.0f, 0.0001f, {}, L"TargetGamut == 3" },
+                { L"BluePrimary",  L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.15f,   0.06f   }, 0.0f, 1.0f, 0.0001f, {}, L"TargetGamut == 3" },
+                { L"WhitePoint",   L"float2", winrt::Windows::Foundation::Numerics::float2{ 0.3127f, 0.3290f }, 0.0f, 1.0f, 0.0001f, {}, L"TargetGamut == 3" },
+            };
+            // Fixed, not user-editable: a consumer indexes the table with
+            // the same constants, so a resized table would be read wrongly.
+            desc.hiddenDefaults = {
+                { L"OutputWidth",  Graph::PropertyValue{ kGamutLutW } },
+                { L"OutputHeight", Graph::PropertyValue{ kGamutLutH } },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2137,9 +2849,17 @@ cbuffer constants : register(b0) {
     float Gain;       // default 1000
 };
 
-float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
+float4 main(
+    float4 pos      : SV_POSITION,
+    float4 scenePos : SCENE_POSITION,
+    float4 uv0      : TEXCOORD0) : SV_Target
 {
-    float4 color = Source.Load(int3(uv, 0));
+    // This one mattered more than most: with the old two-parameter signature
+    // the Load() read out of bounds and returned 0, so diff = abs(back - 0)*Gain
+    // came out BLACK -- which this effect defines as "round trip is correct".
+    // The suite's one free correctness oracle was reporting a pass while
+    // reading transparent padding.
+    float4 color = Source.Sample(Sampler, uv0.xy);
     float3 ictcp = ScRGBToICtCp(color.rgb);
     float3 back  = ICtCpToScRGB(ictcp);
     float3 diff  = abs(back - color.rgb) * Gain;
@@ -2148,7 +2868,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Round-Trip Validator";
-            desc.effectId = L"ICtCp Round-Trip Validator"; desc.effectVersion = 3;
+            desc.effectId = L"ICtCp Round-Trip Validator"; desc.effectVersion = 4;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2199,6 +2919,7 @@ cbuffer constants : register(b0) {
     SHADERLAB_PARAM(float, TargetPeakNits)        // SDR target peak (e.g. 80, 203)
     float  Strength;                              // 0..1 lerp from identity to compressed+lifted
     float  ToneLift;                              // 0..1 mid-tone lift
+    float  KneeNits;                              // identity below this; 0 = compress from black
 };
 
 [numthreads(8, 8, 1)]
@@ -2214,7 +2935,27 @@ void main(uint3 dtid : SV_DispatchThreadID)
 
     float peakIn  = NitsToI(SourcePeakNits);
     float peakOut = NitsToI(TargetPeakNits);
-    float compressed = ReinhardCompressI(ictcp.x, peakIn, peakOut);
+
+    // Optional knee (BT.2390-EETF-style): content at or below KneeNits
+    // passes through UNCHANGED; only [knee, SourcePeak] compresses into
+    // [knee, TargetPeak]. This is the mixed-content-safe shape for the
+    // primary screenshot workflow — an HDR capture of a mixed SDR/HDR
+    // desktop converts to SDR with the SDR windows kept at their
+    // presentation brightness while true-HDR highlights roll off into
+    // the remaining headroom. The shifted Reinhard has slope 1 at the
+    // knee (C1-continuous). KneeNits = 0 reproduces the classic
+    // compress-from-black curve exactly.
+    float kneeI = NitsToI(clamp(KneeNits, 0.0, TargetPeakNits * 0.999));
+    float compressed;
+    if (ictcp.x <= kneeI || peakIn <= peakOut)
+    {
+        compressed = ictcp.x;
+    }
+    else
+    {
+        compressed = kneeI + ReinhardCompressI(
+            ictcp.x - kneeI, peakIn - kneeI, peakOut - kneeI);
+    }
 
     // Anchored polynomial lift in I-space, applied AFTER compression.
     // Curve: f(x) = x + a*x*(1-x), evaluated in normalized [0, peakOut]
@@ -2236,7 +2977,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Tone Map (HDR -> SDR)";
-            desc.effectId = L"ICtCp Tone Map"; desc.effectVersion = 12;
+            desc.effectId = L"ICtCp Tone Map"; desc.effectVersion = 14;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -2255,6 +2996,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
                 Graph::ParameterDefinition{ L"TargetPeakNits", L"float",  203.0f,  80.0f,   500.0f,  1.0f, {}, L"", true },
                 Graph::ParameterDefinition{ L"Strength",       L"float",    1.0f,   0.0f,     1.0f, 0.05f },
                 Graph::ParameterDefinition{ L"ToneLift",       L"float",    0.0f,   0.0f,     1.0f, 0.05f },
+                Graph::ParameterDefinition{ L"KneeNits",       L"float",    0.0f,   0.0f,   500.0f,  1.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2281,6 +3023,7 @@ cbuffer constants : register(b0) {
     SHADERLAB_PARAM(float, TargetPeakNits)        // typical 1000-10000
     float  Strength;                              // 0..1 lerp from identity to expanded
     float  DiffuseWhiteNits;                      // shadow/mid anchor (HDR paper white)
+    float  KneeNits;                              // identity below this; 0 = expand from black
 };
 
 [numthreads(8, 8, 1)]
@@ -2300,17 +3043,43 @@ void main(uint3 dtid : SV_DispatchThreadID)
     // [0, sdrI] (SDR range); the helper returns I in [0, hdrI] (HDR).
     float sdrI = NitsToI(SourcePeakNits);
     float hdrI = NitsToI(TargetPeakNits);
-    float expanded = ReinhardExpandI(ictcp.x, hdrI, sdrI);
+
+    // Optional knee: content at or below KneeNits passes through
+    // UNCHANGED; only the range above expands toward the target peak.
+    // This is the mixed-content-safe shape (BT.2390-style): an image
+    // whose "SDR chunk" is already presentation-referenced (e.g. white
+    // level boosted, or a mixed SDR/HDR composite) keeps that region
+    // intact instead of blowing everything above SourcePeakNits to the
+    // peak. The shifted inverse-Reinhard has slope 1 at the knee, so
+    // the curve is C1-continuous there. KneeNits = 0 reproduces the
+    // classic expand-from-black curve exactly.
+    float kneeI = NitsToI(clamp(KneeNits, 0.0, SourcePeakNits * 0.999));
+    float expanded;
+    if (ictcp.x <= kneeI || hdrI <= sdrI)
+    {
+        expanded = ictcp.x;
+    }
+    else
+    {
+        expanded = kneeI + ReinhardExpandI(
+            ictcp.x - kneeI, hdrI - kneeI, sdrI - kneeI);
+    }
 
     // Shadow/mid anchor: the pure inverse-Reinhard has slope 1 at black
     // in I-space, so shadows keep their SDR nit levels while the rest of
     // the picture expands -- perceptually crushed blacks. Let the low end
     // instead scale like an SDR presentation at DiffuseWhiteNits paper
     // white (nits x D/S, the BT.2446-style lift), and let the expansion
-    // curve take over wherever it exceeds that.
-    float diffuseScale = max(DiffuseWhiteNits, 1.0) / max(SourcePeakNits, 1.0);
-    float lifted = NitsToI(IToNits(ictcp.x) * diffuseScale);
-    expanded = min(max(expanded, lifted), hdrI);
+    // curve take over wherever it exceeds that. Skipped when a knee is
+    // set -- the knee's contract is bit-exact identity below it, which
+    // a lift would violate.
+    if (KneeNits < 1.0)
+    {
+        float diffuseScale = max(DiffuseWhiteNits, 1.0) / max(SourcePeakNits, 1.0);
+        float lifted = NitsToI(IToNits(ictcp.x) * diffuseScale);
+        expanded = max(expanded, lifted);
+    }
+    expanded = min(expanded, hdrI);
 
     ictcp.x = lerp(ictcp.x, expanded, saturate(Strength));
 
@@ -2320,7 +3089,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Inverse Tone Map (SDR -> HDR)";
-            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 12;
+            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 14;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -2335,6 +3104,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
                 Graph::ParameterDefinition{ L"TargetPeakNits", L"float", 1000.0f,  100.0f, 10000.0f, 50.0f, {}, L"", true },
                 Graph::ParameterDefinition{ L"Strength",       L"float",    1.0f,    0.0f,     1.0f, 0.05f },
                 Graph::ParameterDefinition{ L"DiffuseWhiteNits", L"float",  203.0f,   80.0f,   400.0f, 1.0f },
+                Graph::ParameterDefinition{ L"KneeNits",       L"float",    0.0f,    0.0f,   500.0f,  1.0f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2354,9 +3124,12 @@ cbuffer constants : register(b0) {
     float Saturation;   // 1.0 = identity, 0.0 = grayscale, >1 = boosted
 };
 
-float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
+float4 main(
+    float4 pos      : SV_POSITION,
+    float4 scenePos : SCENE_POSITION,
+    float4 uv0      : TEXCOORD0) : SV_Target
 {
-    float4 color = Source.Load(int3(uv, 0));
+    float4 color = Source.Sample(Sampler, uv0.xy);
     float3 ictcp = ScRGBToICtCp(color.rgb);
     ictcp.y *= Saturation;
     ictcp.z *= Saturation;
@@ -2366,7 +3139,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Saturation";
-            desc.effectId = L"ICtCp Saturation"; desc.effectVersion = 2;
+            desc.effectId = L"ICtCp Saturation"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2431,7 +3204,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Highlight Desaturation";
-            desc.effectId = L"ICtCp Highlight Desaturation"; desc.effectVersion = 4;
+            desc.effectId = L"ICtCp Highlight Desaturation"; desc.effectVersion = 5;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -2469,15 +3242,16 @@ void main(uint3 dtid : SV_DispatchThreadID)
 //
 // LineWidth controls the dividing line thickness in pixels.
 //
-// Inputs of mismatched dimensions are stretched to the union output rect
-// via normalized-UV Sample() (linear-filtered) -- so feeding e.g. a
-// 4K source on ImageA and a 1080p tone-mapped result on ImageB still
-// fills both halves of the wipe, instead of returning black for any
-// out-of-bounds Load on the smaller input.
+// Both inputs are read at the output coordinate. The effect runs with
+// D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING, whose contract is that a pixel
+// shader reads its inputs 1:1 with the output; an input smaller than the
+// union output rect therefore covers only its own region and reads black
+// elsewhere. Put a Scale node upstream to compare branches of differing
+// size.
 
 Texture2D ImageA : register(t0);
 Texture2D ImageB : register(t1);
-SamplerState LinearSampler : register(s0);
+SamplerState InputSampler : register(s0);
 
 cbuffer Constants : register(b0)
 {
@@ -2488,50 +3262,33 @@ cbuffer Constants : register(b0)
                            // 45 = top-left-to-bottom-right diagonal
     float OutputW;         // host-injected: union of input *content* widths
     float OutputH;         // host-injected: union of input *content* heights
-    // Per-input content dimensions. D2D pixel-shader inputs live inside
-    // atlas allocations that are larger than the actual content rect (e.g.
-    // 1920x1080 content in a 4096x4096 atlas). [0,1] UV with Sample() maps
-    // to the full atlas, so we have to scale by content/atlas to land on
-    // the content sub-rect.
-    float ImageAW;
-    float ImageAH;
-    float ImageBW;
-    float ImageBH;
 };
 
 float4 main(
-    float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+    float4 pos      : SV_POSITION,
+    float4 scenePos : SCENE_POSITION,
+    float4 uv0      : TEXCOORD0,
+    float4 uv1      : TEXCOORD1) : SV_TARGET
 {
-    // Use the host-supplied output dimensions, not GetDimensions(), since
-    // D2D pads input textures to atlas allocation sizes (e.g. 4096x4096
-    // when the actual output rect is 3840x2160). uv0 is in true pixel
-    // coords thanks to D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING.
+    // THE two-input displacement bug, and the reason it looked like a
+    // two-input problem rather than a signature problem. D2D gives each input
+    // its OWN texel coordinate -- TEXCOORD0 for input 0, TEXCOORD1 for input 1
+    // -- after SV_POSITION and SCENE_POSITION. This shader declared neither
+    // SCENE_POSITION nor TEXCOORD1, so the single parameter it called uv0
+    // received the SCENE coordinate and was then used to Load() BOTH inputs.
+    // Whenever an input's content did not fill D2D's intermediate allocation,
+    // that coordinate was offset by -(intermediate - content)/2 and both
+    // images sampled from the wrong place.
+    //
+    // Use the host-supplied output dimensions, not GetDimensions(), since D2D
+    // pads input textures to atlas allocation sizes (e.g. 4096x4096 when the
+    // actual output rect is 3840x2160).
     float W = max(OutputW, 1.0);
     float H = max(OutputH, 1.0);
 
-    // Sample each input through its own atlas-aware UV. Logic:
-    //   uvNormOutput = uv0 / (W,H)              -> [0,1] across the wipe canvas
-    //   contentUV    = uvNormOutput * contentSize  -> pixel coords within
-    //                                                 the input's content rect
-    //   atlasUV      = contentUV / atlasSize    -> [0..content/atlas] within
-    //                                                 the actual D2D texture
-    // For exactly-sized inputs (compute outputs) atlas == content so atlasUV
-    // is the simple [0,1] mapping. For atlas-padded inputs (D2D pixel-shader
-    // outputs), atlas > content so atlasUV is < 1 and stays within content.
-    float2 atlasA, atlasB;
-    ImageA.GetDimensions(atlasA.x, atlasA.y);
-    ImageB.GetDimensions(atlasB.x, atlasB.y);
-    atlasA = max(atlasA, float2(1.0, 1.0));
-    atlasB = max(atlasB, float2(1.0, 1.0));
-
-    float2 uvA = uv0.xy * float2(max(ImageAW, 1.0), max(ImageAH, 1.0))
-               / (float2(W, H) * atlasA);
-    float2 uvB = uv0.xy * float2(max(ImageBW, 1.0), max(ImageBH, 1.0))
-               / (float2(W, H) * atlasB);
-
-    float4 a = ImageA.Sample(LinearSampler, uvA);
-    float4 b = ImageB.Sample(LinearSampler, uvB);
+    // Each input sampled with its own normalized coordinate.
+    float4 a = ImageA.Sample(InputSampler, uv0.xy);
+    float4 b = ImageB.Sample(InputSampler, uv1.xy);
 
     // Direction vector along which we project pixel positions.
     float radians = Angle * 3.14159265 / 180.0;
@@ -2541,7 +3298,8 @@ float4 main(
     // SplitPosition = 0..1 sweeps the wipe across the full extent of
     // the image *along* the dir vector, with 0.5 always pivoting on
     // the geometric image center regardless of angle.
-    float2 p = uv0.xy - float2(W * 0.5, H * 0.5);
+    // scenePos, not uv0: the wipe is defined in pixels, and uv0 is normalized.
+    float2 p = scenePos.xy - float2(W * 0.5, H * 0.5);
     float projPx  = dot(p, dir);
     float halfMax = 0.5 * (abs(dir.x) * W + abs(dir.y) * H);
     float projNorm = saturate(projPx / max(halfMax * 2.0, 1.0) + 0.5);
@@ -2562,7 +3320,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Split Comparison";
-            desc.effectId = L"Split Comparison"; desc.effectVersion = 6;
+            desc.effectId = L"Split Comparison"; desc.effectVersion = 8;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2572,15 +3330,12 @@ float4 main(
                 { L"SplitPosition", L"float",   0.5f,    0.0f,   1.0f,  0.01f },
                 { L"LineWidth",     L"float",   2.0f,    0.0f,  10.0f,  0.5f },
                 { L"Angle",         L"float",   0.0f, -360.0f, 360.0f,  1.0f },
-                // Hidden: host writes actual output-rect dimensions and
-                // per-input content dimensions every frame (see
-                // GraphEvaluator's pixel-shader eval).
+                // Hidden: host writes the actual output-rect dimensions
+                // every frame (see GraphEvaluator's pixel-shader eval).
+                // The per-input ImageAW/AH/BW/BH pair dropped in v7 along
+                // with the atlas-compensating Sample() path.
                 Graph::ParameterDefinition{ L"OutputW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
                 Graph::ParameterDefinition{ L"OutputH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
-                Graph::ParameterDefinition{ L"ImageAW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
-                Graph::ParameterDefinition{ L"ImageAH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
-                Graph::ParameterDefinition{ L"ImageBW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
-                Graph::ParameterDefinition{ L"ImageBH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2596,14 +3351,19 @@ float4 main(
 // per-luminance stats use Luminance Statistics; for chromaticity stats
 // use Chromaticity Statistics.
 //
-// 32x32 = 1024 threads, dispatched as (1,1,1).
-// Each thread strides across the full image, reduces in groupshared,
-// then thread 0 computes median/P95 from a 256-bin histogram CDF.
+// Multi-group reduction (SHADERLAB_REDUCE_SCRATCH): SHADERLAB_REDUCE_GROUPS
+// groups of 32x32 threads each take every G-th row, reduce into groupshared,
+// and write a partial block to scratch; the last group to finish folds the
+// partials and computes median/P95 from the merged 256-bin histogram. It
+// used to be ONE group walking the whole frame on a single CU.
 //
 // Result[0..6]: Min, Max, Mean, Median, P95, Samples, Nonzero%
 
+#include "shaderlab_params.hlsli"
+
 Texture2D<float4> Source : register(t0);
 RWStructuredBuffer<float4> Result : register(u0);
+SHADERLAB_REDUCE_SCRATCH
 
 cbuffer Constants : register(b0)
 {
@@ -2617,6 +3377,11 @@ cbuffer Constants : register(b0)
 #define THREAD_COUNT (GROUP_SIZE * GROUP_SIZE)
 #define HIST_BINS 256
 #define HIST_MAX 100.0
+
+// Scratch words: per-group partial blocks, then per-group histograms.
+#define PART_STRIDE 8
+#define PART_BASE   SHADERLAB_REDUCE_CLEARED
+#define HIST_BASE   (PART_BASE + SHADERLAB_REDUCE_GROUPS * PART_STRIDE)
 
 groupshared float gs_min[THREAD_COUNT];
 groupshared float gs_max[THREAD_COUNT];
@@ -2634,10 +3399,29 @@ float GetValue(float4 pix, uint ch)
     return pix.a;
 }
 
+void ReduceShared(uint tid)
+{
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = THREAD_COUNT / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            gs_min[tid] = min(gs_min[tid], gs_min[tid + stride]);
+            gs_max[tid] = max(gs_max[tid], gs_max[tid + stride]);
+            gs_sum[tid] += gs_sum[tid + stride];
+            gs_count[tid] += gs_count[tid + stride];
+            gs_total[tid] += gs_total[tid + stride];
+            gs_nonzero[tid] += gs_nonzero[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
 [numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
-void main(uint3 GTid : SV_GroupThreadID)
+void main(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
 {
     uint tid = GTid.x + GTid.y * GROUP_SIZE;
+    uint g = Gid.x;
 
     for (uint bi = tid; bi < HIST_BINS; bi += THREAD_COUNT)
         gs_hist[bi] = 0;
@@ -2650,9 +3434,9 @@ void main(uint3 GTid : SV_GroupThreadID)
     uint  tTotal = 0;
     uint  tNonzero = 0;
 
-    for (uint y = GTid.y; y < Height; y += GROUP_SIZE)
+    for (uint y = g; y < Height; y += SHADERLAB_REDUCE_GROUPS)
     {
-        for (uint x = GTid.x; x < Width; x += GROUP_SIZE)
+        for (uint x = tid; x < Width; x += THREAD_COUNT)
         {
             float4 pix = Source.Load(int3(x, y, 0));
             float v = GetValue(pix, Channel);
@@ -2679,21 +3463,49 @@ void main(uint3 GTid : SV_GroupThreadID)
     gs_count[tid] = tCount;
     gs_total[tid] = tTotal;
     gs_nonzero[tid] = tNonzero;
-    GroupMemoryBarrierWithGroupSync();
+    ReduceShared(tid);
 
-    for (uint stride = THREAD_COUNT / 2; stride > 0; stride >>= 1)
+    // This group's partial block + histogram.
+    uint pb = PART_BASE + g * PART_STRIDE;
+    if (tid == 0)
     {
-        if (tid < stride)
-        {
-            gs_min[tid] = min(gs_min[tid], gs_min[tid + stride]);
-            gs_max[tid] = max(gs_max[tid], gs_max[tid + stride]);
-            gs_sum[tid] += gs_sum[tid + stride];
-            gs_count[tid] += gs_count[tid + stride];
-            gs_total[tid] += gs_total[tid + stride];
-            gs_nonzero[tid] += gs_nonzero[tid + stride];
-        }
-        GroupMemoryBarrierWithGroupSync();
+        ShaderLabScratchStore(pb + 0, asuint(gs_min[0]));
+        ShaderLabScratchStore(pb + 1, asuint(gs_max[0]));
+        ShaderLabScratchStore(pb + 2, asuint(gs_sum[0]));
+        ShaderLabScratchStore(pb + 3, gs_count[0]);
+        ShaderLabScratchStore(pb + 4, gs_total[0]);
+        ShaderLabScratchStore(pb + 5, gs_nonzero[0]);
     }
+    for (uint hb = tid; hb < HIST_BINS; hb += THREAD_COUNT)
+        ShaderLabScratchStore(HIST_BASE + g * HIST_BINS + hb, gs_hist[hb]);
+
+    if (!ShaderLabReduceIsLastGroup(tid))
+        return;
+
+    // Last group: fold every group's partials.
+    if (tid < SHADERLAB_REDUCE_GROUPS)
+    {
+        uint b2 = PART_BASE + tid * PART_STRIDE;
+        gs_min[tid]     = asfloat(ShaderLabScratchLoad(b2 + 0));
+        gs_max[tid]     = asfloat(ShaderLabScratchLoad(b2 + 1));
+        gs_sum[tid]     = asfloat(ShaderLabScratchLoad(b2 + 2));
+        gs_count[tid]   = ShaderLabScratchLoad(b2 + 3);
+        gs_total[tid]   = ShaderLabScratchLoad(b2 + 4);
+        gs_nonzero[tid] = ShaderLabScratchLoad(b2 + 5);
+    }
+    else
+    {
+        gs_min[tid] = 1e30; gs_max[tid] = -1e30; gs_sum[tid] = 0;
+        gs_count[tid] = 0; gs_total[tid] = 0; gs_nonzero[tid] = 0;
+    }
+    for (uint fb = tid; fb < HIST_BINS; fb += THREAD_COUNT)
+    {
+        uint s = 0;
+        for (uint gg = 0; gg < SHADERLAB_REDUCE_GROUPS; ++gg)
+            s += ShaderLabScratchLoad(HIST_BASE + gg * HIST_BINS + fb);
+        gs_hist[fb] = s;
+    }
+    ReduceShared(tid);
 
     if (tid == 0)
     {
@@ -2735,7 +3547,7 @@ void main(uint3 GTid : SV_GroupThreadID)
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"Channel Statistics";
-            desc.effectId = L"Channel Statistics"; desc.effectVersion = 1;
+            desc.effectId = L"Channel Statistics"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.subcategory = L"Statistics";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -2768,7 +3580,16 @@ void main(uint3 GTid : SV_GroupThreadID)
             static const std::string luminanceStatsHLSL = R"HLSL(
 // Luminance Statistics - D3D11 Compute Shader
 // Outputs (in nits when Units = 1, normalized otherwise):
-//   Min, Max, Mean, Median, P95, P99, AvgLog, ClippedFraction, Samples
+//   Min, Max, Mean, Median, P95, P99, AvgLog, ClippedFraction, Samples,
+//   WhiteErrorBudget
+//
+// WhiteErrorBudget = min(ClippedFraction * BudgetScale, BudgetMax), computed
+// HERE rather than in a downstream Numeric Expression node. That is a
+// performance decision, not a tidiness one: Numeric Expression evaluates on
+// the CPU, so binding it to ClippedFraction forces this node's analysis buffer
+// through a GPU->CPU Map() every frame -- measured at 10.2 ms of CPU stall per
+// frame at 5.2 Mpx, because the Map waits on the GPU and destroys CPU/GPU
+// overlap. Producing the value on the GPU removes that consumer entirely.
 //
 // Units enum:
 //   0 = Normalized (scRGB Y, where 1.0 = SDR white = 80 nits)
@@ -2776,8 +3597,16 @@ void main(uint3 GTid : SV_GroupThreadID)
 //
 // ClippedFraction: fraction of pixels whose luminance >= ClipNits.
 
+// Multi-group reduction (SHADERLAB_REDUCE_SCRATCH): SHADERLAB_REDUCE_GROUPS
+// groups each take every G-th row and write a partial block; the last group
+// to finish folds them. It used to be ONE 32x32 group walking the whole frame
+// on a single CU -- 1-6 ms at 4K for what is a memory-bound scan.
+
+#include "shaderlab_params.hlsli"
+
 Texture2D<float4> Source : register(t0);
 RWStructuredBuffer<float4> Result : register(u0);
+SHADERLAB_REDUCE_SCRATCH
 
 cbuffer Constants : register(b0)
 {
@@ -2785,6 +3614,8 @@ cbuffer Constants : register(b0)
     uint Height;
     uint Units;        // 0 = Normalized, 1 = Nits
     float ClipNits;
+    float BudgetScale; // dE ITP of white error to spend per unit clipped
+    float BudgetMax;   // ceiling, matching WhiteErrorBudget's own max
 };
 
 #define GROUP_SIZE 32
@@ -2796,6 +3627,11 @@ cbuffer Constants : register(b0)
 #define LOG_MIN   -2.0
 #define LOG_RANGE 8.0
 
+// Scratch words: per-group partial blocks, then per-group histograms.
+#define PART_STRIDE 8
+#define PART_BASE   SHADERLAB_REDUCE_CLEARED
+#define HIST_BASE   (PART_BASE + SHADERLAB_REDUCE_GROUPS * PART_STRIDE)
+
 groupshared float gs_min[THREAD_COUNT];
 groupshared float gs_max[THREAD_COUNT];
 groupshared float gs_sum[THREAD_COUNT];
@@ -2804,10 +3640,29 @@ groupshared uint  gs_count[THREAD_COUNT];
 groupshared uint  gs_clipped[THREAD_COUNT];
 groupshared uint  gs_hist[HIST_BINS];
 
+void ReduceShared(uint tid)
+{
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = THREAD_COUNT / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            gs_min[tid] = min(gs_min[tid], gs_min[tid + stride]);
+            gs_max[tid] = max(gs_max[tid], gs_max[tid + stride]);
+            gs_sum[tid] += gs_sum[tid + stride];
+            gs_logsum[tid] += gs_logsum[tid + stride];
+            gs_count[tid] += gs_count[tid + stride];
+            gs_clipped[tid] += gs_clipped[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
 [numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
-void main(uint3 GTid : SV_GroupThreadID)
+void main(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
 {
     uint tid = GTid.x + GTid.y * GROUP_SIZE;
+    uint g = Gid.x;
 
     for (uint bi = tid; bi < HIST_BINS; bi += THREAD_COUNT)
         gs_hist[bi] = 0;
@@ -2823,9 +3678,9 @@ void main(uint3 GTid : SV_GroupThreadID)
     uint  tCount = 0;
     uint  tClipped = 0;
 
-    for (uint y = GTid.y; y < Height; y += GROUP_SIZE)
+    for (uint y = g; y < Height; y += SHADERLAB_REDUCE_GROUPS)
     {
-        for (uint x = GTid.x; x < Width; x += GROUP_SIZE)
+        for (uint x = tid; x < Width; x += THREAD_COUNT)
         {
             float4 pix = Source.Load(int3(x, y, 0));
             float Y = max(0.0, dot(pix.rgb, float3(0.2126, 0.7152, 0.0722)));
@@ -2835,10 +3690,10 @@ void main(uint3 GTid : SV_GroupThreadID)
             tMin = min(tMin, nits);
             tMax = max(tMax, nits);
             tSum += nits;
-            tLogSum += log10(max(nits, 1e-4));
+            float lv = log10(max(nits, 1e-4));
+            tLogSum += lv;
             if (nits >= clipNitsResolved) tClipped++;
 
-            float lv = log10(max(nits, 1e-4));
             float t = (lv - LOG_MIN) / LOG_RANGE;
             uint bin = clamp((uint)(saturate(t) * (HIST_BINS - 1)), 0u, (uint)(HIST_BINS - 1));
             InterlockedAdd(gs_hist[bin], 1u);
@@ -2851,21 +3706,48 @@ void main(uint3 GTid : SV_GroupThreadID)
     gs_logsum[tid] = tLogSum;
     gs_count[tid] = tCount;
     gs_clipped[tid] = tClipped;
-    GroupMemoryBarrierWithGroupSync();
+    ReduceShared(tid);
 
-    for (uint stride = THREAD_COUNT / 2; stride > 0; stride >>= 1)
+    uint pb = PART_BASE + g * PART_STRIDE;
+    if (tid == 0)
     {
-        if (tid < stride)
-        {
-            gs_min[tid] = min(gs_min[tid], gs_min[tid + stride]);
-            gs_max[tid] = max(gs_max[tid], gs_max[tid + stride]);
-            gs_sum[tid] += gs_sum[tid + stride];
-            gs_logsum[tid] += gs_logsum[tid + stride];
-            gs_count[tid] += gs_count[tid + stride];
-            gs_clipped[tid] += gs_clipped[tid + stride];
-        }
-        GroupMemoryBarrierWithGroupSync();
+        ShaderLabScratchStore(pb + 0, asuint(gs_min[0]));
+        ShaderLabScratchStore(pb + 1, asuint(gs_max[0]));
+        ShaderLabScratchStore(pb + 2, asuint(gs_sum[0]));
+        ShaderLabScratchStore(pb + 3, asuint(gs_logsum[0]));
+        ShaderLabScratchStore(pb + 4, gs_count[0]);
+        ShaderLabScratchStore(pb + 5, gs_clipped[0]);
     }
+    for (uint hb = tid; hb < HIST_BINS; hb += THREAD_COUNT)
+        ShaderLabScratchStore(HIST_BASE + g * HIST_BINS + hb, gs_hist[hb]);
+
+    if (!ShaderLabReduceIsLastGroup(tid))
+        return;
+
+    // Last group: fold every group's partials.
+    if (tid < SHADERLAB_REDUCE_GROUPS)
+    {
+        uint b2 = PART_BASE + tid * PART_STRIDE;
+        gs_min[tid]     = asfloat(ShaderLabScratchLoad(b2 + 0));
+        gs_max[tid]     = asfloat(ShaderLabScratchLoad(b2 + 1));
+        gs_sum[tid]     = asfloat(ShaderLabScratchLoad(b2 + 2));
+        gs_logsum[tid]  = asfloat(ShaderLabScratchLoad(b2 + 3));
+        gs_count[tid]   = ShaderLabScratchLoad(b2 + 4);
+        gs_clipped[tid] = ShaderLabScratchLoad(b2 + 5);
+    }
+    else
+    {
+        gs_min[tid] = 1e30; gs_max[tid] = -1e30; gs_sum[tid] = 0;
+        gs_logsum[tid] = 0; gs_count[tid] = 0; gs_clipped[tid] = 0;
+    }
+    for (uint fb = tid; fb < HIST_BINS; fb += THREAD_COUNT)
+    {
+        uint s = 0;
+        for (uint gg = 0; gg < SHADERLAB_REDUCE_GROUPS; ++gg)
+            s += ShaderLabScratchLoad(HIST_BASE + gg * HIST_BINS + fb);
+        gs_hist[fb] = s;
+    }
+    ReduceShared(tid);
 
     if (tid == 0)
     {
@@ -2911,12 +3793,19 @@ void main(uint3 GTid : SV_GroupThreadID)
         Result[6] = float4(fAvgLog * scale, 0, 0, 0);
         Result[7] = float4(clippedFrac, 0, 0, 0);
         Result[8] = float4(float(totalSamples), 0, 0, 0);
+        // Adaptive white-error budget (a dE ITP allowance that grows with
+        // the clipped fraction), ready to bind straight into a consumer's
+        // gpu-bindable parameter with nothing CPU-side in between. Clamped here so a consumer cannot be handed a value
+        // outside the parameter's declared range.
+        Result[9] = float4(
+            clamp(min(clippedFrac * BudgetScale, BudgetMax), 0.0, BudgetMax),
+            0, 0, 0);
     }
 }
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"Luminance Statistics";
-            desc.effectId = L"Luminance Statistics"; desc.effectVersion = 2;
+            desc.effectId = L"Luminance Statistics"; desc.effectVersion = 4;
             desc.category = L"Analysis";
             desc.subcategory = L"Statistics";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -2926,6 +3815,8 @@ void main(uint3 GTid : SV_GroupThreadID)
             desc.parameters = {
                 { L"Units",      L"float", 1.0f,    0.0f, 1.0f,    1.0f, { L"Normalized", L"Nits" } },
                 { L"ClipNits",   L"float", 203.0f, 10.0f, 10000.0f, 1.0f },
+                { L"BudgetScale", L"float", 15.0f,  0.0f, 100.0f,   0.5f },
+                { L"BudgetMax",   L"float", 20.0f,  0.0f, 100.0f,   0.5f },
             };
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
             desc.analysisFields = {
@@ -2938,6 +3829,7 @@ void main(uint3 GTid : SV_GroupThreadID)
                 { L"AvgLog",          Graph::AnalysisFieldType::Float },
                 { L"ClippedFraction", Graph::AnalysisFieldType::Float },
                 { L"Samples",         Graph::AnalysisFieldType::Float },
+                { L"WhiteErrorBudget", Graph::AnalysisFieldType::Float },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2959,8 +3851,13 @@ void main(uint3 GTid : SV_GroupThreadID)
 //   [4] MeanHueDeg   = degrees from atan2(Cp, Ct), wrapped 0..360
 //   [5] Samples
 
+// Multi-group reduction (SHADERLAB_REDUCE_SCRATCH); see Luminance Statistics.
+
+#include "shaderlab_params.hlsli"
+
 Texture2D<float4> Source : register(t0);
 RWStructuredBuffer<float4> Result : register(u0);
+SHADERLAB_REDUCE_SCRATCH
 
 cbuffer Constants : register(b0)
 {
@@ -2970,6 +3867,8 @@ cbuffer Constants : register(b0)
 
 #define GROUP_SIZE 32
 #define THREAD_COUNT (GROUP_SIZE * GROUP_SIZE)
+#define PART_STRIDE 8
+#define PART_BASE   SHADERLAB_REDUCE_CLEARED
 
 groupshared float gs_ct[THREAD_COUNT];
 groupshared float gs_cp[THREAD_COUNT];
@@ -2979,10 +3878,30 @@ groupshared float gs_huex[THREAD_COUNT];   // accumulator for mean-of-angles via
 groupshared float gs_huey[THREAD_COUNT];
 groupshared uint  gs_count[THREAD_COUNT];
 
+void ReduceShared(uint tid)
+{
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = THREAD_COUNT / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            gs_ct[tid] += gs_ct[tid + stride];
+            gs_cp[tid] += gs_cp[tid + stride];
+            gs_chroma[tid] += gs_chroma[tid + stride];
+            gs_chromaMax[tid] = max(gs_chromaMax[tid], gs_chromaMax[tid + stride]);
+            gs_huex[tid] += gs_huex[tid + stride];
+            gs_huey[tid] += gs_huey[tid + stride];
+            gs_count[tid] += gs_count[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
 [numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
-void main(uint3 GTid : SV_GroupThreadID)
+void main(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
 {
     uint tid = GTid.x + GTid.y * GROUP_SIZE;
+    uint g = Gid.x;
 
     float tCt = 0, tCp = 0;
     float tChroma = 0;
@@ -2990,9 +3909,9 @@ void main(uint3 GTid : SV_GroupThreadID)
     float tHx = 0, tHy = 0;
     uint  tCount = 0;
 
-    for (uint y = GTid.y; y < Height; y += GROUP_SIZE)
+    for (uint y = g; y < Height; y += SHADERLAB_REDUCE_GROUPS)
     {
-        for (uint x = GTid.x; x < Width; x += GROUP_SIZE)
+        for (uint x = tid; x < Width; x += THREAD_COUNT)
         {
             float4 pix = Source.Load(int3(x, y, 0));
             float3 ictcp = ScRGBToICtCp(pix.rgb);
@@ -3020,22 +3939,40 @@ void main(uint3 GTid : SV_GroupThreadID)
     gs_huex[tid] = tHx;
     gs_huey[tid] = tHy;
     gs_count[tid] = tCount;
-    GroupMemoryBarrierWithGroupSync();
+    ReduceShared(tid);
 
-    for (uint stride = THREAD_COUNT / 2; stride > 0; stride >>= 1)
+    uint pb = PART_BASE + g * PART_STRIDE;
+    if (tid == 0)
     {
-        if (tid < stride)
-        {
-            gs_ct[tid] += gs_ct[tid + stride];
-            gs_cp[tid] += gs_cp[tid + stride];
-            gs_chroma[tid] += gs_chroma[tid + stride];
-            gs_chromaMax[tid] = max(gs_chromaMax[tid], gs_chromaMax[tid + stride]);
-            gs_huex[tid] += gs_huex[tid + stride];
-            gs_huey[tid] += gs_huey[tid + stride];
-            gs_count[tid] += gs_count[tid + stride];
-        }
-        GroupMemoryBarrierWithGroupSync();
+        ShaderLabScratchStore(pb + 0, asuint(gs_ct[0]));
+        ShaderLabScratchStore(pb + 1, asuint(gs_cp[0]));
+        ShaderLabScratchStore(pb + 2, asuint(gs_chroma[0]));
+        ShaderLabScratchStore(pb + 3, asuint(gs_chromaMax[0]));
+        ShaderLabScratchStore(pb + 4, asuint(gs_huex[0]));
+        ShaderLabScratchStore(pb + 5, asuint(gs_huey[0]));
+        ShaderLabScratchStore(pb + 6, gs_count[0]);
     }
+
+    if (!ShaderLabReduceIsLastGroup(tid))
+        return;
+
+    if (tid < SHADERLAB_REDUCE_GROUPS)
+    {
+        uint b2 = PART_BASE + tid * PART_STRIDE;
+        gs_ct[tid]        = asfloat(ShaderLabScratchLoad(b2 + 0));
+        gs_cp[tid]        = asfloat(ShaderLabScratchLoad(b2 + 1));
+        gs_chroma[tid]    = asfloat(ShaderLabScratchLoad(b2 + 2));
+        gs_chromaMax[tid] = asfloat(ShaderLabScratchLoad(b2 + 3));
+        gs_huex[tid]      = asfloat(ShaderLabScratchLoad(b2 + 4));
+        gs_huey[tid]      = asfloat(ShaderLabScratchLoad(b2 + 5));
+        gs_count[tid]     = ShaderLabScratchLoad(b2 + 6);
+    }
+    else
+    {
+        gs_ct[tid] = 0; gs_cp[tid] = 0; gs_chroma[tid] = 0; gs_chromaMax[tid] = 0;
+        gs_huex[tid] = 0; gs_huey[tid] = 0; gs_count[tid] = 0;
+    }
+    ReduceShared(tid);
 
     if (tid == 0)
     {
@@ -3061,7 +3998,7 @@ void main(uint3 GTid : SV_GroupThreadID)
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"Chromaticity Statistics";
-            desc.effectId = L"Chromaticity Statistics"; desc.effectVersion = 1;
+            desc.effectId = L"Chromaticity Statistics"; desc.effectVersion = 2;
             desc.category = L"Analysis";
             desc.subcategory = L"Statistics";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -3159,7 +4096,7 @@ void main(uint3 GTid : SV_GroupThreadID)
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Clock";
-            desc.effectId = L"Clock"; desc.effectVersion = 1;
+            desc.effectId = L"Clock"; desc.effectVersion = 2;
             desc.category = L"Parameter";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
             desc.parameters = {
@@ -3168,6 +4105,15 @@ void main(uint3 GTid : SV_GroupThreadID)
                 { L"StopTime",  L"float", 10.0f, 0.0f, 3600.0f, 0.1f },
                 { L"Speed",     L"float", 1.0f, -10.0f, 10.0f, 0.1f },
                 { L"Loop",      L"float", 1.0f, 0.0f, 1.0f, 1.0f, { L"Off", L"On" } },
+                // How often the clock actually EMITS, in Hz. 0 = every frame,
+                // which is what it always did. Above 0, Time and Progress are
+                // quantised to 1/rate and consumers are dirtied only when that
+                // quantised value changes -- so the rate controls how often
+                // downstream work is invalidated, not merely what number is
+                // reported. That distinction is the point: a clock that
+                // dirties every frame makes every downstream node re-run every
+                // frame regardless of how slowly its value is moving.
+                { L"UpdateRate", L"float", 0.0f, 0.0f, 240.0f, 1.0f },
             };
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
             desc.analysisFields = {
@@ -3304,20 +4250,47 @@ float W_gauss(float t) {
     return exp(-(t*t) * 2.0);   // = exp(-t^2 / (2*0.5^2))
 }
 
-[numthreads(8, 8, 1)]
-void main(uint3 dtid : SV_DispatchThreadID)
+float Kernel1D(uint mode, float t) {
+    if      (mode == 0) return W_bilinear(t);
+    else if (mode == 1) return W_catmullrom(t);
+    else if (mode == 2) return W_mitchell(t);
+    else if (mode == 3) return W_lanczos3(t);
+    else if (mode == 4) return W_box(t, 0.5);
+    return W_gauss(t);
+}
+
+// ---- Separable filtering, one dispatch -------------------------------------
+// The kernel is separable (w = wx * wy), so each 8x8 output tile filters the
+// SOURCE rows it needs horizontally into groupshared, then filters those
+// vertically. Rows are streamed through a small buffer CHUNK rows at a time,
+// so any scale ratio works with one code path. Each 1-D weight is evaluated
+// once per tile column / row instead of once per tap, and each source texel
+// is read ~once per tile column instead of once per overlapping output tap:
+// a Lanczos-3 4x downscale went from 625 taps + 2,500 sin per output pixel to
+// ~25. The sum is the same mathematically (sum_y wy * sum_x wx * S) but in a
+// different order, so results differ from the old 2-D loop by rounding only.
+//
+// Groupshared is kept small on purpose: an 8 KB buffer measured an 8x8 tile
+// upscale at 2x the time of the plain per-pixel loop, from occupancy alone.
+#define TILE      8
+#define MAX_R     12
+#define MAX_TAPS  (2 * MAX_R + 1)
+#define CHUNK     16
+groupshared float4 gsH[CHUNK * TILE];
+groupshared float  gsWx[TILE * MAX_TAPS];
+groupshared float  gsWy[TILE * MAX_TAPS];
+
+[numthreads(TILE, TILE, 1)]
+void main(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     // Pass-through when OutputWidth/Height not set: act as identity.
     uint outW = (OutputWidth  > 0) ? OutputWidth  : Width;
     uint outH = (OutputHeight > 0) ? OutputHeight : Height;
-    if (dtid.x >= outW || dtid.y >= outH) return;
+    const bool active = dtid.x < outW && dtid.y < outH;
 
-    // Output pixel center -> source-pixel-center coords.
-    float2 outCenter = float2(dtid.xy) + 0.5;
     float2 outSize   = float2(outW, outH);
     float2 srcSize   = float2(Width, Height);
     float2 ratio     = srcSize / outSize;             // src per dst pixel
-    float2 srcCenter = outCenter * ratio - 0.5;
 
     // For downscale (ratio > 1) we widen the kernel by the ratio so the
     // filter integrates over the *destination footprint* in source pixels;
@@ -3336,44 +4309,86 @@ void main(uint3 dtid : SV_DispatchThreadID)
     // Effective radius in source pixels after widening for downscale.
     float2 effR = baseRadius * support;
     int2   r    = int2(ceil(effR));
-    r = clamp(r, int2(1, 1), int2(12, 12));   // safety cap
+    r = clamp(r, int2(1, 1), int2(MAX_R, MAX_R));   // safety cap
+    const int nx = 2 * r.x + 1;
+    const int ny = 2 * r.y + 1;
 
-    int2 ic = int2(floor(srcCenter));
+    const uint tid = gtid.y * TILE + gtid.x;
+    const uint ox0 = gid.x * TILE;
+    const uint oy0 = gid.y * TILE;
 
-    float4 sum  = float4(0, 0, 0, 0);
-    float  wsum = 0.0;
-
-    [loop]
-    for (int dy = -r.y; dy <= r.y; ++dy)
+    // 1-D weights: one set per tile column (horizontal) and row (vertical),
+    // each at the edge-clamped tap position, exactly as the 2-D loop had.
+    for (uint i = tid; i < (uint)(TILE * nx); i += TILE * TILE)
     {
-        [loop]
-        for (int dx = -r.x; dx <= r.x; ++dx)
-        {
-            int2 sxy = clamp(ic + int2(dx, dy),
-                             int2(0, 0),
-                             int2(int(Width) - 1, int(Height) - 1));
-            float2 t = (float2(sxy) + 0.5 - srcCenter) / support;
-
-            float wx, wy;
-            if      (mode == 0) { wx = W_bilinear(t.x);   wy = W_bilinear(t.y); }
-            else if (mode == 1) { wx = W_catmullrom(t.x); wy = W_catmullrom(t.y); }
-            else if (mode == 2) { wx = W_mitchell(t.x);   wy = W_mitchell(t.y); }
-            else if (mode == 3) { wx = W_lanczos3(t.x);   wy = W_lanczos3(t.y); }
-            else if (mode == 4) { wx = W_box(t.x, 0.5);   wy = W_box(t.y, 0.5); }
-            else                { wx = W_gauss(t.x);      wy = W_gauss(t.y); }
-
-            float w = wx * wy;
-            sum  += Source.Load(int3(sxy, 0)) * w;
-            wsum += w;
-        }
+        uint c = i / (uint)nx, k = i % (uint)nx;
+        float scx = (ox0 + c + 0.5) * ratio.x - 0.5;
+        int   sx  = clamp(int(floor(scx)) + int(k) - r.x, 0, int(Width) - 1);
+        gsWx[c * MAX_TAPS + k] = Kernel1D(mode, (float(sx) + 0.5 - scx) / support.x);
     }
+    for (uint j = tid; j < (uint)(TILE * ny); j += TILE * TILE)
+    {
+        uint c = j / (uint)ny, k = j % (uint)ny;
+        float scy = (oy0 + c + 0.5) * ratio.y - 0.5;
+        int   sy  = clamp(int(floor(scy)) + int(k) - r.y, 0, int(Height) - 1);
+        gsWy[c * MAX_TAPS + k] = Kernel1D(mode, (float(sy) + 0.5 - scy) / support.y);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Source rows this tile spans, before edge clamping.
+    const int rowLo = int(floor((oy0 + 0.5) * ratio.y - 0.5)) - r.y;
+    // This thread's first vertical tap.
+    const int myLo = int(floor((dtid.y + 0.5) * ratio.y - 0.5)) - r.y;
+    // Trip count from uniforms alone, so every barrier is in uniform flow:
+    // a tile spans at most (TILE-1)*ratio + 1 centre rows, plus the taps.
+    const int maxRows = int(ceil((TILE - 1) * ratio.y)) + 1 + ny;
+    const int chunks  = (maxRows + CHUNK - 1) / CHUNK;
+
+    float4 sum = float4(0, 0, 0, 0);
+    [loop]
+    for (int ch = 0; ch < chunks; ++ch)
+    {
+        const int base = rowLo + ch * CHUNK;
+        // Horizontal pass: CHUNK source rows x every tile column.
+        for (uint h = tid; h < CHUNK * TILE; h += TILE * TILE)
+        {
+            uint rr = h / TILE, c = h % TILE;
+            int   sy  = clamp(base + int(rr), 0, int(Height) - 1);
+            float scx = (ox0 + c + 0.5) * ratio.x - 0.5;
+            int   icx = int(floor(scx));
+            float4 acc = float4(0, 0, 0, 0);
+            [loop]
+            for (int k = 0; k < nx; ++k)
+            {
+                int sx = clamp(icx + k - r.x, 0, int(Width) - 1);
+                acc += Source.Load(int3(sx, sy, 0)) * gsWx[c * MAX_TAPS + k];
+            }
+            gsH[rr * TILE + c] = acc;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        // Vertical pass: this thread's taps that fall in the chunk.
+        const int k0 = max(0, base - myLo);
+        const int k1 = min(ny - 1, base + CHUNK - 1 - myLo);
+        [loop]
+        for (int k = k0; k <= k1; ++k)
+            sum += gsH[(myLo + k - base) * TILE + gtid.x] * gsWy[gtid.y * MAX_TAPS + k];
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (!active) return;
+
+    float wxSum = 0.0, wySum = 0.0;
+    for (int kx = 0; kx < nx; ++kx) wxSum += gsWx[gtid.x * MAX_TAPS + kx];
+    for (int ky = 0; ky < ny; ++ky) wySum += gsWy[gtid.y * MAX_TAPS + ky];
+    float wsum = wxSum * wySum;
 
     ImageOutput[dtid.xy] = (wsum > 1e-6) ? (sum / wsum) : float4(0, 0, 0, 0);
 }
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"Scale";
-            desc.effectId = L"ShaderLab Scale"; desc.effectVersion = 1;
+            desc.effectId = L"ShaderLab Scale"; desc.effectVersion = 2;
             desc.category = L"Color";
             desc.subcategory = L"Resampling";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;

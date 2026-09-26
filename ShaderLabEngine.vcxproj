@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <Import Project="packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props" Condition="Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props')" />
   <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.props" Condition="Exists('packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.props')" />
@@ -75,7 +75,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <DisableSpecificWarnings>4251;%(DisableSpecificWarnings)</DisableSpecificWarnings>
-      <AdditionalOptions>%(AdditionalOptions) /bigobj</AdditionalOptions>
+      <AdditionalOptions>%(AdditionalOptions) /bigobj /utf-8</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -124,6 +124,7 @@
     <ClInclude Include="Rendering\EffectGraphFile.h" />
     <ClInclude Include="Rendering\FalseColorOverlay.h" />
     <ClInclude Include="Rendering\GraphEvaluator.h" />
+    <ClInclude Include="Rendering\GpuTimer.h" />
     <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\MathExpression.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
@@ -131,8 +132,10 @@
     <ClInclude Include="Rendering\CaptureNode.h" />
     <ClInclude Include="Effects\ShaderLabParamsHlsl.h" />
     <ClInclude Include="Effects\IEngineComputeOutput.h" />
+    <ClInclude Include="Effects\IEngineComputeTexture.h" />
     <ClInclude Include="Rendering\WorkingSpaceSync.h" />
     <ClInclude Include="Rendering\PixelReadback.h" />
+    <ClInclude Include="Rendering\VideoExport.h" />
     <ClInclude Include="Effects\Performance.h" />
     <ClInclude Include="Effects\BytecodeCache.h" />
     <ClInclude Include="Effects\CustomComputeBridgeEffect.h" />
@@ -143,6 +146,7 @@
     <ClInclude Include="Effects\PropertyMetadata.h" />
     <ClInclude Include="Effects\ShaderCompiler.h" />
     <ClInclude Include="Effects\ShaderLabEffects.h" />
+    <ClInclude Include="Effects\ColorMathCpu.h" />
     <ClInclude Include="Effects\DxgiDuplicationSourceProvider.h" />
     <ClInclude Include="Effects\WindowsGraphicsCaptureSourceProvider.h" />
     <ClInclude Include="Effects\SourceNodeFactory.h" />
@@ -159,10 +163,12 @@
     <ClCompile Include="Rendering\DisplayMonitor.cpp" />
     <ClCompile Include="Rendering\FalseColorOverlay.cpp" />
     <ClCompile Include="Rendering\GraphEvaluator.cpp" />
+    <ClCompile Include="Rendering\GpuTimer.cpp" />
     <ClCompile Include="Rendering\IccProfileParser.cpp" />
     <ClCompile Include="Rendering\CaptureNode.cpp" />
     <ClCompile Include="Rendering\WorkingSpaceSync.cpp" />
     <ClCompile Include="Rendering\PixelReadback.cpp" />
+    <ClCompile Include="Rendering\VideoExport.cpp" />
     <ClCompile Include="Rendering\EffectGraphFile.cpp" />
     <ClCompile Include="Rendering\MathExpression.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>

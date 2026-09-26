@@ -144,6 +144,18 @@ namespace ShaderLab::Controls
         // Used to place auto-positioned new nodes in the user's current view.
         void SetViewportSize(float w, float h) { m_viewportW = w; m_viewportH = h; }
 
+        // Annotate each node on the canvas with its GPU cost and the reason
+        // that figure reads the way it does. Purely a display switch -- the
+        // measurement itself is the GPU timer's, and is taken whether or not
+        // anything is shown. Read on the UI thread only.
+        void SetShowNodeGpuStats(bool on)
+        {
+            if (m_showNodeGpuStats == on) return;
+            m_showNodeGpuStats = on;
+            m_needsRedraw = true;
+        }
+        bool ShowNodeGpuStats() const { return m_showNodeGpuStats; }
+
         // Returns the axis-aligned bounding box of all node visuals in canvas
         // (pre-pan/zoom) space. Returns {0,0,0,0} when no nodes are laid out.
         // Caller is responsible for calling RebuildLayout() first if the graph
@@ -324,10 +336,12 @@ namespace ShaderLab::Controls
         winrt::com_ptr<ID2D1SolidColorBrush> m_brushText;
         winrt::com_ptr<ID2D1SolidColorBrush> m_brushDataPin;     // Orange for data pins
         winrt::com_ptr<ID2D1SolidColorBrush> m_brushDataEdge;    // Orange for data edges
+        winrt::com_ptr<ID2D1SolidColorBrush> m_brushGpuBadge;   // Retinted per GPU state
         winrt::com_ptr<IDWriteTextFormat>     m_textFormat;
         winrt::com_ptr<IDWriteTextFormat>     m_pinLabelFormat;   // Small text for pin labels
         bool m_resourcesCreated{ false };
         bool m_needsRedraw{ true }; // Set when graph topology/selection/layout changes
+        bool m_showNodeGpuStats{ false };
 
         void EnsureResources(ID2D1DeviceContext* dc);
 

@@ -1,6 +1,8 @@
 #include "pch_engine.h"
 #include "../ShaderTestBench.h"
 #include "../TestCommon.h"
+#include "Effects/ShaderLabEffects.h"
+#include "Rendering/VideoExport.h"
 
 #include <cstdio>
 
@@ -195,6 +197,393 @@ namespace ShaderLab::Tests
                 && Near(r[0].x, 100.0f, 0.5f)
                 && Near(r[0].y, 0.0f,   1.0f)
                 && Near(r[0].z, 0.0f,   1.0f));
+        }
+
+        // ---- SoftCompressDistance (gamut soft roll-off) -------------------
+        // Contract tests: these hold for any hardness p >= 1 of the ACES
+        // power curve (p=1 is exactly Reinhard). threshold=0.75,
+        // limit=1.5, power=1.2 (the ACES RGC default) unless stated.
+        {
+            // Identity zone: d <= threshold returns d exactly.
+            auto r = bench.Run(R"(
+                float a = SoftCompressDistance(0.30, 0.75, 1.5, 1.2);
+                float b = SoftCompressDistance(0.75, 0.75, 1.5, 1.2);
+                Result[0] = float4(a, b, 0, 0);
+            )");
+            TEST("SoftCompressDistance: identity below threshold",
+                !r.empty()
+                && Near(r[0].x, 0.30f, 1e-6f)
+                && Near(r[0].y, 0.75f, 1e-5f));
+        }
+        {
+            // Anchor: d == limit lands exactly on the boundary (1.0).
+            auto r = bench.Run(R"(
+                Result[0] = float4(SoftCompressDistance(1.5, 0.75, 1.5, 1.2), 0, 0, 0);
+            )");
+            TEST("SoftCompressDistance: limit maps onto boundary (== 1.0)",
+                !r.empty() && Near(r[0].x, 1.0f, 1e-3f));
+        }
+        {
+            // C1 join: slope ~= 1 just above threshold, so gradients
+            // crossing the knee don't kink. Central-difference slope over
+            // [t, t + 0.02] must be within 15% of 1.
+            auto r = bench.Run(R"(
+                float y0 = SoftCompressDistance(0.75, 0.75, 1.5, 1.2);
+                float y1 = SoftCompressDistance(0.77, 0.75, 1.5, 1.2);
+                Result[0] = float4((y1 - y0) / 0.02, 0, 0, 0);
+            )");
+            TEST("SoftCompressDistance: slope ~= 1 entering the knee (C1)",
+                !r.empty() && Near(r[0].x, 1.0f, 0.15f));
+        }
+        {
+            // Monotone + compressive: outputs strictly increase with d,
+            // and never exceed the input above the threshold.
+            auto r = bench.Run(R"(
+                float d[5] = { 0.8, 1.0, 1.2, 1.4, 1.5 };
+                float prev = -1.0;
+                float mono = 1.0, comp = 1.0;
+                [unroll]
+                for (int i = 0; i < 5; ++i) {
+                    float y = SoftCompressDistance(d[i], 0.75, 1.5, 1.2);
+                    if (y <= prev)  mono = 0.0;
+                    if (y > d[i] + 1e-5) comp = 0.0;
+                    prev = y;
+                }
+                Result[0] = float4(mono, comp, 0, 0);
+            )");
+            TEST("SoftCompressDistance: monotone increasing and compressive",
+                !r.empty()
+                && Near(r[0].x, 1.0f, 1e-6f)
+                && Near(r[0].y, 1.0f, 1e-6f));
+        }
+        {
+            // Softness proper: a point between threshold and limit must map
+            // strictly BELOW the hard boundary (that's the whole feature —
+            // headroom is reserved so d in (1, limit] stays ordered instead
+            // of flattening onto the shell).
+            auto r = bench.Run(R"(
+                Result[0] = float4(SoftCompressDistance(1.2, 0.75, 1.5, 1.2), 0, 0, 0);
+            )");
+            TEST("SoftCompressDistance: interior of knee stays below boundary (soft, not clip)",
+                !r.empty() && r[0].x < 0.999f && r[0].x > 0.75f);
+        }
+        {
+            // Hardness ordering: higher power tracks identity longer, so at
+            // a fixed d inside the knee it must compress LESS than p=1
+            // (Reinhard). Also pins p=1 == Reinhard closed form:
+            // s = (1-t)(l-t)/(l-1) = 0.375; y(1.0) = t + s*x/(s+x) = 0.90.
+            auto r = bench.Run(R"(
+                float soft = SoftCompressDistance(1.0, 0.75, 1.5, 1.0);
+                float hard = SoftCompressDistance(1.0, 0.75, 1.5, 3.0);
+                Result[0] = float4(soft, hard, 0, 0);
+            )");
+            TEST("SoftCompressDistance: p=1 matches Reinhard; higher hardness compresses less",
+                !r.empty()
+                && Near(r[0].x, 0.90f, 1e-3f)
+                && r[0].y > r[0].x + 0.01f);
+        }
+
+        // ---- 8-bit dither / quantize (screenshot output path) --------------
+        {
+            // Zero strength must land exactly on the 8-bit grid.
+            auto r = bench.Run(R"(
+                float3 q = DitherQuantize(float3(0.5, 0.25, 0.75), float2(3, 7), 256.0, 0.0);
+                float3 grid = round(float3(0.5, 0.25, 0.75) * 255.0) / 255.0;
+                Result[0] = float4(abs(q - grid), 0);
+            )");
+            TEST("DitherQuantize(strength 0) lands exactly on the 8-bit grid",
+                !r.empty() && r[0].x < 1e-6f && r[0].y < 1e-6f && r[0].z < 1e-6f);
+        }
+        {
+            // The dither stays inside its nominal +-1 LSB across a pixel sweep.
+            auto r = bench.Run(R"(
+                float lo = 1e9, hi = -1e9;
+                [unroll]
+                for (int i = 0; i < 32; ++i) {
+                    float d = RotatedIgnDither(float2(i, i * 3 + 1));
+                    lo = min(lo, d); hi = max(hi, d);
+                }
+                Result[0] = float4(lo, hi, 0, 0);
+            )");
+            TEST("RotatedIgnDither stays within its nominal [-1, 1]",
+                !r.empty() && r[0].x >= -1.0f && r[0].y <= 1.0f && r[0].y > r[0].x);
+        }
+        {
+            // Pin the ACTUAL distribution, which is neither triangular nor
+            // trapezoidal. IGN(p) and IGN(p + 5.588238) are not independent:
+            // the offset shifts dot(p,k) by 0.407649, which the x52.98
+            // amplification turns into a fixed rotation of n1 -- +0.59844 or
+            // +0.61552 depending on whether the inner frac wraps (62%/38%,
+            // never neither). n1 + frac(n1 + r) - 1 is then a 2-slope sawtooth
+            // whose slopes each map uniform n1 to a UNIFORM output, on +-(1-r)
+            // and +-r at density 0.5. Superposing them gives a STEPPED density
+            // -- 1.0 on the plateau, 0.5 on the shoulders, vertical risers, no
+            // ramps. (A trapezoid needs a convolution, not a superposition.)
+            // Consequences: symmetric and mean-preserving (good, see below), but
+            // variance 0.0945 rather than a real TPDF's 1/6, and support +-0.615
+            // rather than +-1. If someone decorrelates the second sample this
+            // test fails -- that is intentional. It is a real behaviour change
+            // (output noise ~0.31 -> ~0.41 codes RMS), not a cleanup.
+            auto r = bench.Run(R"(
+                float s1 = 0, s2 = 0, mx = 0;
+                for (int y = 0; y < 64; ++y) {
+                    for (int x = 0; x < 64; ++x) {
+                        float d = RotatedIgnDither(float2(x, y));
+                        s1 += d; s2 += d * d; mx = max(mx, abs(d));
+                    }
+                }
+                Result[0] = float4(s1 / 4096.0, s2 / 4096.0, mx, 0);
+            )");
+            TEST("RotatedIgnDither is a symmetric stepped density, not a true TPDF",
+                !r.empty()
+                && fabs(r[0].x) < 0.005f            // symmetric: mean ~ 0
+                && Near(r[0].y, 0.0946f, 0.004f)    // variance, NOT 1/6 = 0.1667
+                && Near(r[0].z, 0.6152f, 0.01f));   // support, NOT 1.0
+        }
+        {
+            // A value sitting between two codes must resolve to BOTH codes
+            // across pixels -- that is the whole mechanism by which dither
+            // trades banding for noise. 0.5 encodes to ~187.5/255.
+            auto r = bench.Run(R"(
+                float v = 187.5 / 255.0;
+                float lo = 1e9, hi = -1e9;
+                [unroll]
+                for (int i = 0; i < 32; ++i) {
+                    float q = DitherQuantize(float3(v, v, v), float2(i, i * 5 + 2), 256.0, 1.0).x;
+                    lo = min(lo, q); hi = max(hi, q);
+                }
+                Result[0] = float4(lo * 255.0, hi * 255.0, 0, 0);
+            )");
+            TEST("DitherQuantize spreads a between-codes value across both codes",
+                !r.empty()
+                && Near(r[0].x, 187.0f, 0.51f)
+                && Near(r[0].y, 188.0f, 0.51f));
+        }
+        {
+            // A gamut early-out built on this search is sound only if
+            // the boundary search never reports a radius SHORTER than a
+            // coarse-grid sample it would itself have found inside:
+            //
+            //   InTargetCube(I, dir*rq), rq on the coarse grid
+            //        =>  CubeBoundaryRadius(I, dir) >= rq
+            //        =>  d = r/B <= threshold  =>  SoftCompressDistance is identity
+            //
+            // That chain is the whole justification for skipping the search,
+            // and it is why the skip rounds its test radius UP to a grid
+            // sample. Testing r/threshold directly does NOT satisfy it: the
+            // scan can step straight over a thin in-gamut window -- the
+            // tangential vertex graze pure blue exhibits -- and that showed up
+            // as 7 differing FP32 components on a real HDR frame, worst
+            // 4.88e-4 scRGB. This test slices the SHIPPED helpers out of the
+            // effect's own HLSL, so it cannot drift from the code it guards.
+            auto& lib = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+            // The helpers ship inside the ICtCp Gamut Boundary LUT's source
+            // (colorMath + GamutBoundaryHLSL + the LUT's own kernel); slice
+            // them out up to where the kernel begins.
+            const auto* desc = lib.FindById(L"ICtCp Gamut Boundary LUT");
+            std::string pre;
+            if (desc)
+            {
+                const std::string& src = desc->hlslSource;
+                auto a = src.find("#define CUBE_EPS");
+                auto b = src.find("// ICtCp Gamut Boundary LUT - D3D11 Compute Shader");
+                if (a != std::string::npos && b != std::string::npos && b > a)
+                    pre = src.substr(a, b - a);
+            }
+            TEST("Gamut boundary search HLSL slice located", !pre.empty());
+
+            // Per target gamut: the invariant is about the search, and the
+            // search now runs against whichever cube the target defines. The
+            // gamut arrives as a #define rather than a loop in the kernel --
+            // this kernel already sits near fxc's compile-time cliff.
+            const char* gamutNames[] = { "sRGB", "Display P3", "BT.2020" };
+            for (int gi = 0; gi < 3; ++gi)
+            {
+                auto r = bench.Run(R"(
+                    TargetXf tg = MakeTargetXf(TEST_GAMUT, 0, 0, 0, 0);
+                    int violations = 0;
+                    const float step = 0.45 / CUBE_COARSE;
+                    for (int hi = 0; hi < 24; ++hi)
+                    {
+                        float ang = hi * (6.28318530718 / 24.0);
+                        float2 dir = float2(cos(ang), sin(ang));
+                        for (int ii = 1; ii <= 12; ++ii)
+                        {
+                            float I = ii / 13.0;
+                            float peak = 6.0;          // W = 480 nits
+                            float B = CubeBoundaryRadius(I, dir, peak, tg);
+                            for (int k = 1; k <= CUBE_COARSE; ++k)
+                            {
+                                float rq = step * k;
+                                if (InTargetCube(I, dir * rq, peak, tg) && B < rq - 1e-6)
+                                    violations++;
+                            }
+                        }
+                    }
+                    Result[0] = float4(violations, 0, 0, 0);
+                )", 1, "#define TEST_GAMUT " + std::to_string(gi) + "\n" + pre);
+                TEST(std::format("CubeBoundaryRadius >= every coarse sample found inside, {} "
+                                 "(the gamut early-out depends on this)", gamutNames[gi]).c_str(),
+                    !r.empty() && r[0].x == 0.0f);
+            }
+
+            // Video export conversion (Rendering/VideoExport.cpp) against
+            // values any Y'CbCr table gives. BT.709 limited 8-bit: red is
+            // (63, 102, 240), white (235, 128, 128), black (16, 128, 128).
+            // BT.2020 PQ limited 10-bit: black 64, a 100-nit neutral
+            // floor(64 + 876 * PQ(100) + 0.5) = floor(64 + 876*0.5080784 + 0.5)
+            // = 509, 10000 nits 940; neutrals carry chroma 512.
+            {
+                auto r = bench.Run(R"(
+                    float3 red  = VideoEncodeSdr(float3(1, 0, 0));
+                    float3 wht  = VideoEncodeSdr(float3(1, 1, 1));
+                    float3 blk  = VideoEncodeSdr(float3(0, 0, 0));
+                    Result[0] = float4(VideoLumaCode(red, 1), VideoChromaCode(VideoChromaDiff(red, 1), 1), 0);
+                    Result[1] = float4(VideoLumaCode(wht, 1), VideoChromaCode(VideoChromaDiff(wht, 1), 1), 0);
+                    Result[2] = float4(VideoLumaCode(blk, 1), VideoChromaCode(VideoChromaDiff(blk, 1), 1), 0);
+                    float3 h100 = VideoEncodeHdr10(float3(1.25, 1.25, 1.25));
+                    float3 hMax = VideoEncodeHdr10(float3(125, 125, 125));
+                    float3 hBlk = VideoEncodeHdr10(float3(0, 0, 0));
+                    Result[3] = float4(VideoLumaCode(h100, 0), VideoChromaCode(VideoChromaDiff(h100, 0), 0), 0);
+                    Result[4] = float4(VideoLumaCode(hMax, 0), VideoLumaCode(hBlk, 0), VideoChromaCode(VideoChromaDiff(hBlk, 0), 0));
+                    Result[5] = float4(VideoContentNits(float3(1.25, 1.25, 1.25)), VideoContentNits(float3(500, 0, 0)),
+                                       VideoContentNits(float3(-1, -1, -1)), 0);
+                )", 6, ShaderLab::Rendering::VideoConvertHelpersHLSL());
+                const bool ok = r.size() >= 6;
+                TEST("Video SDR: BT.709 red encodes to (63, 102, 240)",
+                    ok && r[0].x == 63.0f && r[0].y == 102.0f && r[0].z == 240.0f);
+                TEST("Video SDR: white (235,128,128), black (16,128,128)",
+                    ok && r[1].x == 235.0f && r[1].y == 128.0f && r[1].z == 128.0f
+                       && r[2].x == 16.0f && r[2].y == 128.0f && r[2].z == 128.0f);
+                TEST("Video HDR10: 100-nit neutral is Y 509, chroma 512",
+                    ok && r[3].x == 509.0f && r[3].y == 512.0f && r[3].z == 512.0f);
+                TEST("Video HDR10: 10000 nits is Y 940, black Y 64 / chroma 512",
+                    ok && r[4].x == 940.0f && r[4].y == 64.0f && r[4].z == 512.0f && r[4].w == 512.0f);
+                TEST("Video content light: 100-nit neutral reads 100, clamps at 10000 and 0",
+                    ok && Near(r[5].x, 100.0f, 0.05f) && r[5].y == 10000.0f && r[5].z == 0.0f);
+            }
+
+            // Dither must be a function of the PIXEL, not of the exact float
+            // D2D hands in: SCENE_POSITION carries up to 2^-12 px of
+            // interpolation error that moves when D2D re-tiles an effect, and
+            // IGN turned that into different codes for the same pixel.
+            {
+                auto r = bench.Run(R"(
+                    int diffs = 0;
+                    for (int y = 0; y < 32; ++y)
+                        for (int x = 0; x < 32; ++x)
+                        {
+                            float3 v = float3(0.3137, 0.5021, 0.7412);
+                            float2 c = float2(x, y) + 0.5;
+                            float3 a = DitherQuantize(v, c, 256.0, 1.0);
+                            float3 b = DitherQuantize(v, c + float2(4.8828125e-4, -2.44140625e-4), 256.0, 1.0);
+                            if (any(a != b)) diffs++;
+                        }
+                    Result[0] = float4(diffs, 0, 0, 0);
+                )");
+                TEST("DitherQuantize is immune to sub-pixel scene-position error",
+                    !r.empty() && r[0].x == 0.0f);
+            }
+
+            // Gamut Map's Clip mode routes Custom through TargetXf; its presets
+            // use the library's hard-coded P3 matrix. Custom set to P3's own
+            // primaries must land on the same target RGB.
+            {
+                auto r = bench.Run(R"(
+                    TargetXf t = MakeTargetXf(3, GAMUT_P3_R, GAMUT_P3_G, GAMUT_P3_B, D65_WHITE);
+                    float worst = 0;
+                    float3 probes[4] = { float3(1,0,0), float3(-0.5,1.2,-0.1), float3(40,-3,2), float3(0.2,0.2,0.9) };
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        float3 viaXf  = ScRGBToTarget(t, probes[i]);
+                        float3 preset = mul(XYZ_TO_P3D65, ScRGBToXYZ(probes[i]));
+                        float3 rel = abs(viaXf - preset) / max(abs(preset), 1e-3);
+                        worst = max(worst, max(rel.x, max(rel.y, rel.z)));
+                    }
+                    Result[0] = float4(worst, 0, 0, 0);
+                )", 1, pre);
+                TEST("TargetXf Custom(P3 primaries) matches the preset P3 matrix (Gamut Map Clip)",
+                    !r.empty() && r[0].x < 1e-3f);
+            }
+
+            // The target matrix itself, against published values. sRGB red in
+            // P3 is (0.8225, 0.0332, 0.0171) and in BT.2020 (0.6274, 0.0691,
+            // 0.0164) -- the BT.2087 / Display P3 conversion tables.
+            {
+                auto m = bench.Run(R"(
+                    TargetXf s  = MakeTargetXf(0, 0, 0, 0, 0);
+                    TargetXf p3 = MakeTargetXf(1, 0, 0, 0, 0);
+                    TargetXf bt = MakeTargetXf(2, 0, 0, 0, 0);
+                    // Custom set to P3's own primaries and D65: must equal preset 1.
+                    TargetXf cp = MakeTargetXf(3, GAMUT_P3_R, GAMUT_P3_G, GAMUT_P3_B, D65_WHITE);
+                    // Custom P3 primaries with a D50 white: a D65 neutral must land
+                    // as R = G = B (the adaptation's whole job).
+                    TargetXf d5 = MakeTargetXf(3, GAMUT_P3_R, GAMUT_P3_G, GAMUT_P3_B, float2(0.3457, 0.3585));
+                    float3 red = float3(1, 0, 0);
+                    Result[0] = float4(ScRGBToTarget(p3, red), 0);
+                    Result[1] = float4(ScRGBToTarget(bt, red), 0);
+                    float3 x = float3(0.3, -0.2, 1.7);
+                    Result[2] = float4(TargetToScRGB(p3, ScRGBToTarget(p3, x)) - x,
+                                       length(TargetToScRGB(d5, ScRGBToTarget(d5, x)) - x));
+                    Result[3] = float4(s.fingerprint, p3.fingerprint, bt.fingerprint, cp.fingerprint);
+                    Result[4] = float4(ScRGBToTarget(d5, float3(2, 2, 2)), s.identity ? 1 : 0);
+                    // Luminance weights: a target-RGB white must read as Y = 1.
+                    Result[5] = float4(dot(float3(1,1,1), p3.lumaT), dot(float3(1,1,1), bt.lumaT),
+                                       dot(float3(1,1,1), d5.lumaT), 0);
+                )", 6, pre);
+                const bool ok = m.size() >= 6;
+                TEST("TargetXf: sRGB red -> P3 matches (0.8225, 0.0332, 0.0171)",
+                    ok && Near(m[0].x, 0.8225f, 2e-3f) && Near(m[0].y, 0.0332f, 2e-3f) && Near(m[0].z, 0.0171f, 2e-3f));
+                TEST("TargetXf: sRGB red -> BT.2020 matches (0.6274, 0.0691, 0.0164)",
+                    ok && Near(m[1].x, 0.6274f, 2e-3f) && Near(m[1].y, 0.0691f, 2e-3f) && Near(m[1].z, 0.0164f, 2e-3f));
+                TEST("TargetXf: forward/inverse round-trip (D65 and adapted D50)",
+                    ok && std::abs(m[2].x) < 1e-4f && std::abs(m[2].y) < 1e-4f && std::abs(m[2].z) < 1e-4f && m[2].w < 1e-4f);
+                TEST("TargetXf: sRGB is the exact identity (fingerprint 15)",
+                    ok && m[4].w == 1.0f && m[3].x == 15.0f);
+                TEST("TargetXf: Custom with P3 primaries + D65 fingerprints as the P3 preset",
+                    ok && std::abs(m[3].w - m[3].y) <= 1e-4f * m[3].y);
+                TEST("TargetXf: preset fingerprints are far apart (LUT stamp can tell them apart)",
+                    ok && std::abs(m[3].x - m[3].y) > 1e-2f && std::abs(m[3].y - m[3].z) > 1e-2f
+                       && std::abs(m[3].x - m[3].z) > 1e-2f);
+                TEST("TargetXf: Bradford D65 -> D50 keeps a neutral neutral (R = G = B)",
+                    ok && Near(m[4].x, m[4].y, 1e-4f * 2) && Near(m[4].y, m[4].z, 1e-4f * 2));
+                TEST("TargetXf: target white reads as luminance 1 (P3, BT.2020, D50-adapted)",
+                    ok && Near(m[5].x, 1.0f, 1e-4f) && Near(m[5].y, 1.0f, 1e-4f) && Near(m[5].z, 1.0f, 1e-4f));
+            }
+
+            // Table ACCURACY is deliberately not measured here. An in-kernel
+            // emulation (texels computed by CubeBoundaryRadius, blended with the
+            // reader's index math) sent fxc past 2.5 GB and minutes of compile
+            // even with one call site and 7x fewer queries -- dynamic indexing
+            // and a data-dependent branch inside a [loop] wrapping the search's
+            // 27 unrolled reconstructions. It is measured end to end instead,
+            // on the real D2D texture path: see the CHANGELOG entry for the
+            // ICtCp Gamut Boundary LUT.
+        }
+        {
+            // Mean preservation is the entire point of dithering: averaged over
+            // a field, the quantized output must land back on the un-quantized
+            // value. A fractional part away from .5 is the discriminating case.
+            // An exact half-code -- like the 187.5 above -- is mean-preserving
+            // even at HALF the correct amplitude, which is exactly why that
+            // test did not catch a half-amplitude dither: the shipped
+            // DitherQuantize scaled by 0.5*strength and left ~0.197 codes of
+            // bias at every other fractional part.
+            auto r = bench.Run(R"(
+                float s0 = 0, s1 = 0;
+                for (int y = 0; y < 16; ++y) {
+                    for (int x = 0; x < 16; ++x) {
+                        float2 p = float2(x, y);
+                        s0 += DitherQuantize(float3(200.75 / 255.0, 0, 0), p, 256.0, 1.0).x;
+                        s1 += DitherQuantize(float3(254.7083 / 255.0, 0, 0), p, 256.0, 1.0).x;
+                    }
+                }
+                Result[0] = float4(s0 / 256.0 * 255.0, s1 / 256.0 * 255.0, 0, 0);
+            )");
+            TEST("DitherQuantize(strength 1) is mean-preserving off a half-code",
+                !r.empty()
+                && Near(r[0].x, 200.75f, 0.05f)
+                && Near(r[0].y, 254.7083f, 0.05f));
         }
     }
 }

@@ -85,6 +85,12 @@ namespace ShaderLab::Effects
             const D2D1_RECT_L* outputRect,
             D2D1_RECT_L* inputRects,
             UINT32 inputRectCount) const override;
+        // Kept only so the previous whole-input behaviour stays readable and
+        // revertible while the sub-rect answer is on trial. Not an override.
+        IFACEMETHODIMP MapOutputRectToInputRectsWholeInput(
+            const D2D1_RECT_L* outputRect,
+            D2D1_RECT_L* inputRects,
+            UINT32 inputRectCount) const;
         IFACEMETHODIMP MapInvalidRect(
             UINT32 inputIndex,
             D2D1_RECT_L invalidInputRect,
@@ -107,6 +113,21 @@ namespace ShaderLab::Effects
 
         // Set per-instance shader GUID (must be set before loading bytecode).
         void SetShaderGuid(const GUID& guid) { m_shaderGuid = guid; }
+
+        // How many input pins are real IMAGE inputs, as opposed to pins
+        // reserved to carry analysis textures for gpu-bindable parameters.
+        // Output bounds must come from the image inputs ONLY: an analysis
+        // texture is 1 x N texels and says nothing about where this effect
+        // draws, so unioning it into the output rect collapses it and the
+        // node renders nothing at all -- with no error anywhere. Defaults to
+        // "all pins are image inputs", which is correct for every effect that
+        // declares no gpu-bindable parameters.
+        void SetImageInputCount(UINT32 n) { m_imageInputCount = n; }
+        UINT32 ImageInputCount() const
+        {
+            return (m_imageInputCount == 0 || m_imageInputCount > m_inputCount)
+                 ? m_inputCount : m_imageInputCount;
+        }
 
         // Force-upload the constant buffer to the GPU via DrawInfo.
         // Call this from the evaluator when properties change, bypassing
@@ -157,6 +178,9 @@ namespace ShaderLab::Effects
         GUID m_shaderGuid{};  // Per-instance shader ID for D2D LoadPixelShader.
         std::vector<BYTE> m_constantBuffer;
         UINT32            m_inputCount{ 1 };
+        UINT32            m_imageInputCount{ 0 };  // 0 = same as m_inputCount
+        // Every input's own rect, from the last MapInputRectsToOutputRect.
+        std::vector<D2D1_RECT_L> m_allInputRects;
         D2D1_RECT_L       m_inputRect{};
         D2D1_RECT_L       m_lastOutputRect{}; // From MapInputRectsToOutputRect, for 1:1 TEXCOORD mapping.
 

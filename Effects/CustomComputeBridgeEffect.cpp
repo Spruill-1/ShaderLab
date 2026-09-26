@@ -110,6 +110,7 @@ float4 main(
         else if (riid == __uuidof(ID2D1TransformNode))  *ppv = static_cast<ID2D1TransformNode*>(this);
         else if (riid == IID_ICustomComputeBridge)      *ppv = static_cast<ICustomComputeBridge*>(this);
         else if (riid == IID_IEngineComputeOutput)      *ppv = static_cast<IEngineComputeOutput*>(this);
+        else if (riid == IID_IEngineComputeTexture)     *ppv = static_cast<IEngineComputeTexture*>(this);
         else return E_NOINTERFACE;
 
         AddRef();
@@ -236,7 +237,19 @@ float4 main(
         const BYTE* bytecode, UINT32 bytecodeSize)
     {
         if (!bytecode || bytecodeSize == 0) return E_INVALIDARG;
+        // Content-compare, cheaply: every DXBC blob carries a 16-byte
+        // compiler checksum at offset 4. The evaluator calls this before
+        // every dispatch with whatever variant the binding plan implies, so
+        // it MUST be a no-op when nothing changed -- it used to mark the
+        // shader dirty unconditionally, and the evaluator's post-dispatch
+        // "restore baseline" made that two CreateComputeShader calls per
+        // frame for every GPU-bound consumer.
+        const ShaderId id = IdOf(bytecode, bytecodeSize);
+        const ShaderId& current = m_bytecodeDirty ? m_pendingId : m_installedId;
+        if ((m_bytecodeDirty || m_hasInstalled) && id == current)
+            return S_OK;
         m_pendingBytecode.assign(bytecode, bytecode + bytecodeSize);
+        m_pendingId = id;
         m_bytecodeDirty = true;
         return S_OK;
     }
@@ -281,13 +294,14 @@ float4 main(
 
             D2D1_RECT_F bounds{};
             dc->GetImageLocalBounds(inputImage, &bounds);
-            UINT32 w = static_cast<UINT32>((std::min)(bounds.right - bounds.left, 8192.0f));
-            UINT32 h = static_cast<UINT32>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-            if (w == 0 || h == 0)
+            D2D1_RECT_L px{};
+            if (HRESULT snapHr = SnapComputeInputRect(bounds, px); FAILED(snapHr))
             {
                 dc->SetDpi(oldDpiX, oldDpiY);
-                return E_NOT_VALID_STATE;
+                return snapHr;
             }
+            const UINT32 w = static_cast<UINT32>(px.right - px.left);
+            const UINT32 h = static_cast<UINT32>(px.bottom - px.top);
             if (idx == 0) { firstW = w; firstH = h; }
 
             winrt::com_ptr<ID2D1Bitmap1> inputBmp;
@@ -301,9 +315,10 @@ float4 main(
                 winrt::com_ptr<ID2D1Bitmap1> asBitmap;
                 if (SUCCEEDED(inputImage->QueryInterface(asBitmap.put())) && asBitmap)
                 {
-                    auto px = asBitmap->GetPixelFormat();
+                    auto fmt = asBitmap->GetPixelFormat();
                     auto sz = asBitmap->GetPixelSize();
-                    if (px.format == DXGI_FORMAT_R32G32B32A32_FLOAT &&
+                    if (fmt.format == DXGI_FORMAT_R32G32B32A32_FLOAT &&
+                        px.left == 0 && px.top == 0 &&
                         sz.width == w && sz.height == h)
                     {
                         inputBmp = asBitmap;
@@ -340,7 +355,8 @@ float4 main(
                 dc->GetTarget(prevTarget.put());
                 dc->SetTarget(inputBmp.get());
                 dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-                dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
+                dc->DrawImage(inputImage, D2D1::Point2F(
+                    -static_cast<float>(px.left), -static_cast<float>(px.top)));
                 dc->SetTarget(prevTarget.get());
                 dc->Flush();  // D2D batches DrawImage until Flush/EndDraw.
             }
@@ -365,14 +381,27 @@ float4 main(
 
         if (m_bytecodeDirty)
         {
-            winrt::com_ptr<ID3D11ComputeShader> tempShader;
-            HRESULT hr = device->CreateComputeShader(
-                m_pendingBytecode.data(),
-                m_pendingBytecode.size(),
-                nullptr, tempShader.put());
-            if (FAILED(hr)) return hr;
-            m_runner.InstallPrecompiledShader(
-                m_pendingBytecode, tempShader);
+            // Switching between the baseline and a GPU-binding variant (a
+            // binding added or removed) reuses a shader created earlier
+            // rather than creating it again.
+            winrt::com_ptr<ID3D11ComputeShader> shader;
+            for (const auto& v : m_shaderVariants)
+                if (v.id == m_pendingId) { shader = v.shader; break; }
+            if (!shader)
+            {
+                HRESULT hr = device->CreateComputeShader(
+                    m_pendingBytecode.data(),
+                    m_pendingBytecode.size(),
+                    nullptr, shader.put());
+                if (FAILED(hr)) return hr;
+                constexpr size_t kMaxVariants = 4;
+                if (m_shaderVariants.size() >= kMaxVariants)
+                    m_shaderVariants.erase(m_shaderVariants.begin());
+                m_shaderVariants.push_back({ m_pendingId, shader });
+            }
+            m_runner.InstallPrecompiledShader(m_pendingBytecode, shader);
+            m_installedId = m_pendingId;
+            m_hasInstalled = true;
             m_bytecodeDirty = false;
         }
 
@@ -405,11 +434,20 @@ float4 main(
         // passes outAnalysisFloats=nullptr it signals "no CPU consumer
         // this frame" -- skip the runner's CopyResource + Map.
         const bool readbackToCpu = (outAnalysisFloats != nullptr);
+        const auto readbackMode = !readbackToCpu
+            ? Rendering::D3D11ComputeRunner::Readback::None
+            : (m_asyncReadback ? Rendering::D3D11ComputeRunner::Readback::Async
+                               : Rendering::D3D11ComputeRunner::Readback::Blocking);
 
         // Build a raw-pointer array of input textures for the runner.
         std::vector<ID3D11Texture2D*> inputRaw;
         inputRaw.reserve(inputTextures.size());
         for (const auto& t : inputTextures) inputRaw.push_back(t.get());
+
+        // The runner records the whole dispatch on its own deferred context
+        // and submits it as a single ExecuteCommandList -- see
+        // D3D11ComputeRunner::Initialize. No lock is needed here, and none is
+        // taken: compute has no dependency on Direct2D's threading.
 
         auto floats = m_runner.DispatchWithImageOutput(
             inputRaw,
@@ -418,18 +456,43 @@ float4 main(
             m_imageOutputTex.get(),
             m_dispatchX, m_dispatchY, m_dispatchZ,
             m_gpuBindingSrvs, m_gpuBindingSlots,
-            readbackToCpu);
+            readbackMode);
 
         if (outAnalysisFloats)
             *outAnalysisFloats = std::move(floats);
 
         // Reset per-frame state so the next dispatch starts clean.
+        m_asyncReadback = false;
         m_gpuBindingSrvs.clear();
         m_gpuBindingSlots.clear();
         m_dispatchX = m_dispatchY = m_dispatchZ = 1;
 
         m_lastEvaluatedFrame++;
         return S_OK;
+    }
+
+    CustomComputeBridgeEffect::ShaderId CustomComputeBridgeEffect::IdOf(
+        const BYTE* bytes, size_t size)
+    {
+        ShaderId id{};
+        if (size >= 20 && bytes[0] == 'D' && bytes[1] == 'X' && bytes[2] == 'B' && bytes[3] == 'C')
+        {
+            std::memcpy(id.data(), bytes + 4, id.size());
+            return id;
+        }
+        // Not DXBC (never expected): fall back to a full FNV-1a so two
+        // different blobs still compare different.
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < size; ++i) { h ^= bytes[i]; h *= 1099511628211ull; }
+        std::memcpy(id.data(), &h, sizeof(h));
+        const uint64_t sz = size;
+        std::memcpy(id.data() + 8, &sz, sizeof(sz));
+        return id;
+    }
+
+    bool CustomComputeBridgeEffect::PollAnalysisReadback(std::vector<float>& out)
+    {
+        return m_runner.PollReadback(out);
     }
 
     HRESULT CustomComputeBridgeEffect::SetGpuBinding(
@@ -492,6 +555,29 @@ float4 main(
     }
 
     // ---- IEngineComputeOutput -------------------------------------------
+
+    // ---- IEngineComputeTexture (lane 3) -----------------------------------
+    // Straight delegation: the runner owns the texture, the copy shader and
+    // the decision not to create either until asked. Requesting the lane is
+    // what makes a compute node pay for it, so the request has to reach the
+    // runner rather than being cached here.
+
+    HRESULT STDMETHODCALLTYPE CustomComputeBridgeEffect::RequestAnalysisTexture()
+    {
+        return m_runner.RequestAnalysisTexture();
+    }
+
+    HRESULT STDMETHODCALLTYPE CustomComputeBridgeEffect::GetAnalysisTexture(
+        ID3D11Texture2D** out)
+    {
+        return m_runner.GetAnalysisTexture(out);
+    }
+
+    HRESULT STDMETHODCALLTYPE CustomComputeBridgeEffect::GetAnalysisTextureSrv(
+        ID3D11ShaderResourceView** out)
+    {
+        return m_runner.GetAnalysisTextureSrv(out);
+    }
 
     HRESULT STDMETHODCALLTYPE CustomComputeBridgeEffect::GetAnalysisSrv(
         ID3D11ShaderResourceView** out)

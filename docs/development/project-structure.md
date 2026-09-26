@@ -44,7 +44,7 @@ ShaderLab/
 │   ├── EngineMcpRoutes.h / .cpp    # 25 engine-pure routes + IEngineCommandSink + EngineContext
 │
 ├── Tests/                          # ShaderLabTests + smoke scripts
-│   ├── TestRunner.cpp              # 261 tests total (graph, evaluator, dispatcher [+fail-fast], snapshot, bytecode cache, router, JSON-RPC, frame/crypto/peer/channel, math bench)
+│   ├── TestRunner.cpp              # 289 tests (the runner prints the authoritative total) (graph, evaluator, dispatcher [+fail-fast], snapshot, bytecode cache, router, JSON-RPC, frame/crypto/peer/channel, math bench)
 │   ├── TestCommon.h                # Shared TEST() macro across TUs
 │   ├── ShaderTestBench.h / .cpp    # D3D11 compute test harness for HLSL math
 │   ├── Math/                       # 51 HLSL math tests
@@ -53,11 +53,14 @@ ShaderLab/
 │   │   ├── MobiusReinhardTests.cpp    # ICtCp tone-map curve invariants
 │   │   ├── DeltaETests.cpp            # Sharma reference pairs for CIEDE2000
 │   │   └── GamutTests.cpp             # CIE xy boundary tests
+│   ├── RunVideoExport.ps1          # headless --video vs a spec-derived CPU reference (needs ffmpeg; SKIPs without)
 │   ├── RunTests.ps1                # 40-test MCP integration suite (shim-driven; pins a running session, GUI-only tests self-skip on headless)
 │   ├── RunMathTests.ps1            # Local runner for the math test bench
 │   ├── RunHeadlessSmoke.ps1        # CI smoke (PNG + FP32 pixels + script batch)
 │   ├── RunBrokerSmoke.ps1          # CI smoke (Step 5): hub election, shim protocol, idle exit
-│   └── fixtures/test_cli_basic.json   # Golden graph for headless smoke
+│   └── fixtures/                      # test_cli_basic.json (golden graph for headless smoke),
+│                                      # MakeVideoFixtures.ps1 -> video_*_30f.mp4 (generated with ffmpeg, git-ignored;
+│                                      # the video seek + zero-copy test reports [SKIP] without them)
 │
 ├── ShaderLabHeadless/
 │   └── Main.cpp                    # Console host: PNG render / --pixels / --script / --serve / --mcp-session
@@ -93,8 +96,9 @@ ShaderLab/
 │   ├── MathExpression.h / .cpp     # ExprTk-backed expression evaluator (PCH disabled on .cpp)
 │
 ├── Effects/                        # Engine: built-in effect wrappers + custom effect base
-│   ├── ShaderLabEffects.h / .cpp   # 35 ShaderLab effects (versioned) — embedded HLSL
+│   ├── ShaderLabEffects.h / .cpp   # 36 ShaderLab effects (versioned) — embedded HLSL
 │   ├── ColorMath.cpp               # Shared HLSL color math library (extracted from ShaderLabEffects)
+│   ├── ColorMathCpu.h              # CPU port of the ICtCp path, for derived-constant tables (tested against the HLSL)
 │   ├── PropertyMetadata.h          # Effect property metadata for UI generation
 │   ├── ImageLoader.h / .cpp        # WIC HDR/SDR image loading
 │   ├── SourceNodeFactory.h / .cpp  # Source node creation (image / video / flood / DXGI / WGC) + per-frame tick

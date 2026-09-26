@@ -948,6 +948,7 @@ namespace ShaderLab::Controls
         m_brushText = nullptr;
         m_brushDataPin = nullptr;
         m_brushDataEdge = nullptr;
+        m_brushGpuBadge = nullptr;
         m_textFormat = nullptr;
         m_pinLabelFormat = nullptr;
         m_resourcesCreated = false;
@@ -966,6 +967,9 @@ namespace ShaderLab::Controls
         dc->CreateSolidColorBrush(D2D1::ColorF(0xE8E8EC), m_brushText.put());
         dc->CreateSolidColorBrush(D2D1::ColorF(0xF5A623), m_brushDataPin.put());
         dc->CreateSolidColorBrush(D2D1::ColorF(0xF5A623, 0.75f), m_brushDataEdge.put());
+        // Recoloured per node when the GPU annotation is drawn; kept separate
+        // from m_brushText so retinting it cannot leak into node titles.
+        dc->CreateSolidColorBrush(D2D1::ColorF(0x9AA0A6), m_brushGpuBadge.put());
 
         winrt::com_ptr<IDWriteFactory> dwriteFactory;
         DWriteCreateFactory(
@@ -1229,6 +1233,59 @@ namespace ShaderLab::Controls
                     m_brushText.get());
             }
 
+            // Per-node GPU annotation. Drawn ABOVE the node so it cannot
+            // collide with the title, the pins, or any in-body content, and
+            // so turning it on never reflows the graph.
+            //
+            // The state matters as much as the number. A bare figure (or a
+            // bare blank) cannot distinguish "this node cost nothing" from
+            // "this node's cost is real but lives inside a measurement
+            // attributed elsewhere" -- the same ambiguity that made the
+            // dispatch counter read as broken when it was merely honest.
+            if (m_showNodeGpuStats && m_pinLabelFormat && m_brushGpuBadge)
+            {
+                std::wstring badge;
+                D2D1_COLOR_F badgeColor{};
+                switch (node->gpuState)
+                {
+                case Graph::GpuNodeState::Measured:
+                    badge = std::format(L"{:.3f} ms  measured", node->lastGpuMs);
+                    badgeColor = D2D1::ColorF(0x7CD97C);   // a real number
+                    break;
+                case Graph::GpuNodeState::Cached:
+                    badge = L"cached";
+                    badgeColor = D2D1::ColorF(0x6EA8D8);   // no work, by design
+                    break;
+                case Graph::GpuNodeState::Fused:
+                    badge = L"fused downstream";
+                    badgeColor = D2D1::ColorF(0x9AA0A6);   // counted elsewhere
+                    break;
+                case Graph::GpuNodeState::Idle:
+                    badge = L"idle · no consumer";
+                    badgeColor = D2D1::ColorF(0xC9A227);   // actionable: wire it up
+                    break;
+                case Graph::GpuNodeState::CpuOnly:
+                    badge = L"cpu only";
+                    badgeColor = D2D1::ColorF(0x6B6B70);   // nothing to attribute
+                    break;
+                default:
+                    badge = L"not measured";
+                    badgeColor = D2D1::ColorF(0x6B6B70);   // no data at all
+                    break;
+                }
+
+                D2D1_RECT_F badgeRect = {
+                    visual.bounds.left,
+                    visual.bounds.top - 14.0f,
+                    visual.bounds.right,
+                    visual.bounds.top - 1.0f
+                };
+                m_brushGpuBadge->SetColor(badgeColor);
+                m_pinLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                dc->DrawText(badge.c_str(), static_cast<UINT32>(badge.size()),
+                    m_pinLabelFormat.get(), badgeRect, m_brushGpuBadge.get());
+            }
+
             // Math Expression: show the formula text under the header.
             if (m_pinLabelFormat && m_brushText && node->customEffect.has_value() &&
                 node->customEffect->shaderLabEffectId == L"Math Expression")
@@ -1344,7 +1401,20 @@ namespace ShaderLab::Controls
                                 }
                             }
                             if (valStr.empty())
-                                valStr = std::format(L"{:.4g}", val);
+                            {
+                                // Vector properties (e.g. bound gamut primaries)
+                                // previously fell through the float-only read
+                                // above and always displayed "= 0".
+                                using namespace winrt::Windows::Foundation::Numerics;
+                                if (auto* v2 = std::get_if<float2>(&propIt->second))
+                                    valStr = std::format(L"{:.3g}, {:.3g}", v2->x, v2->y);
+                                else if (auto* v3 = std::get_if<float3>(&propIt->second))
+                                    valStr = std::format(L"{:.3g}, {:.3g}, {:.3g}", v3->x, v3->y, v3->z);
+                                else if (auto* v4 = std::get_if<float4>(&propIt->second))
+                                    valStr = std::format(L"{:.3g}, {:.3g}, {:.3g}, {:.3g}", v4->x, v4->y, v4->z, v4->w);
+                                else
+                                    valStr = std::format(L"{:.4g}", val);
+                            }
                             label += L" = " + valStr;
                         }
                         D2D1_RECT_F labelRect = {
@@ -1885,16 +1955,11 @@ namespace ShaderLab::Controls
         }
         else
         {
+            // Only the consumer changed; the evaluator pulls it downstream.
             if (m_dispatcher)
-                m_dispatcher->DispatchSync([&]{
-                    destNode->dirty = true;
-                    m_graph->MarkAllDirty();
-                });
+                m_dispatcher->DispatchSync([&]{ destNode->dirty = true; });
             else
-            {
                 destNode->dirty = true;
-                m_graph->MarkAllDirty();
-            }
         }
         m_needsRedraw = true;
         return true;

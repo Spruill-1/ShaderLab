@@ -34,6 +34,20 @@ namespace ShaderLab::Effects
             IStream* stream,
             ID2D1DeviceContext5* dc);
 
+        // Every file extension WIC can decode on THIS machine, lowercased,
+        // dot-prefixed, sorted and de-duplicated (".avif", ".heic", ".jpg", ...).
+        //
+        // Enumerated from the registered WIC decoders rather than hardcoded:
+        // the codec set is machine state, not a compile-time constant. Windows
+        // ships HEIF/AVIF support as installable extensions and users add RAW
+        // codecs, so any fixed list is wrong on some machines and goes stale on
+        // all of them -- .heic decoded fine but could not be picked, because the
+        // file dialog filter never listed it.
+        //
+        // Falls back to a small built-in list if enumeration fails, so the
+        // picker is never empty.
+        static std::vector<std::wstring> SupportedExtensions();
+
     private:
         // Decode one WIC frame into the canonical linear scRGB FP16
         // bitmap (see class comment). Must be called OUTSIDE an active

@@ -1,5 +1,6 @@
 #include "pch_engine.h"
 #include "CustomPixelShaderEffect.h"
+#include "Performance.h"
 
 namespace ShaderLab::Effects
 {
@@ -223,10 +224,17 @@ namespace ShaderLab::Effects
         else if (inputRectCount > 0 && inputRects)
         {
             m_inputRect = inputRects[0];
+            // Remember every input's own extent. Non-image pins are answered
+            // with it in MapOutputRectToInputRects -- see there.
+            m_allInputRects.assign(inputRects, inputRects + inputRectCount);
 
-            // Compute union of input rects.
+            // Union of the IMAGE input rects only. Pins past that point carry
+            // analysis textures (1 x N texels) for gpu-bindable parameters;
+            // they say nothing about where this effect draws, and including
+            // them collapses the output rect so the node renders nothing.
+            const UINT32 imageInputs = (std::min)(inputRectCount, ImageInputCount());
             *outputRect = inputRects[0];
-            for (UINT32 i = 1; i < inputRectCount; ++i)
+            for (UINT32 i = 1; i < imageInputs; ++i)
             {
                 outputRect->left   = (std::min)(outputRect->left,   inputRects[i].left);
                 outputRect->top    = (std::min)(outputRect->top,    inputRects[i].top);
@@ -252,6 +260,44 @@ namespace ShaderLab::Effects
     }
 
     IFACEMETHODIMP CustomPixelShaderEffect::MapOutputRectToInputRects(
+        const D2D1_RECT_L* outputRect,
+        D2D1_RECT_L* inputRects,
+        UINT32 inputRectCount) const
+    {
+        // Honour the queried sub-rect for IMAGE inputs.
+        //
+        // Demanding the whole input for every query is only free while D2D
+        // renders the output in one pass. Past ~2048 px WIDE it tiles, asks
+        // for each tile in turn, and a whole-input answer makes it re-render
+        // the entire upstream chain once per tile. Measured cliff: 2048x1280
+        // 1.10 ms, 2100x1280 56.05 ms -- 1.03x the pixels, 51x the time.
+        //
+        // TRIVIAL_SAMPLING is declared, so output pixel N depends only on
+        // input pixel N and the 1:1 answer is the correct one.
+        //
+        // Analysis pins (>= ImageInputCount) are 1 x N parameter textures and
+        // say nothing about geometry; they keep the old answer.
+        if (!::ShaderLab::Performance::IsSubRectInputDemandEnabled())
+            return MapOutputRectToInputRectsWholeInput(
+                outputRect, inputRects, inputRectCount);
+
+        const UINT32 imageInputs = (std::min)(inputRectCount, ImageInputCount());
+        for (UINT32 i = 0; i < imageInputs; ++i)
+            inputRects[i] = *outputRect;
+        // Lookup tables and analysis textures are read at COMPUTED coordinates,
+        // so every tile needs all of them -- demand each one's own full extent.
+        // Not the output rect: asking a 256x128 table for 2880x1800 invites D2D
+        // to build an intermediate that size around it on every frame.
+        for (UINT32 i = imageInputs; i < inputRectCount; ++i)
+            inputRects[i] = (i < m_allInputRects.size()) ? m_allInputRects[i]
+                                                         : m_lastOutputRect;
+        return S_OK;
+    }
+
+    // The behaviour that shipped, kept reachable as a kill switch. See
+    // Performance::IsSubRectInputDemandEnabled for why it is no longer the
+    // default and what it costs (53 ms -> 2.6 ms at 2880x1800).
+    IFACEMETHODIMP CustomPixelShaderEffect::MapOutputRectToInputRectsWholeInput(
         const D2D1_RECT_L* /*outputRect*/,
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const

@@ -1,5 +1,7 @@
 #include "pch_engine.h"
 #include "D3D11ComputeRunner.h"
+#include "../Effects/Performance.h"
+#include "../Effects/ShaderLabParamsHlsl.h"
 
 namespace ShaderLab::Rendering
 {
@@ -9,8 +11,16 @@ namespace ShaderLab::Rendering
         if (iid == __uuidof(IUnknown) ||
             iid == Effects::IID_IEngineComputeOutput)
         {
+            // Disambiguate explicitly: the runner now inherits two IUnknown
+            // paths, so a plain `this` would be ambiguous and, worse, an
+            // implicit pick could hand back the wrong vtable.
             *out = static_cast<Effects::IEngineComputeOutput*>(this);
             // No-op AddRef -- runner lifetime owned by GraphEvaluator's cache.
+            return S_OK;
+        }
+        if (iid == Effects::IID_IEngineComputeTexture)
+        {
+            *out = static_cast<Effects::IEngineComputeTexture*>(this);
             return S_OK;
         }
         *out = nullptr;
@@ -30,7 +40,41 @@ namespace ShaderLab::Rendering
     {
         if (!device) return;
         m_device.copy_from(device);
-        m_device->GetImmediateContext(m_context.put());
+        m_device->GetImmediateContext(m_immediate.put());
+
+        // Record on a PRIVATE deferred context, submit as one command list.
+        //
+        // The immediate context is shared with Direct2D -- the render
+        // thread's and the UI thread's D2D contexts both draw through it --
+        // and its shader / SRV / UAV bindings are context state, not
+        // per-caller state. SetMultithreadProtected serializes individual
+        // calls, not sequences, so a dispatch issued as the usual five calls
+        // (clear, set shader, set SRVs, set UAVs, Dispatch) could have another
+        // thread's work land in the middle and run with its bindings gone:
+        // ~8% of re-dispatches wrote nothing while returning S_OK. Recording
+        // here and submitting with a single ExecuteCommandList makes the
+        // whole dispatch one call, which multithread protection DOES make
+        // atomic -- with no lock, and no knowledge that D2D exists at all.
+        if (FAILED(m_device->CreateDeferredContext(0, m_deferredCtx.put())))
+            m_deferredCtx = nullptr;
+        m_context = m_deferredCtx ? m_deferredCtx : m_immediate;
+        m_deferred = (m_context == m_deferredCtx);
+    }
+
+    void D3D11ComputeRunner::SubmitRecorded()
+    {
+        if (!m_deferred || !m_context || !m_immediate) return;
+        winrt::com_ptr<ID3D11CommandList> list;
+        // FALSE: the deferred context starts the next recording from default
+        // state, which is what we want -- every dispatch binds what it uses.
+        if (FAILED(m_context->FinishCommandList(FALSE, list.put())) || !list)
+            return;
+        // TRUE is NOT optional. With FALSE the runtime resets the immediate
+        // context to defaults afterwards, and if this submit lands in the
+        // middle of D2D building its own pipeline state, that reset wipes
+        // D2D's half-set bindings -- the same race, pointed the other way.
+        // TRUE leaves the immediate context exactly as this call found it.
+        m_immediate->ExecuteCommandList(list.get(), TRUE);
     }
 
     bool D3D11ComputeRunner::CompileShader(const std::string& hlslSource)
@@ -78,12 +122,176 @@ namespace ShaderLab::Rendering
         return true;
     }
 
+
+    // -----------------------------------------------------------------------
+    // Lane 3: analysis values as a 1 x N RGBA32F texture
+    // -----------------------------------------------------------------------
+    //
+    // Exists because Direct2D will not let a custom PIXEL shader bind an
+    // arbitrary SRV: it maps a transform's INPUTS to Texture2D at t0, t1, ...
+    // and nothing else. ID2D1EffectContext::CreateResourceTexture looks like
+    // the way round and is not -- it takes `const BYTE*` CPU memory, so it
+    // would reintroduce the GPU->CPU readback this lane exists to remove.
+    //
+    // A buffer cannot be CopyResource'd into a texture (the API will not
+    // convert dimensions), so the copy is a one-line compute pass. It is N
+    // threads over a handful of texels; the cost is the dispatch, not the work.
+
+    namespace
+    {
+        // Result[] -> row 0 of a 1 x N RGBA32F texture, texel i = Result[i].
+        constexpr const char* kAnalysisCopyHLSL = R"HLSL(
+StructuredBuffer<float4>   Src : register(t0);
+RWTexture2D<float4>        Dst : register(u0);
+cbuffer C : register(b0) { uint Count; uint3 _pad; };
+[numthreads(64, 1, 1)]
+void main(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= Count) return;
+    Dst[int2((int)tid.x, 0)] = Src[tid.x];
+}
+)HLSL";
+    }
+
+    HRESULT __stdcall D3D11ComputeRunner::RequestAnalysisTexture()
+    {
+        if (!m_device) return E_NOT_VALID_STATE;
+        m_analysisTexWanted = true;
+        return S_OK;
+    }
+
+    HRESULT __stdcall D3D11ComputeRunner::GetAnalysisTexture(ID3D11Texture2D** out)
+    {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!m_analysisTex || !m_analysisTexFilled) return E_NOT_VALID_STATE;
+        *out = m_analysisTex.get();
+        (*out)->AddRef();
+        return S_OK;
+    }
+
+    HRESULT __stdcall D3D11ComputeRunner::GetAnalysisTextureSrv(
+        ID3D11ShaderResourceView** out)
+    {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!m_analysisTexSRV || !m_analysisTexFilled) return E_NOT_VALID_STATE;
+        *out = m_analysisTexSRV.get();
+        (*out)->AddRef();
+        return S_OK;
+    }
+
+    bool D3D11ComputeRunner::EnsureAnalysisTexture()
+    {
+        if (!m_analysisTexWanted || !m_device || m_resultCount == 0) return false;
+        if (m_analysisTex && m_analysisCopyShader) return true;
+
+        m_analysisTex = nullptr;
+        m_analysisTexUAV = nullptr;
+        m_analysisTexSRV = nullptr;
+
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = m_resultCount;
+        td.Height = 1;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        // SHADER_RESOURCE so a consumer can read it; UNORDERED_ACCESS so the
+        // copy pass can write it. No CPU access on purpose -- the entire point
+        // is that these values never touch the CPU.
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        if (FAILED(m_device->CreateTexture2D(&td, nullptr, m_analysisTex.put())))
+        {
+            m_analysisTexWanted = false;   // do not retry every frame
+            return false;
+        }
+        if (FAILED(m_device->CreateUnorderedAccessView(
+                m_analysisTex.get(), nullptr, m_analysisTexUAV.put())) ||
+            FAILED(m_device->CreateShaderResourceView(
+                m_analysisTex.get(), nullptr, m_analysisTexSRV.put())))
+        {
+            m_analysisTex = nullptr;
+            m_analysisTexWanted = false;
+            return false;
+        }
+
+        if (!m_analysisCopyShader)
+        {
+            winrt::com_ptr<ID3DBlob> blob, errors;
+            HRESULT hr = D3DCompile(
+                kAnalysisCopyHLSL, std::strlen(kAnalysisCopyHLSL),
+                "AnalysisCopy", nullptr, nullptr, "main", "cs_5_0",
+                D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                0, blob.put(), errors.put());
+            if (FAILED(hr) || !blob)
+            {
+                m_analysisTexWanted = false;
+                return false;
+            }
+            if (FAILED(m_device->CreateComputeShader(
+                    blob->GetBufferPointer(), blob->GetBufferSize(),
+                    nullptr, m_analysisCopyShader.put())))
+            {
+                m_analysisTexWanted = false;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void D3D11ComputeRunner::PublishAnalysisTexture()
+    {
+        if (!EnsureAnalysisTexture()) return;
+        if (!m_resultSRV || !m_analysisTexUAV || !m_context) return;
+
+        // Its own tiny cbuffer: the main shader's constants have a different
+        // layout, and rebinding theirs here would corrupt the next dispatch.
+        struct { UINT count; UINT pad[3]; } cb{ m_resultCount, {0, 0, 0} };
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = sizeof(cb);
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        winrt::com_ptr<ID3D11Buffer> cbuf;
+        D3D11_SUBRESOURCE_DATA init{ &cb, 0, 0 };
+        if (FAILED(m_device->CreateBuffer(&bd, &init, cbuf.put()))) return;
+
+        ID3D11ShaderResourceView* srvs[] = { m_resultSRV.get() };
+        ID3D11UnorderedAccessView* uavs[] = { m_analysisTexUAV.get() };
+        ID3D11Buffer* cbs[] = { cbuf.get() };
+        UINT counts[] = { 0 };
+
+        m_context->CSSetShader(m_analysisCopyShader.get(), nullptr, 0);
+        m_context->CSSetShaderResources(0, 1, srvs);
+        m_context->CSSetUnorderedAccessViews(0, 1, uavs, counts);
+        m_context->CSSetConstantBuffers(0, 1, cbs);
+        m_context->Dispatch((m_resultCount + 63) / 64, 1, 1);
+
+        // Unbind: leaving the result SRV bound to t0 would conflict with the
+        // next dispatch binding the same resource as a UAV, and D3D silently
+        // drops one of the two.
+        ID3D11ShaderResourceView* nullSrv[] = { nullptr };
+        ID3D11UnorderedAccessView* nullUav[] = { nullptr };
+        m_context->CSSetShaderResources(0, 1, nullSrv);
+        m_context->CSSetUnorderedAccessViews(0, 1, nullUav, counts);
+        m_context->CSSetShader(nullptr, nullptr, 0);
+
+        m_analysisTexFilled = true;
+    }
+
     void D3D11ComputeRunner::EnsureBuffers(uint32_t resultCount)
     {
         if (m_resultCount == resultCount && m_resultBuffer) return;
         m_resultCount = resultCount;
+        // Lane 3 is sized off resultCount, so it has to go with the rest.
+        // Keep m_analysisTexWanted: the consumer's request outlives a resize.
+        m_analysisTex = nullptr;
+        m_analysisTexUAV = nullptr;
+        m_analysisTexSRV = nullptr;
+        m_analysisTexFilled = false;
         m_resultBuffer = nullptr;
-        m_stagingBuffer = nullptr;
+        for (auto& slot : m_staging) { slot.buffer = nullptr; slot.pending = false; }
         m_resultUAV = nullptr;
         m_resultSRV = nullptr;
         m_cbuffer = nullptr;
@@ -120,12 +328,13 @@ namespace ShaderLab::Rendering
         srvDesc.Buffer.NumElements = resultCount;
         m_device->CreateShaderResourceView(m_resultBuffer.get(), &srvDesc, m_resultSRV.put());
 
-        // Staging buffer for readback.
+        // Staging ring for readback.
         bufDesc.Usage = D3D11_USAGE_STAGING;
         bufDesc.BindFlags = 0;
         bufDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         bufDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-        m_device->CreateBuffer(&bufDesc, nullptr, m_stagingBuffer.put());
+        for (auto& slot : m_staging)
+            m_device->CreateBuffer(&bufDesc, nullptr, slot.buffer.put());
 
         // Constant buffer (256 bytes max — room for Width, Height + user params).
         bufDesc.ByteWidth = 256;
@@ -149,6 +358,78 @@ namespace ShaderLab::Rendering
         m_bytecode = bytecode;
         m_shader = std::move(shader);
         m_compileError.clear();
+
+        // Does this shader opt into the multi-group reduction contract?
+        m_usesScratch = false;
+        winrt::com_ptr<ID3D11ShaderReflection> reflect;
+        if (!m_bytecode.empty() &&
+            SUCCEEDED(D3DReflect(m_bytecode.data(), m_bytecode.size(),
+                IID_ID3D11ShaderReflection, reinterpret_cast<void**>(reflect.put()))) && reflect)
+        {
+            D3D11_SHADER_INPUT_BIND_DESC bd{};
+            if (SUCCEEDED(reflect->GetResourceBindingDescByName("_SLScratch", &bd)))
+                m_usesScratch = (bd.BindPoint == 2);
+        }
+    }
+
+    bool D3D11ComputeRunner::EnsureScratch()
+    {
+        if (m_scratchUAV) return true;
+        if (!m_device) return false;
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = Effects::kReduceScratchUints * 4u;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        if (FAILED(m_device->CreateBuffer(&bd, nullptr, m_scratch.put()))) return false;
+
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.FirstElement = 0;
+        ud.Buffer.NumElements = Effects::kReduceScratchUints;
+        ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+        if (FAILED(m_device->CreateUnorderedAccessView(m_scratch.get(), &ud, m_scratchUAV.put())))
+            return false;
+        ud.Buffer.NumElements = Effects::kReduceScratchClearedUints;
+        if (FAILED(m_device->CreateUnorderedAccessView(m_scratch.get(), &ud, m_scratchHeadUAV.put())))
+        {
+            m_scratchUAV = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    bool D3D11ComputeRunner::PollReadback(std::vector<float>& out)
+    {
+        if (!m_immediate || m_resultCount == 0) return false;
+        // Newest completed copy wins; walk newest-first so the first success
+        // ends the search, then retire everything older.
+        std::array<StagingSlot*, kStagingSlots> order{};
+        size_t n = 0;
+        for (auto& s : m_staging) if (s.pending) order[n++] = &s;
+        std::sort(order.begin(), order.begin() + n,
+            [](const StagingSlot* a, const StagingSlot* b) { return a->seq > b->seq; });
+        for (size_t i = 0; i < n; ++i)
+        {
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            HRESULT hr = m_immediate->Map(order[i]->buffer.get(), 0, D3D11_MAP_READ,
+                                          D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+            if (hr == DXGI_ERROR_WAS_STILL_DRAWING) continue;
+            if (SUCCEEDED(hr))
+            {
+                const float* data = static_cast<const float*>(mapped.pData);
+                out.assign(data, data + m_resultCount * 4);
+                m_immediate->Unmap(order[i]->buffer.get(), 0);
+            }
+            // Completed (or failed for good): this slot and every older one
+            // are done -- older values are superseded by this one.
+            const uint64_t seq = order[i]->seq;
+            for (auto& s : m_staging)
+                if (s.pending && s.seq <= seq) s.pending = false;
+            return SUCCEEDED(hr);
+        }
+        return false;
     }
 
     std::vector<float> D3D11ComputeRunner::Dispatch(
@@ -168,9 +449,14 @@ namespace ShaderLab::Rendering
         uint32_t dispatchX, uint32_t dispatchY, uint32_t dispatchZ,
         const std::vector<ID3D11ShaderResourceView*>& extraSrvs,
         const std::vector<uint32_t>& extraSrvSlots,
-        bool readbackToCpu)
+        Readback readbackMode)
     {
         std::vector<float> result;
+        // Record on the private deferred context unless the A/B switch says
+        // otherwise (see Performance::IsComputeCommandListEnabled).
+        m_context = (m_deferredCtx && Performance::IsComputeCommandListEnabled())
+            ? m_deferredCtx : m_immediate;
+        m_deferred = (m_context == m_deferredCtx) && m_deferredCtx;
         if (!m_shader || !m_context || inputTextures.empty() || !inputTextures[0])
             return result;
 
@@ -265,8 +551,20 @@ namespace ShaderLab::Rendering
             m_context->CSSetShaderResources(extraSrvSlots[i], 1, one);
         }
 
-        ID3D11UnorderedAccessView* uavs[2] = { m_resultUAV.get(), imageUAV.get() };
-        UINT uavCount = imageUAV ? 2u : 1u;
+        // Multi-group reduction: scratch at u2, head zeroed, and a
+        // kReduceGroups-wide dispatch unless the caller sized it.
+        const bool scratch = m_usesScratch && EnsureScratch();
+        if (scratch)
+        {
+            const UINT zero[4] = { 0, 0, 0, 0 };
+            m_context->ClearUnorderedAccessViewUint(m_scratchHeadUAV.get(), zero);
+            if (dispatchX <= 1 && dispatchY <= 1 && dispatchZ <= 1)
+                dispatchX = Effects::kReduceGroups;
+        }
+
+        ID3D11UnorderedAccessView* uavs[3] = { m_resultUAV.get(), imageUAV.get(),
+                                               scratch ? m_scratchUAV.get() : nullptr };
+        UINT uavCount = scratch ? 3u : (imageUAV ? 2u : 1u);
         m_context->CSSetUnorderedAccessViews(0, uavCount, uavs, nullptr);
         ID3D11Buffer* cbs[] = { m_cbuffer.get() };
         m_context->CSSetConstantBuffers(0, 1, cbs);
@@ -284,9 +582,19 @@ namespace ShaderLab::Rendering
             ID3D11ShaderResourceView* none[1] = { nullptr };
             m_context->CSSetShaderResources(extraSrvSlots[i], 1, none);
         }
-        ID3D11UnorderedAccessView* nullUAVs[2] = { nullptr, nullptr };
+        ID3D11UnorderedAccessView* nullUAVs[3] = { nullptr, nullptr, nullptr };
         m_context->CSSetUnorderedAccessViews(0, uavCount, nullUAVs, nullptr);
         m_context->CSSetShader(nullptr, nullptr, 0);
+
+        // Lane 3: publish Result[] into the 1 x N texture, but ONLY if some
+        // consumer asked for it. This is the demand-driven half of the
+        // three-lane contract -- a graph with no pixel-shader consumer never
+        // creates the texture, never compiles the copy shader and never
+        // dispatches it. Runs after the main dispatch's UAVs are unbound,
+        // because the copy reads the result buffer as an SRV and D3D will
+        // silently drop one of the two views if both are bound at once.
+        if (m_analysisTexWanted && resultCount > 0)
+            PublishAnalysisTexture();
 
         // Readback (only if caller asked for analysis values; image
         // output stays GPU-resident). Phase 8c: also gated by
@@ -294,16 +602,46 @@ namespace ShaderLab::Rendering
         // no CPU consumer needs the values this frame -- the SRV at
         // `m_resultSRV` is unaffected and downstream GPU bindings still
         // see the buffer's freshly-written contents.
-        if (resultCount > 0 && readbackToCpu)
+        const bool readback = (resultCount > 0 && readbackMode != Readback::None);
+        StagingSlot* slot = nullptr;
+        if (readback)
         {
-            m_context->CopyResource(m_stagingBuffer.get(), m_resultBuffer.get());
-            hr = m_context->Map(m_stagingBuffer.get(), 0, D3D11_MAP_READ, 0, &mapped);
+            // Prefer a free slot; with all three in flight, reuse the oldest
+            // (its values are superseded by this copy anyway).
+            for (auto& s : m_staging)
+                if (s.buffer && !s.pending) { slot = &s; break; }
+            if (!slot)
+            {
+                for (auto& s : m_staging)
+                    if (s.buffer && (!slot || s.seq < slot->seq)) slot = &s;
+            }
+            if (slot)
+                m_context->CopyResource(slot->buffer.get(), m_resultBuffer.get());
+        }
+
+        // Everything above -- clears, bindings, dispatch, unbind, the lane-3
+        // publish and the staging copy -- goes to the GPU as ONE call.
+        SubmitRecorded();
+
+        // A deferred context cannot Map for READ, so the readback happens on
+        // the immediate context, after the list that fills the staging
+        // buffer. One call, touching a buffer nothing else binds.
+        if (slot && readbackMode == Readback::Blocking)
+        {
+            hr = m_immediate->Map(slot->buffer.get(), 0, D3D11_MAP_READ, 0, &mapped);
             if (SUCCEEDED(hr))
             {
                 const float* data = static_cast<const float*>(mapped.pData);
                 result.assign(data, data + resultCount * 4);
-                m_context->Unmap(m_stagingBuffer.get(), 0);
+                m_immediate->Unmap(slot->buffer.get(), 0);
             }
+            // Anything still in flight is older than what was just read.
+            for (auto& s : m_staging) s.pending = false;
+        }
+        else if (slot)
+        {
+            slot->pending = true;
+            slot->seq = ++m_stagingSeq;
         }
 
         // Phase 8: bump the dispatch counter so downstream

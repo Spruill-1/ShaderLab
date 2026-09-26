@@ -167,7 +167,6 @@ namespace ShaderLab::Controls
                     if (m_width > 0 && m_height > 0)
                     {
                         CreateSwapChain();
-                        CreateRenderTarget();
                     }
 
                     // P7: push initial size into the sink so the worker can
@@ -204,145 +203,6 @@ namespace ShaderLab::Controls
         }
     }
 
-    void OutputWindow::FitToView(ID2D1DeviceContext5* dc, ID2D1Image* image)
-    {
-        if (!image || m_width == 0 || m_height == 0)
-            return;
-
-        D2D1_RECT_F bounds{};
-        dc->GetImageLocalBounds(image, &bounds);
-        float imgW = bounds.right - bounds.left;
-        float imgH = bounds.bottom - bounds.top;
-        if (imgW <= 0 || imgH <= 0)
-            return;
-
-        float dpi = 96.0f * m_panel.CompositionScaleX();
-        float vpW = static_cast<float>(m_width) / (dpi / 96.0f);
-        float vpH = static_cast<float>(m_height) / (dpi / 96.0f);
-        m_zoom = (std::min)(vpW / imgW, vpH / imgH);
-        m_panX = (vpW - imgW * m_zoom) * 0.5f;
-        m_panY = (vpH - imgH * m_zoom) * 0.5f;
-    }
-
-    void OutputWindow::Present(ID2D1DeviceContext5* dc, ID2D1Image* image)
-    {
-        if (!m_isOpen || !dc || !m_swapChain || !m_renderTarget)
-            return;
-
-        try
-        {
-            // Handle pending resize.
-            if (m_needsResize)
-            {
-                m_needsResize = false;
-                ReleaseRenderTarget();
-
-                if (m_width > 0 && m_height > 0)
-                {
-                    HRESULT hr = m_swapChain->ResizeBuffers(0, m_width, m_height,
-                        DXGI_FORMAT_UNKNOWN, 0);
-                    if (SUCCEEDED(hr))
-                        CreateRenderTarget();
-                }
-
-                if (!m_renderTarget)
-                    return;
-
-                m_needsFit = true;
-            }
-
-            // Auto-fit: scale to fill window until user manually pans/zooms.
-            if ((m_needsFit || m_autoFit) && image)
-            {
-                m_needsFit = false;
-                FitToView(dc, image);
-            }
-
-            // Store for save.
-            m_lastImage = image;
-
-            // Save the main window's render target and state.
-            winrt::com_ptr<ID2D1Image> oldTarget;
-            dc->GetTarget(oldTarget.put());
-            float oldDpiX, oldDpiY;
-            dc->GetDpi(&oldDpiX, &oldDpiY);
-            auto oldTransform = D2D1::Matrix3x2F::Identity();
-            dc->GetTransform(&oldTransform);
-
-            // Set our render target.
-            dc->SetTarget(m_renderTarget.get());
-            float dpi = 96.0f * m_panel.CompositionScaleX();
-            dc->SetDpi(dpi, dpi);
-
-            dc->BeginDraw();
-            dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-
-            if (image)
-            {
-                // Apply pan/zoom transform.
-                dc->SetTransform(
-                    D2D1::Matrix3x2F::Scale(m_zoom, m_zoom) *
-                    D2D1::Matrix3x2F::Translation(m_panX, m_panY));
-                dc->DrawImage(image);
-            }
-            else
-            {
-                // Draw "No Input" indicator for broken/disconnected graph chain.
-                winrt::com_ptr<IDWriteFactory> dwFactory;
-                DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
-                    __uuidof(IDWriteFactory), dwFactory.as<IUnknown>().put());
-                if (dwFactory)
-                {
-                    winrt::com_ptr<IDWriteTextFormat> fmt;
-                    dwFactory->CreateTextFormat(L"Segoe UI", nullptr,
-                        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                        DWRITE_FONT_STRETCH_NORMAL, 18.0f, L"en-us", fmt.put());
-                    if (fmt)
-                    {
-                        fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                        fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-                        winrt::com_ptr<ID2D1SolidColorBrush> brush;
-                        dc->CreateSolidColorBrush(D2D1::ColorF(0.5f, 0.5f, 0.5f, 0.8f), brush.put());
-                        if (brush)
-                        {
-                            D2D1_SIZE_F sz = m_renderTarget->GetSize();
-                            dc->DrawText(L"No Input", 8, fmt.get(),
-                                D2D1::RectF(0, 0, sz.width, sz.height), brush.get());
-                        }
-                    }
-                }
-            }
-
-            dc->SetTransform(D2D1::Matrix3x2F::Identity());
-            HRESULT hr = dc->EndDraw();
-            if (FAILED(hr))
-            {
-                OutputDebugStringW(std::format(L"[OutputWindow] EndDraw error hr=0x{:08X}\n",
-                    static_cast<uint32_t>(hr)).c_str());
-            }
-
-            DXGI_PRESENT_PARAMETERS params{};
-            m_swapChain->Present1(1, 0, &params);
-
-            // Restore the main window's render target and state.
-            dc->SetTarget(oldTarget.get());
-            dc->SetDpi(oldDpiX, oldDpiY);
-            dc->SetTransform(&oldTransform);
-
-            // FPS / timing display is driven by SetStatusText from the main
-            // window so all windows show the same numbers in the same
-            // format. No per-window counter -- every render tick presents
-            // to all output windows synchronously, so per-window FPS would
-            // be redundant.
-        }
-        catch (const winrt::hresult_error& ex)
-        {
-            OutputDebugStringW(std::format(L"[OutputWindow] Present failed: {}\n",
-                std::wstring_view(ex.message())).c_str());
-        }
-        catch (...) {}
-    }
-
     void OutputWindow::Close()
     {
         m_isOpen = false;
@@ -356,7 +216,6 @@ namespace ShaderLab::Controls
             std::scoped_lock lock(m_sink->viewMutex);
             m_sink->closed = true;
         }
-        ReleaseRenderTarget();
         m_swapChain = nullptr;
 
         if (m_window)
@@ -367,7 +226,12 @@ namespace ShaderLab::Controls
                     m_panel.SizeChanged(m_sizeChangedToken);
                 m_window.Close();
             }
-            catch (...) {}
+            catch (...)
+            {
+                // Deliberate swallow: teardown. Revoking a token or closing a
+                // window that XAML already tore down throws, and every field
+                // this method clears is nulled immediately below either way.
+            }
             m_window = nullptr;
         }
 
@@ -378,27 +242,38 @@ namespace ShaderLab::Controls
     void OutputWindow::SetTitle(const std::wstring& title)
     {
         m_nodeName = title;
-        if (m_window)
+        if (m_window && title != m_lastTitle)
+        {
             m_window.Title(winrt::hstring(title));
+            m_lastTitle = title;
+        }
     }
 
     void OutputWindow::SetStatusText(const std::wstring& text)
     {
-        if (m_fpsText)
+        if (m_fpsText && text != m_lastStatusText)
+        {
             m_fpsText.Text(winrt::hstring(text));
+            m_lastStatusText = text;
+        }
     }
 
     void OutputWindow::SetStatusTooltip(const std::wstring& tooltip)
     {
-        if (!m_fpsText) return;
-        // Wrap the tooltip text in a monospace TextBlock for readability.
+        if (!m_fpsText || tooltip == m_lastTooltip) return;
+        m_lastTooltip = tooltip;
+        // Wrap the tooltip text in a monospace TextBlock for readability,
+        // created once and updated in place.
         namespace MUX = winrt::Microsoft::UI::Xaml;
         namespace MUXC = winrt::Microsoft::UI::Xaml::Controls;
-        auto tb = MUXC::TextBlock();
-        tb.FontFamily(MUX::Media::FontFamily(L"Cascadia Mono, Consolas, Courier New"));
-        tb.FontSize(11);
-        tb.Text(winrt::hstring(tooltip));
-        MUXC::ToolTipService::SetToolTip(m_fpsText, tb);
+        if (!m_tooltipBlock)
+        {
+            m_tooltipBlock = MUXC::TextBlock();
+            m_tooltipBlock.FontFamily(MUX::Media::FontFamily(L"Cascadia Mono, Consolas, Courier New"));
+            m_tooltipBlock.FontSize(11);
+            MUXC::ToolTipService::SetToolTip(m_fpsText, m_tooltipBlock);
+        }
+        m_tooltipBlock.Text(winrt::hstring(tooltip));
     }
 
     void OutputWindow::CreateSwapChain()
@@ -438,36 +313,30 @@ namespace ShaderLab::Controls
 
         auto panelNative = m_panel.as<ISwapChainPanelNative>();
         panelNative->SetSwapChain(m_swapChain.get());
+        ApplyInverseCompositionScale();
     }
 
-    void OutputWindow::CreateRenderTarget()
+    // A SwapChainPanel composes its swap chain in DIPs. The buffer here is
+    // sized in PHYSICAL pixels (ActualSize * CompositionScale) so the image is
+    // sharp -- which means that without the inverse matrix the panel magnifies
+    // it by the display scale, anchored at the top-left. At 150% that showed
+    // the top-left two thirds of a correctly fitted image (measured: a 34 px
+    // letterbox landing at 50 px, the bottom pushed under the status bar).
+    // Invisible at 100% scaling. MainWindow::UpdateGraphPanelScale does the
+    // same for the node-graph panel.
+    void OutputWindow::ApplyInverseCompositionScale()
     {
-        if (!m_swapChain || !m_dc)
-            return;
-
-        winrt::com_ptr<IDXGISurface2> backBuffer;
-        HRESULT hr = m_swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.put()));
-        if (FAILED(hr)) return;
-
-        D2D1_BITMAP_PROPERTIES1 bitmapProps = D2D1::BitmapProperties1(
-            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-            D2D1::PixelFormat(m_format.dxgiFormat, D2D1_ALPHA_MODE_PREMULTIPLIED));
-
-        hr = m_dc->CreateBitmapFromDxgiSurface(
-            backBuffer.get(),
-            &bitmapProps,
-            m_renderTarget.put());
-
-        if (FAILED(hr))
-        {
-            OutputDebugStringW(std::format(L"[OutputWindow] CreateRenderTarget failed hr=0x{:08X}\n",
-                static_cast<uint32_t>(hr)).c_str());
-        }
-    }
-
-    void OutputWindow::ReleaseRenderTarget()
-    {
-        m_renderTarget = nullptr;
+        if (!m_swapChain || !m_panel) return;
+        winrt::com_ptr<IDXGISwapChain2> swapChain2;
+        if (FAILED(m_swapChain->QueryInterface(IID_PPV_ARGS(swapChain2.put())))) return;
+        const float sx = (std::max)(1e-3f, static_cast<float>(m_panel.CompositionScaleX()));
+        const float sy = (std::max)(1e-3f, static_cast<float>(m_panel.CompositionScaleY()));
+        DXGI_MATRIX_3X2_F m{};
+        m._11 = 1.0f / sx;
+        m._22 = 1.0f / sy;
+        swapChain2->SetMatrixTransform(&m);
+        m_appliedScaleX = sx;
+        m_appliedScaleY = sy;
     }
 
     void OutputWindow::OnPanelSizeChanged(
@@ -487,7 +356,6 @@ namespace ShaderLab::Controls
         if (!m_swapChain)
         {
             CreateSwapChain();
-            CreateRenderTarget();
         }
         else
         {
@@ -543,9 +411,12 @@ namespace ShaderLab::Controls
             auto fileExt = std::wstring(file.FileType().c_str());
             bool isJxr = (fileExt == L".jxr" || fileExt == L".wdp");
 
+            // PNG uses the _SRGB variant: encode the linear scene on
+            // write (plain UNORM wrote linear bytes -> dark in viewers).
+            // JXR stays FP16 linear scRGB.
             DXGI_FORMAT renderFormat = isJxr
                 ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                : DXGI_FORMAT_B8G8R8A8_UNORM;
+                : DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 
             winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
             D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
@@ -621,7 +492,22 @@ namespace ShaderLab::Controls
             if (m_fpsText)
                 m_fpsText.Text(L"Saved: " + file.Name());
         }
-        catch (...) {}
+        catch (const winrt::hresult_error& ex)
+        {
+            // Every step above is check_hresult'd, so a WIC/D2D failure lands
+            // here. Report it where the success message goes -- silently doing
+            // nothing after the user picked a file reads as a no-op UI bug.
+            OutputDebugStringW(std::format(L"[OutputWindow] Save failed: {}\n",
+                std::wstring_view(ex.message())).c_str());
+            if (m_fpsText)
+                m_fpsText.Text(L"Save failed: " + ex.message());
+        }
+        catch (...)
+        {
+            OutputDebugStringW(L"[OutputWindow] Save failed (non-hresult exception)\n");
+            if (m_fpsText)
+                m_fpsText.Text(L"Save failed");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -682,19 +568,48 @@ namespace ShaderLab::Controls
                     m_needsFit = true;
                 }
             }
-            catch (...) {}
+            catch (...)
+            {
+                // Deliberate swallow: reading XAML layout properties races
+                // window teardown. Leaving m_needsResize alone just means the
+                // next tick re-reads the size, which is the desired behavior.
+            }
         }
 
         // Handle pending swap-chain resize before consuming a frame.
+        //
+        // ResizeBuffers fails while ANY reference to a back buffer is alive
+        // (a D2D bitmap wrapping it, a context whose target it is). Until this
+        // was fixed a leftover wrapper from the pre-P7 Present path pinned
+        // buffer 0, so every resize failed -- and because the flag was
+        // cleared BEFORE the call, the failure was consumed: the swap chain
+        // stayed at its creation size for the life of the window while the
+        // fit math used the new panel size, clipping the image and stretching
+        // an undersized buffer. The per-blit wrapper below is released (and
+        // the target cleared) before we return, so nothing pins it now; a
+        // failure stays pending and is logged instead of being swallowed.
         if (m_needsResize)
         {
-            m_needsResize = false;
             if (m_width > 0 && m_height > 0)
             {
                 HRESULT hr = m_swapChain->ResizeBuffers(0, m_width, m_height,
                     DXGI_FORMAT_UNKNOWN, 0);
-                if (FAILED(hr)) return;
+                if (FAILED(hr))
+                {
+                    OutputDebugStringW(std::format(
+                        L"[OutputWindow] ResizeBuffers({}x{}) failed hr=0x{:08X}; will retry\n",
+                        m_width, m_height, static_cast<uint32_t>(hr)).c_str());
+                    return;
+                }
             }
+            m_needsResize = false;
+            ApplyInverseCompositionScale();
+        }
+        else if (m_panel &&
+                 (static_cast<float>(m_panel.CompositionScaleX()) != m_appliedScaleX ||
+                  static_cast<float>(m_panel.CompositionScaleY()) != m_appliedScaleY))
+        {
+            ApplyInverseCompositionScale();
         }
 
         const int32_t idx = m_sink->publishedIdx.load(std::memory_order_acquire);
@@ -731,6 +646,17 @@ namespace ShaderLab::Controls
 
         auto* sourceBitmap = m_sink->uiSources[idx].get();
         if (!sourceBitmap) return;
+
+        // Nothing new to show? A fit still pending counts as new (it changes
+        // the view below), as does any resize, DPI or pan/zoom change.
+        const uint64_t version = m_sink->publishedVersion.load(std::memory_order_acquire);
+        const PresentedView view{ m_width, m_height,
+            m_panel ? static_cast<float>(m_panel.CompositionScaleX()) : 1.0f,
+            m_zoom, m_panX, m_panY };
+        // (Auto-fit needs no exception: its result depends only on the panel
+        // size and scale, which the view signature already covers.)
+        if (version == m_lastBlittedVersion && view == m_lastPresentedView && !m_needsFit)
+            return;
 
         // Cache for SaveImageAsync. The source bitmap wraps the worker's
         // offscreen texture; the wrapper lifetime is governed by uiSources
@@ -793,5 +719,9 @@ namespace ShaderLab::Controls
 
         DXGI_PRESENT_PARAMETERS params{};
         m_swapChain->Present1(1, 0, &params);
+        m_lastBlittedVersion = version;
+        m_lastPresentedView = { m_width, m_height,
+            m_panel ? static_cast<float>(m_panel.CompositionScaleX()) : 1.0f,
+            m_zoom, m_panX, m_panY };
     }
 }

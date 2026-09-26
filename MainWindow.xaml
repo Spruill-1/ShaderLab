@@ -333,10 +333,87 @@
                            Style="{StaticResource CaptionTextBlockStyle}" />
                 <Button.Flyout>
                     <Flyout x:Name="FpsFlyout" ShowMode="Standard">
-                        <TextBlock x:Name="FpsTooltipText"
-                                   FontFamily="Cascadia Mono, Consolas, Courier New"
-                                   FontSize="11"
-                                   Text="(no data yet)" />
+                        <StackPanel Spacing="10" MinWidth="360">
+                            <TextBlock x:Name="FpsTooltipText"
+                                       FontFamily="Cascadia Mono, Consolas, Courier New"
+                                       FontSize="11"
+                                       Text="(no data yet)" />
+                            <Border Height="1"
+                                    Background="{ThemeResource DividerStrokeColorDefaultBrush}" />
+                            <CheckBox x:Name="GpuTimingCheck"
+                                      Content="Measure real GPU time"
+                                      Checked="OnGpuTimingToggled"
+                                      Unchecked="OnGpuTimingToggled">
+                                <ToolTipService.ToolTip>
+                                    <ToolTip>
+                                        <TextBlock TextWrapping="Wrap" MaxWidth="320"
+                                                   Text="Samples D3D11 timestamp queries. The phase times above are CPU wall-clock around an asynchronous API, so they measure command recording, not GPU execution. Costs a Flush per span, which perturbs the frame being measured -- turn it on to measure, off to run." />
+                                    </ToolTip>
+                                </ToolTipService.ToolTip>
+                            </CheckBox>
+                            <CheckBox x:Name="UnthrottledCheck"
+                                      Content="Unthrottled render loop (benchmark)"
+                                      Checked="OnUnthrottledToggled"
+                                      Unchecked="OnUnthrottledToggled">
+                                <ToolTipService.ToolTip>
+                                    <ToolTip>
+                                        <TextBlock TextWrapping="Wrap" MaxWidth="320"
+                                                   Text="Runs the graph as fast as the machine allows instead of pacing to the display. The worker drops its 16 ms wait (a ~62.5 Hz cap), evaluates every tick whether or not anything is dirty, and the UI presents with vsync interval 0. Expect tearing, a pegged GPU and fans -- the point is to measure real pipeline throughput, which the display cadence otherwise hides. Pair with Measure real GPU time for per-phase cost." />
+                                    </ToolTip>
+                                </ToolTipService.ToolTip>
+                            </CheckBox>
+                            <CheckBox x:Name="NodeGpuStatsCheck"
+                                      Content="Show GPU time on graph nodes"
+                                      Checked="OnNodeGpuStatsToggled"
+                                      Unchecked="OnNodeGpuStatsToggled">
+                                <ToolTipService.ToolTip>
+                                    <ToolTip>
+                                        <TextBlock TextWrapping="Wrap" MaxWidth="320"
+                                                   Text="Annotates each node on the canvas with its GPU cost and how that figure was obtained. Compute nodes read &quot;measured&quot; -- each dispatch is bracketed exactly. Image nodes read &quot;fused&quot;: Direct2D evaluates a chain lazily at DrawImage, so only the node at the end of a chain carries a number, and it is the cost of everything feeding it. &quot;cached&quot; means the node was needed but did no work this frame. Needs GPU timing on." />
+                                    </ToolTip>
+                                </ToolTipService.ToolTip>
+                            </CheckBox>
+                            <CheckBox x:Name="ForceRedrawCheck"
+                                      Content="Force full redraw every frame (no caching)"
+                                      Checked="OnForceRedrawToggled"
+                                      Unchecked="OnForceRedrawToggled">
+                                <ToolTipService.ToolTip>
+                                    <ToolTip>
+                                        <TextBlock TextWrapping="Wrap" MaxWidth="320"
+                                                   Text="The worst case, every frame: every node regenerates as if its inputs had just changed. D2D output caches are dropped, every compute node dispatches, generators such as the gamut boundary LUT rebuild. Without this a static graph evaluates to cached outputs and measures the cost of doing nothing. Image sources are not re-read from disk -- that would measure WIC, not the pipeline." />
+                                    </ToolTip>
+                                </ToolTipService.ToolTip>
+                            </CheckBox>
+                            <CheckBox x:Name="GpuBindingsCheck"
+                                      Content="Keep analysis on the GPU (GPU bindings)"
+                                      Checked="OnGpuBindingsToggled"
+                                      Unchecked="OnGpuBindingsToggled">
+                                <ToolTipService.ToolTip>
+                                    <ToolTip>
+                                        <TextBlock TextWrapping="Wrap" MaxWidth="320"
+                                                   Text="Lets a compute-analysis result feed a downstream shader parameter without travelling GPU-&gt;CPU-&gt;GPU: a compute consumer binds it as an SRV, a pixel shader receives it as a 1-row texture on an extra input. Output is identical either way; only the readback stall goes away. Bindings no consumer can take (built-in D2D effects) still read back." />
+                                    </ToolTip>
+                                </ToolTipService.ToolTip>
+                            </CheckBox>
+                            <StackPanel Spacing="4" Margin="0,8,0,0">
+                                <TextBlock Text="Refresh analysis readouts" />
+                                <ComboBox x:Name="AnalysisRefreshCombo"
+                                          SelectedIndex="0"
+                                          HorizontalAlignment="Stretch"
+                                          SelectionChanged="OnAnalysisRefreshChanged">
+                                    <ComboBoxItem Content="Selected node only, every 2 s" />
+                                    <ComboBoxItem Content="All nodes, every 2 s" />
+                                    <ComboBoxItem Content="All nodes, every 250 ms" />
+                                    <ComboBoxItem Content="All nodes, every frame (readback stall)" />
+                                </ComboBox>
+                                <ToolTipService.ToolTip>
+                                    <ToolTip>
+                                        <TextBlock TextWrapping="Wrap" MaxWidth="320"
+                                                   Text="How often the analysis numbers shown on the canvas and in the Properties panel are read back from the GPU. Display only: a binding that needs a CPU value always gets a fresh one every frame, and GPU-bound parameters never wait for this. Each refresh is a GPU-&gt;CPU Map() that stalls on the frame -- ~10 ms at 5 Mpx -- so 'every frame' pays that on every frame. Use the first option when benchmarking." />
+                                    </ToolTip>
+                                </ToolTipService.ToolTip>
+                            </StackPanel>
+                        </StackPanel>
                     </Flyout>
                 </Button.Flyout>
                 <ToolTipService.ToolTip>

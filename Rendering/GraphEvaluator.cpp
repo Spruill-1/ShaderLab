@@ -5,8 +5,45 @@
 #include "../Effects/Performance.h"
 #include "../Effects/IEngineComputeOutput.h"
 #include "MathExpression.h"
+#include "../Effects/ShaderLabEffects.h"
 
 using namespace ShaderLab::Graph;
+
+namespace
+{
+    // A resolved binding must never carry a non-finite value into
+    // node->properties: that map is what /graph/save serialises, and a NaN
+    // lands in the document as 1.#QNAN -- an .effectgraph no JSON parser will
+    // load. Analysis fields legitimately carry NaN (one bad texel is enough)
+    // and binding one to a property is a recipe this project recommends, so
+    // the guard belongs at the write-back.
+    //
+    // Covers EVERY float-bearing alternative, not just scalar float: a float2
+    // binding was still corrupting documents while the scalar path was
+    // guarded, which is the same partial-sweep mistake twice over.
+    bool IsFinitePropertyValue(const ::ShaderLab::Graph::PropertyValue& v)
+    {
+        using namespace winrt::Windows::Foundation::Numerics;
+        if (const auto* f = std::get_if<float>(&v))   return std::isfinite(*f);
+        if (const auto* f2 = std::get_if<float2>(&v)) return std::isfinite(f2->x) && std::isfinite(f2->y);
+        if (const auto* f3 = std::get_if<float3>(&v))
+            return std::isfinite(f3->x) && std::isfinite(f3->y) && std::isfinite(f3->z);
+        if (const auto* f4 = std::get_if<float4>(&v))
+            return std::isfinite(f4->x) && std::isfinite(f4->y) && std::isfinite(f4->z) && std::isfinite(f4->w);
+        if (const auto* vec = std::get_if<std::vector<float>>(&v))
+        {
+            for (float e : *vec) if (!std::isfinite(e)) return false;
+            return true;
+        }
+        if (const auto* m = std::get_if<D2D1_MATRIX_5X4_F>(&v))
+        {
+            for (int i = 0; i < 20; ++i)
+                if (!std::isfinite(reinterpret_cast<const float*>(m)[i])) return false;
+            return true;
+        }
+        return true;   // int / uint / bool / wstring cannot be non-finite
+    }
+}
 
 namespace ShaderLab::Rendering
 {
@@ -124,24 +161,39 @@ namespace ShaderLab::Rendering
 
         ID2D1Image* finalOutput = nullptr;
 
-        // Propagate dirty downstream in topological order. If any node is
-        // dirty at the start of this frame (e.g. a Source whose video frame
-        // just uploaded, or a node whose property changed), every node it
-        // feeds is also dirty — they need to re-evaluate against the new
-        // upstream output. Without this, analysis-only compute nodes
-        // (Channel/Luminance/Chromaticity Statistics) freeze their fields
-        // on the first frame because their own properties never change
-        // even as the input image content does.
-        for (uint32_t nodeId : order)
-        {
-            auto* n = graph.FindNode(nodeId);
-            if (!n || !n->dirty) continue;
-            for (const auto* edge : graph.GetOutputEdges(nodeId))
-            {
-                if (auto* dn = graph.FindNode(edge->destNodeId))
-                    dn->dirty = true;
-            }
-        }
+        // Collect any async analysis readbacks that have landed since the
+        // last pass. This marks their bound consumers dirty, so it has to run
+        // BEFORE the walk for them to be re-evaluated in this pass.
+        if (!m_asyncReadbackPending.empty())
+            PollAsyncReadbacks(graph);
+
+        // Dirty propagation is PULL-based, done at each node's visit below
+        // rather than in a pass up front.
+        //
+        // It used to be a push: walk the order once, and for every node
+        // already dirty, mark its successors. That misses two things, and the
+        // second one served stale numbers silently for as long as it existed.
+        //
+        //  1. A property binding is an invalidation edge too, but not a graph
+        //     edge. A Clock node has NO output pins and NO edges -- it drives
+        //     consumers purely through bindings -- so a push along edges
+        //     leaves everything it animates marked clean.
+        //
+        //  2. A node can become dirty DURING the main loop, when ResolveBindings
+        //     sees a bound value move. A pass that ran before the loop cannot
+        //     know about that, and by the next frame the flag has already been
+        //     cleared -- so the change never propagates on any frame.
+        //
+        // Together those meant an analysis node downstream of animated content
+        // dispatched exactly once, on the frame its analysisOutput was still
+        // empty, and then reported cached forever while its input kept moving.
+        // Its fields stayed plausible and wrong. CLAUDE.md warns about exactly
+        // this shape; here it was structural.
+        //
+        // Pulling instead is correct by construction: topological order means
+        // every predecessor -- edge or binding -- has finished its visit, so
+        // m_outputChangedThisEval is final for all of them.
+        m_outputChangedThisEval.clear();
 
         for (uint32_t nodeId : order)
         {
@@ -149,12 +201,48 @@ namespace ShaderLab::Rendering
             if (!node)
                 continue;
 
-            // Skip nodes not needed by any visible output.
-            if (!node->needed)
+            // Did anything this node reads change earlier in the pass?
+            if (!node->dirty)
             {
-                node->dirty = false;
-                continue;
+                for (const auto* edge : graph.GetInputEdges(nodeId))
+                {
+                    if (m_outputChangedThisEval.count(edge->sourceNodeId))
+                    { node->dirty = true; break; }
+                }
             }
+            if (!node->dirty)
+            {
+                for (const auto& [propName, binding] : node->propertyBindings)
+                {
+                    if (binding.wholeArray)
+                    {
+                        if (m_outputChangedThisEval.count(binding.wholeArraySourceNodeId))
+                        { node->dirty = true; break; }
+                        continue;
+                    }
+                    for (const auto& src : binding.sources)
+                    {
+                        if (src.has_value() &&
+                            m_outputChangedThisEval.count(src->sourceNodeId))
+                        { node->dirty = true; break; }
+                    }
+                    if (node->dirty) break;
+                }
+            }
+
+            // Record BEFORE the visit for the start-of-frame case; the binding
+            // sites below add themselves when they discover a change mid-visit.
+            if (node->dirty)
+                m_outputChangedThisEval.insert(nodeId);
+
+            // Skip nodes not needed by any visible output -- but KEEP their
+            // pending change. Clearing `dirty` here threw away an edit made
+            // while the node was hidden, so switching the preview to it showed
+            // stale output; that is why every edit site used to MarkAllDirty.
+            // EffectGraph::HasDirtyNodes ignores unneeded nodes, so a parked
+            // change does not keep the host rendering.
+            if (!node->needed)
+                continue;
 
             switch (node->type)
             {
@@ -172,10 +260,17 @@ namespace ShaderLab::Rendering
                         for (const auto& [propName, binding] : node->propertyBindings)
                         {
                             auto eit = effectiveProps.find(propName);
-                            if (eit != effectiveProps.end())
-                                node->properties[propName] = eit->second;
+                            if (eit == effectiveProps.end()) continue;
+                            if (!IsFinitePropertyValue(eit->second))
+                            {
+                                node->runtimeError = L"binding '" + propName +
+                                    L"' resolved to a non-finite value; previous kept";
+                                continue;
+                            }
+                            node->properties[propName] = eit->second;
                         }
                         node->dirty = true;
+                        m_outputChangedThisEval.insert(nodeId);
                     }
                 }
                 node->dirty = false;
@@ -185,6 +280,12 @@ namespace ShaderLab::Rendering
             case NodeType::BuiltInEffect:
             {
                 ID2D1Effect* effect = GetOrCreateEffect(dc, *node);
+                // Creation is retried on every visit whatever `dirty` says, so
+                // a failure must not leave the flag set: a node stuck dirty
+                // keeps HasDirtyNodes() true and costs every frame a second
+                // full Evaluate plus the frozen post-dispatch pass.
+                if (!effect)
+                    node->dirty = false;
                 if (effect)
                 {
                     WireInputs(effect, *node, graph);
@@ -199,16 +300,32 @@ namespace ShaderLab::Rendering
                         for (const auto& [propName, binding] : node->propertyBindings)
                         {
                             auto eit = effectiveProps.find(propName);
-                            if (eit != effectiveProps.end())
-                                node->properties[propName] = eit->second;
+                            if (eit == effectiveProps.end()) continue;
+                            if (!IsFinitePropertyValue(eit->second))
+                            {
+                                node->runtimeError = L"binding '" + propName +
+                                    L"' resolved to a non-finite value; previous kept";
+                                continue;
+                            }
+                            node->properties[propName] = eit->second;
                         }
                     }
 
-                    if (node->dirty || bindingsChanged)
+                    const bool wasDirty = node->dirty || bindingsChanged;
+                    // A binding that moved changes this node's output, so
+                    // downstream consumers have to learn about it too.
+                    if (bindingsChanged) m_outputChangedThisEval.insert(nodeId);
+                    if (wasDirty)
                     {
                         ApplyProperties(effect, *node, effectiveProps);
                         node->dirty = false;
                     }
+
+                    // Clean-subgraph caching: enable D2D's output cache;
+                    // drop it when content changed (upstream in-place
+                    // texture updates arrive as node->dirty via the dirty
+                    // walks, which D2D itself cannot see).
+                    UpdateEffectCachePolicy(effect, nodeId, wasDirty);
 
                     // The effect's output is an ID2D1Image. Take ownership so the
                     // image survives D2D's internal pipeline churn (input toggles,
@@ -220,10 +337,19 @@ namespace ShaderLab::Rendering
 
                     // For analysis effects (e.g., Histogram), force computation
                     // by drawing the output, then read back the result property.
-                    if (node->effectClsid.has_value() &&
+                    // Only when something changed -- it used to redraw the whole
+                    // image on every pass (2-3 per frame) of a static graph.
+                    // And never in the frozen post-dispatch pass: that runs
+                    // INSIDE the host's BeginDraw, so the helper's own
+                    // BeginDraw nests and fails (D2DERR_WRONG_STATE). Leave
+                    // the node dirty instead and read it on the next frame.
+                    if (wasDirty && node->effectClsid.has_value() &&
                         IsEqualGUID(node->effectClsid.value(), CLSID_D2D1Histogram))
                     {
-                        ReadHistogramOutput(dc, effect, *node);
+                        if (m_deferredComputeFrozen)
+                            node->dirty = true;
+                        else
+                            ReadHistogramOutput(dc, effect, *node);
                     }
                 }
                 break;
@@ -247,9 +373,16 @@ namespace ShaderLab::Rendering
                             {
                                 auto eit = effectiveProps.find(propName);
                                 if (eit != effectiveProps.end())
-                                    node->properties[propName] = eit->second;
+                                {
+                                    if (IsFinitePropertyValue(eit->second))
+                                        node->properties[propName] = eit->second;
+                                    else
+                                        node->runtimeError = L"binding '" + propName +
+                                            L"' resolved to a non-finite value; previous kept";
+                                }
                             }
                             node->dirty = true;
+                            m_outputChangedThisEval.insert(nodeId);
                         }
                     }
 
@@ -282,55 +415,93 @@ namespace ShaderLab::Rendering
                             }
                         }
                     }
+                    // A GENERATOR declares no image inputs: its output is a
+                    // function of its parameters alone (a lookup table, say).
+                    // The compute path assumes an input 0 throughout -- the
+                    // dispatch gate below, the deferred queue, the bridge's
+                    // pre-render -- so feed it the 1x1 zero placeholder. That
+                    // placeholder is never dirty, which is exactly the point:
+                    // the generator re-dispatches only when one of its own
+                    // properties moves, and otherwise serves its cached output.
+                    if (node->customEffect->inputNames.empty() && inputImages.empty())
+                    {
+                        EnsureAnalysisDummy(dc);
+                        if (m_analysisDummyBitmap)
+                            inputImages.emplace_back().copy_from(
+                                static_cast<ID2D1Image*>(m_analysisDummyBitmap.get()));
+                    }
                     ID2D1Image* primaryInput = inputImages.empty() ? nullptr : inputImages[0].get();
                     bool hasImageOutput = !node->outputPins.empty();
                     // Image-producing compute: recompute when dirty or no cached output.
                     // Analysis-only compute: also recompute if no analysis fields yet.
                     //
-                    // Phase 8c regression fix: when skip-readback is on, ALL
-                    // compute nodes must redispatch every frame regardless
-                    // of dirty state. Pre-skip-readback the per-frame
-                    // upstream dirty-propagation in OnRenderTick lit up
-                    // compute consumers via image edges, but inside this
-                    // EvaluateNode the upstream's `dirty` has already been
-                    // cleared (Source case clears it before downstream eval
-                    // runs) so we can't use it here. The host's upstream
-                    // propagation does set node->dirty for us when Source
-                    // ticks, but ResolveBindings on the consumer of an
-                    // analysis source (e.g. ICtCp <- LumStats.Mean) only
-                    // dirties the consumer when CPU value changes -- which
-                    // never happens when LumStats's Map() was throttled.
-                    // Force redispatch for every compute node so the GPU
-                    // dispatch fires and the structured-buffer / image-
-                    // output texture are kept fresh.
-                    const bool skipReadbackForcesRedispatch =
-                        Performance::IsSkipUnneededCpuReadbackEnabled();
+                    // GPU-binding freshness chain (replaces the Phase 8c
+                    // redispatch-every-frame-under-skip-readback rule): a
+                    // compute consumer must redispatch when one of its
+                    // binding SOURCES is queued for dispatch this cycle —
+                    // its dispatch reads the source's analysis SRV, whose
+                    // content is about to change. When no source is
+                    // dispatching, the SRV retains last cycle's values and
+                    // an identical redispatch would produce identical
+                    // output, so dirty-gating is safe. (The old rule
+                    // redispatched EVERY compute node EVERY frame, which
+                    // both burned GPU on static graphs and — because each
+                    // image-producing dispatch transitively dirties its
+                    // downstream — permanently defeated clean-subgraph
+                    // output caching.) The topological order includes
+                    // binding dependencies, so sources are visited before
+                    // their consumers.
+                    bool bindingSourceQueued = false;
+                    for (const auto& [bpName, b] : node->propertyBindings)
+                    {
+                        if (b.wholeArray)
+                        {
+                            if (m_queuedComputeThisEval.count(b.wholeArraySourceNodeId))
+                            { bindingSourceQueued = true; break; }
+                        }
+                        else
+                        {
+                            for (const auto& s : b.sources)
+                            {
+                                if (s.has_value() &&
+                                    m_queuedComputeThisEval.count(s->sourceNodeId))
+                                { bindingSourceQueued = true; break; }
+                            }
+                        }
+                        if (bindingSourceQueued) break;
+                    }
                     bool needsCompute = node->dirty ||
-                        skipReadbackForcesRedispatch ||
+                        bindingSourceQueued ||
                         (hasImageOutput && !node->cachedOutput) ||
                         (!hasImageOutput && node->analysisOutput.fields.empty());
-                    if (primaryInput && needsCompute && !m_deferredComputeFrozen)
+                    // Queued at most ONCE per evaluate cycle. m_queuedComputeThisEval
+                    // lives until ProcessDeferredCompute drains the queue, so on
+                    // the host's second pass a node whose binding source was
+                    // queued in the first saw bindingSourceQueued again and was
+                    // pushed twice -- two dispatches, two pre-renders, two
+                    // readbacks. The dispatch reads the node's state at
+                    // ProcessDeferredCompute time, so one entry is always
+                    // current.
+                    //
+                    // No pre-render here any more. This used to render every
+                    // input of an image-producing node into a NEW full-size FP32
+                    // bitmap (133 MB at 4K) right here, "while properties are
+                    // fresh" -- but ProcessDeferredCompute already had to discard
+                    // that snapshot whenever the producer was dispatched in the
+                    // same pass (it predates the dispatch), and the render it
+                    // does instead, inside the draw session, is the fresh one by
+                    // construction. It is now the only one, into a persistent
+                    // per-producer target.
+                    if (primaryInput && needsCompute && !m_deferredComputeFrozen &&
+                        !m_queuedComputeThisEval.count(nodeId))
                     {
                         // Phase 8: ensure the bridge effect exists for this
                         // node so ProcessDeferredCompute can drive it via
                         // ICustomComputeBridge. CreateOrGetEffect captures
                         // the impl into m_bridgeImplCache.
                         GetOrCreateEffect(dc, *node);
-
-                        // For image-producing compute, pre-render every upstream
-                        // input to its own FP32 bitmap NOW while properties are
-                        // fresh. This avoids D2D GPU caching returning stale data
-                        // when ProcessDeferredCompute renders later inside BeginDraw.
-                        std::vector<winrt::com_ptr<ID2D1Bitmap1>> preRendered(inputImages.size());
-                        if (hasImageOutput)
-                        {
-                            for (size_t i = 0; i < inputImages.size(); ++i)
-                            {
-                                if (inputImages[i])
-                                    preRendered[i] = PreRenderInputBitmap(dc, inputImages[i].get());
-                            }
-                        }
-                        m_deferredCompute.push_back({ nodeId, std::move(inputImages), std::move(preRendered) });
+                        m_deferredCompute.push_back({ nodeId, std::move(inputImages) });
+                        m_queuedComputeThisEval.insert(nodeId);
                     }
                     node->dirty = false;
                     if (!hasImageOutput)
@@ -355,7 +526,13 @@ namespace ShaderLab::Rendering
                             {
                                 auto eit = effectiveProps.find(propName);
                                 if (eit != effectiveProps.end())
-                                    node->properties[propName] = eit->second;
+                                {
+                                    if (IsFinitePropertyValue(eit->second))
+                                        node->properties[propName] = eit->second;
+                                    else
+                                        node->runtimeError = L"binding '" + propName +
+                                            L"' resolved to a non-finite value; previous kept";
+                                }
                             }
                         }
                     }
@@ -376,8 +553,26 @@ namespace ShaderLab::Rendering
                         double duration = static_cast<double>(stopTime - startTime);
                         if (duration <= 0.0) duration = 1.0;
 
-                        float currentTime = startTime + static_cast<float>(node->clockTime);
-                        float progress = static_cast<float>(node->clockTime / duration);
+                        // Quantise to the emit rate, with the SAME rule the
+                        // tick uses to decide whether to dirty. If these two
+                        // disagreed, a consumer could be woken for a tick and
+                        // then read a value from between ticks -- the output
+                        // would creep every frame while claiming to be
+                        // rate-limited.
+                        float updateRate = 0.0f;
+                        auto urIt = node->properties.find(L"UpdateRate");
+                        if (urIt != node->properties.end())
+                            if (auto* f = std::get_if<float>(&urIt->second)) updateRate = *f;
+
+                        double quantized = node->clockTime;
+                        if (updateRate > 0.0f)
+                        {
+                            const double step = 1.0 / static_cast<double>(updateRate);
+                            quantized = std::floor(node->clockTime / step) * step;
+                        }
+
+                        float currentTime = startTime + static_cast<float>(quantized);
+                        float progress = static_cast<float>(quantized / duration);
 
                         for (const auto& fd : node->customEffect->analysisFields)
                         {
@@ -569,6 +764,8 @@ namespace ShaderLab::Rendering
                         node->runtimeError = L"Auto-compile failed: " + cached.errorMessage;
                         node->cachedOutput = nullptr;
                         m_outputCache.erase(nodeId);
+                        // Retried on every visit regardless; see BuiltInEffect.
+                        node->dirty = false;
                         break;
                     }
                 }
@@ -579,6 +776,7 @@ namespace ShaderLab::Rendering
                     node->runtimeError = L"Failed to create D2D effect. Check effect registration.";
                     node->cachedOutput = nullptr;
                     m_outputCache.erase(nodeId);
+                    node->dirty = false;   // retried on every visit regardless
                     break;
                 }
                 node->runtimeError.clear();
@@ -589,6 +787,9 @@ namespace ShaderLab::Rendering
                     std::map<std::wstring, PropertyValue> effectiveProps;
                     bool bindingsChanged = ResolveBindings(*node, graph, effectiveProps);
                     bool wasDirty = node->dirty || bindingsChanged;
+                    // A binding that moved changes this node's output, so
+                    // downstream consumers have to learn about it too.
+                    if (bindingsChanged) m_outputChangedThisEval.insert(nodeId);
 
                     // Inject host-driven output dimensions for shaders that
                     // declare OutputW / OutputH cbuffer fields. D2D pads input
@@ -627,9 +828,19 @@ namespace ShaderLab::Rendering
                             // bitmap may live inside e.g. a 4096x4096 atlas
                             // even when its content rect is only 1920x1080.
                             // Sampling [0,1] would otherwise read the padding.
+                            // Only flip DPI when the context isn't already
+                            // at 96 — a real DPI change here invalidates
+                            // every D2D1_PROPERTY_CACHED intermediate in
+                            // the context (caches are DPI-referenced), and
+                            // this block runs per-eval for dims-declaring
+                            // nodes. The render context is pinned at 96
+                            // (RenderEngine), so this is normally a no-op.
                             float oldDpiX = 0, oldDpiY = 0;
                             dc->GetDpi(&oldDpiX, &oldDpiY);
-                            dc->SetDpi(96.0f, 96.0f);
+                            const bool dpiFlip =
+                                (oldDpiX != 96.0f || oldDpiY != 96.0f);
+                            if (dpiFlip)
+                                dc->SetDpi(96.0f, 96.0f);
                             float unionLeft = (std::numeric_limits<float>::max)();
                             float unionTop = (std::numeric_limits<float>::max)();
                             float unionRight = -(std::numeric_limits<float>::max)();
@@ -659,7 +870,8 @@ namespace ShaderLab::Rendering
                                 if (edge->destPin < perInputWH.size())
                                     perInputWH[edge->destPin] = { bw, bh };
                             }
-                            dc->SetDpi(oldDpiX, oldDpiY);
+                            if (dpiFlip)
+                                dc->SetDpi(oldDpiX, oldDpiY);
                             if (anyValid)
                             {
                                 float w = unionRight - unionLeft;
@@ -738,14 +950,20 @@ namespace ShaderLab::Rendering
                         for (const auto& [propName, binding] : node->propertyBindings)
                         {
                             auto eit = effectiveProps.find(propName);
-                            if (eit != effectiveProps.end())
-                                node->properties[propName] = eit->second;
+                            if (eit == effectiveProps.end()) continue;
+                            if (!IsFinitePropertyValue(eit->second))
+                            {
+                                node->runtimeError = L"binding '" + propName +
+                                    L"' resolved to a non-finite value; previous kept";
+                                continue;
+                            }
+                            node->properties[propName] = eit->second;
                         }
                     }
 
                     if (wasDirty)
                     {
-                        ApplyCustomEffect(effect, *node, effectiveProps);
+                        ApplyCustomEffect(effect, *node, effectiveProps, graph, dc);
 
                         // Force-upload the cbuffer directly to the GPU.
                         auto implIt = m_customImplCache.find(node->id);
@@ -771,7 +989,23 @@ namespace ShaderLab::Rendering
                             effect->SetInput(0, m_dummySourceBitmap.get());
                     }
 
-                    // Force D2D to re-render by toggling input 0.
+                    // Custom effects upload their cbuffer directly to the
+                    // GPU (bypassing the D2D property system), so D2D has
+                    // no idea a re-render is needed when one changes. Two
+                    // manual invalidation mechanisms, by mode:
+                    //   * caching ON: UpdateEffectCachePolicy drops this
+                    //     node's D2D1_PROPERTY_CACHED intermediate on
+                    //     wasDirty — the next pull finds no cache and must
+                    //     re-execute, picking up the fresh cbuffer. This
+                    //     touches ONLY this node's cache.
+                    //   * caching OFF: legacy input-0 detach/reattach
+                    //     toggle. NOT used when caching is on because
+                    //     detaching the consumer of an upstream effect's
+                    //     output releases that upstream's cached
+                    //     intermediate as collateral — one dirty custom
+                    //     node per frame (any animated graph) then defeats
+                    //     caching for its whole input chain.
+                    if (wasDirty && !Performance::IsEffectOutputCachingEnabled())
                     {
                         winrt::com_ptr<ID2D1Image> savedInput;
                         effect->GetInput(0, savedInput.put());
@@ -781,6 +1015,8 @@ namespace ShaderLab::Rendering
                             effect->SetInput(0, savedInput.get());
                         }
                     }
+
+                    UpdateEffectCachePolicy(effect, nodeId, wasDirty);
 
                     winrt::com_ptr<ID2D1Image> output;
                     effect->GetOutput(output.put());
@@ -806,15 +1042,18 @@ namespace ShaderLab::Rendering
                         node->runtimeError = L"Shader not compiled. Open in Effect Designer and compile.";
                         node->cachedOutput = nullptr;
                         m_outputCache.erase(nodeId);
+                        node->dirty = false;
                     }
                     else
                     {
                         WireInputs(effect, *node, graph);
-                        if (node->dirty)
+                        const bool wasDirtyFallback = node->dirty;
+                        if (wasDirtyFallback)
                         {
                             ApplyProperties(effect, *node, node->properties);
                             node->dirty = false;
                         }
+                        UpdateEffectCachePolicy(effect, nodeId, wasDirtyFallback);
                         winrt::com_ptr<ID2D1Image> output;
                         effect->GetOutput(output.put());
                         m_outputCache[nodeId] = output;
@@ -879,11 +1118,13 @@ namespace ShaderLab::Rendering
             if (n.type == NodeType::Source && !n.cachedOutput)
             {
                 m_deferredCompute.clear();
+                m_queuedComputeThisEval.clear();
                 return false;
             }
         }
 
         bool imageComputeProduced = false;
+        m_dispatchesLastFrame = 0;
 
         // Phase 8c: build the per-frame "needs CPU readback" set. When
         // the skip-readback feature flag is OFF, the set is treated as
@@ -922,9 +1163,44 @@ namespace ShaderLab::Rendering
             {
                 for (const auto& [propName, binding] : consumerNode.propertyBindings)
                 {
-                    bool gpuServed =
+                    // The skip must match the mode the consumer is ACTUALLY
+                    // compiled in, not merely the mode that is possible.
+                    // Texture mode only engages once the producer has published
+                    // a bitmap (see ApplyCustomEffect); before that the consumer
+                    // is still cbuffer-bound and genuinely needs the CPU value.
+                    // Skipping on the possible mode would starve exactly the
+                    // frames that have no texture yet -- a silent wrong value,
+                    // not a slow one.
+                    const GpuBindMode mode =
                         CanServeBindingViaGpu(consumerNode, propName, binding, graph);
-                    if (gpuServed) continue;
+                    // Lane 3 has to be ASKED for before the dispatch that
+                    // fills it -- the producer creates nothing until then.
+                    // Requesting it does not yet make the binding served; see
+                    // IsGpuBindModeWired.
+                    if (mode == GpuBindMode::Texture)
+                    {
+                        for (const auto& srcOpt : binding.sources)
+                        {
+                            if (!srcOpt.has_value()) continue;
+                            const uint32_t pid = srcOpt->sourceNodeId;
+                            m_analysisTextureWanted.insert(pid);
+                            auto bIt = m_bridgeImplCache.find(pid);
+                            if (bIt == m_bridgeImplCache.end() || !bIt->second) continue;
+                            winrt::com_ptr<Effects::IEngineComputeTexture> iect;
+                            if (SUCCEEDED(bIt->second->QueryInterface(
+                                    __uuidof(Effects::IEngineComputeTexture), iect.put_void())))
+                                iect->RequestAnalysisTexture();
+                        }
+                    }
+                    bool served = (mode == GpuBindMode::StructuredBuffer);
+                    if (mode == GpuBindMode::Texture)
+                    {
+                        served = true;
+                        for (const auto& srcOpt : binding.sources)
+                            if (srcOpt.has_value() && !AnalysisBitmap(srcOpt->sourceNodeId))
+                                served = false;
+                    }
+                    if (served) continue;
                     for (const auto& srcOpt : binding.sources)
                     {
                         if (srcOpt.has_value())
@@ -938,30 +1214,27 @@ namespace ShaderLab::Rendering
             return !skipFlag || needsReadback.count(nodeId) > 0;
         };
 
-        // Phase 8 perf: pre-render each unique upstream input ONCE
-        // per frame and share the FP32 bitmap across all deferred-
-        // compute consumers that share it. Without this, a graph
-        // like {Source -> 4 stats + ICtCp Tone Map} pays 5x the
-        // upstream-render cost (each bridge re-rendered the source
-        // into its own private FP32 bitmap).
+        // Pre-render each distinct upstream image ONCE per pass into an FP32
+        // bitmap the bridge can bind as a texture, and share it across every
+        // deferred consumer of that image. This is the ONLY pre-render: it
+        // runs inside the draw session and after any producer in the same
+        // pass has been dispatched, so it is fresh by construction.
         //
-        // We do the SetTarget+Clear+DrawImage inline (NOT via
-        // PreRenderInputBitmap, which nests BeginDraw and breaks
-        // submission inside an outer draw session). dc->Flush() forces
-        // the commands out before the bridge's D3D11 compute reads.
-        // Cache key is the raw ID2D1Image pointer of the upstream's
-        // cachedOutput; cleared at end of ProcessDeferredCompute.
-        struct SharedFp32 {
-            winrt::com_ptr<ID2D1Bitmap1> bitmap;
-            UINT32 width{ 0 };
-            UINT32 height{ 0 };
-        };
-        std::unordered_map<ID2D1Image*, SharedFp32> sharedPreRender;
+        // Inline SetTarget + Clear + DrawImage (no nested BeginDraw, which
+        // would fail inside the outer session); Flush forces the commands
+        // out before the bridge's D3D11 compute reads.
+        //
+        // Targets persist across frames in m_sharedPreRenderCache, keyed by
+        // the producing node + pin; `sharedPreRender` memoizes per pass by
+        // image, so fan-out renders once.
+        std::unordered_map<ID2D1Image*, ID2D1Bitmap1*> sharedPreRender;
+        const uint64_t kNoProducerKey = ~0ull;
 
-        auto preRenderShared = [&](ID2D1Image* inputImage) -> ID2D1Bitmap1*
+        auto preRenderShared = [&](ID2D1Image* inputImage, uint64_t cacheKey,
+                                   HRESULT* failHr) -> ID2D1Bitmap1*
         {
             auto it = sharedPreRender.find(inputImage);
-            if (it != sharedPreRender.end()) return it->second.bitmap.get();
+            if (it != sharedPreRender.end()) return it->second;
 
             float oldDpiX = 0, oldDpiY = 0;
             dc->GetDpi(&oldDpiX, &oldDpiY);
@@ -982,21 +1255,46 @@ namespace ShaderLab::Rendering
             }
             catch (...)
             {
+                // Deliberate: "not ready yet", retried next frame (see above).
                 dc->SetDpi(oldDpiX, oldDpiY);
                 return nullptr;
             }
+            D2D1_RECT_L px{};
+            if (SUCCEEDED(bhr))
+                bhr = Effects::SnapComputeInputRect(bounds, px);
             if (FAILED(bhr))
             {
                 dc->SetDpi(oldDpiX, oldDpiY);
+                if (failHr) *failHr = bhr;
                 return nullptr;
             }
-            UINT32 w = static_cast<UINT32>((std::min)(bounds.right - bounds.left, 8192.0f));
-            UINT32 h = static_cast<UINT32>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-            if (w == 0 || h == 0) { dc->SetDpi(oldDpiX, oldDpiY); return nullptr; }
+            const UINT32 w = static_cast<UINT32>(px.right - px.left);
+            const UINT32 h = static_cast<UINT32>(px.bottom - px.top);
 
-            // Reuse the previous frame's bitmap if dimensions match;
-            // otherwise allocate a new one.
-            auto& cacheBitmap = m_sharedPreRenderCache[inputImage];
+            // Already an FP32 bitmap covering exactly its bounds -- the image
+            // output of an upstream compute node, or the generator
+            // placeholder. The bridge binds it directly; copying it would
+            // buy nothing. Safe for freshness because a producer in this pass
+            // was dispatched earlier in topological order, so its texture
+            // already holds this pass's pixels.
+            {
+                winrt::com_ptr<ID2D1Bitmap1> asBitmap;
+                if (SUCCEEDED(inputImage->QueryInterface(asBitmap.put())) && asBitmap)
+                {
+                    const auto fmt = asBitmap->GetPixelFormat();
+                    const auto sz  = asBitmap->GetPixelSize();
+                    if (fmt.format == DXGI_FORMAT_R32G32B32A32_FLOAT &&
+                        px.left == 0 && px.top == 0 && sz.width == w && sz.height == h)
+                    {
+                        dc->SetDpi(oldDpiX, oldDpiY);
+                        sharedPreRender[inputImage] = asBitmap.get();
+                        return asBitmap.get();
+                    }
+                }
+            }
+
+            // Reuse the persistent target when its size still matches.
+            auto& cacheBitmap = m_sharedPreRenderCache[cacheKey];
             if (!cacheBitmap.bitmap || cacheBitmap.width != w || cacheBitmap.height != h)
             {
                 D2D1_BITMAP_PROPERTIES1 bp{};
@@ -1006,32 +1304,65 @@ namespace ShaderLab::Rendering
                 bp.dpiY = 96.0f;
                 winrt::com_ptr<ID2D1Bitmap1> newBmp;
                 HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bp, newBmp.put());
-                if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return nullptr; }
+                if (FAILED(hr))
+                {
+                    dc->SetDpi(oldDpiX, oldDpiY);
+                    if (failHr) *failHr = hr;
+                    return nullptr;
+                }
                 cacheBitmap.bitmap = std::move(newBmp);
                 cacheBitmap.width  = w;
                 cacheBitmap.height = h;
             }
 
-            // Render upstream into the cached bitmap. Inline pattern
-            // (no nested BeginDraw); Flush forces submit before the
-            // bridge's D3D11 compute reads.
+            // Integer origin: see SnapComputeInputRect for why a fractional
+            // one is wrong.
             winrt::com_ptr<ID2D1Image> prevTarget;
             dc->GetTarget(prevTarget.put());
             dc->SetTarget(cacheBitmap.bitmap.get());
             dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-            dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
+            dc->DrawImage(inputImage, D2D1::Point2F(
+                -static_cast<float>(px.left), -static_cast<float>(px.top)));
             dc->SetTarget(prevTarget.get());
             dc->Flush();
             dc->SetDpi(oldDpiX, oldDpiY);
 
-            SharedFp32 s;
-            s.bitmap = cacheBitmap.bitmap;
-            s.width  = w;
-            s.height = h;
-            auto* ptr = s.bitmap.get();
-            sharedPreRender[inputImage] = std::move(s);
+            auto* ptr = cacheBitmap.bitmap.get();
+            sharedPreRender[inputImage] = ptr;
             return ptr;
         };
+
+        // Nodes whose image output is (re)produced by THIS pass. An input fed
+        // by one of them must NOT use the Evaluate-time pre-render: that
+        // bitmap was captured before the producer was dispatched, so it holds
+        // the PREVIOUS evaluation's pixels. Symptom is a clean one-mutation
+        // lag -- a CS-Img consuming a CS-Img reports the value its upstream
+        // had before the last set-property, silently and at HTTP 200.
+        // m_deferredCompute is built in topological order (see
+        // docs/architecture/topological-evaluation.md), so by the time a
+        // consumer is reached its producer has already been dispatched and a
+        // re-render here picks up fresh pixels.
+        std::unordered_set<uint32_t> producedThisPass;
+        for (const auto& d : m_deferredCompute)
+            producedThisPass.insert(d.nodeId);
+
+        // ...and everything DOWNSTREAM of them. Checking only the immediate
+        // producer fixes compute -> compute but leaves the lag alive one hop
+        // further out: a pixel shader between two compute nodes is not in the
+        // deferred set, yet its D2D output still resolves through a producer
+        // that has not been dispatched at Evaluate time, so the consumer's
+        // snapshot of it is a frame stale. Measured on
+        // ICtCp Tone Map -> Nit Map -> ICtCp Highlight Desaturation: the
+        // consumer reported 1.400438 / 1.400438 / 0.772682 while its input read
+        // 1.401232 / 0.772924 / 2.435596 -- each value one mutation behind.
+        // Data-only consumers never had this because they do not pre-render at
+        // all, which is why the direct-edge test passed and this did not.
+        std::unordered_set<uint32_t> staleThisPass = producedThisPass;
+        std::vector<uint32_t> reach(producedThisPass.begin(), producedThisPass.end());
+        for (size_t qi = 0; qi < reach.size(); ++qi)
+            for (const auto* e : graph.GetOutputEdges(reach[qi]))
+                if (e && staleThisPass.insert(e->destNodeId).second)
+                    reach.push_back(e->destNodeId);
 
         for (auto& deferred : m_deferredCompute)
         {
@@ -1044,25 +1375,72 @@ namespace ShaderLab::Rendering
                 continue;
             auto* bridge = bit->second;
 
-            // Use the deferred entry's pre-rendered bitmap per-input slot
-            // if it exists (image-producing computes pre-render in
-            // EvaluateNode while D2D effect properties are fresh).
-            // Otherwise share via the per-frame map.
+            // Resolve each input from the graph NOW rather than trusting the
+            // image recorded at Evaluate time: a later Evaluate pass in the
+            // same cycle can rebuild an upstream effect, and a producer
+            // dispatched earlier in this pass has just replaced its output.
+            // The recorded image is the fallback for a slot whose producer
+            // currently has no output.
             std::vector<ID2D1Bitmap1*> preRendered(deferred.inputImages.size(), nullptr);
             std::vector<ID2D1Image*>   inputRaw(deferred.inputImages.size(), nullptr);
+            std::unordered_map<uint32_t, const Graph::EffectEdge*> edgeByPin;
+            for (const auto* e : graph.GetInputEdges(deferred.nodeId))
+                if (e) edgeByPin[e->destPin] = e;
+
+            HRESULT preRenderHr = S_OK;
+            size_t failedPin = 0;
             for (size_t i = 0; i < deferred.inputImages.size(); ++i)
             {
-                if (!deferred.inputImages[i]) continue;
-                inputRaw[i] = deferred.inputImages[i].get();
-                if (i < deferred.preRenderedInputs.size() && deferred.preRenderedInputs[i])
-                    preRendered[i] = deferred.preRenderedInputs[i].get();
-                else
-                    preRendered[i] = preRenderShared(inputRaw[i]);
+                uint64_t key = kNoProducerKey;
+                ID2D1Image* img = deferred.inputImages[i].get();
+                auto eit = edgeByPin.find(static_cast<uint32_t>(i));
+                if (eit != edgeByPin.end())
+                {
+                    key = (static_cast<uint64_t>(eit->second->sourceNodeId) << 32) |
+                          eit->second->sourcePin;
+                    if (auto* src = graph.FindNode(eit->second->sourceNodeId);
+                        src && src->cachedOutput)
+                        img = src->cachedOutput;
+                }
+                if (!img) continue;
+                inputRaw[i] = img;
+                HRESULT hr = S_OK;
+                preRendered[i] = preRenderShared(img, key, &hr);
+                if (FAILED(hr) && SUCCEEDED(preRenderHr)) { preRenderHr = hr; failedPin = i; }
+            }
+            if (preRenderHr == E_BOUNDS)
+            {
+                // An unbounded image (Flood, Tile, Border, Turbulence) cannot
+                // be copied into a texture; it used to become a 1 GiB 8192^2
+                // FP32 allocation. Say so instead of dispatching on garbage.
+                node->runtimeError = std::format(
+                    L"Input {} has unbounded extent (Flood, Tile, Border or Turbulence?). "
+                    L"Crop it before feeding a compute effect.", failedPin);
+                continue;
             }
 
             const bool readback = isReadbackNeeded(node->id);
+            // Exact per-node attribution: this dispatch is its own D3D11
+            // submission, so bracketing it measures this node and nothing else.
+            //
+            // NOTE the non-flushing EndNode. The flushing overload exists for
+            // spans around DIRECT2D work, which may not have been emitted yet
+            // when the span closes. A compute dispatch is not D2D work, so a
+            // flush here buys nothing -- and it would flush the context in the
+            // middle of ProcessDeferredCompute's own target juggling, inside a
+            // draw session this codebase already documents as fragile.
+            // Async readback only in the GUI's live loop (skip-readback on)
+            // and only when the host opted in; see Performance.h.
+            const bool asyncReadback = readback && skipFlag &&
+                Performance::IsAsyncAnalysisReadbackEnabled();
+            bridge->SetAsyncReadback(asyncReadback);
+            if (m_gpuTimer) m_gpuTimer->BeginNode(node->id);
             DispatchViaBridge(dc, graph, *node, inputRaw,
                 preRendered, bridge, readback);
+            if (m_gpuTimer) m_gpuTimer->EndNode(node->id);
+            if (asyncReadback && bridge->HasPendingReadback())
+                m_asyncReadbackPending.insert(node->id);
+            ++m_dispatchesLastFrame;
 
             // Phase 8c: record the timestamp for hinted nodes whose
             // readback actually ran this frame so the throttle window
@@ -1071,6 +1449,25 @@ namespace ShaderLab::Rendering
             // every frame regardless of throttle.
             if (readback && skipFlag && m_cpuAnalysisInterest.count(node->id))
                 m_lastHintReadbackTime[node->id] = std::chrono::steady_clock::now();
+
+            // Lane 3: the copy pass has just run inside DispatchViaBridge, so
+            // the texture now holds this frame's values. Wrapping it as a D2D
+            // bitmap is what makes it attachable as an effect input.
+            if (m_analysisTextureWanted.count(node->id))
+                EnsureAnalysisBitmap(node->id, dc);
+
+            // Consumers BOUND to this node's analysis values are stale now too,
+            // and no edge reaches them: a Luminance Statistics feeding a
+            // tone mapper's SourcePeakNits has no image output at all.
+            // Without this the consumer evaluated with whatever the binding
+            // held BEFORE this dispatch -- a frame late on a live graph, and
+            // on a static one (a still image, no clock) forever: headless
+            // rendered a capture with SourcePeakNits 2712 (the saved value)
+            // while the statistics said 608. It hid in any graph where some
+            // other edge happened to dirty the consumer.
+            // The caller's frozen post-dispatch Evaluate re-runs the marked
+            // nodes this frame, so the value is used the frame it is made.
+            MarkBindingConsumersDirty(graph, node->id);
 
             bool hasImageOutput = !node->outputPins.empty();
             if (hasImageOutput && node->cachedOutput)
@@ -1093,6 +1490,25 @@ namespace ShaderLab::Rendering
         }
 
         m_deferredCompute.clear();
+        m_queuedComputeThisEval.clear();
+
+        // Drop pre-render targets whose producer has left the graph. Each is
+        // a full-size FP32 surface; keying by node id already stops the
+        // per-edit leak, this stops the per-deleted-node one.
+        for (auto it = m_sharedPreRenderCache.begin(); it != m_sharedPreRenderCache.end();)
+        {
+            const uint64_t key = it->first;
+            const bool orphan = key != kNoProducerKey &&
+                !graph.FindNode(static_cast<uint32_t>(key >> 32));
+            if (orphan) it = m_sharedPreRenderCache.erase(it);
+            else ++it;
+        }
+
+        // Per-frame: a consumer removed from the graph must stop the producer
+        // paying for lane 3. The producer's own RequestAnalysisTexture latch
+        // is intentionally sticky -- tearing the texture down and rebuilding
+        // it on alternate frames would cost more than keeping it.
+        m_analysisTextureWanted.clear();
         return true;
     }
 
@@ -1111,6 +1527,254 @@ namespace ShaderLab::Rendering
     //     IEngineComputeOutput for downstream Phase 8 GPU-binding
     //     consumers,
     //   * wraps the image-output texture as an ID2D1Bitmap1.
+
+    GraphEvaluator::BytecodeId GraphEvaluator::IdOfBytecode(const std::vector<uint8_t>& b)
+    {
+        BytecodeId id{};
+        if (b.size() >= 20 && b[0] == 'D' && b[1] == 'X' && b[2] == 'B' && b[3] == 'C')
+        {
+            std::memcpy(id.data(), b.data() + 4, id.size());
+            return id;
+        }
+        uint64_t h = 1469598103934665603ull;
+        for (uint8_t c : b) { h ^= c; h *= 1099511628211ull; }
+        std::memcpy(id.data(), &h, sizeof(h));
+        const uint64_t sz = b.size();
+        std::memcpy(id.data() + 8, &sz, sizeof(sz));
+        return id;
+    }
+
+    std::shared_ptr<const std::vector<uint8_t>> GraphEvaluator::GetVariantBytecode(
+        const EffectNode& node, const std::wstring& effectId, uint32_t effectVersion,
+        const std::string& target, uint32_t bits)
+    {
+        const auto& def = node.customEffect.value();
+        if (def.compiledBytecode.empty()) return nullptr;
+        // Keyed by the BASELINE's checksum: the variant is a pure function of
+        // the source the baseline was compiled from plus the bitset, so a
+        // recompile (new baseline) can never be served an old variant.
+        const VariantKey key{ IdOfBytecode(def.compiledBytecode), bits };
+        auto it = m_variantMemo.find(key);
+        if (it != m_variantMemo.end()) return it->second;
+
+        auto gpuNames = ExtractGpuBindableNames(def);
+        auto variant = CompileViaCache(effectId, effectVersion,
+                                       def.hlslSource, target, bits, gpuNames);
+        if (variant.status != Effects::BytecodeStatus::Ready || variant.bytecode.empty())
+            return nullptr;   // not memoized: a background compile may finish later
+        if (m_variantMemo.size() > 256) m_variantMemo.clear();
+        auto bytes = std::make_shared<const std::vector<uint8_t>>(std::move(variant.bytecode));
+        m_variantMemo[key] = bytes;
+        return bytes;
+    }
+
+    std::shared_ptr<const GraphEvaluator::ReflectedCb> GraphEvaluator::ReflectComputeCb(
+        const std::vector<uint8_t>& bytes)
+    {
+        const BytecodeId id = IdOfBytecode(bytes);
+        auto it = m_computeReflectMemo.find(id);
+        if (it != m_computeReflectMemo.end()) return it->second;
+
+        auto out = std::make_shared<ReflectedCb>();
+        winrt::com_ptr<ID3D11ShaderReflection> reflect;
+        if (SUCCEEDED(D3DReflect(bytes.data(), bytes.size(),
+                IID_ID3D11ShaderReflection, reinterpret_cast<void**>(reflect.put()))) && reflect)
+        {
+            auto* cbReflect = reflect->GetConstantBufferByIndex(0);
+            D3D11_SHADER_BUFFER_DESC cbDesc{};
+            if (cbReflect && SUCCEEDED(cbReflect->GetDesc(&cbDesc)))
+            {
+                out->sizeBytes = cbDesc.Size;
+                for (UINT v = 0; v < cbDesc.Variables; ++v)
+                {
+                    auto* var = cbReflect->GetVariableByIndex(v);
+                    D3D11_SHADER_VARIABLE_DESC varDesc{};
+                    if (!var || FAILED(var->GetDesc(&varDesc))) continue;
+                    ReflectedCbVar rv;
+                    rv.name.assign(varDesc.Name, varDesc.Name + strlen(varDesc.Name));
+                    rv.offset = varDesc.StartOffset;
+                    D3D11_SHADER_TYPE_DESC typeDesc{};
+                    if (auto* typeInfo = var->GetType();
+                        typeInfo && SUCCEEDED(typeInfo->GetDesc(&typeDesc)))
+                    {
+                        rv.type = typeDesc.Type;
+                        rv.cols = typeDesc.Columns;
+                    }
+                    out->vars.push_back(std::move(rv));
+                }
+            }
+        }
+        if (m_computeReflectMemo.size() > 256) m_computeReflectMemo.clear();
+        m_computeReflectMemo[id] = out;
+        return out;
+    }
+
+    void GraphEvaluator::UnpackAnalysisFloats(EffectNode& node, const std::vector<float>& analysisFloats)
+    {
+        const auto& def = node.customEffect.value();
+        {
+            node.analysisOutput.type = AnalysisOutputType::Typed;
+            node.analysisOutput.fields.clear();
+            UINT32 pixelOffset = 0;
+            for (const auto& fd : def.analysisFields)
+            {
+                AnalysisFieldValue fv;
+                fv.name = fd.name;
+                fv.type = fd.type;
+
+                UINT32 pc = fd.pixelCount();
+                bool isArray = AnalysisFieldIsArray(fd.type);
+                UINT32 cc = AnalysisFieldComponentCount(fd.type);
+
+                if (!isArray)
+                {
+                    if (pixelOffset * 4 < analysisFloats.size())
+                    {
+                        for (UINT32 c = 0; c < cc && (pixelOffset * 4 + c) < analysisFloats.size(); ++c)
+                            fv.components[c] = analysisFloats[pixelOffset * 4 + c];
+                    }
+                }
+                else
+                {
+                    fv.arrayData.resize(fd.arrayLength * cc, 0.0f);
+                    for (UINT32 i = 0; i < fd.arrayLength; ++i)
+                    {
+                        UINT32 base = (pixelOffset + i) * 4;
+                        for (UINT32 c = 0; c < cc && (base + c) < analysisFloats.size(); ++c)
+                            fv.arrayData[i * cc + c] = analysisFloats[base + c];
+                    }
+                }
+                pixelOffset += pc;
+                node.analysisOutput.fields.push_back(std::move(fv));
+            }
+        }
+    }
+
+    void GraphEvaluator::MarkBindingConsumersDirty(EffectGraph& graph, uint32_t producerId)
+    {
+        std::vector<uint32_t> staleQueue;
+        for (const auto& consumer : graph.Nodes())
+        {
+            bool bound = false;
+            for (const auto& [propName, binding] : consumer.propertyBindings)
+            {
+                if (binding.wholeArray && binding.wholeArraySourceNodeId == producerId)
+                    bound = true;
+                for (const auto& src : binding.sources)
+                    if (src.has_value() && src->sourceNodeId == producerId)
+                        bound = true;
+                if (bound) break;
+            }
+            if (bound) staleQueue.push_back(consumer.id);
+        }
+        for (size_t i = 0; i < staleQueue.size(); ++i)
+        {
+            auto* sn = graph.FindNode(staleQueue[i]);
+            if (!sn) continue;
+            sn->dirty = true;
+            for (const auto* edge : graph.GetOutputEdges(staleQueue[i]))
+            {
+                auto* dn = graph.FindNode(edge->destNodeId);
+                if (dn && !dn->dirty)
+                {
+                    dn->dirty = true;
+                    staleQueue.push_back(edge->destNodeId);
+                }
+            }
+        }
+    }
+
+    bool GraphEvaluator::PollAsyncReadbacks(EffectGraph& graph)
+    {
+        bool any = false;
+        for (auto it = m_asyncReadbackPending.begin(); it != m_asyncReadbackPending.end();)
+        {
+            const uint32_t id = *it;
+            auto* node = graph.FindNode(id);
+            auto bIt = m_bridgeImplCache.find(id);
+            if (!node || !node->customEffect.has_value() ||
+                bIt == m_bridgeImplCache.end() || !bIt->second)
+            {
+                it = m_asyncReadbackPending.erase(it);
+                continue;
+            }
+            std::vector<float> floats;
+            if (bIt->second->PollAnalysisReadback(floats) && !floats.empty())
+            {
+                UnpackAnalysisFloats(*node, floats);
+                MarkBindingConsumersDirty(graph, id);
+                any = true;
+            }
+            if (!bIt->second->HasPendingReadback())
+                it = m_asyncReadbackPending.erase(it);
+            else
+                ++it;
+        }
+        return any;
+    }
+
+    void GraphEvaluator::EnsureAnalysisDummy(ID2D1DeviceContext5* dc)
+    {
+        if (m_analysisDummyBitmap || !dc) return;
+        // 1x1 and zero-filled. A shader reading it gets 0, which is the same
+        // thing an unbound cbuffer slot would give -- and it is never actually
+        // read, because a parameter only compiles to texture mode when a real
+        // bitmap is attached.
+        const float zero[4]{ 0, 0, 0, 0 };
+        D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_NONE,
+            D2D1::PixelFormat(DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_IGNORE));
+        dc->CreateBitmap(D2D1::SizeU(1, 1), zero, sizeof(zero), &props,
+                         m_analysisDummyBitmap.put());
+    }
+
+    ID2D1Bitmap1* GraphEvaluator::EnsureAnalysisBitmap(
+        uint32_t producerNodeId, ID2D1DeviceContext5* dc)
+    {
+        if (!dc) return nullptr;
+        auto bIt = m_bridgeImplCache.find(producerNodeId);
+        if (bIt == m_bridgeImplCache.end() || !bIt->second) return nullptr;
+
+        winrt::com_ptr<Effects::IEngineComputeTexture> iect;
+        if (FAILED(bIt->second->QueryInterface(
+                __uuidof(Effects::IEngineComputeTexture), iect.put_void())))
+            return nullptr;
+
+        winrt::com_ptr<ID3D11Texture2D> tex;
+        if (FAILED(iect->GetAnalysisTexture(tex.put())) || !tex)
+            return nullptr;   // not filled yet -- next frame
+
+        // Reuse the wrapper while it still points at the same texture. The
+        // bitmap is a VIEW, not a copy: the copy pass writes the texture and
+        // the bitmap sees it, so recreating per frame would buy nothing and
+        // cost an allocation on every dispatch.
+        auto cIt = m_analysisBitmapCache.find(producerNodeId);
+        auto sIt = m_analysisBitmapSource.find(producerNodeId);
+        if (cIt != m_analysisBitmapCache.end() && cIt->second &&
+            sIt != m_analysisBitmapSource.end() && sIt->second == tex.get())
+            return cIt->second.get();
+
+        winrt::com_ptr<IDXGISurface> surface;
+        if (FAILED(tex->QueryInterface(__uuidof(IDXGISurface), surface.put_void())))
+            return nullptr;
+
+        // R32G32B32A32_FLOAT, matching the texture: the analysis values are
+        // absolute nits and similar magnitudes, and FP16 would quantise a
+        // 620-nit peak to half-nit steps for no reason -- the whole lane
+        // exists to avoid losing precision on the way to the shader.
+        // IGNORE alpha: these are data, not colour, and a premultiplied
+        // interpretation would let D2D scale the .x channel by .w.
+        D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_NONE,
+            D2D1::PixelFormat(DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_IGNORE));
+        winrt::com_ptr<ID2D1Bitmap1> bmp;
+        if (FAILED(dc->CreateBitmapFromDxgiSurface(surface.get(), &props, bmp.put())))
+            return nullptr;
+
+        m_analysisBitmapSource[producerNodeId] = tex.get();
+        m_analysisBitmapCache[producerNodeId] = bmp;
+        return bmp.get();
+    }
 
     void GraphEvaluator::DispatchViaBridge(
         ID2D1DeviceContext5* dc,
@@ -1181,7 +1845,7 @@ namespace ShaderLab::Rendering
         std::vector<GpuBindingEntry> bindingPlan;
         uint32_t macroBitset = 0;
         const std::vector<uint8_t>* reflectBytecode = &def.compiledBytecode;
-        std::vector<uint8_t> variantBytecode;
+        std::shared_ptr<const std::vector<uint8_t>> variantBytecode;
 
         if (Performance::IsGpuBindingsEnabled())
         {
@@ -1252,7 +1916,9 @@ namespace ShaderLab::Rendering
                     fieldIndex,
                     p.name,
                     std::move(srv) });
-                macroBitset |= (1u << thisGpuIdx);
+                // Mode 1 (StructuredBuffer) for a compute consumer, in the
+                // low bit of this param's 2-bit field. See BytecodeCache.h.
+                macroBitset |= (1u << (2u * thisGpuIdx));
                 // (telemetry already bumped by ResolveBindings; no
                 // double-count here.)
             }
@@ -1263,17 +1929,11 @@ namespace ShaderLab::Rendering
             // (commit 74eb9a5), so this is typically a cache hit.
             if (macroBitset != 0)
             {
-                auto gpuNames = ExtractGpuBindableNames(def);
-                auto variant = CompileViaCache(
-                    node.name, /*effectVersion*/ 1u,
-                    def.hlslSource, "cs_5_0", macroBitset, gpuNames);
-                if (variant.status == Effects::BytecodeStatus::Ready)
+                variantBytecode = GetVariantBytecode(
+                    node, node.name, 1u, "cs_5_0", macroBitset);
+                if (variantBytecode)
                 {
-                    variantBytecode  = std::move(variant.bytecode);
-                    reflectBytecode  = &variantBytecode;
-                    bridge->SetCompiledBytecode(
-                        variantBytecode.data(),
-                        static_cast<UINT32>(variantBytecode.size()));
+                    reflectBytecode = variantBytecode.get();
                 }
                 else
                 {
@@ -1285,6 +1945,15 @@ namespace ShaderLab::Rendering
                 }
             }
         }
+
+        // Install whatever the plan implies -- baseline or variant -- before
+        // every dispatch. The bridge compares by DXBC checksum, so this is a
+        // no-op unless the plan changed. (It used to swap the variant in
+        // here and the baseline back after the dispatch, which recreated
+        // the compute shader twice per frame.)
+        if (!reflectBytecode->empty())
+            bridge->SetCompiledBytecode(reflectBytecode->data(),
+                static_cast<UINT32>(reflectBytecode->size()));
 
         // Analysis float4 count: sum over typed-field pixel counts.
         UINT32 analysisFloat4Count = 0;
@@ -1365,8 +2034,12 @@ namespace ShaderLab::Rendering
                     dc->SetDpi(96.0f, 96.0f);
                     D2D1_RECT_F bounds{};
                     dc->GetImageLocalBounds(primaryInput, &bounds);
-                    imageOutW = static_cast<UINT32>((std::min)(bounds.right - bounds.left, 8192.0f));
-                    imageOutH = static_cast<UINT32>((std::min)(bounds.bottom - bounds.top, 8192.0f));
+                    D2D1_RECT_L px{};
+                    if (SUCCEEDED(Effects::SnapComputeInputRect(bounds, px)))
+                    {
+                        imageOutW = static_cast<UINT32>(px.right - px.left);
+                        imageOutH = static_cast<UINT32>(px.bottom - px.top);
+                    }
                     dc->SetDpi(oldDpiX, oldDpiY);
                 }
                 if (imageOutW < 64) imageOutW = 64;
@@ -1384,69 +2057,45 @@ namespace ShaderLab::Rendering
         std::vector<BYTE> cbBytes;
         if (!def.parameters.empty() && !reflectBytecode->empty())
         {
-            winrt::com_ptr<ID3D11ShaderReflection> reflect;
-            HRESULT hr = D3DReflect(
-                reflectBytecode->data(), reflectBytecode->size(),
-                IID_ID3D11ShaderReflection, reinterpret_cast<void**>(reflect.put()));
-            if (SUCCEEDED(hr) && reflect)
+            // Layout memoized per bytecode (it never changes for given bytes).
+            auto cb = ReflectComputeCb(*reflectBytecode);
+            if (cb && cb->sizeBytes > 8)
             {
-                auto* cbReflect = reflect->GetConstantBufferByIndex(0);
-                D3D11_SHADER_BUFFER_DESC cbDesc{};
-                if (cbReflect && SUCCEEDED(cbReflect->GetDesc(&cbDesc)) && cbDesc.Size > 8)
+                cbBytes.assign(cb->sizeBytes - 8, BYTE{ 0 });
+                for (const auto& var : cb->vars)
                 {
-                    UINT32 userSize = cbDesc.Size - 8;
-                    cbBytes.assign(userSize, BYTE{ 0 });
-                    for (UINT v = 0; v < cbDesc.Variables; ++v)
+                    if (var.offset < 8) continue; // skip Width/Height
+                    const UINT32 destOff = var.offset - 8;
+                    if (destOff >= cbBytes.size()) continue;
+                    const UINT32 remaining = static_cast<UINT32>(cbBytes.size() - destOff);
+
+                    // Phase 8 GPU-binding index slot. Variant
+                    // bytecode declares a `uint _SLIdx_<paramName>;`
+                    // for each gpuBindable param routed via SRV.
+                    // The host packs the upstream's float4 index
+                    // here so the consumer's shader reads the right
+                    // slot via _SLBuf_<name>[_SLIdx_<name>].
+                    if (var.name.starts_with(L"_SLIdx_"))
                     {
-                        auto* var = cbReflect->GetVariableByIndex(v);
-                        D3D11_SHADER_VARIABLE_DESC varDesc{};
-                        if (!var || FAILED(var->GetDesc(&varDesc))) continue;
-                        if (varDesc.StartOffset < 8) continue; // skip Width/Height
-
-                        std::wstring varName(varDesc.Name, varDesc.Name + strlen(varDesc.Name));
-                        UINT32 destOff = varDesc.StartOffset - 8;
-                        if (destOff >= cbBytes.size()) continue;
-                        UINT32 remaining = static_cast<UINT32>(cbBytes.size() - destOff);
-
-                        // Phase 8 GPU-binding index slot. Variant
-                        // bytecode declares a `uint _SLIdx_<paramName>;`
-                        // for each gpuBindable param routed via SRV.
-                        // The host packs the upstream's float4 index
-                        // here so the consumer's shader reads the right
-                        // slot via _SLBuf_<name>[_SLIdx_<name>].
-                        if (varName.starts_with(L"_SLIdx_"))
+                        const std::wstring paramName = var.name.substr(7);
+                        for (const auto& be : bindingPlan)
                         {
-                            std::wstring paramName = varName.substr(7);
-                            for (const auto& e : bindingPlan)
+                            if (be.paramName == paramName)
                             {
-                                if (e.paramName == paramName)
-                                {
-                                    uint32_t idx = e.fieldIndex;
-                                    if (remaining >= sizeof(uint32_t))
-                                        memcpy(cbBytes.data() + destOff, &idx, sizeof(uint32_t));
-                                    break;
-                                }
+                                uint32_t idx = be.fieldIndex;
+                                if (remaining >= sizeof(uint32_t))
+                                    memcpy(cbBytes.data() + destOff, &idx, sizeof(uint32_t));
+                                break;
                             }
-                            continue;
                         }
-
-                        auto propIt = node.properties.find(varName);
-                        if (propIt == node.properties.end()) continue;
-
-                        D3D11_SHADER_TYPE_DESC typeDesc{};
-                        D3D_SHADER_VARIABLE_TYPE hlslType = D3D_SVT_FLOAT;
-                        UINT cols = 1;
-                        if (auto* typeInfo = var->GetType();
-                            typeInfo && SUCCEEDED(typeInfo->GetDesc(&typeDesc)))
-                        {
-                            hlslType = typeDesc.Type;
-                            cols = typeDesc.Columns;
-                        }
-
-                        Effects::PackPropertyToCBuffer(
-                            cbBytes.data() + destOff, remaining,
-                            hlslType, cols, propIt->second);
+                        continue;
                     }
+
+                    auto propIt = node.properties.find(var.name);
+                    if (propIt == node.properties.end()) continue;
+                    Effects::PackPropertyToCBuffer(
+                        cbBytes.data() + destOff, remaining,
+                        var.type, var.cols, propIt->second);
                 }
             }
         }
@@ -1543,18 +2192,6 @@ namespace ShaderLab::Rendering
         if (!readbackToCpu)
             Performance::IncrementSkippedCpuReadbacks();
 
-        // After dispatch, restore the baseline bytecode on the bridge
-        // so a subsequent dispatch with a different binding plan starts
-        // from a known state. Cheap since bridge keeps both blobs as
-        // bytecode pointers; CreateComputeShader is the only D3D cost
-        // and the cache returns the same bytes for the same key.
-        if (macroBitset != 0 && !def.compiledBytecode.empty())
-        {
-            bridge->SetCompiledBytecode(
-                def.compiledBytecode.data(),
-                static_cast<UINT32>(def.compiledBytecode.size()));
-        }
-
         if (FAILED(hr))
         {
             node.runtimeError = std::format(L"Bridge dispatch failed 0x{:08X}",
@@ -1569,43 +2206,11 @@ namespace ShaderLab::Rendering
         // values (or empty if never populated). Hosts that need fresh
         // values must include the node in
         // `GraphEvaluator::SetCpuAnalysisInterest` (see Performance.h).
-        if (readbackToCpu && analysisFloat4Count > 0)
-        {
-            node.analysisOutput.type = AnalysisOutputType::Typed;
-            node.analysisOutput.fields.clear();
-            UINT32 pixelOffset = 0;
-            for (const auto& fd : def.analysisFields)
-            {
-                AnalysisFieldValue fv;
-                fv.name = fd.name;
-                fv.type = fd.type;
-
-                UINT32 pc = fd.pixelCount();
-                bool isArray = AnalysisFieldIsArray(fd.type);
-                UINT32 cc = AnalysisFieldComponentCount(fd.type);
-
-                if (!isArray)
-                {
-                    if (pixelOffset * 4 < analysisFloats.size())
-                    {
-                        for (UINT32 c = 0; c < cc && (pixelOffset * 4 + c) < analysisFloats.size(); ++c)
-                            fv.components[c] = analysisFloats[pixelOffset * 4 + c];
-                    }
-                }
-                else
-                {
-                    fv.arrayData.resize(fd.arrayLength * cc, 0.0f);
-                    for (UINT32 i = 0; i < fd.arrayLength; ++i)
-                    {
-                        UINT32 base = (pixelOffset + i) * 4;
-                        for (UINT32 c = 0; c < cc && (base + c) < analysisFloats.size(); ++c)
-                            fv.arrayData[i * cc + c] = analysisFloats[base + c];
-                    }
-                }
-                pixelOffset += pc;
-                node.analysisOutput.fields.push_back(std::move(fv));
-            }
-        }
+        // An async readback returns nothing now -- PollAsyncReadbacks unpacks
+        // it when it lands -- and a failed Map returns nothing too; neither
+        // may overwrite the previous values with zeros.
+        if (readbackToCpu && analysisFloat4Count > 0 && !analysisFloats.empty())
+            UnpackAnalysisFloats(node, analysisFloats);
 
         // Image-producing nodes wire their output to the bridge's
         // wrapped bitmap. Downstream nodes consume node->cachedOutput
@@ -1623,28 +2228,40 @@ namespace ShaderLab::Rendering
     // counts the source as needing CPU readback. Keep this in sync
     // with the bindingPlan construction in DispatchViaBridge -- if a
     // new GPU-routability requirement is added there, mirror it here.
-    bool GraphEvaluator::CanServeBindingViaGpu(
+    GraphEvaluator::GpuBindMode GraphEvaluator::CanServeBindingViaGpu(
         const EffectNode&         consumer,
         const std::wstring&       paramName,
         const Graph::PropertyBinding& binding,
         const EffectGraph&        graph) const
     {
+        using Mode = GpuBindMode;
         if (!Performance::IsGpuBindingsEnabled())
-            return false;
-        // Consumer must be a D3D11 compute custom effect (only the
-        // CustomComputeBridgeEffect can wire upstream SRVs at t-slots).
-        // Pixel-shader / D2D-tiled / built-in D2D effects always go CPU.
+            return Mode::None;
         if (!consumer.customEffect.has_value())
-            return false;
-        if (consumer.customEffect->shaderType != Graph::CustomShaderType::D3D11ComputeShader)
-            return false;
+            return Mode::None;
+
+        // The lane depends on what the CONSUMER can bind.
+        //   D3D11 compute -> lane 1: CustomComputeBridgeEffect controls its own
+        //     dispatch, so it can bind an upstream SRV at any t-slot.
+        //   Pixel shader  -> lane 3: Direct2D owns the draw and maps only a
+        //     transform's INPUTS to t0, t1, ..., so the values have to arrive
+        //     as an image. (CreateResourceTexture is not a way round this: it
+        //     takes const BYTE* CPU memory and would reintroduce the readback.)
+        // Anything else -- D2D-tiled, built-in D2D -- has no GPU-side route.
+        Mode mode = Mode::None;
+        switch (consumer.customEffect->shaderType)
+        {
+        case Graph::CustomShaderType::D3D11ComputeShader: mode = Mode::StructuredBuffer; break;
+        case Graph::CustomShaderType::PixelShader:        mode = Mode::Texture;          break;
+        default:                                          return Mode::None;
+        }
         // Single-component bindings only -- multi-source per-component
         // packing always goes CPU.
         if (binding.wholeArray ||
             binding.sources.empty() ||
             binding.sources.size() > 1 ||
             !binding.sources[0].has_value())
-            return false;
+            return Mode::None;
         // Target parameter must be flagged gpuBindable.
         const auto& def = consumer.customEffect.value();
         const Graph::ParameterDefinition* paramDef = nullptr;
@@ -1653,7 +2270,7 @@ namespace ShaderLab::Rendering
             if (p.name == paramName) { paramDef = &p; break; }
         }
         if (!paramDef || !paramDef->gpuBindable)
-            return false;
+            return Mode::None;
         // Source bridge must exist and expose IEngineComputeOutput. We
         // don't actually call GetAnalysisSrv here (it can fail before
         // first dispatch); presence of the bridge in m_bridgeImplCache
@@ -1664,10 +2281,10 @@ namespace ShaderLab::Rendering
         const uint32_t srcId = binding.sources[0]->sourceNodeId;
         auto bridgeIt = m_bridgeImplCache.find(srcId);
         if (bridgeIt == m_bridgeImplCache.end() || !bridgeIt->second)
-            return false;
+            return Mode::None;
         const EffectNode* srcNode = graph.FindNode(srcId);
         if (!srcNode || !srcNode->customEffect.has_value())
-            return false;
+            return Mode::None;
         // Source field must exist on the upstream's analysisFields.
         const auto& srcFieldName = binding.sources[0]->sourceFieldName;
         bool fieldFound = false;
@@ -1675,7 +2292,7 @@ namespace ShaderLab::Rendering
         {
             if (fd.name == srcFieldName) { fieldFound = true; break; }
         }
-        return fieldFound;
+        return fieldFound ? mode : Mode::None;
     }
 
     // -----------------------------------------------------------------------
@@ -1688,8 +2305,21 @@ namespace ShaderLab::Rendering
         m_outputCache.clear();
         m_customImplCache.clear();
         m_bridgeImplCache.clear();
+        // The lane-3 wrappers alias textures owned by the bridges being
+        // dropped here; keeping them would leave D2D bitmaps over freed D3D
+        // resources.
+        m_analysisBitmapCache.clear();
+        m_analysisBitmapSource.clear();
+        m_analysisTextureWanted.clear();
+        m_analysisDummyBitmap = nullptr;
         m_sharedPreRenderCache.clear();
+        m_asyncReadbackPending.clear();
+        m_histogramTarget = nullptr;
+        m_analysisTarget = nullptr;
+        m_analysisCpuBitmap = nullptr;
         m_lastHintReadbackTime.clear();
+        m_cacheEnabled.clear();
+        m_queuedComputeThisEval.clear();
         m_dummySourceBitmap = nullptr;
 
         // P7: also drop any deferred-compute entries that the previous
@@ -1720,6 +2350,8 @@ namespace ShaderLab::Rendering
         m_outputCache.erase(nodeId);
         m_customImplCache.erase(nodeId);
         m_bridgeImplCache.erase(nodeId);
+        m_cacheEnabled.erase(nodeId);
+        m_asyncReadbackPending.erase(nodeId);
         // Note: caller must also clear EffectNode::cachedOutput on the node
         // (the raw pointer it holds is now dangling). Prefer the graph-aware
         // overload below.
@@ -1750,7 +2382,13 @@ namespace ShaderLab::Rendering
                 {
                     auto eit = effectiveProps.find(propName);
                     if (eit != effectiveProps.end())
-                        node.properties[propName] = eit->second;
+                    {
+                        if (IsFinitePropertyValue(eit->second))
+                            node.properties[propName] = eit->second;
+                        else
+                            node.runtimeError = L"binding '" + propName +
+                                L"' resolved to a non-finite value; previous kept";
+                    }
                 }
                 node.dirty = true;
             }
@@ -1770,6 +2408,7 @@ namespace ShaderLab::Rendering
         {
             m_effectCache.erase(nodeId);
             m_bridgeImplCache.erase(nodeId);
+            m_cacheEnabled.erase(nodeId);
             return;
         }
         auto implIt = m_customImplCache.find(nodeId);
@@ -1806,6 +2445,20 @@ namespace ShaderLab::Rendering
                 static_cast<UINT32>(def.compiledBytecode.size()));
             implIt->second.computeImpl->SetThreadGroupSize(
                 def.threadGroupX, def.threadGroupY, def.threadGroupZ);
+        }
+
+        // The effect instance survives the bytecode swap, so any cached
+        // output intermediate is now stale — drop it. The next Evaluate
+        // re-enables caching after the fresh render.
+        if (effectIt != m_effectCache.end())
+        {
+            auto cacheIt = m_cacheEnabled.find(nodeId);
+            if (cacheIt != m_cacheEnabled.end() && cacheIt->second)
+            {
+                effectIt->second->SetValue(D2D1_PROPERTY_CACHED, FALSE);
+                cacheIt->second = false;
+                ++m_cacheInvalidations;
+            }
         }
     }
 
@@ -1847,8 +2500,9 @@ namespace ShaderLab::Rendering
             clsid = node.customEffect->shaderGuid;
             // D2D custom effects require at least 1 input. Source effects
             // (empty inputNames) get a hidden input fed by a dummy bitmap.
-            UINT32 inputCount = static_cast<UINT32>(
-                (std::max)(size_t(1), node.customEffect->inputNames.size()));
+            // Declared image inputs plus one reserved pin per gpu-bindable
+            // parameter (pixel shaders only). See TotalInputCount.
+            UINT32 inputCount = TotalInputCount(node, node.customEffect.value());
 
             // Register this specific CLSID if not already registered.
             winrt::com_ptr<ID2D1Factory> factory;
@@ -1892,9 +2546,9 @@ namespace ShaderLab::Rendering
         // initializes m_inputCount correctly for SetSingleTransformNode.
         if (node.customEffect.has_value())
         {
-            // Always at least 1 for D2D (source effects get a dummy input).
-            UINT32 ic = static_cast<UINT32>(
-                (std::max)(size_t(1), node.customEffect->inputNames.size()));
+            // Must match the count used at registration exactly -- D2D sizes
+            // the transform's input array from this.
+            UINT32 ic = TotalInputCount(node, node.customEffect.value());
             if (node.type == NodeType::PixelShader)
                 Effects::CustomPixelShaderEffect::s_pendingInputCount = ic;
             else if (node.type == NodeType::ComputeShader)
@@ -1921,6 +2575,11 @@ namespace ShaderLab::Rendering
         if (node.type == NodeType::PixelShader && Effects::CustomPixelShaderEffect::s_lastCreated)
         {
             auto* impl = Effects::CustomPixelShaderEffect::s_lastCreated;
+            // Split the pins: the first DeclaredInputCount are image inputs,
+            // the rest are reserved for analysis textures. The impl needs this
+            // to compute output bounds correctly -- see SetImageInputCount.
+            if (node.customEffect.has_value())
+                impl->SetImageInputCount(GeometricInputCount(node.customEffect.value()));
             m_customImplCache[node.id] = { impl, nullptr };
 
             // For zero-input source effects, set fixed output size from properties.
@@ -2090,6 +2749,17 @@ namespace ShaderLab::Rendering
         UINT32 totalInputs = effect->GetInputCount();
         std::vector<bool> connected(totalInputs, false);
 
+        // Re-setting an input D2D already holds may count as a topology
+        // change and drop the effect's D2D1_PROPERTY_CACHED intermediate,
+        // so only call SetInput when the pointer actually differs.
+        auto setInputIfChanged = [effect](UINT32 pin, ID2D1Image* desired)
+        {
+            winrt::com_ptr<ID2D1Image> current;
+            effect->GetInput(pin, current.put());
+            if (current.get() != desired)
+                effect->SetInput(pin, desired);
+        };
+
         for (const auto* edge : inputEdges)
         {
             if (edge->destPin >= totalInputs)
@@ -2098,22 +2768,126 @@ namespace ShaderLab::Rendering
             const EffectNode* srcNode = graph.FindNode(edge->sourceNodeId);
             if (srcNode && srcNode->cachedOutput)
             {
-                effect->SetInput(edge->destPin, srcNode->cachedOutput);
+                setInputIfChanged(edge->destPin, srcNode->cachedOutput);
                 connected[edge->destPin] = true;
             }
         }
 
-        // Clear any inputs that are no longer connected.
-        for (UINT32 i = 0; i < totalInputs; ++i)
+        // Clear inputs that are no longer connected -- but STOP at the
+        // declared image inputs. The pins past that point carry lane-3
+        // analysis textures, which are attached by the binding pass rather
+        // than by a graph edge; clearing them here would unbind the analysis
+        // texture on every frame, and the shader would sample an empty pin
+        // while still compiled to read from it.
+        UINT32 clearLimit = totalInputs;
+        UINT32 firstLookup = totalInputs;
+        if (destNode.type == NodeType::PixelShader && destNode.customEffect.has_value())
         {
-            if (!connected[i])
-                effect->SetInput(i, nullptr);
+            clearLimit = (std::min)(totalInputs,
+                                    DeclaredInputCount(destNode.customEffect.value()));
+            firstLookup = (std::min)(clearLimit,
+                                     GeometricInputCount(destNode.customEffect.value()));
+        }
+        for (UINT32 i = 0; i < clearLimit; ++i)
+        {
+            if (connected[i]) continue;
+            // An unwired LOOKUP pin gets the 1x1 zero placeholder rather than
+            // null: D2D renders nothing at all for an effect with a null input,
+            // so leaving an optional table pin empty would blank the node. The
+            // placeholder's alpha of 0 is how the shader reads "no table".
+            // (ApplyCustomEffect creates it before this runs.)
+            ID2D1Image* fill = nullptr;
+            if (i >= firstLookup && m_analysisDummyBitmap)
+                fill = static_cast<ID2D1Image*>(m_analysisDummyBitmap.get());
+            setInputIfChanged(i, fill);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Clean-subgraph output caching policy
+    // -----------------------------------------------------------------------
+
+    void GraphEvaluator::UpdateEffectCachePolicy(
+        ID2D1Effect* effect, uint32_t nodeId, bool contentDirty)
+    {
+        if (!effect)
+            return;
+
+        bool& enabled = m_cacheEnabled[nodeId];   // default-inserts false
+
+        if (!Performance::IsEffectOutputCachingEnabled())
+        {
+            // Kill switch: release any held intermediate and stop caching.
+            if (enabled)
+            {
+                effect->SetValue(D2D1_PROPERTY_CACHED, FALSE);
+                enabled = false;
+            }
+            return;
+        }
+
+        if (contentDirty)
+        {
+            // Content changed through a channel D2D can't see (in-place
+            // texture update or direct cbuffer upload). Drop the cache and
+            // STAY uncached while dirty: an uncached effect re-executes on
+            // every pull, which both picks up the fresh cbuffer and — the
+            // hysteresis part — avoids touching the CACHED property again
+            // next frame. Measured: any per-frame property transition on a
+            // consumer (input toggle OR the CACHED off->on poke) causes
+            // D2D to drop its PRODUCERS' cached intermediates as
+            // collateral, so a per-frame-dirty node (an animated split)
+            // must generate ZERO property traffic to let its upstream
+            // caches survive. Cache re-enables one frame after the node
+            // goes clean.
+            if (enabled)
+            {
+                effect->SetValue(D2D1_PROPERTY_CACHED, FALSE);
+                enabled = false;
+                ++m_cacheInvalidations;
+            }
+            return;
+        }
+
+        if (!enabled)
+        {
+            effect->SetValue(D2D1_PROPERTY_CACHED, TRUE);
+            enabled = true;
         }
     }
 
     // -----------------------------------------------------------------------
     // Property binding resolution
     // -----------------------------------------------------------------------
+
+    // Exact-equality compare for PropertyValue. std::variant's operator==
+    // is unusable here because D2D1_MATRIX_5X4_F has no operator==; the
+    // WinRT numerics are compared componentwise for the same reason.
+    // Exact float compare is intentional: binding sources are
+    // deterministic frame to frame, so "unchanged" means bit-identical.
+    static bool PropertyValuesEqual(
+        const Graph::PropertyValue& a, const Graph::PropertyValue& b)
+    {
+        namespace num = winrt::Windows::Foundation::Numerics;
+        if (a.index() != b.index()) return false;
+        return std::visit([&b](const auto& av) -> bool
+        {
+            using T = std::decay_t<decltype(av)>;
+            const T* bv = std::get_if<T>(&b);
+            if (!bv) return false;
+            if constexpr (std::is_same_v<T, D2D1_MATRIX_5X4_F>)
+                return std::memcmp(&av, bv, sizeof(T)) == 0;
+            else if constexpr (std::is_same_v<T, num::float2>)
+                return av.x == bv->x && av.y == bv->y;
+            else if constexpr (std::is_same_v<T, num::float3>)
+                return av.x == bv->x && av.y == bv->y && av.z == bv->z;
+            else if constexpr (std::is_same_v<T, num::float4>)
+                return av.x == bv->x && av.y == bv->y &&
+                       av.z == bv->z && av.w == bv->w;
+            else
+                return av == *bv;
+        }, a);
+    }
 
     // Helper: resolve a single ComponentSource to a float value.
     static bool ResolveComponentSource(
@@ -2219,8 +2993,17 @@ namespace ShaderLab::Rendering
                 {
                     if (fv.name == binding.wholeArraySourceFieldName && AnalysisFieldIsArray(fv.type))
                     {
-                        effectiveProps[propName] = fv.arrayData;
-                        anyChanged = true;
+                        // Only report a change when the resolved value
+                        // actually differs — "resolved every frame" used
+                        // to mean "changed every frame", which re-applied
+                        // properties and defeated output caching on every
+                        // binding consumer even for static values.
+                        PropertyValue resolvedArr = fv.arrayData;
+                        if (!PropertyValuesEqual(propIt->second, resolvedArr))
+                        {
+                            effectiveProps[propName] = std::move(resolvedArr);
+                            anyChanged = true;
+                        }
                         break;
                     }
                 }
@@ -2313,8 +3096,15 @@ namespace ShaderLab::Rendering
 
             if (resolved)
             {
-                effectiveProps[propName] = newVal;
-                anyChanged = true;
+                // Value-compare before reporting change (see whole-array
+                // note above): the resolved value equals the stored one on
+                // every frame where the source didn't move, and reporting
+                // "changed" then would dirty the consumer needlessly.
+                if (!PropertyValuesEqual(propIt->second, newVal))
+                {
+                    effectiveProps[propName] = newVal;
+                    anyChanged = true;
+                }
             }
         }
 
@@ -2328,7 +3118,9 @@ namespace ShaderLab::Rendering
     void GraphEvaluator::ApplyCustomEffect(
         ID2D1Effect* effect,
         EffectNode& node,
-        const std::map<std::wstring, PropertyValue>& effectiveProps)
+        const std::map<std::wstring, PropertyValue>& effectiveProps,
+        const EffectGraph& graph,
+        ID2D1DeviceContext5* dc)
     {
         if (!node.customEffect.has_value()) return;
         auto& def = node.customEffect.value();
@@ -2337,17 +3129,144 @@ namespace ShaderLab::Rendering
         if (implIt == m_customImplCache.end())
             return;
 
+        // ---- lane 3: analysis textures into a pixel shader ----------------
+        // Build the plan first: it decides which shader VARIANT to load, so it
+        // has to run before the bytecode is chosen.
+        //
+        // A parameter only goes texture-mode if the producer has actually
+        // published a bitmap. Before the first compute dispatch there is none,
+        // so the parameter stays cbuffer-bound and reads the CPU value -- the
+        // path degrades to correct-but-slower rather than to wrong. Once the
+        // producer has run, the bitmap persists and the mode is stable.
+        struct AnalysisBind { uint32_t pin; uint32_t fieldIndex; std::wstring name; ID2D1Bitmap1* bmp; };
+        std::vector<AnalysisBind> analysisBinds;
+        uint32_t gpuModeBits = 0;
+        if (node.type == NodeType::PixelShader &&
+            Performance::IsGpuBindingsEnabled() &&
+            GpuBindablePinCount(def) > 0)
+        {
+            const uint32_t declared = DeclaredInputCount(def);
+            uint32_t gi = 0;
+            for (const auto& prm : def.parameters)
+            {
+                if (!prm.gpuBindable) continue;
+                const uint32_t idx = gi++;
+
+                auto bIt = node.propertyBindings.find(prm.name);
+                if (bIt == node.propertyBindings.end()) continue;
+                const auto& binding = bIt->second;
+                if (binding.wholeArray || binding.sources.size() != 1 ||
+                    !binding.sources[0].has_value())
+                    continue;
+
+                const uint32_t srcId = binding.sources[0]->sourceNodeId;
+                ID2D1Bitmap1* bmp = AnalysisBitmap(srcId);
+                if (!bmp) continue;
+
+                const EffectNode* srcNode = graph.FindNode(srcId);
+                if (!srcNode || !srcNode->customEffect.has_value()) continue;
+
+                // Same prefix-sum the structured-buffer lane uses, so both
+                // lanes address a field identically.
+                uint32_t fieldIndex = 0;
+                bool found = false;
+                for (const auto& fd : srcNode->customEffect->analysisFields)
+                {
+                    if (fd.name == binding.sources[0]->sourceFieldName)
+                    {
+                        fieldIndex += binding.sources[0]->sourceIndex;
+                        found = true;
+                        break;
+                    }
+                    fieldIndex += fd.pixelCount();
+                }
+                if (!found) continue;
+
+                analysisBinds.push_back({ declared + idx, fieldIndex, prm.name, bmp });
+                gpuModeBits |= (2u << (2u * idx));   // mode 2 for this parameter
+            }
+        }
+
+        // Pick the bytecode the plan implies. Falling back to baseline on a
+        // cache miss keeps the node rendering (cbuffer mode, CPU values)
+        // rather than failing.
+        const std::vector<uint8_t>* activeBytecode = &def.compiledBytecode;
+        std::shared_ptr<const std::vector<uint8_t>> variantBytes;
+        GUID activeGuid = def.shaderGuid;
+        if (gpuModeBits != 0)
+        {
+            variantBytes = GetVariantBytecode(
+                node,
+                def.shaderLabEffectId.empty() ? node.name : def.shaderLabEffectId,
+                def.shaderLabEffectVersion ? def.shaderLabEffectVersion : 1u,
+                "ps_5_0", gpuModeBits);
+            if (variantBytes && !variantBytes->empty())
+            {
+                activeBytecode = variantBytes.get();
+                // A DISTINCT GUID is mandatory, not cosmetic: Direct2D ignores
+                // LoadPixelShader when a shader with the same GUID is already
+                // loaded, so reusing def.shaderGuid would silently keep
+                // running the cbuffer-mode bytecode while the host believed it
+                // had switched -- the parameter would read whatever the
+                // unbound cbuffer slot happened to hold.
+                activeGuid.Data1 ^= (0xA5A50000u ^ gpuModeBits);
+            }
+            else
+            {
+                analysisBinds.clear();
+                gpuModeBits = 0;
+            }
+        }
+
+        // Fill EVERY reserved pin -- bound ones with their analysis bitmap,
+        // the rest with a 1x1 dummy. Direct2D will not render a custom effect
+        // that has an unconnected input: the output rect comes back empty and
+        // the node draws nothing, with no error raised anywhere. Leaving the
+        // unbound pins null therefore breaks the effect even when no binding
+        // is in play, which is exactly how this surfaced -- a tone mapper with
+        // no bindings at all rendered nothing the moment the pins existed.
+        // WireInputs (which runs next) fills unwired lookup pins with the
+        // placeholder, and has no device context to create it with.
+        if (effect && node.type == NodeType::PixelShader && def.lookupInputCount > 0)
+            EnsureAnalysisDummy(dc);
+
+        if (effect && node.type == NodeType::PixelShader && node.customEffect.has_value())
+        {
+            const uint32_t declared = DeclaredInputCount(def);
+            const uint32_t total    = TotalInputCount(node, def);
+            if (total > declared)
+            {
+                EnsureAnalysisDummy(dc);
+                for (uint32_t pin = declared; pin < total; ++pin)
+                {
+                    ID2D1Image* desired = static_cast<ID2D1Image*>(m_analysisDummyBitmap.get());
+                    for (const auto& ab : analysisBinds)
+                        if (ab.pin == pin) { desired = static_cast<ID2D1Image*>(ab.bmp); break; }
+                    if (!desired) continue;
+                    winrt::com_ptr<ID2D1Image> current;
+                    effect->GetInput(pin, current.put());
+                    // Only on change: re-setting an input D2D already holds
+                    // counts as a topology change and drops the cached
+                    // intermediate.
+                    if (current.get() != desired)
+                        effect->SetInput(pin, desired);
+                }
+            }
+        }
+
         // Load bytecode only if not already loaded (bytecode doesn't change
         // on property updates, only on recompile/update-in-graph).
         bool needsShaderLoad = false;
         if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
         {
-            if (implIt->second.pixelImpl->NeedsShaderLoad())
+            uint32_t& loadedMode = m_pixelGpuModeBits[node.id];
+            if (implIt->second.pixelImpl->NeedsShaderLoad() || loadedMode != gpuModeBits)
             {
-                implIt->second.pixelImpl->SetShaderGuid(def.shaderGuid);
+                implIt->second.pixelImpl->SetShaderGuid(activeGuid);
                 implIt->second.pixelImpl->LoadShaderBytecode(
-                    def.compiledBytecode.data(),
-                    static_cast<UINT32>(def.compiledBytecode.size()));
+                    activeBytecode->data(),
+                    static_cast<UINT32>(activeBytecode->size()));
+                loadedMode = gpuModeBits;
                 needsShaderLoad = true;
             }
         }
@@ -2362,7 +3281,25 @@ namespace ShaderLab::Rendering
         }
 
         // Reflect the bytecode to discover cbuffer layout.
-        auto reflection = Effects::ShaderCompiler::Reflect(def.compiledBytecode);
+        // Reflect what is actually loaded. A texture-mode parameter swaps its
+        // cbuffer value slot for a uint index slot, so every offset after it
+        // moves -- reflecting the baseline would pack every later parameter
+        // at the wrong offset.
+        std::shared_ptr<const Effects::ShaderReflectionResult> reflectionPtr;
+        {
+            const BytecodeId rid = IdOfBytecode(*activeBytecode);
+            auto rit = m_pixelReflectMemo.find(rid);
+            if (rit != m_pixelReflectMemo.end())
+                reflectionPtr = rit->second;
+            else
+            {
+                if (m_pixelReflectMemo.size() > 256) m_pixelReflectMemo.clear();
+                reflectionPtr = std::make_shared<const Effects::ShaderReflectionResult>(
+                    Effects::ShaderCompiler::Reflect(*activeBytecode));
+                m_pixelReflectMemo[rid] = reflectionPtr;
+            }
+        }
+        const auto& reflection = *reflectionPtr;
         if (!reflection.constantBuffers.empty())
         {
             auto& cb = reflection.constantBuffers[0];
@@ -2385,31 +3322,61 @@ namespace ShaderLab::Rendering
                     std::wstring(var.name.begin(), var.name.end()));
                 if (propIt == effectiveProps.end()) continue;
 
-                std::visit([&](const auto& v)
+                // Typed pack: converts float-stored enum properties to the
+                // declared uint/int/bool HLSL slot type. The previous raw
+                // memcpy here wrote float bit patterns into uint slots, so
+                // `uint Mode` read 3.0f as 1077936128 and every uint-enum
+                // switch on the D2D pixel/compute-shader path silently fell
+                // through to its default branch for any non-zero value.
+                if (var.offset < cbData.size())
                 {
-                    using T = std::decay_t<decltype(v)>;
-                    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, int32_t> ||
-                                  std::is_same_v<T, uint32_t> || std::is_same_v<T, bool>)
-                    {
-                        if (var.offset + sizeof(T) <= cbData.size())
-                            memcpy(cbData.data() + var.offset, &v, sizeof(T));
-                    }
-                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
-                    {
-                        if (var.offset + sizeof(float) * 2 <= cbData.size())
-                            memcpy(cbData.data() + var.offset, &v, sizeof(float) * 2);
-                    }
-                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
-                    {
-                        if (var.offset + sizeof(float) * 3 <= cbData.size())
-                            memcpy(cbData.data() + var.offset, &v, sizeof(float) * 3);
-                    }
-                    else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
-                    {
-                        if (var.offset + sizeof(float) * 4 <= cbData.size())
-                            memcpy(cbData.data() + var.offset, &v, sizeof(float) * 4);
-                    }
-                }, propIt->second);
+                    Effects::PackPropertyToCBuffer(
+                        cbData.data() + var.offset,
+                        static_cast<uint32_t>(cbData.size()) - var.offset,
+                        var.type, var.columns, propIt->second);
+                }
+            }
+
+            // Lane 3: the variant replaced each bound parameter's value slot
+            // with `uint _SLIdx_<name>`, which no property matches by name --
+            // the host supplies the field index that the shader Loads with.
+            for (const auto& ab : analysisBinds)
+            {
+                const std::wstring slot = L"_SLIdx_" + ab.name;
+                for (const auto& var : cb.variables)
+                {
+                    if (var.name != slot) continue;
+                    if (var.offset + sizeof(uint32_t) > cbData.size()) break;
+                    const uint32_t v = ab.fieldIndex;
+                    std::memcpy(cbData.data() + var.offset, &v, sizeof(v));
+                    break;
+                }
+            }
+
+            // Derived constants: parameter-only tables a built-in computes on
+            // the CPU instead of per pixel. Written only into variables this
+            // bytecode declares, so older saved HLSL is untouched.
+            if (!def.shaderLabEffectId.empty())
+            {
+                const auto* slDesc =
+                    Effects::ShaderLabEffects::Instance().FindById(def.shaderLabEffectId);
+                if (slDesc && slDesc->deriveConstants)
+                {
+                    slDesc->deriveConstants(effectiveProps,
+                        [&](std::wstring_view name, const float* data, size_t floatCount)
+                        {
+                            for (const auto& var : cb.variables)
+                            {
+                                if (var.name != name) continue;
+                                if (var.offset >= cbData.size()) return;
+                                size_t bytes = (std::min)(floatCount * sizeof(float),
+                                    static_cast<size_t>(var.size));
+                                bytes = (std::min)(bytes, cbData.size() - var.offset);
+                                std::memcpy(cbData.data() + var.offset, data, bytes);
+                                return;
+                            }
+                        });
+                }
             }
 
             // Set the packed cbuffer on the concrete impl.
@@ -2530,32 +3497,44 @@ namespace ShaderLab::Rendering
         // Get the input image bounds to size the temp target appropriately.
         D2D1_RECT_F bounds{};
         dc->GetImageLocalBounds(node.cachedOutput, &bounds);
-        uint32_t w = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 4096.0f));
-        uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 4096.0f));
-        if (w == 0) w = 1;
-        if (h == 0) h = 1;
+        D2D1_RECT_L px{};
+        if (FAILED(Effects::SnapComputeInputRect(bounds, px)))
+        {
+            node.runtimeError = L"histogram input has unbounded or empty extent; crop it first";
+            return;
+        }
+        uint32_t w = (std::min)(static_cast<uint32_t>(px.right - px.left), 4096u);
+        uint32_t h = (std::min)(static_cast<uint32_t>(px.bottom - px.top), 4096u);
 
         // Recreate temp target if size changed.
-        if (!m_analysisTarget || m_analysisTargetW != w || m_analysisTargetH != h ||
-            m_analysisTargetFormat != DXGI_FORMAT_B8G8R8A8_UNORM)
+        if (!m_histogramTarget || m_histogramTargetW != w || m_histogramTargetH != h)
         {
-            m_analysisTarget = nullptr;
+            m_histogramTarget = nullptr;
             D2D1_BITMAP_PROPERTIES1 props = {};
             props.pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED };
             props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-            HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, props, m_analysisTarget.put());
+            HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, props, m_histogramTarget.put());
             if (FAILED(hr)) { dc->SetTarget(prevTarget.get()); return; }
-            m_analysisTargetW = w;
-            m_analysisTargetH = h;
-            m_analysisTargetFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+            m_histogramTargetW = w;
+            m_histogramTargetH = h;
         }
 
-        dc->SetTarget(m_analysisTarget.get());
+        dc->SetTarget(m_histogramTarget.get());
         dc->BeginDraw();
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-        dc->DrawImage(node.cachedOutput, D2D1::Point2F(-bounds.left, -bounds.top));
-        dc->EndDraw();
+        dc->DrawImage(node.cachedOutput, D2D1::Point2F(
+            -static_cast<float>(px.left), -static_cast<float>(px.top)));
+        HRESULT histHr = dc->EndDraw();
         dc->SetTarget(prevTarget.get());
+        if (FAILED(histHr))
+        {
+            node.runtimeError = L"histogram draw failed (nested draw session?)";
+            std::fwprintf(stderr,
+                L"[ShaderLab] ReadHistogramOutput node %u EndDraw failed "
+                L"hr=0x%08X -- histogram is STALE\n",
+                node.id, static_cast<unsigned>(histHr));
+            return;
+        }
 
         // Read the channel selector for labeling.
         uint32_t channelIdx = 0;
@@ -2621,8 +3600,7 @@ namespace ShaderLab::Rendering
         if (w == 0) w = 1;
         if (h == 0) h = 1;
 
-        if (!m_analysisTarget || m_analysisTargetW != w || m_analysisTargetH != h ||
-            m_analysisTargetFormat != DXGI_FORMAT_R32G32B32A32_FLOAT)
+        if (!m_analysisTarget || m_analysisTargetW != w || m_analysisTargetH != h)
         {
             m_analysisTarget = nullptr;
             D2D1_BITMAP_PROPERTIES1 props = {};
@@ -2632,7 +3610,6 @@ namespace ShaderLab::Rendering
             if (FAILED(hr)) { dc->SetTarget(prevTarget.get()); return; }
             m_analysisTargetW = w;
             m_analysisTargetH = h;
-            m_analysisTargetFormat = DXGI_FORMAT_R32G32B32A32_FLOAT;
         }
 
         dc->SetTarget(m_analysisTarget.get());
@@ -2641,17 +3618,34 @@ namespace ShaderLab::Rendering
         dc->DrawImage(node.cachedOutput, D2D1::Point2F(-bounds.left, -bounds.top));
         HRESULT drawHr = dc->EndDraw();
         dc->SetTarget(prevTarget.get());
-        if (FAILED(drawHr)) return;
+        if (FAILED(drawHr))
+        {
+            // Silent before: nothing reached runtimeError, analysisOutput or
+            // LastError, so a broken nested session produced stale-but-
+            // plausible analysis fields with no diagnostic anywhere.
+            node.runtimeError = L"analysis draw failed (nested draw session?)";
+            std::fwprintf(stderr,
+                L"[ShaderLab] ReadCustomAnalysisOutput node %u EndDraw failed "
+                L"hr=0x%08X -- analysis fields are STALE\n",
+                node.id, static_cast<unsigned>(drawHr));
+            return;
+        }
 
-        // Create a CPU-readable bitmap to read back analysis pixels.
-        winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
-        D2D1_BITMAP_PROPERTIES1 cpuProps = {};
-        cpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
-
+        // CPU-readable bitmap for the analysis row, kept across calls.
         uint32_t readW = (std::max)(totalPixels, 1u);
-        HRESULT hr = dc->CreateBitmap(D2D1::SizeU(readW, 1), nullptr, 0, cpuProps, cpuBitmap.put());
-        if (FAILED(hr)) return;
+        if (!m_analysisCpuBitmap || m_analysisCpuBitmapW != readW)
+        {
+            m_analysisCpuBitmap = nullptr;
+            D2D1_BITMAP_PROPERTIES1 cpuProps = {};
+            cpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+            cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+            HRESULT chr = dc->CreateBitmap(D2D1::SizeU(readW, 1), nullptr, 0, cpuProps,
+                                           m_analysisCpuBitmap.put());
+            if (FAILED(chr)) return;
+            m_analysisCpuBitmapW = readW;
+        }
+        ID2D1Bitmap1* cpuBitmap = m_analysisCpuBitmap.get();
+        HRESULT hr = S_OK;
 
         D2D1_POINT_2U dest = { 0, 0 };
         D2D1_RECT_U srcRect = { 0, 0, readW, 1 };
@@ -2714,48 +3708,6 @@ namespace ShaderLab::Rendering
     }
 
 
-    // -----------------------------------------------------------------------
-    // Pre-render upstream D2D chain to FP32 bitmap at 96 DPI
-    // -----------------------------------------------------------------------
-
-    winrt::com_ptr<ID2D1Bitmap1> GraphEvaluator::PreRenderInputBitmap(
-        ID2D1DeviceContext5* dc, ID2D1Image* inputImage)
-    {
-        if (!dc || !inputImage) return nullptr;
-
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
-
-        D2D1_RECT_F bounds{};
-        dc->GetImageLocalBounds(inputImage, &bounds);
-        uint32_t w = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
-        uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-        if (w == 0 || h == 0) { dc->SetDpi(oldDpiX, oldDpiY); return nullptr; }
-
-        winrt::com_ptr<ID2D1Bitmap1> bitmap;
-        D2D1_BITMAP_PROPERTIES1 props{};
-        props.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-        props.dpiX = 96.0f;
-        props.dpiY = 96.0f;
-        HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, props, bitmap.put());
-        if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return nullptr; }
-
-        // Render inside a standalone BeginDraw/EndDraw pair so the D2D
-        // effect chain is fully evaluated with current property values.
-        winrt::com_ptr<ID2D1Image> prevTarget;
-        dc->GetTarget(prevTarget.put());
-        dc->SetTarget(bitmap.get());
-        dc->BeginDraw();
-        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-        dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
-        dc->EndDraw();
-        dc->SetTarget(prevTarget.get());
-
-        dc->SetDpi(oldDpiX, oldDpiY);
-        return bitmap;
-    }
 
 }
 

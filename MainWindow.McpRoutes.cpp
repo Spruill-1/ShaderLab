@@ -3,12 +3,16 @@
 #include "Engine/Mcp/McpRouter.h"
 #include "Engine/Mcp/McpJsonRpc.h"
 #include "Engine/Mcp/McpTimeouts.h"
+#include "Engine/Mcp/McpPeerIdentity.h"
 #include <appmodel.h>
 #include <shlobj.h>
+#include <shobjidl_core.h>
+#include <winrt/Windows.ApplicationModel.h>
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/SourceNodeFactory.h"
+#include "Effects/Performance.h"
 #include "Rendering/IccProfileParser.h"
 #include "Version.h"
 
@@ -194,6 +198,39 @@ namespace winrt::ShaderLab::implementation
         // keeps running (update-immune by design, stdio-migration Step 8).
         EnsureShimDistributed();
 
+        // Summon the hub BEFORE the session client's first connect. The
+        // client only CONNECTS (capped ≤4 s backoff) — it never activates
+        // a hub. When no hub is running at app start (e.g. a dev rebuild
+        // killed it), this window's session sat unregistered until an
+        // external shim call happened to activate one — minutes of "no
+        // sessions" for MCP clients. Activation is idempotent: the hub is
+        // a singleton and a second activation is a no-op. Best-effort —
+        // on failure the old behavior (wait for a shim to summon the hub)
+        // still applies.
+        try
+        {
+            std::wstring pipeBase;
+            {
+                wchar_t env[256]{};
+                if (GetEnvironmentVariableW(L"SHADERLAB_MCP_PIPE", env, ARRAYSIZE(env)) > 0)
+                    pipeBase = env;
+                else
+                    pipeBase = ::ShaderLab::Mcp::DefaultPipeBaseName();
+            }
+            const std::wstring aumid =
+                std::wstring(winrt::Windows::ApplicationModel::Package::Current().Id().FamilyName())
+                + L"!Hub";
+            winrt::com_ptr<IApplicationActivationManager> mgr;
+            if (SUCCEEDED(CoCreateInstance(CLSID_ApplicationActivationManager, nullptr,
+                    CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(mgr.put()))))
+            {
+                const std::wstring args = std::format(L"--hub --pipe {}", pipeBase);
+                DWORD pid = 0;
+                mgr->ActivateApplication(aumid.c_str(), args.c_str(), AO_NONE, &pid);
+            }
+        }
+        catch (...) { /* unpackaged/dev edge — session client still retries */ }
+
         if (m_mcpSessionId.empty())
         {
             GUID g{};
@@ -338,7 +375,7 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::GuiEngineCommandSink::OnNodeAdded(uint32_t nodeId)
     {
-        window->m_graph.MarkAllDirty();
+        // The new node starts dirty and has no consumers yet.
         window->m_forceRender = true;
         // Detect Output nodes added via /graph/apply or other engine-side
         // routes and auto-open a window for each. Engine-pure hosts don't
@@ -361,7 +398,7 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::GuiEngineCommandSink::OnNodeRemoved(uint32_t nodeId)
     {
         window->m_graphEvaluator.InvalidateNode(nodeId);
-        window->m_graph.MarkAllDirty();
+        // RemoveNode already dirtied the removed node's consumers.
         window->m_forceRender = true;
         auto* w = window;
         w->DispatcherQueue().TryEnqueue([w, nodeId]{
@@ -533,8 +570,9 @@ namespace winrt::ShaderLab::implementation
     "colorSpace": "Linear sRGB primaries, Rec.709"
 },
 "shaderConventions": {
-    "texcoords": "D2D provides TEXCOORD0 in pixel/scene space, not normalized 0-1",
-    "sampling": "Use Load int3 uv0.xy 0 for direct texel access; all inputs share TEXCOORD0",
+    "signature": "Pixel shaders MUST declare (SV_POSITION, SCENE_POSITION, TEXCOORD0..N), one TEXCOORD per input. Omitting SCENE_POSITION binds the scene coordinate to TEXCOORD0 and displaces sampling whenever content is smaller than the D2D intermediate",
+    "texcoords": "With the signature correct TEXCOORD is NORMALIZED 0-1; pixel coordinates come from SCENE_POSITION",
+    "sampling": "Sample(InputSampler, uvN.xy) using each input's own TEXCOORD; never reuse one coordinate across inputs",
     "filteredSampling": "Use SampleLevel with GetDimensions normalization for bilinear",
     "constantBuffer": "register b0, variables packed by D3DReflect offsets",
     "textures": "register t0..t7, one per input",
@@ -640,9 +678,11 @@ namespace winrt::ShaderLab::implementation
                 auto jobj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
                 uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
                 return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
+                    // No MarkAllDirty: changes made while a node was not
+                    // needed are kept pending by the evaluator, so newly
+                    // needed nodes still re-evaluate what they must.
                     SelectPreviewNode(nodeId);
                     m_forceRender = true;
-                    m_graph.MarkAllDirty();
                     return { 200, R"({"ok":true})" };
                 });
             }
@@ -719,9 +759,9 @@ namespace winrt::ShaderLab::implementation
             return m_renderDispatcher.DispatchSync(
                 [this]() -> ::ShaderLab::Mcp::Response {
                 // Run on render thread (single writer to graph + owns the
-                // engine D2D context). Force a full re-evaluation so the
-                // capture reflects current state.
-                m_graph.MarkAllDirty();
+                // engine D2D context). Evaluates whatever is dirty, which is
+                // exactly what is out of date -- a forced full re-evaluation
+                // (as this did) bought the same pixels at worst-case cost.
                 RenderFrameToOffscreen(0.0);
                 auto pngData = CapturePreviewAsPng();
                 if (pngData.empty())
@@ -762,14 +802,274 @@ namespace winrt::ShaderLab::implementation
                 "\"endDrawFlushMs\":{:.2f},"
                 "\"uiTickMs\":{:.2f},\"outputWindowsMs\":{:.2f},\"traceMs\":{:.2f},"
                 "\"computeDispatches\":{},"
-                "\"framesSampled\":{},\"endDrawFailed\":{}}}",
+                "\"framesSampled\":{},\"endDrawFailed\":{},"
+                "\"cachedEffects\":{},\"cacheInvalidations\":{},"
+                // GPU block. `gpu*Ms` are real GPU execution time from D3D11
+                // timestamp queries; every other field above is CPU wall-clock
+                // around an asynchronous API and cannot see shader cost.
+                // gpuEnabled=false means the gpu*Ms values are stale/zero --
+                // POST /perf/gpu-timing {"enabled":true} to start sampling.
+                "\"unthrottled\":{},"
+                "\"gpuAvailable\":{},\"gpuEnabled\":{},"
+                "\"gpuFramesOpened\":{},\"gpuFramesResolved\":{},\"gpuDisjointDrops\":{},"
+                "\"gpuFrameMs\":{:.3f},\"gpuSourcesPrepMs\":{:.3f},"
+                "\"gpuEvaluateMs\":{:.3f},\"gpuDeferredComputeMs\":{:.3f},"
+                "\"gpuDrawMs\":{:.3f}}}",
                 fps, t.totalUs / 1000.0,
                 t.sourcesPrepUs / 1000.0, t.evaluateUs / 1000.0,
                 t.deferredComputeUs / 1000.0, t.drawUs / 1000.0,
                 t.endDrawFlushUs / 1000.0,
-                t.uiTickUs / 1000.0, t.outputWindowsUs / 1000.0, t.traceUs / 1000.0,
+                // UI-thread fields come from the LIVE struct: the UI thread
+                // writes them, and the render-thread snapshot above only
+                // refreshes when frames render -- they read 0 on an idle graph.
+                m_frameTiming.uiTickUs / 1000.0, m_frameTiming.outputWindowsUs / 1000.0,
+                t.traceUs / 1000.0,
                 t.computeDispatches,
-                t.framesSampled, t.endDrawFailed) };
+                t.framesSampled, t.endDrawFailed,
+                m_graphEvaluator.CachedEffectCount(),
+                m_graphEvaluator.CacheInvalidations(),
+                // Read the timer LIVE rather than from the frame snapshot.
+                // The snapshot only refreshes every 30 frames, so a freshly
+                // toggled flag reads stale -- which looks exactly like the
+                // toggle not working.
+                ::ShaderLab::Performance::IsUnthrottledRenderEnabled() ? "true" : "false",
+                m_renderEngine.Timer().IsInitialized() ? "true" : "false",
+                m_renderEngine.Timer().IsEnabled() ? "true" : "false",
+                m_renderEngine.Timer().FramesOpened(),
+                m_renderEngine.Timer().FramesResolved(),
+                m_renderEngine.Timer().DisjointDrops(),
+                t.gpuFrameMs, t.gpuSourcesPrepMs,
+                t.gpuEvaluateMs, t.gpuDeferredComputeMs,
+                t.gpuDrawMs) };
+        });
+
+        // =====================================================================
+        // POST /perf/render-mode -- unthrottled (benchmark) render loop.
+        // Off by default: it drops the worker's 16 ms pacing wait, evaluates
+        // every tick regardless of dirty state, and presents with vsync
+        // interval 0. That is the right shape for measuring throughput and
+        // the wrong shape for sitting in front of.
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/perf/render-mode",
+            [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
+        {
+            // Each key changes only its own setting; an absent key is left
+            // alone. (This route used to default `unthrottled` to TRUE when the
+            // key was missing, which a forceRedraw-only call would have tripped.)
+            namespace WDJ = winrt::Windows::Data::Json;
+            WDJ::JsonObject jobj{ nullptr };
+            const bool parsed = WDJ::JsonObject::TryParse(winrt::to_hstring(body), jobj);
+            // Untyped MCP args arrive as JSON STRINGS from Claude Code
+            // ("true", not true) -- the coercion rule in CLAUDE.md.
+            auto readBool = [&](const wchar_t* key, bool& out) -> bool
+            {
+                if (!parsed || !jobj.HasKey(key)) return false;
+                auto v = jobj.GetNamedValue(key);
+                if (v.ValueType() == WDJ::JsonValueType::Boolean) out = v.GetBoolean();
+                else if (v.ValueType() == WDJ::JsonValueType::Number) out = v.GetNumber() != 0.0;
+                else if (v.ValueType() == WDJ::JsonValueType::String)
+                {
+                    auto sv = std::wstring(v.GetString());
+                    out = !(sv == L"false" || sv == L"False" || sv == L"0" ||
+                            sv == L"off"   || sv == L"no");
+                }
+                else return false;
+                return true;
+            };
+
+            bool unthrottled = false, forceRedraw = false;
+            if (readBool(L"unthrottled", unthrottled))
+            {
+                ::ShaderLab::Performance::SetUnthrottledRenderEnabled(unthrottled);
+                if (auto box = UnthrottledCheck())
+                    DispatcherQueue().TryEnqueue([box, unthrottled]() { box.IsChecked(unthrottled); });
+            }
+            if (readBool(L"forceRedraw", forceRedraw))
+            {
+                m_forceContinuousRedraw.store(forceRedraw, std::memory_order_release);
+                if (auto box = ForceRedrawCheck())
+                    DispatcherQueue().TryEnqueue([box, forceRedraw]() { box.IsChecked(forceRedraw); });
+            }
+            // analysisRefresh: the flyout's "Refresh analysis readouts" preset
+            // index (0..3, see Performance::SetAnalysisReadoutPreset).
+            if (parsed && jobj.HasKey(L"analysisRefresh"))
+            {
+                auto v = jobj.GetNamedValue(L"analysisRefresh");
+                double d = -1.0;
+                if (v.ValueType() == WDJ::JsonValueType::Number) d = v.GetNumber();
+                else if (v.ValueType() == WDJ::JsonValueType::String)   // untyped MCP arg
+                {
+                    try { d = std::stod(std::wstring(v.GetString())); } catch (...) { d = -1.0; }  // not a number: rejected below
+                }
+                const int32_t preset = static_cast<int32_t>(d);
+                if (!::ShaderLab::Performance::SetAnalysisReadoutPreset(preset))
+                    return { 400, R"({"error":"analysisRefresh must be 0..3"})" };
+                if (auto combo = AnalysisRefreshCombo())
+                    DispatcherQueue().TryEnqueue([combo, preset]() { combo.SelectedIndex(preset); });
+            }
+            // Wake the worker so a new mode applies on this tick, not after
+            // one more 16 ms wait.
+            m_renderDispatcher.Wake();
+            // Read back rather than echo: echoing made a toggle that never
+            // took effect look like it had.
+            return { 200, std::format(
+                "{{\"unthrottled\":{},\"forceRedraw\":{},\"analysisRefresh\":{}}}",
+                ::ShaderLab::Performance::IsUnthrottledRenderEnabled() ? "true" : "false",
+                m_forceContinuousRedraw.load(std::memory_order_acquire) ? "true" : "false",
+                ::ShaderLab::Performance::AnalysisReadoutPreset()) };
+        });
+
+        // =====================================================================
+        // POST /perf/gpu-bindings -- the "Keep analysis on the GPU" checkbox.
+        // {enabled:bool} switches; an empty body just reports. Mirrors the
+        // box, whose handler then sees no change and does nothing.
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/perf/gpu-bindings",
+            [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
+        {
+            namespace WDJ = winrt::Windows::Data::Json;
+            WDJ::JsonObject jobj{ nullptr };
+            if (WDJ::JsonObject::TryParse(winrt::to_hstring(body), jobj) && jobj.HasKey(L"enabled"))
+            {
+                bool enable = true;
+                auto v = jobj.GetNamedValue(L"enabled");
+                if (v.ValueType() == WDJ::JsonValueType::Boolean) enable = v.GetBoolean();
+                else if (v.ValueType() == WDJ::JsonValueType::Number) enable = v.GetNumber() != 0.0;
+                else if (v.ValueType() == WDJ::JsonValueType::String)
+                {
+                    // Untyped MCP args arrive as strings (CLAUDE.md).
+                    auto sv = std::wstring(v.GetString());
+                    enable = !(sv == L"false" || sv == L"False" || sv == L"0" || sv == L"off" || sv == L"no");
+                }
+                if (::ShaderLab::Performance::IsGpuBindingsEnabled() != enable)
+                    ApplyGpuBindingsMode(enable);
+                if (auto box = GpuBindingsCheck())
+                    DispatcherQueue().TryEnqueue([box, enable]() { box.IsChecked(enable); });
+            }
+            return { 200, std::format("{{\"enabled\":{}}}",
+                ::ShaderLab::Performance::IsGpuBindingsEnabled() ? "true" : "false") };
+        });
+
+        // =====================================================================
+        // POST /perf/compute-submit -- A/B switch for compute dispatch
+        // submission: command list on the runner's own deferred context
+        // (default), or call-by-call on the shared immediate context.
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/perf/compute-submit",
+            [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
+        {
+            bool enable = true;
+            namespace WDJ = winrt::Windows::Data::Json;
+            WDJ::JsonObject jobj{ nullptr };
+            if (WDJ::JsonObject::TryParse(winrt::to_hstring(body), jobj) && jobj.HasKey(L"commandList"))
+            {
+                auto v = jobj.GetNamedValue(L"commandList");
+                if (v.ValueType() == WDJ::JsonValueType::Boolean) enable = v.GetBoolean();
+                else if (v.ValueType() == WDJ::JsonValueType::Number) enable = v.GetNumber() != 0.0;
+                else if (v.ValueType() == WDJ::JsonValueType::String)
+                {
+                    auto sv = std::wstring(v.GetString());
+                    enable = !(sv == L"false" || sv == L"False" || sv == L"0" || sv == L"off" || sv == L"no");
+                }
+            }
+            ::ShaderLab::Performance::SetComputeCommandListEnabled(enable);
+            return { 200, std::format("{{\"commandList\":{}}}",
+                ::ShaderLab::Performance::IsComputeCommandListEnabled() ? "true" : "false") };
+        });
+
+        // =====================================================================
+        // POST /perf/subrect-demand -- kill switch for sub-rect input demand
+        // in custom pixel-shader transforms. On (default) a tile query is
+        // answered with that tile; off restores the shipped whole-image
+        // answer. Exists so the two can be compared on identical content.
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/perf/subrect-demand",
+            [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
+        {
+            bool enable = true;
+            {
+                namespace WDJ = winrt::Windows::Data::Json;
+                WDJ::JsonObject jobj{ nullptr };
+                if (WDJ::JsonObject::TryParse(winrt::to_hstring(body), jobj) &&
+                    jobj.HasKey(L"enabled"))
+                {
+                    auto v = jobj.GetNamedValue(L"enabled");
+                    if (v.ValueType() == WDJ::JsonValueType::Boolean)
+                        enable = v.GetBoolean();
+                    else if (v.ValueType() == WDJ::JsonValueType::String)
+                    {
+                        auto sv = std::wstring(v.GetString());
+                        enable = !(sv == L"false" || sv == L"False" || sv == L"0" ||
+                                   sv == L"off"   || sv == L"no");
+                    }
+                    else if (v.ValueType() == WDJ::JsonValueType::Number)
+                        enable = v.GetNumber() != 0.0;
+                }
+            }
+            ::ShaderLab::Performance::SetSubRectInputDemandEnabled(enable);
+            // Invalidate and redraw, but do NOT ReleaseCache.
+            //
+            // The flag is read inside MapOutputRectToInputRects on every call,
+            // so no effect needs rebuilding for the new answer to take effect.
+            // Tearing down the whole effect cache from here also turned out to
+            // be unsafe: with the render loop unthrottled, doing it live
+            // reproducibly access-violated inside d2d1.dll (0xc0000005).
+            // Isolated by stages -- unthrottled + sub-rect ON ran clean, and
+            // the crash landed exactly on this route's cache teardown.
+            m_graph.MarkAllDirty();
+            m_forceRender = true;
+            return { 200, std::format(
+                "{{\"subRectInputDemand\":{}}}",
+                ::ShaderLab::Performance::IsSubRectInputDemandEnabled() ? "true" : "false") };
+        });
+
+        // =====================================================================
+        // POST /perf/gpu-timing -- turn GPU timestamp sampling on or off.
+        // Off by default: closing a span around D2D work requires a Flush,
+        // which breaks D2D batching and perturbs the frame being measured.
+        // Turn it on to measure, off to run.
+        // =====================================================================
+        m_mcpServer->AddRoute(L"POST", L"/perf/gpu-timing",
+            [this](const std::wstring&, const std::wstring&, const std::string& body)
+            -> ::ShaderLab::Mcp::Response
+        {
+            bool enable = true;
+            {
+                namespace WDJ = winrt::Windows::Data::Json;
+                WDJ::JsonObject jobj{ nullptr };
+                if (WDJ::JsonObject::TryParse(winrt::to_hstring(body), jobj) &&
+                    jobj.HasKey(L"enabled"))
+                {
+                    // Untyped MCP args arrive as JSON STRINGS from Claude Code
+                    // ("true", not true) -- the coercion rule in CLAUDE.md.
+                    // Accept both so the tool works from every client.
+                    auto v = jobj.GetNamedValue(L"enabled");
+                    if (v.ValueType() == WDJ::JsonValueType::Boolean)
+                        enable = v.GetBoolean();
+                    else if (v.ValueType() == WDJ::JsonValueType::String)
+                    {
+                        auto sv = std::wstring(v.GetString());
+                        enable = !(sv == L"false" || sv == L"False" || sv == L"0");
+                    }
+                    else if (v.ValueType() == WDJ::JsonValueType::Number)
+                        enable = v.GetNumber() != 0.0;
+                }
+            }
+            auto& timer = m_renderEngine.Timer();
+            if (!timer.IsInitialized())
+                return { 200, "{\"gpuAvailable\":false,\"gpuEnabled\":false,"
+                              "\"note\":\"device does not support timestamp queries\"}" };
+            timer.SetEnabled(enable);
+            return { 200, std::format(
+                "{{\"gpuAvailable\":true,\"gpuEnabled\":{},\"latencyFrames\":{}}}",
+                // Read back, do not echo the request: echoing made a toggle
+                // that never took effect look like it had.
+                timer.IsEnabled() ? "true" : "false",
+                ::ShaderLab::Rendering::GpuTimer::kLatency) };
         });
 
         // =====================================================================
@@ -917,11 +1217,16 @@ namespace winrt::ShaderLab::implementation
 
                         // Pixel values.
                         const auto& px = tn.pixel;
-                        j += std::format(",\"pixel\":{{\"scRGB\":[{:.6f},{:.6f},{:.6f},{:.6f}]",
-                            px.scR, px.scG, px.scB, px.scA);
+                        // Raw FP32 readback: same hazard as /render/pixel-region,
+                        // which was hardened. A NaN texel here emitted bare nan.
+                        j += ",\"pixel\":{\"scRGB\":["
+                           + ::ShaderLab::Mcp::JsonFloat(px.scR) + ","
+                           + ::ShaderLab::Mcp::JsonFloat(px.scG) + ","
+                           + ::ShaderLab::Mcp::JsonFloat(px.scB) + ","
+                           + ::ShaderLab::Mcp::JsonFloat(px.scA) + "]";
                         j += std::format(",\"sRGB\":[{},{},{},{}]",
                             px.sR, px.sG, px.sB, px.sA);
-                        j += std::format(",\"luminance\":{:.2f}}}", px.luminanceNits);
+                        j += ",\"luminance\":" + ::ShaderLab::Mcp::JsonFloat(px.luminanceNits) + "}";
 
                         // Analysis fields (for compute/analysis nodes).
                         if (tn.hasAnalysisOutput && !tn.analysisFields.empty())
@@ -954,7 +1259,7 @@ namespace winrt::ShaderLab::implementation
                                     for (uint32_t c = 0; c < cc; ++c)
                                     {
                                         if (c > 0) j += ",";
-                                        j += std::format("{:.6f}", fv.components[c]);
+                                        j += ::ShaderLab::Mcp::JsonFloat(fv.components[c]);
                                     }
                                     j += "]";
                                 }
@@ -967,7 +1272,7 @@ namespace winrt::ShaderLab::implementation
                                     for (size_t i = 0; i < fv.arrayData.size(); ++i)
                                     {
                                         if (i > 0) j += ",";
-                                        j += std::format("{:.6f}", fv.arrayData[i]);
+                                        j += ::ShaderLab::Mcp::JsonFloat(fv.arrayData[i]);
                                     }
                                     j += "]";
                                 }
@@ -1362,6 +1667,7 @@ namespace winrt::ShaderLab::implementation
                     float z = static_cast<float>(v.GetNumber());
                     z = (std::clamp)(z, 0.01f, 100.0f);
                     m_previewZoom = z;
+                    m_previewAutoFit = false;   // an explicit view is a manual view
                     changed = true;
                 }
                 if (jo.HasKey(L"panX"))
@@ -1370,6 +1676,7 @@ namespace winrt::ShaderLab::implementation
                     if (v.ValueType() != WDJ::JsonValueType::Number)
                         return { 400, R"({"error":"'panX' must be a number"})" };
                     m_previewPanX = static_cast<float>(v.GetNumber());
+                    m_previewAutoFit = false;
                     changed = true;
                 }
                 if (jo.HasKey(L"panY"))
@@ -1378,6 +1685,7 @@ namespace winrt::ShaderLab::implementation
                     if (v.ValueType() != WDJ::JsonValueType::Number)
                         return { 400, R"({"error":"'panY' must be a number"})" };
                     m_previewPanY = static_cast<float>(v.GetNumber());
+                    m_previewAutoFit = false;
                     changed = true;
                 }
                 if (changed) m_forceRender = true;
@@ -1397,6 +1705,7 @@ namespace winrt::ShaderLab::implementation
         {
             return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
                 FitPreviewToView();
+                m_previewAutoFit = true;   // same as double-click: stay fitted
                 m_forceRender = true;
                 return { 200, std::format(
                     R"({{"ok":true,"zoom":{:.6f},"panX":{:.6f},"panY":{:.6f}}})",

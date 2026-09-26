@@ -307,19 +307,44 @@ namespace ShaderLab::Effects
         // --- Image source ---
         if (node.shaderPath.has_value() && !node.effectClsid.has_value())
         {
+            // Reuse the decoded bitmap unless the FILE changed. `node.dirty`
+            // means "re-evaluate downstream", not "reload from disk":
+            // MarkAllDirty() fires on graph load, display-profile change and
+            // forced redraw (and used to on every edit), and the render tick
+            // only calls in here when the node is dirty -- so keying the
+            // decode on that flag re-ran a full WIC decode + colour-
+            // management pass on each of those events (~98 ms on a 4K JPEG,
+            // and it dominated the frame).
+            const auto& path = node.shaderPath.value();
             auto it = m_bitmapCache.find(node.id);
-            if (it != m_bitmapCache.end() && !node.dirty)
+            auto pathIt = m_bitmapPathCache.find(node.id);
+            if (it != m_bitmapCache.end() && it->second &&
+                pathIt != m_bitmapPathCache.end() && pathIt->second == path)
             {
                 node.cachedOutput = it->second.get();
+                node.dirty = false;
                 return;
             }
 
-            auto bitmap = m_imageLoader.LoadFromFile(node.shaderPath.value(), dc);
+            auto bitmap = m_imageLoader.LoadFromFile(path, dc);
             if (bitmap)
             {
                 node.cachedOutput = bitmap.get();
                 m_bitmapCache[node.id] = std::move(bitmap);
+                m_bitmapPathCache[node.id] = path;
+                node.runtimeError.clear();
                 node.dirty = false;
+            }
+            else
+            {
+                // A decode failure has to be visible. This used to return
+                // silently, which was survivable while the file picker offered
+                // nine safe formats; it is not now that the filter is built
+                // from every WIC decoder on the machine (65 here, including
+                // camera RAW), where "this particular file will not decode" is
+                // an ordinary outcome rather than a bug. runtimeError surfaces
+                // in the Properties panel and in graph_get_node.
+                node.runtimeError = L"Failed to decode image: " + path;
             }
             return;
         }
@@ -368,12 +393,39 @@ namespace ShaderLab::Effects
     void SourceNodeFactory::ReleaseCache()
     {
         m_bitmapCache.clear();
+        m_bitmapPathCache.clear();
         m_floodCache.clear();
         m_videoCache.clear();
         m_dxgiCaptureCache.clear();
         m_wgcCaptureCache.clear();
         m_pendingWgcItems.clear();
         m_lastClockTime.clear();
+    }
+
+    void SourceNodeFactory::PruneOrphans(const std::vector<Graph::EffectNode>& nodes)
+    {
+        std::unordered_map<uint32_t, const EffectNode*> sources;
+        for (const auto& n : nodes)
+            if (n.type == NodeType::Source) sources[n.id] = &n;
+        auto isKind = [&](uint32_t id, const wchar_t* flag)
+        {
+            auto it = sources.find(id);
+            if (it == sources.end()) return false;
+            auto pit = it->second->properties.find(flag);
+            if (pit == it->second->properties.end()) return false;
+            auto* b = std::get_if<bool>(&pit->second);
+            return b && *b;
+        };
+        std::erase_if(m_videoCache,       [&](const auto& kv) { return !isKind(kv.first, L"IsVideo"); });
+        std::erase_if(m_dxgiCaptureCache, [&](const auto& kv) { return !isKind(kv.first, L"IsDxgiDuplicateOutput"); });
+        std::erase_if(m_wgcCaptureCache,  [&](const auto& kv) { return !isKind(kv.first, L"IsWindowsGraphicsCapture"); });
+        // Plain per-id state: gone with the node. (m_pendingWgcItems is left
+        // alone -- an item can be registered before its node exists.)
+        auto gone = [&](const auto& kv) { return !sources.count(kv.first); };
+        std::erase_if(m_bitmapCache, gone);
+        std::erase_if(m_bitmapPathCache, gone);
+        std::erase_if(m_floodCache, gone);
+        std::erase_if(m_lastClockTime, gone);
     }
 
     bool SourceNodeFactory::HasPlayingVideo() const
@@ -391,6 +443,7 @@ namespace ShaderLab::Effects
         ID2D1DeviceContext5* dc,
         double deltaSeconds)
     {
+        PruneOrphans(nodes);
         bool anyNewFrame = false;
         for (auto& [id, provider] : m_videoCache)
         {
@@ -457,8 +510,10 @@ namespace ShaderLab::Effects
 
                 if (!clockAdvanced)
                 {
-                    // Hold the current frame at exactly seekTime.
-                    if (std::abs(diff) > frameDur * 0.5)
+                    // Hold the frame for seekTime. The frame shown for a
+                    // target starts at or before it, so the position alone
+                    // cannot say "done": also skip a seek already made.
+                    if (std::abs(diff) > frameDur * 0.5 && provider->LastSeekTarget() != seekTime)
                         provider->Seek(seekTime);
                 }
                 // Only seek for actual jumps: backward or very large skip (>5s).
@@ -476,8 +531,9 @@ namespace ShaderLab::Effects
             else
             {
                 // No clock: static frame at Time property value.
-                // Only seek if position differs from target.
-                if (std::abs(diff) > frameDur * 0.5)
+                // Only seek if position differs from target and this target
+                // has not already been asked for (see the paused-clock case).
+                if (std::abs(diff) > frameDur * 0.5 && provider->LastSeekTarget() != seekTime)
                     provider->Seek(seekTime);
             }
 
@@ -532,6 +588,7 @@ namespace ShaderLab::Effects
         std::vector<Graph::EffectNode>& nodes,
         ID2D1DeviceContext5* dc)
     {
+        PruneOrphans(nodes);
         bool anyNewFrame = false;
 
         auto updateAnalysis = [](Graph::EffectNode& node, uint32_t width, uint32_t height, uint64_t frames)

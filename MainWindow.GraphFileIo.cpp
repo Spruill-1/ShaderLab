@@ -542,8 +542,14 @@ namespace winrt::ShaderLab::implementation
                     }
                 }
 
-                m_graphEvaluator.ReleaseCache(m_graph);
-                m_graph = std::move(loaded);
+                // On the render thread: we're on the UI thread here, and the
+                // worker is the graph's single writer -- releasing its caches
+                // or replacing the graph under a live Evaluate is a data race
+                // (the same one that crashed the GPU-bindings toggle).
+                m_renderDispatcher.DispatchSync([this, &loaded] {
+                    m_graphEvaluator.ReleaseCache(m_graph);
+                    m_graph = std::move(loaded);
+                });
                 m_currentFilePath = pathStr;
                 m_unsavedChanges = false;
                 if (!loadResult->extractDir.empty()
@@ -897,18 +903,7 @@ namespace winrt::ShaderLab::implementation
         // play/pause button + progress bar; if it runs first the visual
         // ends up sized as a regular parameter node and the controls
         // never appear until something else triggers another layout.
-        {
-            auto& lib = ::ShaderLab::Effects::ShaderLabEffects::Instance();
-            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-            {
-                if (node.customEffect.has_value() && !node.customEffect->shaderLabEffectId.empty())
-                {
-                    auto* desc = lib.FindById(node.customEffect->shaderLabEffectId);
-                    if (desc)
-                        node.isClock = desc->isClock;
-                }
-            }
-        }
+        ::ShaderLab::Effects::ShaderLabEffects::RestoreRuntimeFlags(m_graph);
 
         m_nodeGraphController.SetGraph(&m_graph);
 

@@ -65,6 +65,22 @@ namespace ShaderLab::Effects
         uint64_t UploadSuccesses() const { return m_uploadSuccesses; }
         uint64_t DecodeCount() const { return m_decodeCount; }
 
+        // The last target handed to Seek(), or NaN once playback has moved
+        // the position since. A caller holding a paused/static Time uses it
+        // to tell "already asked for this" from "somewhere else": the frame
+        // shown for a target starts AT OR BEFORE it, so comparing the target
+        // with CurrentPosition() alone re-seeks forever for any time between
+        // two frame starts.
+        double LastSeekTarget() const { return m_lastSeekTarget.load(); }
+
+        // Zero-copy upload of hardware-decoded frames (on by default). Off
+        // forces the CPU Lock2D path, which exists for software decode; tests
+        // use it to compare the two paths on the same frame.
+        void SetZeroCopyEnabled(bool enabled) { m_zeroCopyAllowed = enabled; }
+        bool LastUploadWasZeroCopy() const { return m_lastUploadZeroCopy; }
+        // The FP16 scRGB output texture (for tests / readback).
+        ID3D11Texture2D* OutputTexture() const { return m_texOutput.get(); }
+
         // Output format from MF Source Reader.
         enum class OutputFormat { RGB32, NV12, P010 };
         OutputFormat GetOutputFormat() const { return m_outputFormat; }
@@ -72,10 +88,14 @@ namespace ShaderLab::Effects
     private:
 
         void DecodeThreadFunc();
-        bool DecodeOneFrame();
+        // discardBefore >= 0: skip samples that end at or before it -- the
+        // decode-forward half of a frame-accurate seek (MF lands on the
+        // preceding keyframe).
+        bool DecodeOneFrame(double discardBefore = -1.0);
         bool CreateGPUResources(ID2D1DeviceContext5* dc, ID3D11Device* d3dDevice);
         bool CompileConversionShader(ID3D11Device* d3dDevice);
-        void RunConversionShader(ID3D11DeviceContext* ctx);
+        void RunConversionShader(ID3D11DeviceContext* ctx, bool planar = false);
+        bool EnsurePlanarTexture(ID3D11Texture2D* decoderTexture);
         static uint16_t FloatToHalf(float f);
 
         // MF objects.
@@ -143,5 +163,30 @@ namespace ShaderLab::Effects
         LONG m_lastPitch{ 0 };           // Pitch from last decoded frame.
         std::mutex m_bufferMutex;
         std::atomic<bool> m_frameReady{ false };
+
+        // Zero-copy path. A hardware-decoded sample is already a D3D11
+        // texture on the render device; it used to be read back to the CPU
+        // (Lock2D maps a staging copy and waits for the GPU), memcpy'd, and
+        // uploaded again -- ~75 MB of traffic per 4K P010 frame. Instead the
+        // decode thread hands the SAMPLE over (holding it keeps its decoder
+        // surface alive) and UploadIfReady copies it GPU-side into a planar
+        // texture whose planes the conversion shader reads through R8/R8G8
+        // (NV12) or R16/R16G16 (P010) views.
+        struct GpuFrame
+        {
+            winrt::com_ptr<IMFSample>       sample;
+            winrt::com_ptr<ID3D11Texture2D> tex;
+            UINT                            subresource{ 0 };
+        };
+        GpuFrame m_backGpu;
+        GpuFrame m_frontGpu;
+        winrt::com_ptr<ID3D11Texture2D>          m_texPlanar;
+        winrt::com_ptr<ID3D11ShaderResourceView> m_srvPlanarY;
+        winrt::com_ptr<ID3D11ShaderResourceView> m_srvPlanarUV;
+        bool m_zeroCopyAllowed{ true };
+        std::atomic<bool> m_zeroCopyFailed{ false };
+        bool m_lastUploadZeroCopy{ false };
+
+        std::atomic<double> m_lastSeekTarget{ std::numeric_limits<double>::quiet_NaN() };
     };
 }

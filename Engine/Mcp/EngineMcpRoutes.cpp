@@ -29,6 +29,45 @@ namespace ShaderLab::Mcp
     namespace
     {
         // ---- Small response helpers --------------------------------------
+        // Interpret a stored PropertyValue as a boolean, however it arrived.
+        //
+        // This exists because `isPlaying` is a RUNTIME field mirrored from a
+        // property, and the mirror used to accept only a std::bool -- so a
+        // client that sent `true` as a JSON string ("true") or a number (1)
+        // set the property, got a 200 back, and the clock silently never
+        // started. CLAUDE.md records that untyped MCP arguments arrive as
+        // JSON STRINGS from Claude Code, so that was the common case, not the
+        // exotic one: the toggle worked from some clients and not others,
+        // with no error either way.
+        //
+        // Returns false only when the value is a type that cannot mean a
+        // boolean at all, so the caller can report the failure instead of
+        // silently dropping it.
+        // The one place that decides what a STRING means as a boolean.
+        // Returns false for a word that means neither, so callers can report
+        // it instead of quietly picking one. Quietly picking one is how
+        // `isPlaying: "banana"` used to read as "pause": a typo silently
+        // stopped the clock and the route still answered 200.
+        inline bool CoerceStringToBool(const std::wstring& w, bool& out)
+        {
+            std::wstring t;
+            for (wchar_t c : w) t += static_cast<wchar_t>(::towlower(c));
+            if (t == L"true"  || t == L"1" || t == L"on"  || t == L"yes") { out = true;  return true; }
+            if (t == L"false" || t == L"0" || t == L"off" || t == L"no")  { out = false; return true; }
+            return false;
+        }
+
+        inline bool CoercePropertyToBool(const ShaderLab::Graph::PropertyValue& v, bool& out)
+        {
+            if (auto* b = std::get_if<bool>(&v))        { out = *b;            return true; }
+            if (auto* f = std::get_if<float>(&v))       { out = (*f != 0.0f);  return true; }
+            if (auto* i = std::get_if<int32_t>(&v))     { out = (*i != 0);     return true; }
+            if (auto* u = std::get_if<uint32_t>(&v))    { out = (*u != 0u);    return true; }
+            if (auto* w = std::get_if<std::wstring>(&v))
+                return CoerceStringToBool(*w, out);
+            return false;
+        }
+
         Response Json(uint16_t status, const std::string& body)
         {
             Response r;
@@ -100,7 +139,7 @@ namespace ShaderLab::Mcp
             return std::visit([](const auto& v) -> std::string {
                 using T = std::decay_t<decltype(v)>;
                 if constexpr (std::is_same_v<T, float>)
-                    return std::format("{:.6f}", v);
+                    return JsonFloat(v);
                 else if constexpr (std::is_same_v<T, int32_t>)
                     return std::format("{}", v);
                 else if constexpr (std::is_same_v<T, uint32_t>)
@@ -110,11 +149,11 @@ namespace ShaderLab::Mcp
                 else if constexpr (std::is_same_v<T, std::wstring>)
                     return "\"" + JsonEscape(WideToUtf8(v)) + "\"";
                 else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
-                    return std::format("[{:.6f},{:.6f}]", v.x, v.y);
+                    return "[" + JsonFloat(v.x) + "," + JsonFloat(v.y) + "]";
                 else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
-                    return std::format("[{:.6f},{:.6f},{:.6f}]", v.x, v.y, v.z);
+                    return "[" + JsonFloat(v.x) + "," + JsonFloat(v.y) + "," + JsonFloat(v.z) + "]";
                 else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
-                    return std::format("[{:.6f},{:.6f},{:.6f},{:.6f}]", v.x, v.y, v.z, v.w);
+                    return "[" + JsonFloat(v.x) + "," + JsonFloat(v.y) + "," + JsonFloat(v.z) + "," + JsonFloat(v.w) + "]";
                 else if constexpr (std::is_same_v<T, D2D1_MATRIX_5X4_F>)
                     return "\"<matrix>\"";
                 else if constexpr (std::is_same_v<T, std::vector<float>>)
@@ -319,7 +358,7 @@ namespace ShaderLab::Mcp
                         for (uint32_t c = 0; c < cc; ++c)
                         {
                             if (c > 0) json += ",";
-                            json += std::format("{:.6f}", fv.components[c]);
+                            json += JsonFloat(fv.components[c]);
                         }
                         json += "]";
                     }
@@ -329,7 +368,7 @@ namespace ShaderLab::Mcp
                         for (size_t i = 0; i < fv.arrayData.size(); ++i)
                         {
                             if (i > 0) json += ",";
-                            json += std::format("{:.6f}", fv.arrayData[i]);
+                            json += JsonFloat(fv.arrayData[i]);
                         }
                         json += "]";
                     }
@@ -499,6 +538,28 @@ namespace ShaderLab::Mcp
                                 n.id, JsonEscape(WideToUtf8(n.name)), typeStr);
                             if (!n.runtimeError.empty())
                                 json += ",\"error\":\"" + JsonEscape(WideToUtf8(n.runtimeError)) + "\"";
+                            // GPU milliseconds attributed to this node on the
+                            // last measured frame, plus WHY it reads that way.
+                            // gpuMs alone is ambiguous -- absent could mean
+                            // "cost zero" or "cost unattributable" -- so the
+                            // state is always emitted when timing is on and a
+                            // reader should branch on it, not on gpuMs.
+                            if (n.gpuState != Graph::GpuNodeState::Unmeasured)
+                            {
+                                const char* st = "unmeasured";
+                                switch (n.gpuState)
+                                {
+                                case Graph::GpuNodeState::Measured: st = "measured"; break;
+                                case Graph::GpuNodeState::Fused:    st = "fused-downstream"; break;
+                                case Graph::GpuNodeState::Cached:   st = "cached"; break;
+                                case Graph::GpuNodeState::Idle:     st = "idle"; break;
+                                case Graph::GpuNodeState::CpuOnly:  st = "cpu-only"; break;
+                                default: break;
+                                }
+                                json += std::format(",\"gpuState\":\"{}\"", st);
+                            }
+                            if (n.lastGpuMs >= 0.0)
+                                json += std::format(",\"gpuMs\":{:.4f}", n.lastGpuMs);
                             json += std::format(",\"inputs\":{},\"outputs\":{}}}",
                                 n.inputPins.size(), n.outputPins.size());
                             first = false;
@@ -589,8 +650,7 @@ namespace ShaderLab::Mcp
                             uint32_t srcPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"srcPin"));
                             uint32_t dstId = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstId"));
                             uint32_t dstPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstPin"));
-                            bool ok = ctx.graph->Connect(srcId, srcPin, dstId, dstPin);
-                            ctx.graph->MarkAllDirty();
+                            bool ok = ctx.graph->Connect(srcId, srcPin, dstId, dstPin);   // dirties dst
                             if (ok) sink.OnGraphStructureChanged();
                             return Json(200,
                                 std::string("{\"connected\":") + (ok ? "true" : "false") + "}");
@@ -614,8 +674,7 @@ namespace ShaderLab::Mcp
                             uint32_t srcPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"srcPin"));
                             uint32_t dstId = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstId"));
                             uint32_t dstPin = static_cast<uint32_t>(jobj.GetNamedNumber(L"dstPin"));
-                            bool ok = ctx.graph->Disconnect(srcId, srcPin, dstId, dstPin);
-                            ctx.graph->MarkAllDirty();
+                            bool ok = ctx.graph->Disconnect(srcId, srcPin, dstId, dstPin);   // dirties dst
                             if (ok) sink.OnGraphStructureChanged();
                             return Json(200,
                                 std::string("{\"disconnected\":") + (ok ? "true" : "false") + "}");
@@ -703,8 +762,7 @@ namespace ShaderLab::Mcp
                             auto name = jobj.GetNamedString(L"effectName");
 
                             auto addAndReply = [&](Graph::EffectNode&& node) -> Response {
-                                auto id = ctx.graph->AddNode(std::move(node));
-                                ctx.graph->MarkAllDirty();
+                                auto id = ctx.graph->AddNode(std::move(node));   // starts dirty
                                 sink.OnNodeAdded(id);
                                 return Json(200, "{\"nodeId\":" + std::to_string(id) + "}");
                             };
@@ -775,6 +833,95 @@ namespace ShaderLab::Mcp
                                     : filePath.substr(filePath.find_last_of(L"\\/") + 1);
                             };
 
+                            // Output node. Not in the effect registry -- it is a
+                            // node TYPE, not an effect -- so it needs its own branch.
+                            // In the GUI host OnNodeAdded opens a window for it, which
+                            // is the only way to get a second surface on screen without
+                            // a human clicking: useful for putting real HDR pixels on
+                            // the desktop while the main preview shows something else.
+                            if (wname == L"Output")
+                            {
+                                auto node = ::ShaderLab::Effects::EffectRegistry::CreateOutputNode();
+                                return addAndReply(std::move(node));
+                            }
+
+                            // Desktop duplication. The node is pure data
+                            // (adapter/output index + RawFP16), so unlike
+                            // Windows Graphics Capture -- which needs a
+                            // GraphicsCaptureItem from the OS picker -- it can
+                            // be created headlessly and over MCP. That matters
+                            // here: it is what makes the whole HDR capture ->
+                            // tone map -> 8-bit handback path scriptable end to
+                            // end instead of requiring a human to click a menu.
+                            //
+                            // RawFP16 is set by the factory: on an HDR display
+                            // the duplicated surface is FP16 scRGB, which is the
+                            // only form that preserves values above 1.0 and the
+                            // negative components carrying wide-gamut chroma.
+                            if (wname == L"Desktop Duplication" || wname == L"DXGI Duplicate Output" ||
+                                wname == L"Display Capture")
+                            {
+                                auto readIndex = [&](const wchar_t* key) -> uint32_t {
+                                    if (!jobj.HasKey(key)) return 0;
+                                    auto v = jobj.GetNamedValue(key);
+                                    // Untyped MCP args arrive as JSON strings
+                                    // ("0"), the same coercion /graph/set-property
+                                    // does -- see CLAUDE.md.
+                                    if (v.ValueType() == WDJ::JsonValueType::String)
+                                        return static_cast<uint32_t>(_wtoi(v.GetString().c_str()));
+                                    if (v.ValueType() == WDJ::JsonValueType::Number)
+                                        return static_cast<uint32_t>(v.GetNumber());
+                                    return 0;
+                                };
+                                const uint32_t adapterIndex = readIndex(L"adapterIndex");
+                                const uint32_t outputIndex  = readIndex(L"outputIndex");
+
+                                auto outputs = ::ShaderLab::Effects::DxgiDuplicationSourceProvider::EnumerateOutputs();
+                                auto match = std::find_if(outputs.begin(), outputs.end(),
+                                    [&](const auto& o) {
+                                        return o.adapterIndex == adapterIndex && o.outputIndex == outputIndex;
+                                    });
+                                if (match == outputs.end())
+                                {
+                                    // Fail loudly with the list rather than
+                                    // creating a node that renders black: a
+                                    // silently dead capture source is very hard
+                                    // to tell from a correctly-captured black
+                                    // screen.
+                                    std::string avail;
+                                    for (const auto& o : outputs)
+                                    {
+                                        if (!avail.empty()) avail += ", ";
+                                        avail += std::to_string(o.adapterIndex) + ":" +
+                                                 std::to_string(o.outputIndex);
+                                    }
+                                    if (avail.empty()) avail = "(none)";
+                                    return Json(400, std::format(
+                                        R"({{"error":"No DXGI output {}:{}. Available adapter:output pairs: {}"}})",
+                                        adapterIndex, outputIndex, JsonEscape(avail)));
+                                }
+
+                                std::wstring label = match->deviceName.empty()
+                                    ? std::format(L"DXGI {}:{}", adapterIndex, outputIndex)
+                                    : std::format(L"DXGI {} ({},{})", match->deviceName,
+                                                  adapterIndex, outputIndex);
+                                auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateDxgiDuplicateOutputSourceNode(
+                                    adapterIndex, outputIndex, label);
+                                auto id = ctx.graph->AddNode(std::move(node));
+                                if (ctx.sourceFactory && ctx.dc)
+                                {
+                                    if (auto* graphNode = ctx.graph->FindNode(id))
+                                        ctx.sourceFactory->PrepareSourceNode(*graphNode,
+                                            static_cast<ID2D1DeviceContext5*>(ctx.dc), 0.0,
+                                            ctx.d3dDevice, ctx.d3dContext);
+                                }
+                                sink.OnNodeAdded(id);
+                                return Json(200, std::format(
+                                    R"({{"nodeId":{},"adapterIndex":{},"outputIndex":{},"name":"{}"}})",
+                                    id, adapterIndex, outputIndex,
+                                    JsonEscape(WideToUtf8(label))));
+                            }
+
                             if (wname == L"Video Source" || wname == L"Video")
                             {
                                 auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(
@@ -787,7 +934,6 @@ namespace ShaderLab::Mcp
                                             static_cast<ID2D1DeviceContext5*>(ctx.dc), 0.0,
                                             ctx.d3dDevice, ctx.d3dContext);
                                 }
-                                ctx.graph->MarkAllDirty();
                                 sink.OnNodeAdded(id);
                                 return Json(200, "{\"nodeId\":" + std::to_string(id) + "}");
                             }
@@ -803,7 +949,6 @@ namespace ShaderLab::Mcp
                                             static_cast<ID2D1DeviceContext5*>(ctx.dc), 0.0,
                                             ctx.d3dDevice, ctx.d3dContext);
                                 }
-                                ctx.graph->MarkAllDirty();
                                 sink.OnNodeAdded(id);
                                 return Json(200, "{\"nodeId\":" + std::to_string(id) + "}");
                             }
@@ -931,6 +1076,7 @@ namespace ShaderLab::Mcp
                     try
                     {
                         loaded = Graph::EffectGraph::FromJson(winrt::to_hstring(body));
+                        Effects::ShaderLabEffects::RestoreRuntimeFlags(loaded);
                     }
                     catch (const std::exception& ex)
                     {
@@ -957,8 +1103,7 @@ namespace ShaderLab::Mcp
                         {
                             auto jobj = WDJ::JsonObject::Parse(winrt::to_hstring(body));
                             uint32_t nodeId = static_cast<uint32_t>(jobj.GetNamedNumber(L"nodeId"));
-                            ctx.graph->RemoveNode(nodeId);
-                            ctx.graph->MarkAllDirty();
+                            ctx.graph->RemoveNode(nodeId);   // dirties its consumers
                             sink.OnNodeRemoved(nodeId);
                             return Json(200, R"({"ok":true})");
                         }
@@ -983,6 +1128,26 @@ namespace ShaderLab::Mcp
 
                             auto* node = ctx.graph->FindNode(nodeId);
                             if (!node) return Json(404, R"({"error":"Node not found"})");
+
+                            // NOTE: a key guard was added here and reverted. It
+                            // rejected every un-seeded D2D built-in property
+                            // (Gaussian Blur Optimization / BorderMode), Clock's
+                            // IsPlaying mirror, shaderPath and numeric index keys,
+                            // because those are legitimately absent from both
+                            // node->properties and customEffect->parameters until
+                            // first written -- so it broke working calls, and
+                            // Tests/RunTests.ps1 Graph.SetProperty asserts one of
+                            // them. Meanwhile /graph/apply writes property maps
+                            // unchecked, so the invalid case it was meant to close
+                            // had a one-call bypass. Accepting an unknown key is a
+                            // real hole (a typo, or a parameter removed by an
+                            // effectVersion bump, lands in the map and serialises
+                            // into the document doing nothing) but it is
+                            // pre-existing and strictly less harmful than
+                            // rejecting valid ones. Closing it properly means
+                            // resolving a key the way GraphEvaluator::ApplyProperties
+                            // does -- built-in GetPropertyIndex included -- and
+                            // guarding /graph/apply on the same predicate.
 
                             switch (val.ValueType())
                             {
@@ -1043,9 +1208,23 @@ namespace ShaderLab::Mcp
                                     if (want == L"float")     node->properties[key] = std::stof(sval);
                                     else if (want == L"uint") node->properties[key] = static_cast<uint32_t>(std::stoul(sval));
                                     else if (want == L"int")  node->properties[key] = static_cast<int32_t>(std::stol(sval));
-                                    else if (want == L"bool") node->properties[key] = (sval == L"true" || sval == L"1");
+                                    else if (want == L"bool")
+                                    {
+                                        bool bv = false;
+                                        if (!CoerceStringToBool(sval, bv))
+                                            // Custom delimiter: the message itself ends in `)"`,
+                                            // which closes a bare R"(...)" literal early.
+                                            return Json(400, R"JSON({"error":"expected a boolean-valued string (true/false, 1/0, on/off, yes/no)"})JSON");
+                                        node->properties[key] = bv;
+                                    }
                                     else                      node->properties[key] = sval;
                                 }
+                                // Not-a-number: keep the raw string rather than
+                                // dropping the write. Note this lands back in
+                                // the broken state the coercion above exists to
+                                // prevent (a wstring in a numeric slot), so it
+                                // should only ever be reached for a genuinely
+                                // non-numeric value the caller sent by mistake.
                                 catch (...) { node->properties[key] = sval; }
                                 break;
                             }
@@ -1072,8 +1251,10 @@ namespace ShaderLab::Mcp
                             default:
                                 return Json(400, R"({"error":"Unsupported value type"})");
                             }
+                            // Only this node changed; the evaluator pulls the change
+                            // downstream. (MarkAllDirty here made every MCP sweep
+                            // step a worst-case full-graph frame.)
                             node->dirty = true;
-                            ctx.graph->MarkAllDirty();
 
                             // Special-cased properties that mirror to dedicated node fields.
                             // Match both casings: graph storage uses `IsPlaying`
@@ -1085,8 +1266,30 @@ namespace ShaderLab::Mcp
                             // `node.isPlaying`, not on the property map).
                             if (key == L"isPlaying" || key == L"IsPlaying")
                             {
-                                if (auto* bv = std::get_if<bool>(&node->properties[key]))
-                                    node->isPlaying = *bv;
+                                bool play = false;
+                                if (!CoercePropertyToBool(node->properties[key], play))
+                                    return Json(400, R"({"error":"isPlaying must be a boolean, number or true/false string"})");
+                                // Play from the end means REWIND, the way every
+                                // transport control works. Without this the
+                                // tick clamps clockTime to duration and stops
+                                // again on the same frame, so "play" on a
+                                // finished non-looping clock is a silent no-op
+                                // -- which reads as the toggle being broken.
+                                if (play && !node->isPlaying)
+                                {
+                                    auto getF = [&](const wchar_t* k, float dflt) {
+                                        auto it = node->properties.find(k);
+                                        if (it != node->properties.end())
+                                            if (auto* f = std::get_if<float>(&it->second)) return *f;
+                                        return dflt;
+                                    };
+                                    const bool loop = getF(L"Loop", 1.0f) > 0.5f;
+                                    double duration = getF(L"StopTime", 10.0f) - getF(L"StartTime", 0.0f);
+                                    if (duration <= 0.0) duration = 1.0;
+                                    if (!loop && node->clockTime >= duration)
+                                        node->clockTime = 0.0;
+                                }
+                                node->isPlaying = play;
                             }
                             if (key == L"shaderPath")
                             {
@@ -1228,9 +1431,20 @@ namespace ShaderLab::Mcp
                                     if (want == L"float")     node.properties[key] = std::stof(sval);
                                     else if (want == L"uint") node.properties[key] = static_cast<uint32_t>(std::stoul(sval));
                                     else if (want == L"int")  node.properties[key] = static_cast<int32_t>(std::stol(sval));
-                                    else if (want == L"bool") node.properties[key] = (sval == L"true" || sval == L"1");
+                                    else if (want == L"bool")
+                                    {
+                                        bool bv = false;
+                                        if (!CoerceStringToBool(sval, bv))
+                                            // Custom delimiter: the message itself ends in `)"`,
+                                            // which closes a bare R"(...)" literal early.
+                                            return Json(400, R"JSON({"error":"expected a boolean-valued string (true/false, 1/0, on/off, yes/no)"})JSON");
+                                        node.properties[key] = bv;
+                                    }
                                     else                      node.properties[key] = sval;
                                 }
+                                // See the matching note in /graph/set-property:
+                                // keeping the raw string preserves the write but
+                                // lands back in the state the coercion prevents.
                                 catch (...) { node.properties[key] = sval; }
                                 break;
                             }
@@ -1261,8 +1475,9 @@ namespace ShaderLab::Mcp
                             // /graph/set-property -- preserve runtime fields.
                             if (key == L"isPlaying" || key == L"IsPlaying")
                             {
-                                if (auto* bv = std::get_if<bool>(&node.properties[key]))
-                                    node.isPlaying = *bv;
+                                bool play = false;
+                                if (CoercePropertyToBool(node.properties[key], play))
+                                    node.isPlaying = play;
                             }
                             if (key == L"shaderPath")
                             {
@@ -1488,7 +1703,8 @@ namespace ShaderLab::Mcp
                             }
                         }
 
-                        ctx.graph->MarkAllDirty();
+                        // Every write above dirtied what it touched: new nodes start
+                        // dirty, Connect and BindProperty dirty their consumer.
                         sink.OnGraphStructureChanged();
 
                         // ---- previewNode (optional) ------------------------------
@@ -1541,7 +1757,7 @@ namespace ShaderLab::Mcp
                         uint32_t w = static_cast<uint32_t>(jo.GetNamedNumber(L"w"));
                         uint32_t h = static_cast<uint32_t>(jo.GetNamedNumber(L"h"));
 
-                        // Cap region area at 32x32 (1024 pixels). Per-axis cap of
+                        // Cap region area at 64 per axis / 1024 total (1024 pixels). Per-axis cap of
                         // 64 lets the agent ask for a thin strip (e.g. 64x4) but
                         // never more than 1024 total samples.
                         if (w == 0 || h == 0)
@@ -1551,8 +1767,9 @@ namespace ShaderLab::Mcp
                                 "{\"error\":\"Region too large (cap: each axis <= 64, total area <= 1024)\"}");
 
                         // Force a fresh frame so dirty nodes evaluate before
-                        // readback. Headless host's renderFrame is a no-op
-                        // (caller is expected to have evaluated the graph).
+                        // readback. Headless sets renderFrame to runEval, so
+                        // this is a full evaluation, not a no-op -- load-bearing
+                        // for anyone counting evaluations in a probe script.
                         if (ctx.renderFrame) ctx.renderFrame();
 
                         auto rr = Rendering::ReadPixelRegion(*ctx.graph, nodeId, x, y, w, h, ctx.dc);
@@ -1583,12 +1800,32 @@ namespace ShaderLab::Mcp
                             + ",\"actualW\":" + std::to_string(rr.actualWidth)
                             + ",\"actualH\":" + std::to_string(rr.actualHeight)
                             + ",\"channelOrder\":[\"r\",\"g\",\"b\",\"a\"],\"pixels\":[";
-                        char buf[32];
+                        char buf[64];
                         for (size_t i = 0; i < rr.pixels.size(); ++i)
                         {
                             if (i) json += ",";
-                            int n = std::snprintf(buf, sizeof(buf), "%.6f", rr.pixels[i]);
-                            json.append(buf, n);
+                            const float v = rr.pixels[i];
+                            if (!std::isfinite(v))
+                            {
+                                // JSON has no Infinity/NaN literals, and "%.6f"
+                                // emits the bare C tokens nan / inf / -inf. The
+                                // route still returned 200, so a caller got a
+                                // body that parsed as a STRING (or threw) while
+                                // looking like a successful read -- measurement
+                                // degraded silently, which is exactly how a
+                                // whole run of plausible wrong numbers happens.
+                                // null is the JSON-legal signal for "no value".
+                                json += "null";
+                                continue;
+                            }
+                            int n = std::snprintf(buf, sizeof(buf), "%.6f", v);
+                            // snprintf returns what it WOULD have written, not
+                            // what it did. Appending that count after a
+                            // truncated write reads past the buffer.
+                            if (n < 0) n = 0;
+                            else if (n >= static_cast<int>(sizeof(buf)))
+                                n = static_cast<int>(sizeof(buf)) - 1;
+                            json.append(buf, static_cast<size_t>(n));
                         }
                         json += "]}";
                         return Json(200, json);
@@ -1693,11 +1930,29 @@ namespace ShaderLab::Mcp
                         // then restore. Cost: one frame of full readback
                         // per MCP analysis read (acceptable given MCP
                         // calls are out-of-band and infrequent).
+                        //
+                        // Clearing the skip flag is necessary but NOT
+                        // sufficient: the readback happens inside the node's
+                        // DISPATCH, so a forced frame in which the node is
+                        // clean re-renders, dispatches nothing, and copies
+                        // nothing back. The route then returned the values
+                        // from whatever frame the node last dispatched with
+                        // readback on -- the first one -- at 200 OK, forever.
+                        //
+                        // It looked convincing: every field present, every
+                        // number plausible. Measured tell: changing the SOURCE
+                        // node's PatternSize from 512 to 2048 left `Samples`
+                        // pinned at 1048576, which is arithmetically
+                        // impossible for a live reduction.
+                        //
+                        // So dirty the node too, and make the forced frame
+                        // actually recompute what it is about to report.
                         const bool prevSkip =
                             ::ShaderLab::Performance::IsSkipUnneededCpuReadbackEnabled();
                         if (prevSkip && ctx.renderFrame)
                         {
                             ::ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(false);
+                            node->dirty = true;
                             ctx.renderFrame();
                             ::ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(prevSkip);
                             // Re-resolve: the graph could have changed.
@@ -1725,7 +1980,7 @@ namespace ShaderLab::Mcp
                                 for (uint32_t c = 0; c < cc; ++c)
                                 {
                                     if (c > 0) json += ",";
-                                    json += std::format("{:.6f}", fv.components[c]);
+                                    json += JsonFloat(fv.components[c]);
                                 }
                                 json += "]";
                             }
@@ -1740,7 +1995,7 @@ namespace ShaderLab::Mcp
                                 for (size_t i = 0; i < fv.arrayData.size(); ++i)
                                 {
                                     if (i > 0) json += ",";
-                                    json += std::format("{:.6f}", fv.arrayData[i]);
+                                    json += JsonFloat(fv.arrayData[i]);
                                 }
                                 json += "]";
                             }
@@ -1815,7 +2070,7 @@ namespace ShaderLab::Mcp
                                 static_cast<uint32_t>(jo.GetNamedNumber(L"maxDim")), 32u, 8192u);
 
                         // Force a fresh frame so dirty nodes evaluate before
-                        // capture. Headless host's renderFrame is a no-op.
+                        // capture. Headless sets renderFrame to runEval: a full evaluation.
                         if (ctx.renderFrame) ctx.renderFrame();
 
                         auto cap = ::ShaderLab::Rendering::CaptureNodeAsPng(
@@ -1962,7 +2217,6 @@ namespace ShaderLab::Mcp
                             }
 
                             node->dirty = true;
-                            ctx.graph->MarkAllDirty();
                             ctx.evaluator->UpdateNodeShader(nodeId, *node);
 
                             // Auto-rename if another custom-effect node has the

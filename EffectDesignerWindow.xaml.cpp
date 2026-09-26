@@ -558,23 +558,41 @@ namespace winrt::ShaderLab::implementation
             }
             if (!def.inputNames.empty())
             {
-                hlsl += L"\n// D2D provides TEXCOORD in pixel/scene space.\n";
-                hlsl += L"// All inputs share TEXCOORD0 (same coordinate space).\n";
-                hlsl += L"// Use Load(int3(uv0.xy, 0)) for direct texel access.\n\n";
+                hlsl += L"SamplerState InputSampler : register(s0);\n";
+                hlsl += L"\n// SCENE_POSITION is mandatory. D2D pixel shaders take\n";
+                hlsl += L"// (SV_POSITION, SCENE_POSITION, TEXCOORD0..N), ONE TEXCOORD PER INPUT.\n";
+                hlsl += L"// Omit the middle parameter and the binding shifts, so what you label\n";
+                hlsl += L"// TEXCOORD0 receives the SCENE coordinate instead of input 0 texel\n";
+                hlsl += L"// coords -- correct-looking until the source is smaller than the D2D\n";
+                hlsl += L"// intermediate, then displaced by -(intermediate - content)/2.\n";
+                hlsl += L"// uv0 is NORMALIZED: sample with Sample(); pixel coords come from\n";
+                hlsl += L"// scenePos.\n\n";
             }
 
-            // Entry point — all inputs use TEXCOORD0 since MapOutputRectToInputRects
-            // returns the same rect for all inputs (1:1 mapping).
+            // Entry point. MapOutputRectToInputRects returns the same rect for
+            // every input, so the inputs are 1:1 with the output -- but that is
+            // about RECTS, not coordinates: each input still carries its own
+            // TEXCOORD, and sharing one across inputs is a defect.
             hlsl += L"float4 main(\n";
-            hlsl += L"    float4 pos : SV_POSITION,\n";
-            hlsl += L"    float4 uv0 : TEXCOORD0) : SV_TARGET\n";
+            hlsl += L"    float4 pos      : SV_POSITION,\n";
+            hlsl += L"    float4 scenePos : SCENE_POSITION";
+            // One TEXCOORD per input. Reusing a single coordinate across
+            // inputs is the "two-input effects render displaced" defect.
+            for (uint32_t ti = 0; ti < def.inputNames.size(); ++ti)
+                hlsl += std::format(L",\n    float4 uv{0}      : TEXCOORD{0}", ti);
+            // Zero inputs means no TEXCOORD to receive, so the loop above emits
+            // nothing and the signature ends at SCENE_POSITION -- which is what
+            // all six shipped source generators declare. Emitting a TEXCOORD0
+            // here would hand a zero-input author the exact shape this release
+            // exists to remove, with no sampler to use it.
+            hlsl += L") : SV_TARGET\n";
             hlsl += L"{\n";
 
             if (def.inputNames.size() >= 1)
             {
                 for (uint32_t i = 0; i < def.inputNames.size(); ++i)
                 {
-                    hlsl += std::format(L"    float4 color{0} = {1}.Load(int3(uv0.xy, 0));\n",
+                    hlsl += std::format(L"    float4 color{0} = {1}.Sample(InputSampler, uv{0}.xy);\n",
                         i, def.inputNames[i]);
                 }
 

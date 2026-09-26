@@ -9,7 +9,8 @@
     session, and runs ~40 tests as tools/calls over stdio. Does NOT build,
     deploy, or launch a session -- a hub + a ShaderLab session (GUI window, or
     `ShaderLabHeadless --mcp-session`) must already be running. GUI-only tests
-    self-skip when the pinned session is headless (detected from its label).
+    self-skip when the pinned session is headless (detected from its advertised
+    tool catalog, not its label).
 
 .PARAMETER Filter
     Run only tests matching this wildcard pattern (e.g. "Graph*").
@@ -36,6 +37,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $script:TestResults = @()
+# Server -> client notifications seen while waiting for responses (see Rpc).
+$script:Notifications = @()
 $script:TestDir = $PSScriptRoot
 $script:RepoRoot = Split-Path $script:TestDir -Parent
 $script:FixturesDir = Join-Path $script:TestDir "fixtures"
@@ -84,14 +87,37 @@ function Stop-Shim {
     }
 }
 
-# One JSON-RPC round-trip over the shim's stdio (serial: send then read the
-# single response line -- notifications aside, the shim answers one line per
-# request, so correlation is positional).
+# One JSON-RPC round-trip over the shim's stdio.
+#
+# Correlates on "id" and skips server -> client notifications. It used to read
+# exactly one line per request and treat position as correlation -- but the
+# shim advertises tools.listChanged in initialize and emits
+# notifications/tools/list_changed right after the use_session reply, once the
+# pinned session's catalog is spliced in. That single unsolicited line shifted
+# every later read by one and cascaded into ~18 bogus failures whose messages
+# were simply the PREVIOUS call's response ("Unknown tool: image_stats" landing
+# on a test that never asked for it). Correlate, never count.
+#
+# A mismatched id is raised rather than tolerated: it means the stream has
+# desynced, and every later read would be silently wrong.
 function Rpc($obj, $timeoutMs = 35000) {
+    $expectedId = $obj['id']
     $script:Shim.StandardInput.WriteLine(($obj | ConvertTo-Json -Depth 8 -Compress))
-    $t = $script:Shim.StandardOutput.ReadLineAsync()
-    if (-not $t.Wait($timeoutMs)) { throw "shim did not respond in ${timeoutMs}ms" }
-    return ($t.Result | ConvertFrom-Json)
+    for ($i = 0; $i -lt 16; $i++) {
+        $t = $script:Shim.StandardOutput.ReadLineAsync()
+        if (-not $t.Wait($timeoutMs)) { throw "shim did not respond in ${timeoutMs}ms" }
+        $msg = $t.Result | ConvertFrom-Json
+        if ($null -eq $msg.PSObject.Properties['id']) {
+            # Notification: record it (some tests assert on these) and read on.
+            $script:Notifications += @($msg.method)
+            continue
+        }
+        if ($null -ne $expectedId -and $msg.id -ne $expectedId) {
+            throw "stream desync: got response id $($msg.id), expected $expectedId"
+        }
+        return $msg
+    }
+    throw "no response after 16 lines (notifications only?)"
 }
 
 function McpCall($toolName, $arguments = @{}) {
@@ -182,10 +208,23 @@ if (-not $sid) {
     Stop-Shim; exit 1
 }
 $use = McpCall "use_session" @{ sessionId = $sid }
-# Host kind from the session label: headless sessions are "headless <pid>";
-# GUI sessions are "ShaderLab <ver> (pid ...)". GUI-only tests skip on headless.
-if ($label -match 'headless') { $script:HostKind = 'headless' }
-Write-Host "Pinned session $sid [$label] -> host kind: $script:HostKind" -ForegroundColor DarkGray
+# Host kind from the pinned session's ADVERTISED TOOL CATALOG, not its label.
+# The label is free text -- --session-label takes anything -- so substring-
+# matching 'headless' silently mis-detects any session named otherwise and
+# reports all ~18 GUI-only tests as real failures. (Observed: a session
+# labelled 'final' produced exactly that, and the failure text was the honest
+# one: "Tool not available on this host: graph_rename_node".) The catalog is
+# the authority: tools/list is filtered by route presence on the serving host,
+# the same predicate tools/call enforces, so a GUI-only tool is advertised
+# exactly when it is callable. graph_rename_node is GUI-only and stable.
+$catalog = @((Rpc @{ jsonrpc = "2.0"; id = (Get-Random -Maximum 999999)
+                     method = "tools/list"; params = @{} }).result.tools.name)
+if ($catalog.Count -eq 0) {
+    Write-Host "tools/list returned an empty catalog -- cannot determine host kind." -ForegroundColor Red
+    Stop-Shim; exit 1
+}
+$script:HostKind = if ($catalog -contains 'graph_rename_node') { 'gui' } else { 'headless' }
+Write-Host "Pinned session $sid [$label] -> host kind: $script:HostKind ($($catalog.Count) tools advertised)" -ForegroundColor DarkGray
 
 function RunTest($name, $scriptBlock, [switch]$RequiresGui) {
     if ($name -notlike $Filter) { return }
@@ -547,15 +586,26 @@ RunTest "Route.CatalogRoundTrip" {
     # make impossible). Every tool must return a well-formed tool-result
     # envelope -- content[] + boolean isError -- never a hang, transport
     # error, or malformed frame. Mutating tools get validation-failing args
-    # so nothing is disturbed; readback tools get a scratch node. Tools
-    # whose backing route is absent on this host return isError=true with
-    # "Tool not available", which is a correctly-shaped result.
+    # so nothing is disturbed; readback tools get a scratch node.
+    #
+    # Also asserts the advertise/serve invariant: tools/list is filtered by
+    # route presence on the serving host, so NO advertised tool may answer
+    # "Tool not available on this host". Before that filter the catalog was
+    # emitted whole and a headless session advertised the 12 GUI-only tools
+    # it then refused -- a correctly-shaped result carrying a false promise.
     $tl = Rpc @{ jsonrpc = '2.0'; id = 1; method = 'tools/list' }
     # Over the shim, tools/list is spliced: the shim's 2 session tools +
     # the pinned session's catalog. Skip the shim's own tools in the sweep
     # (they aren't session routes).
     $tools = @($tl.result.tools | Where-Object { $_.name -notin @('list_sessions','use_session') })
-    if ($tools.Count -lt 30) { Log "tools/list returned only $($tools.Count)"; return $false }
+    # Host-dependent now that the catalog is filtered: a GUI host serves the
+    # whole catalog, headless serves the engine subset. Floors, not equalities,
+    # so adding a tool doesn't fail the suite.
+    $floor = if ($script:HostKind -eq 'gui') { 30 } else { 24 }
+    if ($tools.Count -lt $floor) {
+        Log "tools/list returned only $($tools.Count) on a $script:HostKind host (floor $floor)"
+        return $false
+    }
     $scratch = AddNode "Gaussian Blur"
     $canned = @{
         graph_add_node        = @{ effectName = 'Gaussian Blur' }
@@ -581,6 +631,7 @@ RunTest "Route.CatalogRoundTrip" {
         node_logs             = @{ nodeId = $scratch }
     }
     $badTools = @()
+    $unavailable = @()
     foreach ($t in $tools) {
         $name = $t.name
         $args2 = if ($canned.ContainsKey($name)) { $canned[$name] } else { @{} }
@@ -591,9 +642,16 @@ RunTest "Route.CatalogRoundTrip" {
             $shaped = ($null -ne $env) -and ($null -ne $env.content) -and ($env.isError -is [bool]) -and
                       (($null -ne $env.content[0].text) -or ($env.content[0].type -eq 'image'))
             if (-not $shaped) { $badTools += $name }
+            elseif ("$($env.content[0].text)" -match 'Tool not available on this host') {
+                $unavailable += $name
+            }
         } catch { $badTools += "$name (transport: $($_.Exception.Message))" }
     }
     if ($badTools.Count -gt 0) { Log "Malformed: $($badTools -join ', ')"; return $false }
+    if ($unavailable.Count -gt 0) {
+        Log "Advertised but not servable on this host: $($unavailable -join ', ')"
+        return $false
+    }
     return $true
 }
 

@@ -1,6 +1,7 @@
 #include "pch_engine.h"
 #include "../ShaderTestBench.h"
 #include "../TestCommon.h"
+#include "Effects/ColorMathCpu.h"
 
 #include <cstdio>
 
@@ -112,6 +113,43 @@ namespace ShaderLab::Tests
                 && Near(r[0].y, 0.0f,    1e-4f)
                 && Near(r[0].z, 0.0f,    1e-4f));
         }
+        // The CPU port (Effects/ColorMathCpu.h) builds tables the ICtCp
+        // shaders read instead of recomputing per pixel, so it must agree
+        // with the HLSL it copies. Colours include wide-gamut negatives and
+        // HDR; the boundary vertex exercises PQ_EOTF + XYZToScRGB too.
+        {
+            auto r = bench.Run(R"(
+                Result[0] = float4(ScRGBToICtCp(float3(1, 1, 1)), 0);
+                Result[1] = float4(ScRGBToICtCp(float3(-0.87, 1.0, 0.06)), 0);
+                Result[2] = float4(ScRGBToICtCp(float3(12.5, 0.3, 0.02)), 0);
+                Result[3] = float4(ScRGBToICtCp(float3(0.01, 0.02, 0.9)), 0);
+                // SampleBoundary's vertex 7 of 48 on BT.709 at I = 0.55.
+                float nits = PQ_EOTF(0.55);
+                float Ys = max(nits / 80.0, 0.0001);
+                float2 xy = lerp(GAMUT_709_R, GAMUT_709_G, 7.0 / 16.0);
+                float3 ic = ScRGBToICtCp(XYZToScRGB(float3(xy.x * Ys / xy.y, Ys, (1.0 - xy.x - xy.y) * Ys / xy.y)));
+                Result[4] = float4(ic.y, ic.z, 0, 0);
+            )", 5);
+            namespace CM = ShaderLab::Effects::ColorMathCpu;
+            const CM::V3 in[4] = { { 1, 1, 1 }, { -0.87, 1.0, 0.06 }, { 12.5, 0.3, 0.02 }, { 0.01, 0.02, 0.9 } };
+            float maxErr = r.size() >= 5 ? 0.0f : 1.0f;
+            for (int i = 0; i < 4 && r.size() >= 5; ++i)
+            {
+                const CM::V3 c = CM::ScRGBToICtCp(in[i]);
+                maxErr = (std::max)(maxErr, static_cast<float>(std::abs(c.x - r[i].x)));
+                maxErr = (std::max)(maxErr, static_cast<float>(std::abs(c.y - r[i].y)));
+                maxErr = (std::max)(maxErr, static_cast<float>(std::abs(c.z - r[i].z)));
+            }
+            if (r.size() >= 5)
+            {
+                std::array<CM::V2, 48> b{};
+                CM::SampleBoundary(CM::GamutPrimaries(0, {}, {}, {}), 0.55, b);
+                maxErr = (std::max)(maxErr, static_cast<float>(std::abs(b[7].x - r[4].x)));
+                maxErr = (std::max)(maxErr, static_cast<float>(std::abs(b[7].y - r[4].y)));
+            }
+            printf("  [info] ColorMathCpu vs HLSL max abs err %.3g\n", maxErr);
+            TEST("ColorMathCpu matches the HLSL ICtCp path (max abs err < 1e-4)", maxErr < 1e-4f);
+        }
         // Inverse: ICtCp(0.498, 0, 0) -> scRGB white. Use the same I value
         // we expect from the forward direction so the round trip is exact.
         {
@@ -150,20 +188,97 @@ namespace ShaderLab::Tests
                 !r.empty() && r[0].x < 5e-3f);
         }
 
-        // ---- Negative scRGB protection ------------------------------------
-        // ScRGBToICtCp clamps `max(rgb, 0)` before the XYZ matrix to keep
-        // the LMS path well-defined. Confirm: a slightly-negative input
-        // produces the same ICtCp as the all-zero input.
+        // ---- Wide-gamut (negative scRGB) survival --------------------------
+        // scRGB carries wide-gamut colour as negative Rec.709 components, so
+        // the ICtCp round trip must preserve them. It previously clamped
+        // `max(rgb, 0)` on entry, which silently sRGB-clipped every
+        // wide-gamut pixel *before* any tone/gamut mapping ran.
         {
+            // BT.2020 and DCI-P3 primaries at 80 nits, expressed in scRGB.
+            // Each has at least one strongly negative component.
             auto r = bench.Run(R"(
-                float3 a = ScRGBToICtCp(float3(-0.1, -0.1, -0.1));
-                float3 b = ScRGBToICtCp(float3( 0.0,  0.0,  0.0));
-                float3 d = abs(a - b);
-                float maxErr = max(max(d.x, d.y), d.z);
-                Result[0] = float4(maxErr, a.x, a.y, a.z);
+                float3 wide[4] = {
+                    float3(-0.8667,  1.0000,  0.0596),   // BT.2020 green-ish
+                    float3( 1.2484, -0.0479, -0.0184),   // BT.2020 red-ish
+                    float3(-0.1067,  1.0128,  0.0294),   // P3 green-ish
+                    float3( 1.0930, -0.2267,  0.0442)    // P3 red-ish
+                };
+                float maxErr = 0.0;
+                [unroll]
+                for (int i = 0; i < 4; ++i) {
+                    float3 rt = ICtCpToScRGB(ScRGBToICtCp(wide[i]));
+                    float3 d = abs(rt - wide[i]);
+                    maxErr = max(maxErr, max(max(d.x, d.y), d.z));
+                }
+                Result[0] = float4(maxErr, 0, 0, 0);
             )");
-            TEST("ScRGBToICtCp negative-input clamp matches zero (max err < 1e-5)",
-                !r.empty() && r[0].x < 1e-5f);
+            TEST("ICtCp round trip preserves wide-gamut negatives (max err < 5e-3)",
+                !r.empty() && r[0].x < 5e-3f);
+        }
+        {
+            // The specific regression: a negative component must NOT collapse
+            // to zero. Pin the sign and rough magnitude explicitly so a
+            // reintroduced clamp fails loudly rather than drifting.
+            auto r = bench.Run(R"(
+                float3 rt = ICtCpToScRGB(ScRGBToICtCp(float3(-0.8667, 1.0, 0.0596)));
+                Result[0] = float4(rt, 0);
+            )");
+            TEST("ICtCp round trip keeps R strongly negative (no sRGB clip on entry)",
+                !r.empty() && r[0].x < -0.80f && r[0].x > -0.93f);
+        }
+        {
+            // Signed PQ is symmetric about the origin, so below-black input
+            // round-trips rather than pinning to zero.
+            auto r = bench.Run(R"(
+                float3 rt = ICtCpToScRGB(ScRGBToICtCp(float3(-0.1, -0.1, -0.1)));
+                Result[0] = float4(rt, 0);
+            )");
+            TEST("ICtCp round trip preserves below-black neutral (-0.1 stays negative)",
+                !r.empty() && r[0].x < -0.09f && r[0].x > -0.11f);
+        }
+        {
+            // Regression: a single non-finite texel used to leave ICtCpToScRGB
+            // as roughly -10000 nits (scRGB -125), because clamp() with a NaN
+            // operand is not required to pick either bound and the observed
+            // result was -1, which PQ_EOTF_Signed then expands. One bad texel
+            // from a third-party HDR swapchain therefore poisoned every
+            // downstream mean, max and dE with a large, confidently-signed
+            // value. Bit patterns, not 0.0/0.0, so the optimizer cannot fold
+            // the inputs away at compile time.
+            auto r = bench.Run(R"(
+                float qnan = asfloat(0x7FC00000u);
+                float pinf = asfloat(0x7F800000u);
+                float ninf = asfloat(0xFF800000u);
+                float3 a = ICtCpToScRGB(float3(qnan, 0.0, 0.0));
+                float3 b = ICtCpToScRGB(float3(0.5, pinf, ninf));
+                // Largest magnitude seen across both results. The old failure
+                // mode reads ~125 here; a correct guard keeps it small.
+                float worst = max(max(max(abs(a.x), abs(a.y)), abs(a.z)),
+                                  max(max(abs(b.x), abs(b.y)), abs(b.z)));
+                Result[0] = float4(worst, a.x, b.x, 0);
+            )");
+            TEST("ICtCpToScRGB does not explode on non-finite input",
+                !r.empty() && r[0].x < 2.0f);
+            // And it must not smuggle a non-finite value out either.
+            TEST("ICtCpToScRGB returns finite values for non-finite input",
+                !r.empty() && std::isfinite(r[0].y) && std::isfinite(r[0].z));
+        }
+        {
+            // IsNonFinite must survive the optimizer. Compiled with
+            // OPTIMIZATION_LEVEL3 and no IEEE strictness, isfinite() and any
+            // magnitude comparison against NaN are foldable; the bit test is
+            // not. If this ever reads 0 for the NaN/Inf cases, the guard above
+            // has been optimized out and the -10000 nit failure is back.
+            auto r = bench.Run(R"(
+                Result[0] = float4(
+                    IsNonFinite(asfloat(0x7FC00000u)) ? 1.0 : 0.0,
+                    IsNonFinite(asfloat(0x7F800000u)) ? 1.0 : 0.0,
+                    IsNonFinite(asfloat(0xFF800000u)) ? 1.0 : 0.0,
+                    IsNonFinite(1.5) ? 1.0 : 0.0);
+            )");
+            TEST("IsNonFinite detects NaN / +Inf / -Inf and passes finite",
+                !r.empty() && r[0].x == 1.0f && r[0].y == 1.0f
+                           && r[0].z == 1.0f && r[0].w == 0.0f);
         }
     }
 }

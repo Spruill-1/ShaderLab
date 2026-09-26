@@ -32,6 +32,8 @@ if (-not (Test-Path $exe)) {
 }
 
 $script:failures = 0
+# Server -> client notifications seen while waiting for responses (see Recv).
+$script:notifications = @()
 function Check($name, $cond) {
     if ($cond) { Write-Host "[PASS] $name" -ForegroundColor Green }
     else       { Write-Host "[FAIL] $name" -ForegroundColor Red; $script:failures++ }
@@ -79,10 +81,34 @@ try {
 
     function SendRaw([string]$line) { $shim.StandardInput.WriteLine($line) }
     function Send($obj) { SendRaw ($obj | ConvertTo-Json -Depth 8 -Compress) }
-    function Recv($timeoutMs = 6000) {
+    # Raw single-line read. Returns $null on timeout WITHOUT resyncing, so
+    # never call this directly when a response is expected -- use Recv.
+    function RecvRaw($timeoutMs = 6000) {
         $task = $shim.StandardOutput.ReadLineAsync()
         if (-not $task.Wait($timeoutMs)) { return $null }
         return $task.Result
+    }
+
+    # Reads the next JSON-RPC *response* (a message carrying an "id"),
+    # recording and skipping any server -> client notifications along the way.
+    #
+    # The shim advertises tools.listChanged in initialize and then emits
+    # notifications/tools/list_changed immediately after use_session splices
+    # the pinned session's catalog in -- correct MCP behavior. This harness
+    # used to treat every line as a reply, so that one unsolicited line
+    # shifted every subsequent read by one and cascaded into five failures,
+    # including a FALSE PASS on Session.GoneSurfacesDistinctError (it was
+    # reading the previous call's session_gone text). Correlate, don't count.
+    function Recv($timeoutMs = 6000) {
+        for ($i = 0; $i -lt 16; $i++) {
+            $line = RecvRaw $timeoutMs
+            if ($null -eq $line) { return $null }
+            $obj = $null
+            try { $obj = $line | ConvertFrom-Json } catch { return $line }  # let the caller fail on garbage
+            if ($null -ne $obj.PSObject.Properties['id']) { return $line }
+            $script:notifications += @($obj.method)
+        }
+        return $null
     }
 
     Send @{ jsonrpc = '2.0'; id = 1; method = 'initialize'; params = @{ protocolVersion = '2025-06-18' } }
@@ -149,6 +175,14 @@ try {
             Send @{ jsonrpc = '2.0'; id = 102; method = 'tools/list' }
             $spliced = @(((Recv) | ConvertFrom-Json).result.tools | ForEach-Object name)
             Check "Session.ToolsListSpliced" (($spliced -contains 'list_sessions') -and ($spliced -contains 'graph_add_node') -and ($spliced -contains 'graph_overview'))
+
+            # Attaching changes the advertised tool set, so the shim must emit
+            # notifications/tools/list_changed (it advertises tools.listChanged
+            # in initialize). It is written straight after the use_session
+            # reply, so the Recv above is the first read to consume it --
+            # assert only once that read has happened.
+            Check "Session.ToolsListChangedOnAttach" `
+                ($script:notifications -contains 'notifications/tools/list_changed')
 
             # Drive a real engine route end-to-end (sealed through the hub).
             Send @{ jsonrpc = '2.0'; id = 103; method = 'tools/call'; params = @{ name = 'graph_overview'; arguments = @{} } }

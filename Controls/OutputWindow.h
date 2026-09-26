@@ -25,12 +25,6 @@ namespace ShaderLab::Controls
             const std::wstring& nodeName,
             const Rendering::PipelineFormat& format);
 
-        // Legacy single-thread present path. Retained for compatibility but
-        // unused after P7; the new path is SyncSinkFromUi (UI) +
-        // RenderOutputSink (render thread, free function in RenderTick) +
-        // BlitAndPresent (UI). Will be removed when all call sites migrate.
-        void Present(ID2D1DeviceContext5* dc, ID2D1Image* image);
-
         // P7: push current UI-thread view state (window size, pan/zoom,
         // autoFit, needsFit) into the shared sink under its viewMutex so
         // the render thread can read a coherent snapshot. Called once per
@@ -67,12 +61,10 @@ namespace ShaderLab::Controls
 
     private:
         void CreateSwapChain();
-        void CreateRenderTarget();
-        void ReleaseRenderTarget();
+        void ApplyInverseCompositionScale();
         void OnPanelSizeChanged(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& args);
-        void FitToView(ID2D1DeviceContext5* dc, ID2D1Image* image);
         winrt::fire_and_forget SaveImageAsync();
 
         // Shared (non-owning).
@@ -85,7 +77,8 @@ namespace ShaderLab::Controls
         winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel m_panel{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::TextBlock m_fpsText{ nullptr };
         winrt::com_ptr<IDXGISwapChain3> m_swapChain;
-        winrt::com_ptr<ID2D1Bitmap1> m_renderTarget;
+        float m_appliedScaleX{ 0.0f };   // scale the inverse matrix was built for
+        float m_appliedScaleY{ 0.0f };
 
         // P7 cross-thread state. Created in Create(), shared with the
         // render worker via MainWindow::m_outputSinks.
@@ -113,6 +106,28 @@ namespace ShaderLab::Controls
         float m_panStartY{ 0.0f };
         float m_panOriginX{ 0.0f };
         float m_panOriginY{ 0.0f };
+
+        // Last presented state. BlitAndPresent returns early unless the worker
+        // published a new frame or the view changed: Present1 with sync
+        // interval 1 blocks the UI thread until vblank, and doing it every
+        // tick for every window with nothing new to show cost up to one
+        // refresh period of input latency per window per tick.
+        uint64_t m_lastBlittedVersion{ ~0ull };
+        struct PresentedView
+        {
+            uint32_t w{ 0 }, h{ 0 };
+            float    scale{ 0 }, zoom{ 0 }, panX{ 0 }, panY{ 0 };
+            bool operator==(const PresentedView&) const = default;
+        };
+        PresentedView m_lastPresentedView;
+
+        // XAML is only touched when the text actually changes; the tooltip's
+        // TextBlock is created once. Rebuilding it per tick allocated a XAML
+        // element per window per frame.
+        std::wstring m_lastTitle;
+        std::wstring m_lastStatusText;
+        std::wstring m_lastTooltip;
+        winrt::Microsoft::UI::Xaml::Controls::TextBlock m_tooltipBlock{ nullptr };
 
         // FPS counter -- driven by main window via SetStatusText/SetStatusTooltip.
         // No per-window state; every render tick presents to all output windows

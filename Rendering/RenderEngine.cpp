@@ -47,7 +47,12 @@ namespace ShaderLab::Rendering
                 auto panelNative = m_panel.as<ISwapChainPanelNative>();
                 if (panelNative) panelNative->SetSwapChain(nullptr);
             }
-            catch (...) {}
+            catch (...)
+            {
+                // Deliberate swallow: teardown. The panel may already be torn
+                // down by XAML, and there is nothing useful to do about it --
+                // we are releasing the swap chain on the next line regardless.
+            }
         }
 
         m_swapChain = nullptr;
@@ -55,6 +60,7 @@ namespace ShaderLab::Rendering
         m_renderD2dContext = nullptr; // P7: dedicated render-thread context.
         m_d2dDevice = nullptr;
         m_d2dFactory = nullptr;
+        m_gpuTimer.Shutdown();
         m_d3dContext = nullptr;
         m_d3dDevice = nullptr;
         m_dxgiFactory = nullptr;
@@ -128,6 +134,7 @@ namespace ShaderLab::Rendering
 
         m_d3dDevice = baseDevice.as<ID3D11Device5>();
         m_d3dContext = baseContext.as<ID3D11DeviceContext4>();
+        m_gpuTimer.Initialize(m_d3dDevice.get());
 
         // Enable multithread protection for DXVA2 video decode on background threads.
         {
@@ -239,6 +246,28 @@ namespace ShaderLab::Rendering
         // Bind to SwapChainPanel via ISwapChainPanelNative.
         auto panelNative = panel.as<ISwapChainPanelNative>();
         winrt::check_hresult(panelNative->SetSwapChain(m_swapChain.get()));
+
+        m_compositionScaleX = static_cast<float>(panel.CompositionScaleX());
+        m_compositionScaleY = static_cast<float>(panel.CompositionScaleY());
+        ApplyCompositionScaleMatrix();
+    }
+
+    void RenderEngine::SetCompositionScale(float scaleX, float scaleY)
+    {
+        m_compositionScaleX = scaleX;
+        m_compositionScaleY = scaleY;
+        ApplyCompositionScaleMatrix();
+    }
+
+    void RenderEngine::ApplyCompositionScaleMatrix()
+    {
+        if (!m_swapChain) return;
+        winrt::com_ptr<IDXGISwapChain2> swapChain2;
+        if (FAILED(m_swapChain->QueryInterface(IID_PPV_ARGS(swapChain2.put())))) return;
+        DXGI_MATRIX_3X2_F m{};
+        m._11 = 1.0f / (std::max)(1e-3f, m_compositionScaleX);
+        m._22 = 1.0f / (std::max)(1e-3f, m_compositionScaleY);
+        swapChain2->SetMatrixTransform(&m);
     }
 
     void RenderEngine::ConfigureSwapChainColorSpace()
@@ -278,13 +307,17 @@ namespace ShaderLab::Rendering
         m_renderTarget = std::move(targetBitmap);
         m_d2dDeviceContext->SetTarget(m_renderTarget.get());
 
-        // Set DPI to match the panel's composition scale.
-        float dpi = 96.0f;
-        if (m_panel)
-        {
-            dpi = 96.0f * m_panel.CompositionScaleX();
-        }
-        m_d2dDeviceContext->SetDpi(dpi, dpi);
+        // The render context runs at a FIXED 96 DPI. It used to be set to
+        // the panel's composition scale (96 * CompositionScaleX, e.g. 144
+        // at 150% display scaling), but post-P7 every render-side consumer
+        // — the offscreen preview draw, evaluator bounds math, captures,
+        // output sinks — immediately flipped it to 96 for its work and
+        // restored afterwards. Those per-frame DPI changes invalidated
+        // every D2D1_PROPERTY_CACHED effect intermediate in the context
+        // (caches are DPI-referenced), silently defeating clean-subgraph
+        // caching. Pixel-exact sizing is handled with explicit transforms,
+        // not context DPI; the UI thread blits through its own context.
+        m_d2dDeviceContext->SetDpi(96.0f, 96.0f);
     }
 
     void RenderEngine::ReleaseRenderTarget()
@@ -326,6 +359,7 @@ namespace ShaderLab::Rendering
                 DXGI_FORMAT_UNKNOWN,  // keep current format
                 0));
 
+        ApplyCompositionScaleMatrix();
         CreateRenderTarget();
     }
 
@@ -357,6 +391,7 @@ namespace ShaderLab::Rendering
                 0));
 
         ConfigureSwapChainColorSpace();
+        ApplyCompositionScaleMatrix();
         CreateRenderTarget();
     }
 

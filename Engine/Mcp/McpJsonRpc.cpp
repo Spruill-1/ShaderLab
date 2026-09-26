@@ -267,10 +267,31 @@ namespace ShaderLab::Mcp
 
                 if (method == "tools/list")
                 {
+                    // Advertise only what this host can actually serve.
+                    // tools/call already refuses a tool whose backing route is
+                    // absent ("Tool not available on this host: ..."), but the
+                    // catalog was emitted whole -- so a headless session
+                    // advertised the GUI-only tools and then rejected them. An
+                    // advertisement the next call contradicts is worse than a
+                    // shorter list: an agent plans around the tool, and a test
+                    // harness has no honest way to ask what kind of host it is
+                    // pinned to (Tests/RunTests.ps1 was reduced to substring-
+                    // matching the free-text session label, which mis-detects
+                    // any session not named "*headless*" and reports every
+                    // GUI-only test as a real failure).
+                    //
+                    // Same predicate as the dispatcher, applied to the path
+                    // TEMPLATE. Routes match on longest prefix, and every
+                    // arg mode leaves the registered prefix intact ahead of
+                    // its placeholder -- "/graph/node/{}" still resolves to
+                    // the "/graph/node/" route -- so the check is valid
+                    // before argument substitution.
                     std::string tools = R"({"tools":[)";
                     bool first = true;
                     for (const auto& t : ToolCatalog())
                     {
+                        if (!router.HasSpecificRoute(t.method, t.pathTemplate))
+                            continue;
                         if (!first) tools += ",";
                         tools += t.listJson;
                         first = false;

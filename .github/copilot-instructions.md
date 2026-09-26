@@ -1,5 +1,11 @@
 # Copilot Instructions
 
+> **Companion file:** [`CLAUDE.md`](../CLAUDE.md) at the repo root is the equivalent
+> for Claude Code, and carries the machine-specific build / deploy / MCP procedures
+> that live nowhere else (further detail in `.claude/skills/`). The two files overlap
+> deliberately on the rules that cause crashes or build failures — the graph-access
+> threading rule and the D2D effect gotchas. **Change one, check the other.**
+
 ## Project Identity
 
 ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging Direct2D shader effects with full HDR/WCG support. The primary focus is building tone-mapping and color-correction effects as graph nodes, with empirical fidelity tooling — Delta E Comparator + Luminance Statistics + Working Space node form a closed-loop CIEDE2000 readout that lets us tune effect parameters against measured color accuracy, not visual impression.
@@ -13,10 +19,17 @@ ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, 
 ## Build
 
 - Clone with `--recurse-submodules` (or run `git submodule update --init --recursive`). `exprtk` and `miniz` are git submodules under `third_party/`, pinned to explicit commits; `third_party/miniz_export.h` is an in-tree shim, not part of the submodule. See [build.md](../docs/development/build.md).
-- Open `ShaderLab.slnx` in Visual Studio 2022 17.8+
+- Open `ShaderLab.slnx` in Visual Studio 2022 17.8+ (VS 2026 / v18 also supported)
 - NuGet packages restore automatically (packages.config style, not PackageReference)
-- Build target: **Debug | x64** (also supports ARM64, Release)
-- No command-line build scripts exist; use MSBuild via VS or `msbuild ShaderLab.vcxproj /p:Configuration=Debug /p:Platform=x64`
+- Configurations: **Debug | x64** and **Debug | ARM64** (plus Release for both).
+  CI builds x64 on `windows-latest` and ARM64 natively on `windows-11-arm`.
+- No wrapper build scripts exist; use MSBuild via VS or
+  `msbuild ShaderLab.slnx /p:Configuration=Debug /p:Platform=x64`
+- **Building ARM64 on an ARM64 host** needs the `arm64\MSBuild.exe` binary and the
+  `Microsoft.VisualStudio.Component.UWP.VC.ARM64` component — the default MSBuild is
+  32-bit and fails with misleading `C3859`/`C1076` PCH errors. Full explanation in
+  [build.md](../docs/development/build.md); the commands are in
+  [`CLAUDE.md`](../CLAUDE.md) and `.claude/skills/shaderlab-build/`.
 - Required: Windows App SDK 1.8, Windows 10 SDK 10.0.26100+
 - Linked native libs: `d3d11.lib`, `d2d1.lib`, `dxgi.lib`, `d3dcompiler.lib`, `dxguid.lib`, `windowscodecs.lib`
 - `/bigobj` is enabled; language standard is C++20 (VS 18+) or C++17 (VS 17)
@@ -46,7 +59,7 @@ ShaderLabEngine.dll (host-agnostic)
   │   ├── IccProfileParser      — mscms.dll-based ICC reader
   │   └── MathExpression        — ExprTk-backed expression evaluator (Numeric Expression node)
   ├── Effects/
-  │   ├── ShaderLabEffects      — 35 ShaderLab effects (analysis/source/tone-map/parameter) with embedded HLSL
+  │   ├── ShaderLabEffects      — 36 ShaderLab effects (analysis/source/tone-map/parameter) with embedded HLSL
   │   ├── ColorMath.cpp         — Shared HLSL color math library (BT.709/BT.2020/P3, PQ/HLG, ICtCp)
   │   ├── EffectRegistry        — 40+ wrapped D2D effects across 9 categories
   │   ├── ShaderCompiler        — D3DCompile + D3DReflect + ID3DInclude resolver for shaderlab_params.hlsli
@@ -162,6 +175,32 @@ When creating new D2D effects (the core purpose of this tool):
 5. Register effects in `Effects::RegisterEngineD2DEffects()` at engine init (called from app + headless + tests)
 6. Follow `CustomPixelShaderEffect` / `CustomComputeShaderEffect` as templates
 
+## Looking at HDR Output (an AI agent cannot, directly)
+
+An agent's vision input is 8-bit SDR. A captured PNG of an HDR frame has already
+clipped everything above scRGB 1.0 (80 nits) and discarded the negative components
+that carry wide-gamut chroma. *Seeing* an HDR image requires tone mapping it — which
+in this project is usually the thing under test, so judging a tone mapper from a
+tone-mapped screenshot is circular. In order of preference:
+
+1. **Numbers first** — `read_pixel_region` / headless `--pixels` (FP32, unclipped) and
+   `read_analysis_output` on a Statistics node. Ground truth.
+2. **Measured difference** — `Delta E Comparator` with `Method = dE ITP (BT.2124)` →
+   `Luminance Statistics` → Mean / p95 / Max. Use ITP rather than the CIE Lab metrics
+   for anything HDR or wide-gamut; Lab leaves its fitted domain above ~100 nits
+   (measured on a 1100 vs 1000 nit step: ITP 7.47, CIEDE2000 118.09, CIE76 253.26).
+3. **Diagnostic renders when you need to look** — these encode HDR facts into an
+   SDR-visible image, so capturing them is legitimate: `Nit Map`, `Luminance Heatmap`,
+   `Gamut Highlight`, `CIE Chromaticity Plot`, `ICtCp Boundary`, and
+   `Delta E Comparator` in Heatmap mode.
+4. **A raw capture of HDR content** — composition and gross sanity only.
+
+**State which path was used, and flag when a verdict passes through a tone map or is a
+taste call rather than a measurement.** `render_capture` / `render_capture_node` clip
+to SDR and their MCP tool descriptions say so. Headless `--output foo.jxr` writes a
+lossless full-range artifact, but it still cannot be viewed — it is for archiving,
+golden-image comparison, and round-tripping back in as an Image source.
+
 ## Tone Mapping & Color Correction (Primary Development Focus)
 
 Active development centers on **tone-mapping and color-correction effects authored as graph nodes** — not a built-in tone-mapping pass. The render pipeline is intentionally pass-through (scRGB FP16 in, scRGB FP16 out); users compose tone mappers and color correction from graph effects, validate them with empirical fidelity tooling, and iterate.
@@ -179,9 +218,9 @@ Active development centers on **tone-mapping and color-correction effects author
 - **Display monitoring**: Event-driven — `DisplayInformation` bound to the main window (`IDisplayInformationStaticsInterop::GetForWindow`) raises `AdvancedColorInfoChanged` for HDR toggles, the SDR-brightness slider, and monitor moves; one `AdvancedColorInfo` snapshot feeds all of `DisplayCapabilities`. Requires Win11 22H2 (10.0.22621 min OS). Headless snapshots the primary monitor via `GetForMonitor` (no events).
 - **Graph serialization**: `Windows.Data.Json` (zero extra dependencies). GUID fields use `StringFromGUID2`/`CLSIDFromString`.
 - **Effect registry**: Singleton with 40+ built-in D2D effects across 9 categories. Case-insensitive name lookup.
-- **ShaderLab effects library**: 33 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map + Scale), Source / Generator, Composition (Split Comparison), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use; bytecode cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` (decision #58 catalog → see [builtin-catalog.md](../docs/effects/builtin-catalog.md) for the full per-effect type table).
+- **ShaderLab effects library**: 36 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map + Scale), Source / Generator, Composition (Split Comparison), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use; bytecode cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` (decision #58 catalog → see [builtin-catalog.md](../docs/effects/builtin-catalog.md) for the full per-effect type table).
 - **MCP server**: JSON-RPC 2.0 (protocol 2025-06-18, batching rejected) over **stdio via the broker** — the embedded HTTP listener was deleted in stdio-migration Step 9 (decision #71, superseding #31/#58; engine ABI **3**). The router, dispatcher, 39-tool catalog + 25 engine-pure routes live in `Engine/Mcp/` (handlers take `(path, query, body)`); 16 app-side routes stay in `MainWindow.McpRoutes.cpp`. Each host registers as a hub **session** (`McpSessionClient`, GUID-identified); a client's shim (`ShaderLabMcpBroker --stdio`, unpackaged, distributed to `%LOCALAPPDATA%\ShaderLab\bin\`) activates the packaged hub and pins a session with `use_session`. Both hosts register the same engine-side route set through `IEngineCommandSink`: pure mutation closures dispatched via `sink.Dispatch`, with 8 event hooks (`OnNodeAdded`, `OnNodeRemoved`, `OnNodeChanged`, `OnGraphCleared`, `OnGraphLoaded`, `OnGraphStructureChanged`, `OnCustomEffectRecompiled`, `OnDisplayProfileChanged`) the GUI overrides to keep its UI in sync. CI drives `RunTests.ps1` through a shim against a headless `--mcp-session`.
-- **Versioning**: `Version.h` defines app version (currently **1.7.3**) and graph format version (2). Both are stored in saved graphs. Forward compatibility check on load. `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` is independent — bumped manually on engine ABI breaks; mismatch between header and DLL aborts startup with a friendly message-box.
+- **Versioning**: `Version.h` defines the app version and the graph format version (read them there rather than quoting numbers here). Both are stored in saved graphs. Forward compatibility check on load. `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` is independent — bumped manually on engine ABI breaks; mismatch between header and DLL aborts startup with a friendly message-box.
 - **Refresh-rate-driven render loop on the worker thread**: the render worker `std::jthread` runs the graph evaluate at the active monitor's refresh rate (clamped to 60–240 Hz). Dirty-gated: skips evaluate when no nodes changed, no output window is open, and `m_forceRender` is false. The UI thread runs a `DispatcherQueueTimer` at the same rate, but its body is just "drain dispatcher + blit offscreen + Present1" — sub-ms cost. The interval is re-applied on every display change so dragging the window across monitors picks up the new rate.
 - **`ProcessDeferredCompute` requires an active D2D draw session**: it calls `dc->DrawImage` internally to pre-render the upstream chain into an FP32 bitmap, and outside `BeginDraw`/`EndDraw` that DrawImage silently no-ops. The GUI's `RenderFrame`, the headless host's `runEval` / `RunRender`, and the test bench all wrap accordingly.
 - **Ctrl+Enter** compiles shader from the editor TextBox.
@@ -198,12 +237,16 @@ Active development centers on **tone-mapping and color-correction effects author
 
 These are critical lessons learned during development. Any AI agent generating or modifying D2D custom effect code **must** account for these:
 
+0a. **Never issue a multi-call D3D11 sequence on the shared immediate context — record on a deferred context and submit once.** `SetMultithreadProtected` makes single calls thread-safe, not sequences, and Direct2D on another thread (same device) can land between a UAV bind and the `Dispatch` that needed it — the dispatch then writes nothing and still returns `S_OK` (~8% of compute re-dispatches, before `D3D11ComputeRunner` moved to a deferred context + one `ExecuteCommandList(list, TRUE)`). Don't reach for `ID2D1Multithread` instead: it works, but it couples compute to Direct2D.
+0b. **A lookup-table input (`lookupInputCount`) is read with `Load` at computed coordinates**, is excluded from the output rect, is demanded whole on every tile, and receives a 1×1 zero placeholder when unwired — never null, since D2D renders nothing for an effect with a null input. Keep a matching `TEXCOORDn` in the signature anyway (positional contract), and keep parentheses out of comments inside the parameter list: the signature guard ends the list at the first `)`.
+0. **`MapOutputRectToInputRects` must answer with the TILE it was asked about, not the whole image.** Direct2D tiles a render once the output is wider than ~2048 px and asks for each tile in turn. Answering "I need the entire input" makes it re-render the whole upstream chain once per tile, which is a cliff rather than a slope: 2048x1280 measured **1.10 ms** and 2100x1280 measured **56.05 ms** -- 1.03x the pixels, 51x the time -- while height changes nothing (1280x2560 is 1.02 ms). With `D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING` declared, output pixel N depends only on input pixel N, so the 1:1 answer is the correct one. Analysis pins (1 x N parameter textures) are not image inputs and keep the whole-rect answer. Behind `Performance::IsSubRectInputDemandEnabled` (default on) if you need to compare. **Corollary for profiling:** a shader that looks catastrophically slow at 4K may not be slow at all -- check the transform's rect mapping before touching its arithmetic. An ablation that removed this tone mapper's entire ICtCp pipeline saved 3%.
+
 1. **Typed cbuffer pack (Phase 3+)**: `uint`, `int`, and `bool` cbuffer slots in HLSL are now packed correctly even when the corresponding `PropertyValue` is stored as `float` (the default for enum-style parameters). The `Effects::PackPropertyToCBuffer` helper reflects each cbuffer variable's `D3D_SHADER_VARIABLE_TYPE` and converts via `static_cast<uint32_t>` / `<int32_t>` / `BOOL` before writing. So you *can* declare `uint Mode` in HLSL and use clean `if (Mode == 1)` comparisons. **Pre-Phase-3 historical convention** (still works, used by all existing ShaderLab effects): declare enums as `float` in HLSL with `> 0.5` / `> 1.5` threshold comparisons. New effects can use either; mixing within one effect is fine.
 2. **HLSL compiler with `D3DCOMPILE_WARNINGS_ARE_ERRORS` optimizes out cbuffer variables** not referenced on ALL code paths. Read all cbuffer vars at top of `main()` before any branches.
 3. **D2D custom effects need TWO evaluation passes** for newly created effects — first creates/initializes, second produces correct output. Don't expect correct output on the first frame after creation.
 4. **`RegisterWithInputCount` requires `inputCount >= 1`**. Zero-input source effects must use a hidden dummy bitmap input.
 5. **`MapInputRectsToOutputRect` with `SetFixedOutputSize`** must check fixed size FIRST, before examining input rect. Getting this order wrong causes incorrect output sizing.
-6. **D2D `TEXCOORD` values are in pixel/scene space**, NOT normalized [0,1]. Always use `GetDimensions()` and divide to get normalized UVs.
+6. **A D2D pixel shader MUST declare `SCENE_POSITION`.** The required input signature is `main(float4 : SV_POSITION, float4 : SCENE_POSITION, float4 : TEXCOORD0, ...)`, one TEXCOORD per input. Omitting the middle parameter shifts the binding so what you labelled `TEXCOORD0` receives the **scene** coordinate rather than input 0's texel coordinate. They coincide only while the content fills D2D's intermediate allocation, so it looks correct at the usual source size and then displaces by `-(intermediate - content)/2` per axis when it doesn't. With the signature correct, `TEXCOORD` **is** normalized: sample with `Sample(s, uv0.xy)`, take pixel coordinates from `SCENE_POSITION`, and give each input its own TEXCOORD. (This item previously said TEXCOORD was pixel/scene space and to divide by `GetDimensions()` -- that described the bug, not D2D.) **`SCENE_POSITION` also carries interpolation error** (up to 2^-12 px) that changes with D2D's tiling of the effect; `floor()` it before feeding anything position-hashed such as a dither, or output depends on graph topology.
 7. **D2D custom effect transforms must NOT pass through infinite input rects** in `MapInputRectsToOutputRect`. Infinite rects cause D2D to attempt unbounded rendering.
 8. **`ForceUploadConstantBuffer()` uploads cbuffer but doesn't invalidate cached output**. Need an input toggle trick (disconnect+reconnect dummy input) to force D2D to re-evaluate the effect.
 9. **Monitor gamut comes from `DXGI_OUTPUT_DESC1` primaries** — use `RedPrimary`, `GreenPrimary`, `BluePrimary`, `WhitePoint` fields. These are CIE xy chromaticity coordinates.
@@ -216,11 +259,11 @@ The built-in effects library lives in `Effects/ShaderLabEffects.h/.cpp`:
 - **Embedded HLSL**: Each effect's shader code is stored as a `const char*` string constant. No external `.hlsl` files.
 - **Shared color math**: A common HLSL library (BT.709/BT.2020/P3 color matrices, PQ/HLG transfer functions, CIE XYZ↔xy conversions, luminance calculations) is prepended to each shader at compile time.
 - **Auto-compile**: Effects are compiled via `ShaderCompiler` at first use (when added to graph). Compiled bytecode is cached.
-- **Categories** (33 effects total):
+- **Categories** (36 effects total):
   - **Analysis → Heatmaps** (D3D11 Compute with image output): Luminance Heatmap, Luminance Highlight, Delta E Comparator. **Pixel Shader**: Gamut Highlight, Nit Map.
   - **Analysis → Scopes**: CIE Histogram (D3D11 Compute), CIE Chromaticity Plot (Pixel Shader). (Vectorscope and Waveform Monitor were removed in Phase 8 — they no longer ship.)
   - **Analysis → Statistics** (D3D11 Compute, data-only): Channel Statistics, Luminance Statistics, Chromaticity Statistics, Image Info.
-  - **Analysis → Tone Mapping** (ICtCp suite): ICtCp Round-Trip Validator (PS), ICtCp Tone Map (D3D11 Compute), ICtCp Inverse Tone Map (D3D11 Compute), ICtCp Saturation (PS), ICtCp Highlight Desaturation (D3D11 Compute).
+  - **Analysis → Tone Mapping** (ICtCp suite): ICtCp Round-Trip Validator (PS), ICtCp Tone Map (D3D11 Compute), ICtCp Inverse Tone Map (D3D11 Compute), ICtCp Saturation (PS), ICtCp Highlight Desaturation (D3D11 Compute), ICtCp Gamut Boundary LUT (D3D11 Compute, generator).
   - **Analysis → Gamut**: Gamut Coverage (D3D11 Compute), ICtCp Boundary (PS).
   - **Color Processing** (PS): Gamut Map, ICtCp Gamut Map. **D3D11 Compute**: Scale.
   - **Source / Generator** (PS): Gamut Source, Color Checker, Zone Plate, Gradient Generator, HDR Test Pattern.

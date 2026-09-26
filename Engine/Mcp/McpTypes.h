@@ -12,6 +12,8 @@
 #include <string_view>
 #include <cstdint>
 #include <cstdio>
+#include <format>   // JsonFloat
+#include <cmath>    // std::isfinite
 
 namespace ShaderLab::Mcp
 {
@@ -90,4 +92,25 @@ namespace ShaderLab::Mcp
             return r;
         }
     };
+
+    // JSON has no Infinity/NaN literal, but "{:.6f}" happily emits the bare C
+    // tokens nan / inf / -inf. A response carrying one still returns 200 and
+    // then fails to parse -- callers see a successful-looking read and get no
+    // data, which is how a whole run of plausible wrong numbers happens. Worse,
+    // a non-finite value that reaches a property serialises into a saved
+    // document as 1.#QNAN and makes the .effectgraph unloadable.
+    //
+    // Every float that goes into a JSON body must go through this.
+    inline std::string JsonFloat(float v)
+    {
+        if (!std::isfinite(v)) return "null";
+        return std::format("{:.6f}", v);
+    }
+    // Formats as double rather than narrowing: casting to float turned a
+    // finite 1e39 into inf and therefore into null.
+    inline std::string JsonFloat(double v)
+    {
+        if (!std::isfinite(v)) return "null";
+        return std::format("{:.6f}", v);
+    }
 }

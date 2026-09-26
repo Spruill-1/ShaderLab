@@ -26,7 +26,18 @@
 //      loses Start/Stop/Port/IsRunning + the Winsock listener (keeps
 //      AddRoute/RouteRequest/HasRoute); the broker (shim → hub → session)
 //      is the only transport. ActivityCallback's peer arg becomes clientId.
-#define SHADERLAB_ENGINE_ABI_VERSION 3
+//   4: Layout changes to exported types, accumulated over the GPU-timing and
+//      tiling work: EffectNode gains lastGpuMs / gpuState / clockTickBucket,
+//      CustomEffectDefinition gains lookupInputCount, GraphEvaluator gains the
+//      GPU timer, dispatch counter and pull-propagation set, and
+//      D3D11ComputeRunner is newly exported. A host built against v3 headers
+//      reads these at the wrong offsets -- the exact access violation inside
+//      the engine DLL that a stale incremental build produced mid-session.
+//   5: Performance pass. GraphEvaluator drops the Evaluate-time pre-render
+//      and gains content-addressed variant/reflection memos, split analysis
+//      targets and async-readback bookkeeping; D3D11ComputeRunner's single
+//      staging buffer becomes a ring and its readback flag an enum.
+#define SHADERLAB_ENGINE_ABI_VERSION 5
 
 // C-linkage entry so it can be GetProcAddress'd if a host wants to do a
 // version check before dynamically loading the DLL.

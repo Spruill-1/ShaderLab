@@ -99,7 +99,13 @@ namespace ShaderLab
             if (cb)
             {
                 try { cb("POST", L"/", resp.statusCode, "session"); }
-                catch (...) {}
+                catch (...)
+                {
+                    // Deliberate swallow: this callback only drives a host UI
+                    // activity indicator. A throwing indicator must never turn
+                    // an otherwise-successful MCP request into a failure, and
+                    // the response is already built at this point.
+                }
             }
         }
         return resp;

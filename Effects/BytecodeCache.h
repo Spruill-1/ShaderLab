@@ -76,7 +76,12 @@ namespace ShaderLab::Effects
         uint64_t    sourceHash;          // FNV1a-64 of canonical UTF-8 HLSL.
         uint64_t    paramSignatureHash;  // FNV1a-64 of "name0\0name1\0..." for ordered gpuBindable param names.
         uint64_t    includeLibraryHash;  // Hash of embedded-include library + cache schema version.
-        uint32_t    macroBitset;         // bit i = parameter i has _SLPARAM_<name>_GPU=1.
+        // TWO bits per gpu-bindable parameter: bits [2i, 2i+1] hold the
+        // binding mode for parameter i -- 0 = cbuffer, 1 = StructuredBuffer
+        // SRV, 2 = Texture2D effect input (the only GPU-resident route a
+        // Direct2D pixel shader can take). Part of the cache key, so two
+        // modes of the same effect are distinct entries.
+        uint32_t    macroBitset;
         std::string entryPoint;          // e.g. "main".
         std::string target;              // e.g. "ps_5_0", "cs_5_0".
 

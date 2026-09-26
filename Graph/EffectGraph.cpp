@@ -32,6 +32,13 @@ namespace ShaderLab::Graph
         // graph just fine -- nothing is "needed" so evaluation no-ops
         // until the user adds a new Output node.
 
+        // Everything that consumed the node -- by edge or by binding -- loses
+        // an input, so it is dirty. This is what lets callers dirty only what
+        // changed instead of the whole graph.
+        for (const auto& e : m_edges)
+            if (e.sourceNodeId == nodeId)
+                if (auto* dst = FindNode(e.destNodeId)) dst->dirty = true;
+
         // Remove all edges referencing this node.
         std::erase_if(m_edges, [nodeId](const EffectEdge& e)
         {
@@ -41,7 +48,7 @@ namespace ShaderLab::Graph
         // Remove property bindings referencing this node as a source.
         for (auto& node : m_nodes)
         {
-            std::erase_if(node.propertyBindings, [nodeId](const auto& pair)
+            const size_t removed = std::erase_if(node.propertyBindings, [nodeId](const auto& pair)
             {
                 const auto& b = pair.second;
                 if (b.wholeArray)
@@ -51,6 +58,7 @@ namespace ShaderLab::Graph
                         return true;
                 return false;
             });
+            if (removed) node.dirty = true;
         }
 
         // Remove the node itself.
@@ -111,10 +119,12 @@ namespace ShaderLab::Graph
 
     void EffectGraph::DisconnectInput(uint32_t dstId, uint32_t dstPin)
     {
-        std::erase_if(m_edges, [dstId, dstPin](const EffectEdge& e)
+        const size_t removed = std::erase_if(m_edges, [dstId, dstPin](const EffectEdge& e)
         {
             return e.destNodeId == dstId && e.destPin == dstPin;
         });
+        if (removed)
+            if (auto* dst = FindNode(dstId)) dst->dirty = true;
     }
 
     std::vector<const EffectEdge*> EffectGraph::GetInputEdges(uint32_t nodeId) const
@@ -404,8 +414,10 @@ namespace ShaderLab::Graph
         }
 
         destNode->propertyBindings[propertyName] = std::move(binding);
+        // The consumer is all that changed. The evaluator pulls dirtiness
+        // downstream along edges and bindings, so marking the whole graph
+        // (as this did) only re-ran unrelated and upstream work.
         destNode->dirty = true;
-        MarkAllDirty();
         return {};  // success
     }
 
@@ -416,7 +428,6 @@ namespace ShaderLab::Graph
         if (node->propertyBindings.erase(propertyName) == 0)
             return false;
         node->dirty = true;
-        MarkAllDirty();
         return true;
     }
 
@@ -432,8 +443,11 @@ namespace ShaderLab::Graph
 
     bool EffectGraph::HasDirtyNodes() const
     {
+        // Only nodes some output needs. An unneeded node keeps its pending
+        // change (the evaluator no longer discards it) until it becomes
+        // needed again, and must not keep the host re-evaluating meanwhile.
         for (const auto& node : m_nodes)
-            if (node.dirty) return true;
+            if (node.dirty && node.needed) return true;
         return false;
     }
 
@@ -724,6 +738,9 @@ namespace ShaderLab::Graph
                 }
                 ced.SetNamedValue(L"parameters", params);
 
+                if (def.lookupInputCount > 0)
+                    ced.SetNamedValue(L"lookupInputCount",
+                        WDJ::JsonValue::CreateNumberValue(def.lookupInputCount));
                 ced.SetNamedValue(L"threadGroupX", WDJ::JsonValue::CreateNumberValue(def.threadGroupX));
                 ced.SetNamedValue(L"threadGroupY", WDJ::JsonValue::CreateNumberValue(def.threadGroupY));
                 ced.SetNamedValue(L"threadGroupZ", WDJ::JsonValue::CreateNumberValue(def.threadGroupZ));
@@ -970,6 +987,8 @@ namespace ShaderLab::Graph
                     def.parameters.push_back(std::move(pd));
                 }
 
+                if (ced.HasKey(L"lookupInputCount"))
+                    def.lookupInputCount = static_cast<uint32_t>(ced.GetNamedNumber(L"lookupInputCount"));
                 def.threadGroupX = static_cast<uint32_t>(ced.GetNamedNumber(L"threadGroupX"));
                 def.threadGroupY = static_cast<uint32_t>(ced.GetNamedNumber(L"threadGroupY"));
                 def.threadGroupZ = static_cast<uint32_t>(ced.GetNamedNumber(L"threadGroupZ"));
@@ -1075,7 +1094,16 @@ namespace ShaderLab::Graph
                     if (!node.customEffect->analysisFields.empty())
                         node.customEffect->analysisOutputType = AnalysisOutputType::Typed;
                 }
-                catch (...) {} // Ignore malformed legacy data.
+                catch (...)
+                {
+                    // Malformed legacy data. Keep loading -- the rest of the
+                    // node is valid -- but say so: a silently dropped analysis
+                    // field otherwise shows up later as a binding that cannot
+                    // resolve, with nothing pointing back at the load.
+                    node.runtimeError =
+                        L"Legacy analysis-field metadata was malformed and "
+                        L"could not be migrated; re-save this graph.";
+                }
             }
 
             // Migrate legacy propertyBindings from string property.
@@ -1096,7 +1124,16 @@ namespace ShaderLab::Graph
                         node.propertyBindings[targetProp] = std::move(binding);
                     }
                 }
-                catch (...) {}
+                catch (...)
+                {
+                    // Partial migration: bindings parsed before the throw are
+                    // kept, the rest are lost. Record it -- dropping a user's
+                    // bindings silently on load is indistinguishable from
+                    // never having authored them.
+                    node.runtimeError =
+                        L"Legacy property bindings were malformed; some "
+                        L"bindings could not be migrated and must be re-made.";
+                }
             }
 
             node.dirty = true;

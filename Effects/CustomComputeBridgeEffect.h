@@ -4,10 +4,43 @@
 #include "../EngineExport.h"
 #include "../Graph/PropertyValue.h"
 #include "IEngineComputeOutput.h"
+#include "IEngineComputeTexture.h"
 #include "../Rendering/D3D11ComputeRunner.h"
 
 namespace ShaderLab::Effects
 {
+    // Integer pixel rect a compute input occupies, used to size and place
+    // its FP32 pre-render. One helper for every pre-render site, because the
+    // two ways of getting this wrong were both live:
+    //   * UNBOUNDED inputs (Flood, Tile, Border, Turbulence) report infinite
+    //     local bounds. `right - left` overflowed to +inf, min() turned it
+    //     into 8192, and the pre-render allocated 8192x8192 FP32 -- 1 GiB --
+    //     drawn at an offset of about +FLT_MAX. Now E_BOUNDS, which callers
+    //     surface as a runtime error telling the user to crop first.
+    //   * FRACTIONAL bounds (a Scale or 2D affine upstream) were truncated,
+    //     dropping the last partial row/column, and drawn at a sub-pixel
+    //     offset, so the compute read bilinearly resampled pixels rather
+    //     than the image. Snapping outward to whole pixels and drawing at
+    //     the integer origin fixes both.
+    // Extents above 8192 px are clamped, as before (legit large images).
+    inline HRESULT SnapComputeInputRect(const D2D1_RECT_F& b, D2D1_RECT_L& out)
+    {
+        constexpr float kHuge = 1.0e7f;
+        const float c[4] = { b.left, b.top, b.right, b.bottom };
+        for (float v : c)
+            if (!std::isfinite(v) || std::fabs(v) > kHuge) return E_BOUNDS;
+        LONG L = static_cast<LONG>(std::floor(b.left));
+        LONG T = static_cast<LONG>(std::floor(b.top));
+        LONG R = static_cast<LONG>(std::ceil(b.right));
+        LONG B = static_cast<LONG>(std::ceil(b.bottom));
+        if (R <= L || B <= T) return E_NOT_VALID_STATE;
+        constexpr LONG kMaxExtent = 8192;
+        R = (std::min)(R, L + kMaxExtent);
+        B = (std::min)(B, T + kMaxExtent);
+        out = D2D1_RECT_L{ L, T, R, B };
+        return S_OK;
+    }
+
     // CustomComputeBridgeEffect
     // =========================
     //
@@ -137,6 +170,7 @@ namespace ShaderLab::Effects
         , public ID2D1DrawTransform
         , public ICustomComputeBridge
         , public IEngineComputeOutput
+        , public IEngineComputeTexture
     {
     public:
         // {6D69E5C2-1AC0-481E-9F94-3DB8CCAD5710}
@@ -215,11 +249,31 @@ namespace ShaderLab::Effects
         HRESULT STDMETHODCALLTYPE SetDispatchDims(
             UINT32 x, UINT32 y, UINT32 z) override;
 
+        // Async CPU readback for the NEXT Dispatch only: the copy is queued
+        // and the values are collected later through PollAnalysisReadback,
+        // instead of Map() draining the whole GPU pipeline right after the
+        // submit. Reset after each Dispatch.
+        void SetAsyncReadback(bool async) { m_asyncReadback = async; }
+        // Newest completed async readback, if any landed since the last call.
+        bool PollAnalysisReadback(std::vector<float>& out);
+        bool HasPendingReadback() const { return m_runner.HasPendingReadback(); }
+
         // ---- IEngineComputeOutput ----
         HRESULT STDMETHODCALLTYPE GetAnalysisSrv(
             ID3D11ShaderResourceView** out) override;
         UINT64 STDMETHODCALLTYPE GetLastEvaluatedFrame() override
         { return m_lastEvaluatedFrame; }
+
+        // ---- IEngineComputeTexture (lane 3) ----
+        // Pure delegation to the runner, which owns the texture. The bridge
+        // is the only thing the evaluator can QI -- D2D's outer ID2D1Effect
+        // does not forward arbitrary IIDs to the impl -- so every lane has to
+        // surface here even though none of them live here.
+        HRESULT STDMETHODCALLTYPE RequestAnalysisTexture() override;
+        HRESULT STDMETHODCALLTYPE GetAnalysisTexture(
+            ID3D11Texture2D** out) override;
+        HRESULT STDMETHODCALLTYPE GetAnalysisTextureSrv(
+            ID3D11ShaderResourceView** out) override;
 
     private:
         CustomComputeBridgeEffect() = default;
@@ -245,6 +299,22 @@ namespace ShaderLab::Effects
         Rendering::D3D11ComputeRunner m_runner;
         std::vector<BYTE>             m_pendingBytecode;
         bool                          m_bytecodeDirty{ false };
+        bool                          m_asyncReadback{ false };
+
+        // DXBC checksum identity of the pending / installed bytecode, and a
+        // few previously created shaders so a baseline <-> variant switch
+        // does not recreate one.
+        using ShaderId = std::array<uint8_t, 16>;
+        static ShaderId IdOf(const BYTE* bytes, size_t size);
+        ShaderId m_pendingId{};
+        ShaderId m_installedId{};
+        bool     m_hasInstalled{ false };
+        struct ShaderVariant
+        {
+            ShaderId                             id{};
+            winrt::com_ptr<ID3D11ComputeShader>  shader;
+        };
+        std::vector<ShaderVariant> m_shaderVariants;
 
         // Image-output side. Populated by `Dispatch` when
         // `imageOutputW > 0 && imageOutputH > 0`. The bitmap wraps a

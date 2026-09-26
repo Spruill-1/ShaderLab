@@ -232,7 +232,7 @@ sequenceDiagram
     Note over UI: UI thread blocks here<br/>(short — single eval iteration)
     Disp->>W: queue + Wake()
     W->>Graph: AddNode + FindNode<br/>+ PrepareSourceNode<br/>(render-side D2D ctx)
-    W->>Graph: MarkAllDirty
+    Note over W,Graph: the new node starts dirty;<br/>nothing else needs invalidating
     W-->>Disp: complete
     Disp-->>UI: return
     UI->>UI: AutoLayout + PopulatePreviewNodeSelector<br/>(XAML, UI thread)

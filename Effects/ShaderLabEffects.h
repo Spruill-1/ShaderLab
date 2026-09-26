@@ -4,6 +4,8 @@
 #include "../EngineExport.h"
 #include "../Graph/EffectNode.h"
 
+namespace ShaderLab::Graph { class EffectGraph; }
+
 namespace ShaderLab::Effects
 {
     // Describes a pre-built ShaderLab effect with embedded HLSL.
@@ -19,7 +21,14 @@ namespace ShaderLab::Effects
 
         // Stable identifier and version for upgrade detection.
         std::wstring effectId;          // Stable ID (survives renames)
-        uint32_t effectVersion{ 1 };    // Increment when HLSL or params change
+        uint32_t effectVersion{ 1 };   // Increment when HLSL or params change.
+        // Scoping note: a saved graph stores `colorMath + <effect HLSL>` and
+        // recompiles from that stored string, so a change to the SHARED
+        // ColorMath library changes the stored text of all ~23 effects that
+        // prepend it. Bump the ones whose BEHAVIOUR changes, not all 23 -- an
+        // upgrade prompt is only useful where taking it changes output, and
+        // blanket-bumping trains users to dismiss the badge. When you touch
+        // ColorMath, map the changed function to its call sites and bump those.
 
         // Embedded HLSL source — compiled on first use.
         std::string hlslSource;
@@ -42,6 +51,26 @@ namespace ShaderLab::Effects
         // Hidden default properties (in cbuffer but not shown in Properties panel).
         // Set on node creation; auto-updated by the evaluator for dynamic values.
         std::map<std::wstring, Graph::PropertyValue> hiddenDefaults;
+        // Trailing inputNames that are lookup tables. See
+        // CustomEffectDefinition::lookupInputCount.
+        uint32_t lookupInputCount{ 0 };
+
+        // Host-computed cbuffer contents ("derived constants"). For values
+        // that depend only on the node's parameters but are expensive --
+        // a gamut boundary polygon, a fit scale per intensity -- which a
+        // pixel shader would otherwise rebuild for every pixel. Called by the
+        // evaluator whenever it packs the node's cbuffer; `write(name, data,
+        // floatCount)` fills the cbuffer variable of that name if, and only
+        // if, the compiled shader declares it, so a saved graph carrying an
+        // older HLSL revision is simply unaffected. Implementations should
+        // memoize on their inputs: a node is re-applied every frame its
+        // upstream content changes.
+        using DerivedConstantWriter =
+            std::function<void(std::wstring_view name, const float* data, size_t floatCount)>;
+        using DerivedConstantsFn = std::function<void(
+            const std::map<std::wstring, Graph::PropertyValue>& props,
+            const DerivedConstantWriter& write)>;
+        DerivedConstantsFn deriveConstants;
 
         // Data-only effects have no visible image output pin. They produce
         // analysis output fields but their image output is internal only.
@@ -77,6 +106,13 @@ namespace ShaderLab::Effects
 
         // Create a fully-configured EffectNode from a descriptor.
         static Graph::EffectNode CreateNode(const ShaderLabEffectDescriptor& desc);
+
+        // Re-derive the runtime flags CreateNode sets from the descriptor but
+        // the JSON format does not carry (today: isClock). EVERY graph load
+        // must call this -- a Clock whose flag is false never advances and
+        // never emits Time / Progress, silently freezing everything bound to
+        // it. Only the GUI's file-open path used to do this.
+        static void RestoreRuntimeFlags(Graph::EffectGraph& graph);
 
     private:
         ShaderLabEffects();

@@ -41,6 +41,20 @@ namespace winrt::ShaderLab::implementation
         void SetPendingOpenPath(std::wstring path) { m_pendingOpenPath = std::move(path); }
 
         // XAML-bound event handlers (must be public for generated code).
+        // Performance-flyout toggles. These change how the app is MEASURED,
+        // not what it renders.
+        void OnGpuTimingToggled(winrt::Windows::Foundation::IInspectable const& sender,
+                                winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnForceRedrawToggled(winrt::Windows::Foundation::IInspectable const& sender,
+                                  winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnNodeGpuStatsToggled(winrt::Windows::Foundation::IInspectable const& sender,
+                                   winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnUnthrottledToggled(winrt::Windows::Foundation::IInspectable const& sender,
+                                  winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnAnalysisRefreshChanged(winrt::Windows::Foundation::IInspectable const& sender,
+                                      winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
+        void OnGpuBindingsToggled(winrt::Windows::Foundation::IInspectable const& sender,
+                                  winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
         void OnColumnSplitterPointerPressed(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
@@ -429,6 +443,22 @@ namespace winrt::ShaderLab::implementation
             uint32_t computeDispatches{};
             uint32_t framesSampled{};
             uint32_t endDrawFailed{};    // diagnostic: count of EndDraw failures (D2DERR_RECREATE_TARGET, etc.)
+
+            // --- GPU-side spans (D3D11 timestamp queries) --------------------
+            // Everything above is CPU wall-clock around an ASYNCHRONOUS API,
+            // so it measures command recording, not GPU execution. For shader
+            // work the two are unrelated: a still frame reported 114 fps here
+            // while one re-render of the same graph took hundreds of ms on the
+            // GPU. These fields are the real thing. Off unless gpuEnabled.
+            bool     gpuAvailable{};        // device supports timestamp queries
+            bool     gpuEnabled{};          // timing currently switched on
+            uint64_t gpuFramesResolved{};   // completed GPU frames measured
+            uint32_t gpuDisjointDrops{};    // samples voided by a GPU clock change
+            double   gpuFrameMs{};          // whole render, GPU time
+            double   gpuSourcesPrepMs{};
+            double   gpuEvaluateMs{};
+            double   gpuDeferredComputeMs{};
+            double   gpuDrawMs{};           // effect chain executes HERE (D2D is lazy)
         };
         FrameTimings m_frameTiming;
         FrameTimings m_lastFrameTiming;  // snapshot for MCP read
@@ -528,10 +558,19 @@ namespace winrt::ShaderLab::implementation
         winrt::fire_and_forget BrowseImageForSourceNode(uint32_t nodeId);
         winrt::fire_and_forget BrowseVideoForSourceNode();
         winrt::fire_and_forget BrowseVideoForExistingNode(uint32_t nodeId);
-        void OnSaveImageClicked(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
-        winrt::fire_and_forget SaveImageAsync();
+        // How saved pixel values relate to the working space's scene-
+        // referred scRGB (1.0 = 80 nits). The save path owns the
+        // re-referencing so any node saves correctly in any format:
+        //   PresentationPng — content's diffuse white sits at the OS SDR
+        //     white level (a graph output meant to be looked at on the
+        //     HDR desktop). Divides by SdrWhiteNits/80 in linear space,
+        //     then sRGB-encodes: the file's 1.0 = SDR reference white,
+        //     and DWM re-boosts it on display like any SDR file.
+        //   FilePng — content is already file-referenced (white at 1.0,
+        //     e.g. a pass-through of a loaded image). Encode only.
+        //   HdrJxr — scene-referred FP16 scRGB, written as-is.
+        enum class SaveReference { PresentationPng, FilePng, HdrJxr };
+        winrt::fire_and_forget SaveImageAsync(SaveReference ref);
 
         // Capture the current preview as a PNG byte buffer.
         // Returns empty vector on failure.
@@ -649,10 +688,19 @@ namespace winrt::ShaderLab::implementation
         void UpdateMcpActivityIndicator();
         void ResetMcpActivityState();
         void UpdateFpsTooltip();
+        // Sets the GPU-bindings flag and invalidates the effect cache on the
+        // render thread. Shared by the checkbox and the perf_gpu_bindings route.
+        void ApplyGpuBindingsMode(bool on);
         // Canonical FPS / timing strings shared by the main status bar and
         // every output window. Single source of truth.
         std::wstring BuildFpsStatusText() const;
         std::wstring BuildFpsTooltipText() const;
+
+        // Read by the render worker's needsEval gate every tick. Atomic because
+        // the UI thread writes it and the worker reads it; as a plain bool the
+        // worker never observed the write on ARM64, the same weak-memory
+        // failure the GPU timer's enable flag had.
+        std::atomic<bool> m_forceContinuousRedraw{ false };
 
         // Column splitter drag state.
         bool m_isDraggingSplitter{ false };
@@ -665,14 +713,30 @@ namespace winrt::ShaderLab::implementation
         float m_previewPanY{ 0.0f };
         float m_previewZoom{ 1.0f };
         std::atomic<bool> m_needsFitPreview{ false };  // set on UI/dispatch, read+cleared on worker
+        // Keep the preview fitted (re-fit whenever the image bounds or the
+        // panel size change) until the user pans or zooms; double-click turns
+        // it back on. Without this the preview opened at zoom 1 / pan 0 --
+        // the top-left corner of a 4K image -- unless something happened to
+        // request a one-shot fit (File > Open did; MCP graph_load did not).
+        std::atomic<bool> m_previewAutoFit{ true };
+        // Preview image bounds (context DIPs), measured by the render worker on
+        // the render context each preview draw; read via GetPreviewImageBounds.
+        std::mutex m_previewBoundsMutex;
+        D2D1_RECT_F m_previewBounds{};
         // Per-node preview view memory: returning to a previously-examined node
         // restores its pan/zoom; a node examined for the first time fits.
-        struct PreviewView { float zoom{ 1.0f }; float panX{ 0.0f }; float panY{ 0.0f }; };
+        struct PreviewView { float zoom{ 1.0f }; float panX{ 0.0f }; float panY{ 0.0f }; bool autoFit{ true }; };
         std::unordered_map<uint32_t, PreviewView> m_previewViews;
         // Preview panel size, cached on the UI thread (OnRenderTick) so the
         // render worker can fit-to-view after an eval without touching XAML.
         float m_previewViewportW{ 0.0f };
         float m_previewViewportH{ 0.0f };
+        // Preview pixels per DIP (the panel's CompositionScale), published by
+        // the UI tick for the render worker. Pan / zoom / viewport stay in
+        // DIPs; the preview draw multiplies by this so a DIP-space view fills
+        // the physical-pixel back buffer at full resolution.
+        std::atomic<float> m_previewPixelScale{ 1.0f };
+
         // Written from the UI thread, the render worker, and MCP dispatch
         // closures — atomic for cross-thread visibility.
         std::atomic<bool> m_forceRender{ true }; // Force first render + after pan/zoom changes
@@ -686,6 +750,14 @@ namespace winrt::ShaderLab::implementation
         float m_previewPanOriginX{ 0.0f };
         float m_previewPanOriginY{ 0.0f };
         bool m_previewDragMoved{ false };
+        // Left-button double-click tracking for "re-fit the preview". The
+        // DoubleTapped event cannot be used here: OnPreviewPointerPressed marks
+        // the left-button press Handled to drive panning, and a handled
+        // PointerPressed suppresses XAML's gesture recogniser for that pointer.
+        // (OutputWindow can use the event because it pans on middle/right only.)
+        int64_t m_previewLastClickMs{ 0 };
+        float m_previewLastClickX{ 0.0f };
+        float m_previewLastClickY{ 0.0f };
         float m_traceClickDipX{ 0.0f };
         float m_traceClickDipY{ 0.0f };
         float m_traceClickPanX{ 0.0f };

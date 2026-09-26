@@ -9,6 +9,7 @@
 #include "MainWindow.xaml.h"
 
 #include "Rendering/PipelineFormat.h"
+#include "Effects/Performance.h"
 
 namespace winrt::ShaderLab::implementation
 {
@@ -61,6 +62,8 @@ namespace winrt::ShaderLab::implementation
         {
             m_previewViewportW = static_cast<float>(panel.ActualWidth());
             m_previewViewportH = static_cast<float>(panel.ActualHeight());
+            m_previewPixelScale.store((std::max)(1e-3f, static_cast<float>(panel.CompositionScaleX())),
+                                      std::memory_order_relaxed);
         }
 
         // Drain pending dispatcher closures: NO-OP from the UI side post-P7.
@@ -204,7 +207,46 @@ namespace winrt::ShaderLab::implementation
         auto last = std::chrono::steady_clock::now();
         while (!stop.stop_requested() && !m_renderShouldStop.load(std::memory_order_acquire))
         {
-            m_renderDispatcher.WaitFor(std::chrono::milliseconds(16));
+            // Pacing. The 16 ms timeout is what makes this an editor rather
+            // than a benchmark: it caps the worker near 62.5 Hz so a static
+            // graph does not spin a core. In unthrottled mode we drain
+            // without blocking and loop immediately, so the only limit left
+            // is how fast the machine can actually evaluate the graph.
+            //
+            // Note the wait is a cv predicate wait either way, so a queued
+            // MCP closure already wakes it early -- MCP traffic itself raises
+            // the tick rate, which is worth remembering when benchmarking
+            // over MCP.
+            const bool unthrottled = ::ShaderLab::Performance::IsUnthrottledRenderEnabled();
+            if (unthrottled)
+            {
+                // Drain without blocking, then hand the timeslice over before
+                // re-entering the loop.
+                //
+                // The yield is not politeness, it is required. Each iteration
+                // takes m_graphMutex EXCLUSIVELY twice, and with no wait at
+                // all the next acquire follows the previous release by
+                // essentially zero time. std::shared_mutex is an SRWLOCK and
+                // SRWLOCK is not fair, so the UI thread's shared read for a
+                // canvas paint can lose that race indefinitely -- the app
+                // stays alive and keeps rendering while its UI stops
+                // responding, which is indistinguishable from a hang.
+                // SwitchToThread gives a ready thread on this processor its
+                // chance between iterations.
+                m_renderDispatcher.WaitFor(std::chrono::milliseconds(0));
+                std::this_thread::yield();
+            }
+            else
+            {
+                // The 16 ms timeout is what makes this an editor rather than
+                // a benchmark: it caps the worker near 62.5 Hz so a static
+                // graph does not spin a core.
+                //
+                // Either way this is a cv PREDICATE wait, so a queued MCP
+                // closure wakes it early -- MCP traffic itself raises the
+                // tick rate, which matters when benchmarking over MCP.
+                m_renderDispatcher.WaitFor(std::chrono::milliseconds(16));
+            }
             {
                 // Every MCP mutation arrives as a closure drained here. Hold the
                 // graph exclusively across the whole drain rather than per
@@ -315,7 +357,27 @@ namespace winrt::ShaderLab::implementation
                             node.clockTime = std::clamp(node.clockTime, 0.0, duration);
                             if (node.clockTime >= duration) node.isPlaying = false;
                         }
-                        node.dirty = true;
+
+                        // UpdateRate gates the DIRTY, not just the value. At 0
+                        // the clock behaves as it always has: every frame is a
+                        // tick, and every consumer re-evaluates. Above 0 it
+                        // only ticks when clockTime crosses into a new 1/rate
+                        // bucket, so a 10 Hz clock invalidates downstream work
+                        // ten times a second however fast the renderer runs.
+                        // GraphEvaluator quantises Time/Progress with the same
+                        // rule, so the value a consumer sees always matches the
+                        // tick it was woken for.
+                        float updateRate = getF(L"UpdateRate", 0.0f);
+                        bool emit = true;
+                        if (updateRate > 0.0f)
+                        {
+                            const double step = 1.0 / static_cast<double>(updateRate);
+                            const long long bucket =
+                                static_cast<long long>(std::floor(node.clockTime / step));
+                            emit = (bucket != node.clockTickBucket);
+                            node.clockTickBucket = bucket;
+                        }
+                        if (emit) node.dirty = true;
                     }
                 }
 
@@ -361,7 +423,52 @@ namespace winrt::ShaderLab::implementation
                     std::scoped_lock lk(m_outputSinksMutex);
                     hasOutputWindows = !m_outputSinks.empty();
                 }
-                bool needsEval = hasDirty || m_needsFitPreview || m_forceRender || hasOutputWindows;
+                // GPU timing implies "keep rendering". With a static graph
+                // nothing is dirty, so the worker idles and RenderFrameToOffscreen
+                // never runs -- the timer opens ONE frame, the 4-deep ring never
+                // retires, and every span reads 0.00 ms. That looks exactly like
+                // a broken timer rather than an idle renderer, and cost real time
+                // to diagnose. Asking to measure GPU time is asking for frames to
+                // measure, so supply them.
+                // GPU timing implies "keep rendering", and the flyout's
+                // Force-continuous-redraw box says so explicitly. With a static
+                // graph nothing is dirty, so the worker idles and
+                // RenderFrameToOffscreen never runs -- the timer opens ONE
+                // frame, the 4-deep ring never retires, and every span reads
+                // 0.00 ms. That looks exactly like a broken timer rather than
+                // an idle renderer, and cost real time to diagnose.
+                bool gpuTiming = m_renderEngine.Timer().IsEnabled();
+                bool forceRedraw = m_forceContinuousRedraw.load(std::memory_order_acquire);
+                // `unthrottled` implies evaluate-every-tick. Without that
+                // the loop would free-run over a clean graph and do nothing
+                // at all -- burning a core to measure zero. The point of the
+                // mode is to answer "how fast can this pipeline run", which
+                // requires actually running it.
+                // An async analysis readback still in flight needs frames to
+                // land: its values arrive on a later Evaluate, which then
+                // re-dirties whatever is bound to them.
+                bool pendingReadback = m_graphEvaluator.HasPendingReadbacks();
+                bool needsEval = hasDirty || m_needsFitPreview || m_forceRender
+                              || hasOutputWindows || gpuTiming || forceRedraw
+                              || unthrottled || pendingReadback;
+                // Force redraw means the WORST case, every frame: every node
+                // regenerates as if all of its inputs had just changed. Only
+                // evaluating is not that -- a clean graph evaluates to cached
+                // outputs (D2D output caching serves the effects, clean compute
+                // nodes skip their dispatch, the gamut LUT is reused), which
+                // measured 0.24 ms / 3671 fps on the bird graph: the cost of
+                // doing nothing. Dirtying every node forces all of it to run:
+                // D2D output caches are dropped, every compute node dispatches,
+                // generators rebuild.
+                //
+                // Deliberately AFTER `hasDirty` is read, so forced dirtiness
+                // does not bump m_graphGeneration -- that counter means "the
+                // graph was edited", and the UI rebuilds on it. Image sources
+                // stay decoded: a dirty image re-evaluates downstream but only
+                // re-reads the file when its path changes (SourceNodeFactory),
+                // so this measures the pipeline, not disk and WIC.
+                if (needsEval && forceRedraw)
+                    m_graph.MarkAllDirty();
                 if (needsEval)
                 {
                     RenderFrameToOffscreen(dt);
@@ -374,10 +481,19 @@ namespace winrt::ShaderLab::implementation
                     // computes zoom/pan here on the worker -- worker-owned
                     // bounds + the UI-cached viewport, no XAML. Force one more
                     // frame so the fitted transform actually renders.
-                    if (m_needsFitPreview && FitPreviewToView())
+                    // Auto-fit re-runs the fit every evaluated frame, so only
+                    // force a further frame when the fit actually MOVED the
+                    // view -- forcing unconditionally would keep a static
+                    // graph rendering forever.
+                    if (m_needsFitPreview || m_previewAutoFit.load(std::memory_order_acquire))
                     {
-                        m_needsFitPreview = false;
-                        m_forceRender = true;
+                        const float z0 = m_previewZoom, x0 = m_previewPanX, y0 = m_previewPanY;
+                        if (FitPreviewToView())
+                        {
+                            m_needsFitPreview = false;
+                            if (m_previewZoom != z0 || m_previewPanX != x0 || m_previewPanY != y0)
+                                m_forceRender = true;
+                        }
                     }
                 }
 
@@ -480,6 +596,11 @@ namespace winrt::ShaderLab::implementation
 
         auto tFrameStart = std::chrono::high_resolution_clock::now();
 
+        // GPU spans. No-ops unless GPU timing is switched on, which it is not
+        // by default: closing a span around D2D work needs a Flush, and that
+        // breaks D2D's batching and perturbs the frame being measured.
+        auto& gpu = m_renderEngine.Timer();
+
         // Pick the buffer to write to. We use the OPPOSITE of whatever was
         // just published, so UI thread can keep reading the other one
         // concurrently without contention.
@@ -494,6 +615,16 @@ namespace winrt::ShaderLab::implementation
         if (!dc) return;
         auto* targetBitmap = m_renderEngine.OffscreenRenderBitmap(writeIdx);
         if (!targetBitmap) return;
+
+        // Open the GPU frame only AFTER every early return above. A BeginFrame
+        // with no matching EndFrame leaves the slot's disjoint query begun and
+        // never ended, and m_writeIndex never advances -- so the ring wedges on
+        // that slot and nothing ever retires again. The symptom is
+        // framesResolved stuck at 0 with no error anywhere, which reads as
+        // "the GPU did no work" rather than "the timer is jammed".
+        gpu.BeginFrame();
+        gpu.Begin(::ShaderLab::Rendering::GpuSpan::Frame);
+        gpu.Begin(::ShaderLab::Rendering::GpuSpan::SourcesPrep);
 
         // ---- Source preparation + graph evaluation (same as RenderFrame) ----
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
@@ -512,6 +643,8 @@ namespace winrt::ShaderLab::implementation
         }
 
         auto tSourcesEnd = std::chrono::high_resolution_clock::now();
+        gpu.End(::ShaderLab::Rendering::GpuSpan::SourcesPrep);
+        gpu.Begin(::ShaderLab::Rendering::GpuSpan::Evaluate);
 
         // Compute which nodes are needed (mark roots + propagate upstream).
         {
@@ -560,16 +693,27 @@ namespace winrt::ShaderLab::implementation
             m_graphEvaluator.Evaluate(m_graph, dc); // second pass for new effects
 
         auto tEvalEnd = std::chrono::high_resolution_clock::now();
+        gpu.End(::ShaderLab::Rendering::GpuSpan::Evaluate);
 
         // ---- BeginDraw on offscreen + ProcessDeferredCompute + draw preview --
         winrt::com_ptr<ID2D1Image> oldTarget;
         dc->GetTarget(oldTarget.put());
         dc->SetTarget(targetBitmap);
         dc->BeginDraw();
+        gpu.Begin(::ShaderLab::Rendering::GpuSpan::DeferredCompute);
 
         // CPU-analysis interest set (same as old RenderFrame).
         {
             std::unordered_set<uint32_t> interest;
+            // "Refresh analysis readouts" set to all nodes: hint every
+            // compute node so the canvas labels on unselected nodes refresh
+            // at the throttle interval, not only the selected node's.
+            if (::ShaderLab::Performance::IsCpuAnalysisHintAllNodesEnabled())
+            {
+                for (const auto& n : m_graph.Nodes())
+                    if (n.type == ::ShaderLab::Graph::NodeType::ComputeShader)
+                        interest.insert(n.id);
+            }
             if (m_selectedNodeId != 0)
             {
                 interest.insert(m_selectedNodeId);
@@ -599,32 +743,172 @@ namespace winrt::ShaderLab::implementation
             }
         }
 
+        gpu.End(::ShaderLab::Rendering::GpuSpan::DeferredCompute, dc);
         auto tComputeEnd = std::chrono::high_resolution_clock::now();
-        uint32_t computeCount = static_cast<uint32_t>(m_graphEvaluator.DeferredComputeCount());
+        // The Draw span is where the tone mapper actually costs something:
+        // D2D evaluates the effect chain lazily at DrawImage/EndDraw, not
+        // during Evaluate, so shader time lands here and nowhere else.
+        gpu.Begin(::ShaderLab::Rendering::GpuSpan::Draw);
+        // Dispatches actually issued, not queue depth: ProcessDeferredCompute
+        // drains its queue before returning, so DeferredComputeCount() here
+        // read 0 on every frame the app has ever run.
+        uint32_t computeCount = m_graphEvaluator.DispatchesLastFrame();
 
-        // Set DPI to 96 to match WinUI DIPs.
+        // Set DPI to 96 to match WinUI DIPs — but only when the context
+        // isn't already there: a real per-frame DPI flip invalidates every
+        // D2D1_PROPERTY_CACHED effect intermediate in the context. The
+        // render context is pinned at 96 (RenderEngine), so this is
+        // normally a no-op kept as a safety net.
         float oldDpiX, oldDpiY;
         dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
+        const bool dpiFlip = (oldDpiX != 96.0f || oldDpiY != 96.0f);
+        if (dpiFlip)
+            dc->SetDpi(96.0f, 96.0f);
 
         dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
 
+        // Pan / zoom are in DIPs (they follow pointer positions); the back
+        // buffer is in physical pixels, shown 1:1 via the swap chain's inverse
+        // composition-scale matrix. The final Scale maps DIPs onto those
+        // pixels. Without it -- and without the matrix -- the preview was
+        // magnified by the display scale and anchored top-left.
+        const float pxPerDip = m_previewPixelScale.load(std::memory_order_relaxed);
         D2D1_MATRIX_3X2_F previewTransform =
             D2D1::Matrix3x2F::Scale(m_previewZoom, m_previewZoom) *
-            D2D1::Matrix3x2F::Translation(m_previewPanX, m_previewPanY);
+            D2D1::Matrix3x2F::Translation(m_previewPanX, m_previewPanY) *
+            D2D1::Matrix3x2F::Scale(pxPerDip, pxPerDip);
         dc->SetTransform(previewTransform);
 
         auto* previewImage = ResolveDisplayImage(m_previewNodeId);
         if (previewImage)
             dc->DrawImage(previewImage);
 
+        // Publish the preview image's bounds for everyone else (the fit below
+        // this frame, pointer mapping, Pixel Trace, MCP). They must be measured
+        // HERE, on the render context that owns the image: an effect image is
+        // bound to the context that built it, and the old code asked the UI
+        // context, which failed and returned an empty rect -- so the fit
+        // deferred forever and the preview sat at zoom 1 on the top-left of the
+        // image, and pointer/trace mapping fell back to the viewport size.
+        {
+            D2D1_RECT_F pb{};
+            if (!previewImage || FAILED(dc->GetImageLocalBounds(previewImage, &pb)))
+                pb = D2D1_RECT_F{};
+            std::scoped_lock lock(m_previewBoundsMutex);
+            m_previewBounds = pb;
+        }
+
         dc->SetTransform(D2D1::Matrix3x2F::Identity());
-        dc->SetDpi(oldDpiX, oldDpiY);
+        if (dpiFlip)
+            dc->SetDpi(oldDpiX, oldDpiY);
 
         auto tDrawEnd = std::chrono::high_resolution_clock::now();
 
         HRESULT hrEnd = dc->EndDraw();
         dc->SetTarget(oldTarget.get());
+
+        gpu.End(::ShaderLab::Rendering::GpuSpan::Draw);
+        gpu.End(::ShaderLab::Rendering::GpuSpan::Frame);
+        gpu.EndFrame();
+
+        // Publish per-node GPU results onto the nodes, where the canvas picks
+        // them up through the ordinary GraphUiSnapshot copy.
+        //
+        // Two kinds of number, and the difference is worth keeping straight:
+        //
+        //  * A COMPUTE node reports its own dispatch. That is exact -- each
+        //    bridge dispatch is its own D3D11 submission -- and free.
+        //
+        //  * A D2D IMAGE node reports nothing, EXCEPT the one at the end of
+        //    the chain, which carries the whole fused chain's draw cost.
+        //    Direct2D evaluates a chain lazily at DrawImage, so the
+        //    intermediate effects are never separately dispatched and cannot
+        //    be attributed without materialising each one -- which would
+        //    change the very workload being measured. Attributing the Draw
+        //    span to the drawn node instead is honest and costs nothing: it
+        //    says "everything feeding this node cost X together", which is
+        //    the true shape of the work.
+        {
+            using ::ShaderLab::Graph::GpuNodeState;
+            const auto& nodeMs = gpu.NodeResults();
+            const double chainMs = gpu.SpanMs(::ShaderLab::Rendering::GpuSpan::Draw);
+            const bool timing = gpu.IsEnabled();
+
+            for (auto& n : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+            {
+                // Same rule the evaluator uses to route a node to the D3D11
+                // bridge. Kept in sync deliberately: a node the evaluator
+                // dispatches is a node the timer can bracket, and one it
+                // doesn't is a node whose cost lives inside a D2D chain.
+                const bool isBridgeCompute =
+                    (n.type == ::ShaderLab::Graph::NodeType::PixelShader ||
+                     n.type == ::ShaderLab::Graph::NodeType::ComputeShader) &&
+                    n.customEffect.has_value() &&
+                    n.customEffect->shaderType ==
+                        ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader;
+
+                auto it = nodeMs.find(n.id);
+                double ms = (it == nodeMs.end()) ? -1.0 : it->second;
+                GpuNodeState state = GpuNodeState::Unmeasured;
+
+                if (!timing)
+                {
+                    ms = -1.0;
+                }
+                else if (it != nodeMs.end())
+                {
+                    // Its own bracketed dispatch.
+                    state = GpuNodeState::Measured;
+                }
+                else if (n.id == m_previewNodeId && chainMs > 0.0)
+                {
+                    // The drawn node is the chain end, so it carries the cost
+                    // of everything D2D fused into the draw that produced it.
+                    ms = chainMs;
+                    state = GpuNodeState::Measured;
+                }
+                else if (!n.needed)
+                {
+                    // The evaluator skipped it: nothing downstream consumes
+                    // its output. Worth saying out loud -- an analysis node
+                    // with no consumer reads as "broken measurement" when it
+                    // is really "not wired to anything".
+                    state = GpuNodeState::Idle;
+                }
+                else if (isBridgeCompute)
+                {
+                    // Needed, but the evaluator did not dispatch it -- clean,
+                    // so it served its cached result. Zero, not unknown.
+                    ms = 0.0;
+                    state = GpuNodeState::Cached;
+                }
+                else if (n.outputPins.empty())
+                {
+                    // No image output and not a compute dispatch: a parameter
+                    // node. It cannot be fused into a D2D chain because it
+                    // contributes nothing to one.
+                    ms = 0.0;
+                    state = GpuNodeState::CpuOnly;
+                }
+                else
+                {
+                    // A D2D image node upstream of a chain end. Its cost is
+                    // inside that end's figure and cannot be split out without
+                    // materialising it separately.
+                    state = GpuNodeState::Fused;
+                }
+
+                n.lastGpuMs = ms;
+                n.gpuState = state;
+            }
+
+            // The figures change every frame, so the canvas has to be told
+            // it is stale -- otherwise the annotations freeze at whatever was
+            // on screen when the last topology change happened, which looks
+            // exactly like a broken measurement.
+            if (m_nodeGraphController.ShowNodeGpuStats())
+                m_nodeGraphController.SetNeedsRedraw();
+        }
 
         auto tEndDraw = std::chrono::high_resolution_clock::now();
 
@@ -644,6 +928,20 @@ namespace winrt::ShaderLab::implementation
             t.drawUs            = t.drawUs            * (1-a) + usec(tComputeEnd,  tDrawEnd)    * a;
             t.endDrawFlushUs    = t.endDrawFlushUs    * (1-a) + usec(tDrawEnd,     tEndDraw)    * a;
             t.computeDispatches = computeCount;
+            using GS = ::ShaderLab::Rendering::GpuSpan;
+            t.gpuAvailable       = gpu.IsInitialized();
+            t.gpuEnabled         = gpu.IsEnabled();
+            t.gpuFramesResolved  = gpu.FramesResolved();
+            t.gpuDisjointDrops   = gpu.DisjointDrops();
+            // GPU spans are NOT exponentially averaged like the CPU ones: they
+            // already lag by up to kLatency frames, and smoothing a lagged
+            // signal makes a step change (the thing a perf A/B is looking for)
+            // take ~30 frames to appear and read as drift.
+            t.gpuFrameMs         = gpu.SpanMs(GS::Frame);
+            t.gpuSourcesPrepMs   = gpu.SpanMs(GS::SourcesPrep);
+            t.gpuEvaluateMs      = gpu.SpanMs(GS::Evaluate);
+            t.gpuDeferredComputeMs = gpu.SpanMs(GS::DeferredCompute);
+            t.gpuDrawMs          = gpu.SpanMs(GS::Draw);
             t.totalUs           = t.totalUs           * (1-a) + usec(tFrameStart,  tEndDraw)    * a;
             t.framesSampled++;
             t.endDrawFailed     = FAILED(hrEnd) ? (t.endDrawFailed + 1) : t.endDrawFailed;
@@ -860,6 +1158,14 @@ namespace winrt::ShaderLab::implementation
         if (FAILED(hr)) return;
 
         m_uiD2dContext->SetTarget(backBufferBitmap.get());
+        // A 1:1 pixel copy: pin the DPI and transform instead of inheriting
+        // them. This context is SHARED with the node-graph canvas, which sets
+        // it to 96 * CompositionScale on every repaint and leaves it there; the
+        // preview blit used to inherit that, upscaling the finished frame 1.5x
+        // at 150% scaling on top of the panel's own composition scale -- the
+        // preview showed a zoomed-in corner of a correctly fitted image.
+        m_uiD2dContext->SetDpi(96.0f, 96.0f);
+        m_uiD2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
         m_uiD2dContext->BeginDraw();
         m_uiD2dContext->Clear(D2D1::ColorF(D2D1::ColorF::Black));
         m_uiD2dContext->DrawImage(sourceBitmap);
@@ -867,8 +1173,15 @@ namespace winrt::ShaderLab::implementation
         m_uiD2dContext->SetTarget(nullptr);
         if (FAILED(hr)) return;
 
+        // Interval 0 in unthrottled mode. Interval 1 blocks this thread until
+        // scanout, and with the worker free-running there is a new frame to
+        // blit on nearly every UI tick -- so the UI thread would spend most
+        // of its time parked in Present1 and input would starve. Tearing is
+        // the accepted cost; see Performance::IsUnthrottledRenderEnabled.
+        const UINT interval =
+            ::ShaderLab::Performance::IsUnthrottledRenderEnabled() ? 0u : 1u;
         DXGI_PRESENT_PARAMETERS params{};
-        swap->Present1(1, 0, &params);
+        swap->Present1(interval, 0, &params);
     }
 
 }

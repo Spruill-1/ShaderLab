@@ -11,6 +11,7 @@
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/DxgiDuplicationSourceProvider.h"
 #include "Effects/Performance.h"
+#include "Effects/ImageLoader.h"
 #include "Version.h"
 #include "EngineExport.h"
 #include <microsoft.ui.xaml.media.dxinterop.h>
@@ -96,6 +97,20 @@ namespace winrt::ShaderLab::implementation
 
         // Wire up event handlers (safe before panel is loaded).
         PreviewPanel().SizeChanged({ this, &MainWindow::OnPreviewSizeChanged });
+        // Display scale changes (moving to a monitor with different scaling)
+        // change the pixel size without changing the DIP size, so SizeChanged
+        // does not fire: resize the buffer and refresh the inverse matrix here.
+        PreviewPanel().CompositionScaleChanged([this](auto&&, auto&&)
+        {
+            if (!m_renderEngine.IsInitialized()) return;
+            auto panel = PreviewPanel();
+            const float sx = panel.CompositionScaleX(), sy = panel.CompositionScaleY();
+            m_renderEngine.SetCompositionScale(sx, sy);
+            m_renderEngine.Resize(
+                static_cast<uint32_t>((std::max)(1.0, panel.ActualWidth() * sx)),
+                static_cast<uint32_t>((std::max)(1.0, panel.ActualHeight() * sy)));
+            m_forceRender = true;
+        });
         PreviewPanel().PointerMoved({ this, &MainWindow::OnPreviewPointerMoved });
         PreviewPanel().KeyDown({ this, &MainWindow::OnPreviewKeyDown });
         PreviewPanel().IsTabStop(true);
@@ -119,6 +134,7 @@ namespace winrt::ShaderLab::implementation
             m_previewPanX = cursorX - (cursorX - m_previewPanX) * (newZoom / m_previewZoom);
             m_previewPanY = cursorY - (cursorY - m_previewPanY) * (newZoom / m_previewZoom);
             m_previewZoom = newZoom;
+            m_previewAutoFit = false;
             m_forceRender = true;
             args.Handled(true);
         });
@@ -167,7 +183,6 @@ namespace winrt::ShaderLab::implementation
                 node.cachedOutput = nullptr; // raw pointer is now dangling
                 m_graphEvaluator.InvalidateNode(node.id);
             }
-            m_graph.MarkAllDirty();
             m_nodeGraphController.RebuildLayout();
             PopulatePreviewNodeSelector();
             UpdatePropertiesPanel();
@@ -276,7 +291,6 @@ namespace winrt::ShaderLab::implementation
                         m_graph.Connect(srcIt->second, edge.sourcePin, dstIt->second, edge.destPin);
                 }
 
-                m_graph.MarkAllDirty();
                 m_nodeGraphController.RebuildLayout();
                 PopulatePreviewNodeSelector();
                 args.Handled(true);
@@ -311,7 +325,6 @@ namespace winrt::ShaderLab::implementation
 
                 m_nodeGraphController.DeleteSelected();
                 m_selectedNodeId = 0;
-                m_graph.MarkAllDirty();
                 m_nodeGraphController.RebuildLayout();
                 PopulatePreviewNodeSelector();
                 UpdatePropertiesPanel();
@@ -332,7 +345,25 @@ namespace winrt::ShaderLab::implementation
         });
         NodeGraphContainer().IsTabStop(true);
 
-        SaveImageButton().Click({ this, &MainWindow::OnSaveImageClicked });
+        // Save flyout: the reference frame of the saved file is an
+        // explicit choice, not an inference — a heuristic would darken
+        // the plain image→PNG round trip or wash presentation-graded
+        // output (see SaveReference in the header).
+        {
+            winrt::Microsoft::UI::Xaml::Controls::MenuFlyout saveFlyout;
+            auto addSaveItem = [this, &saveFlyout](
+                winrt::hstring const& text, SaveReference ref)
+            {
+                winrt::Microsoft::UI::Xaml::Controls::MenuFlyoutItem item;
+                item.Text(text);
+                item.Click([this, ref](auto&&, auto&&) { SaveImageAsync(ref); });
+                saveFlyout.Items().Append(item);
+            };
+            addSaveItem(L"PNG (SDR) — from presentation white", SaveReference::PresentationPng);
+            addSaveItem(L"PNG (SDR) — file-referenced as-is", SaveReference::FilePng);
+            addSaveItem(L"JPEG XR (HDR) — scene-referred", SaveReference::HdrJxr);
+            SaveImageButton().Flyout(saveFlyout);
+        }
         EffectDesignerButton().Click([this](auto&&, auto&&) { OpenEffectDesigner(); });
 
         // MCP server toggle.
@@ -498,6 +529,22 @@ namespace winrt::ShaderLab::implementation
         // MCP /analysis/{id} reads temporarily disable the flag so they
         // always return fresh values regardless of selection.
         ::ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(true);
+        // The live loop never needs analysis values the same frame they are
+        // produced, so it collects them asynchronously instead of draining
+        // the GPU pipeline once per compute node. MCP reads force a blocking
+        // frame (they turn skip-readback off for it). See Performance.h.
+        ::ShaderLab::Performance::SetAsyncAnalysisReadbackEnabled(true);
+        // Per-node GPU attribution. The evaluator brackets each compute
+        // dispatch when this is set AND timing is enabled; no-op otherwise.
+        m_graphEvaluator.SetGpuTimer(&m_renderEngine.Timer());
+        // Reflect that default in the flyout, so the checkbox is not
+        // showing the opposite of what the engine is doing.
+        if (AnalysisRefreshCombo()) AnalysisRefreshCombo().SelectedIndex(0);
+        if (GpuTimingCheck())    GpuTimingCheck().IsChecked(false);
+        if (ForceRedrawCheck())  ForceRedrawCheck().IsChecked(false);
+        if (GpuBindingsCheck())  GpuBindingsCheck().IsChecked(::ShaderLab::Performance::IsGpuBindingsEnabled());
+        if (NodeGpuStatsCheck()) NodeGpuStatsCheck().IsChecked(false);
+        if (UnthrottledCheck())  UnthrottledCheck().IsChecked(::ShaderLab::Performance::IsUnthrottledRenderEnabled());
 
         // Subscribe to display changes (AdvancedColorInfoChanged: HDR
         // toggle, SDR-brightness slider, monitor move, profile sim).
@@ -982,8 +1029,14 @@ namespace winrt::ShaderLab::implementation
         }
 
         // ---- RELOAD GRAPH ----
-        try { m_graph = ::ShaderLab::Graph::EffectGraph::FromJson(graphJson); }
-        catch (...) {}
+        try
+        {
+            m_graph = ::ShaderLab::Graph::EffectGraph::FromJson(graphJson);
+            // The adapter-switch reload used to skip this, so switching GPU
+            // left every Clock in the graph frozen.
+            ::ShaderLab::Effects::ShaderLabEffects::RestoreRuntimeFlags(m_graph);
+        }
+        catch (...) {}  // intentional: a failed reload leaves the empty graph; ResetAfterGraphLoad copes
         ResetAfterGraphLoad(false);
         m_nodeGraphController.RebuildLayout();
 
@@ -1152,7 +1205,6 @@ namespace winrt::ShaderLab::implementation
                         } catch (...) {}
                     }
                 }
-                m_graph.MarkAllDirty();
                 return 0;
             });
         }
@@ -1176,6 +1228,8 @@ namespace winrt::ShaderLab::implementation
         auto w = static_cast<uint32_t>((std::max)(1.0f, static_cast<float>(args.NewSize().Width) * scale));
         auto h = static_cast<uint32_t>((std::max)(1.0f, static_cast<float>(args.NewSize().Height) * scale));
         m_renderEngine.Resize(w, h);
+        if (m_previewAutoFit.load(std::memory_order_acquire))
+            m_needsFitPreview = true;
     }
 
     // -----------------------------------------------------------------------
@@ -1399,7 +1453,6 @@ namespace winrt::ShaderLab::implementation
                         if (!slDesc) return;
                         auto node = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*slDesc);
                         m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
-                        m_graph.MarkAllDirty();
                         m_nodeGraphController.RebuildLayout();
                         PopulatePreviewNodeSelector();
                         // Force a render tick that triggers the post-eval
@@ -1502,7 +1555,6 @@ namespace winrt::ShaderLab::implementation
                 outputNode.inputPins = { { L"Input", 0 } };
                 auto nodeId = m_nodeGraphController.AddNode(std::move(outputNode), { 0.0f, 0.0f });
 
-                m_graph.MarkAllDirty();
                 m_nodeGraphController.RebuildLayout();
                 PopulatePreviewNodeSelector();
 
@@ -1566,7 +1618,6 @@ namespace winrt::ShaderLab::implementation
                     newNode.customEffect = std::move(def);
 
                     m_nodeGraphController.AddNode(std::move(newNode), { 0.0f, 0.0f });
-                    m_graph.MarkAllDirty();
                     m_nodeGraphController.RebuildLayout();
                     PopulatePreviewNodeSelector();
                     PopulateAddNodeFlyout(); // refresh custom effects list
@@ -1601,15 +1652,12 @@ namespace winrt::ShaderLab::implementation
         winrt::Windows::Storage::Pickers::FileOpenPicker picker;
         picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
         picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::PicturesLibrary);
-        picker.FileTypeFilter().Append(L".png");
-        picker.FileTypeFilter().Append(L".jpg");
-        picker.FileTypeFilter().Append(L".jpeg");
-        picker.FileTypeFilter().Append(L".bmp");
-        picker.FileTypeFilter().Append(L".tif");
-        picker.FileTypeFilter().Append(L".tiff");
-        picker.FileTypeFilter().Append(L".hdr");
-        picker.FileTypeFilter().Append(L".exr");
-        picker.FileTypeFilter().Append(L".jxr");
+        // Ask WIC what this machine can actually decode instead of hardcoding.
+        // The old fixed list silently excluded formats the loader handles
+        // perfectly well -- .heic decoded fine but was unpickable, because
+        // HEIF ships as an installable OS extension and was never in the list.
+        for (const auto& ext : ::ShaderLab::Effects::ImageLoader::SupportedExtensions())
+            picker.FileTypeFilter().Append(winrt::hstring(ext));
 
         auto file = co_await picker.PickSingleFileAsync();
         if (!file) co_return;
@@ -1676,7 +1724,9 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::OnNodeAdded(uint32_t /*nodeId*/)
     {
-        m_graph.MarkAllDirty();
+        // A new node starts dirty and nothing consumes it yet, so there is
+        // nothing else to invalidate. (This used to MarkAllDirty: every
+        // compute node re-dispatched and every D2D cache dropped per add.)
         m_nodeGraphController.RebuildLayout();
         PopulatePreviewNodeSelector();
         MarkUnsaved();
@@ -1778,25 +1828,14 @@ namespace winrt::ShaderLab::implementation
         return { w, h };
     }
 
+    // Safe on any thread: returns what the render worker measured on the
+    // render context while drawing the preview (at most one frame stale). The
+    // image itself is never touched here -- it belongs to the render context,
+    // and the UI thread must not walk m_graph to find it anyway.
     D2D1_RECT_F MainWindow::GetPreviewImageBounds()
     {
-        auto* previewImage = GetPreviewImage();
-        if (!previewImage) return {};
-
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) return {};
-
-        // Get bounds at 96 DPI to match the preview rendering DPI.
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
-
-        D2D1_RECT_F bounds{};
-        HRESULT hr = dc->GetImageLocalBounds(previewImage, &bounds);
-
-        dc->SetDpi(oldDpiX, oldDpiY);
-        if (FAILED(hr)) return {};
-        return bounds;
+        std::scoped_lock lock(m_previewBoundsMutex);
+        return m_previewBounds;
     }
 
     bool MainWindow::PointerToImageCoords(
@@ -1846,6 +1885,60 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args)
     {
         auto point = args.GetCurrentPoint(PreviewPanel());
+
+        // Left double-click re-fits and re-centres the preview on the pixels
+        // actually rendered -- the same operation SelectPreviewNode requests
+        // for a node you have never looked at, and that /preview/view/fit
+        // exposes over MCP.
+        //
+        // Detected by hand rather than via the DoubleTapped event, which never
+        // fires on this panel: the left-button branch below marks the press
+        // Handled (to claim the drag for panning), and a handled PointerPressed
+        // suppresses XAML's gesture recogniser for that pointer. OutputWindow
+        // can use the event because it pans on middle/right only and leaves the
+        // left button alone.
+        //
+        // Thresholds come from the OS so this matches the user's mouse
+        // settings. GetSystemMetrics reports PHYSICAL pixels while
+        // point.Position() is in DIPs, hence the CompositionScale divide --
+        // without it the slop is ~2x too tight on a 200% display.
+        if (point.Properties().IsLeftButtonPressed())
+        {
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const float x = static_cast<float>(point.Position().X);
+            const float y = static_cast<float>(point.Position().Y);
+            const float dpiScale = (std::max)(1.0f, PreviewPanel().CompositionScaleX());
+            const float slopX = static_cast<float>(::GetSystemMetrics(SM_CXDOUBLECLK)) / dpiScale;
+            const float slopY = static_cast<float>(::GetSystemMetrics(SM_CYDOUBLECLK)) / dpiScale;
+
+            const bool isDoubleClick =
+                (nowMs - m_previewLastClickMs) <= static_cast<int64_t>(::GetDoubleClickTime()) &&
+                std::abs(x - m_previewLastClickX) <= slopX &&
+                std::abs(y - m_previewLastClickY) <= slopY;
+
+            m_previewLastClickMs = nowMs;
+            m_previewLastClickX = x;
+            m_previewLastClickY = y;
+
+            if (isDoubleClick)
+            {
+                // Defer the fit rather than calling FitPreviewToView() here:
+                // it needs GetPreviewImageBounds(), which is only meaningful
+                // once the node has evaluated, and it returns false to ask for
+                // a retry when it isn't. OnRenderTick already owns that retry
+                // loop, so routing through the flag means a double-click on a
+                // not-yet-evaluated node fits when the pixels arrive instead of
+                // being silently dropped.
+                m_needsFitPreview = true;
+                m_previewAutoFit = true;
+                m_forceRender = true;
+                // A third click must not re-trigger off the second.
+                m_previewLastClickMs = 0;
+                args.Handled(true);
+                return;
+            }
+        }
 
         // Left or middle button → start pan
         if (point.Properties().IsMiddleButtonPressed() || point.Properties().IsLeftButtonPressed())
@@ -2192,6 +2285,7 @@ namespace winrt::ShaderLab::implementation
                 m_previewDragMoved = true;
             m_previewPanX = m_previewPanOriginX + dx;
             m_previewPanY = m_previewPanOriginY + dy;
+            if (m_previewDragMoved) m_previewAutoFit = false;
             m_forceRender = true;
             args.Handled(true);
             return;
@@ -2607,7 +2701,6 @@ namespace winrt::ShaderLab::implementation
             m_sliderDragNodeId = sliderNodeId;
             m_nodeGraphController.UpdateSliderDrag(sliderNodeId, canvasPoint);
             m_selectedNodeId = sliderNodeId;
-            m_graph.MarkAllDirty();
             m_forceRender = true;
             UpdatePropertiesPanel();
             NodeGraphContainer().CapturePointer(args.Pointer());
@@ -2640,7 +2733,6 @@ namespace winrt::ShaderLab::implementation
                 auto hit = m_nodeGraphController.HitTestEdge(canvasPoint, 8.0f);
                 if (hit.found && m_nodeGraphController.RemoveEdge(hit))
                 {
-                    m_graph.MarkAllDirty();
                     m_nodeGraphController.RebuildLayout();
                     m_forceRender = true;
                     UpdatePropertiesPanel();
@@ -2736,7 +2828,6 @@ namespace winrt::ShaderLab::implementation
         {
             if (m_nodeGraphController.UpdateSliderDrag(m_sliderDragNodeId, canvasPoint))
             {
-                m_graph.MarkAllDirty();
                 m_forceRender = true;
                 UpdatePropertiesPanel();
             }
@@ -2789,7 +2880,6 @@ namespace winrt::ShaderLab::implementation
             NodeGraphContainer().ReleasePointerCapture(args.Pointer());
             if (connected)
             {
-                m_graph.MarkAllDirty();
                 PopulatePreviewNodeSelector();
             }
         }
@@ -3194,7 +3284,6 @@ namespace winrt::ShaderLab::implementation
                     auto box = sender.template as<Controls::TextBox>();
                     n->properties[L"Expression"] = std::wstring(box.Text().c_str());
                     n->dirty = true;
-                    m_graph.MarkAllDirty();
                     m_forceRender = true;
                     m_nodeGraphController.SetNeedsRedraw();
                 });
@@ -3399,7 +3488,6 @@ namespace winrt::ShaderLab::implementation
                             if (!b.sources.empty() && b.sources[0].has_value())
                                 b.sources[0]->sourceComponent = static_cast<uint32_t>(combo.SelectedIndex());
                             n->dirty = true;
-                            m_graph.MarkAllDirty();
                         });
                         labelRow.Children().Append(compPicker);
                     }
@@ -3531,7 +3619,7 @@ namespace winrt::ShaderLab::implementation
                 auto markDirty = [this, capturedId, capturedKey]()
                 {
                     auto* n = m_graph.FindNode(capturedId);
-                    if (n) { n->dirty = true; m_graph.MarkAllDirty(); }
+                    if (n) n->dirty = true;
 
                     // Log the property change.
                     if (n)
@@ -4393,7 +4481,6 @@ namespace winrt::ShaderLab::implementation
                     n->dirty = true;
                     n->cachedOutput = nullptr; // raw pointer is now dangling
                     m_graphEvaluator.InvalidateNode(capturedId);
-                    m_graph.MarkAllDirty();
                     PopulatePreviewNodeSelector();
                     UpdatePropertiesPanel();
                 });
@@ -4464,7 +4551,6 @@ namespace winrt::ShaderLab::implementation
         node->properties[nextName] = 0.0f;
 
         node->dirty = true;
-        m_graph.MarkAllDirty();
         m_nodeGraphController.RebuildLayout();
         m_forceRender = true;
         UpdatePropertiesPanel();
@@ -4490,7 +4576,6 @@ namespace winrt::ShaderLab::implementation
         m_graph.UnbindProperty(nodeId, paramName);
 
         node->dirty = true;
-        m_graph.MarkAllDirty();
         m_nodeGraphController.RebuildLayout();
         m_forceRender = true;
         UpdatePropertiesPanel();
@@ -4725,15 +4810,12 @@ namespace winrt::ShaderLab::implementation
         winrt::Windows::Storage::Pickers::FileOpenPicker picker;
         picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
         picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::PicturesLibrary);
-        picker.FileTypeFilter().Append(L".png");
-        picker.FileTypeFilter().Append(L".jpg");
-        picker.FileTypeFilter().Append(L".jpeg");
-        picker.FileTypeFilter().Append(L".bmp");
-        picker.FileTypeFilter().Append(L".tif");
-        picker.FileTypeFilter().Append(L".tiff");
-        picker.FileTypeFilter().Append(L".hdr");
-        picker.FileTypeFilter().Append(L".exr");
-        picker.FileTypeFilter().Append(L".jxr");
+        // Ask WIC what this machine can actually decode instead of hardcoding.
+        // The old fixed list silently excluded formats the loader handles
+        // perfectly well -- .heic decoded fine but was unpickable, because
+        // HEIF ships as an installable OS extension and was never in the list.
+        for (const auto& ext : ::ShaderLab::Effects::ImageLoader::SupportedExtensions())
+            picker.FileTypeFilter().Append(winrt::hstring(ext));
 
         auto file = co_await picker.PickSingleFileAsync();
         if (!file) co_return;
@@ -4750,7 +4832,6 @@ namespace winrt::ShaderLab::implementation
         if (dc)
             m_sourceFactory.PrepareSourceNode(*node, dc, 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
 
-        m_graph.MarkAllDirty();
         m_nodeGraphController.RebuildLayout();
         PopulatePreviewNodeSelector();
         FitPreviewToView();
@@ -4793,7 +4874,6 @@ namespace winrt::ShaderLab::implementation
         if (graphNode && dc)
             m_sourceFactory.PrepareSourceNode(*graphNode, dc, 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
 
-        m_graph.MarkAllDirty();
         m_nodeGraphController.RebuildLayout();
         PopulatePreviewNodeSelector();
         FitPreviewToView();
@@ -4835,7 +4915,6 @@ namespace winrt::ShaderLab::implementation
         if (dc)
             m_sourceFactory.PrepareSourceNode(*node, dc, 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
 
-        m_graph.MarkAllDirty();
         m_nodeGraphController.RebuildLayout();
         PopulatePreviewNodeSelector();
         UpdatePropertiesPanel();
@@ -4905,7 +4984,6 @@ namespace winrt::ShaderLab::implementation
             designerImpl->SetAddToGraphCallback([this](::ShaderLab::Graph::EffectNode node) -> uint32_t
             {
                 auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
-                m_graph.MarkAllDirty();
                 m_nodeGraphController.RebuildLayout();
                 PopulatePreviewNodeSelector();
                 PopulateAddNodeFlyout(); // refresh custom effects list
@@ -4924,7 +5002,6 @@ namespace winrt::ShaderLab::implementation
                     node->customEffect = std::move(def);
                     node->dirty = true;
                     node->cachedOutput = nullptr; // shader changed -> output may be released
-                    m_graph.MarkAllDirty();
                     m_graphEvaluator.UpdateNodeShader(nodeId, *node);
 
                     if (hlslChanged)
@@ -4996,13 +5073,6 @@ namespace winrt::ShaderLab::implementation
                 break;
             }
         }
-    }
-
-    void MainWindow::OnSaveImageClicked(
-        winrt::Windows::Foundation::IInspectable const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::RoutedEventArgs const& /*args*/)
-    {
-        SaveImageAsync();
     }
 
     std::vector<uint8_t> MainWindow::CapturePreviewAsPng()
@@ -5267,9 +5337,10 @@ namespace winrt::ShaderLab::implementation
         m_nodeGraphController.SetPanOffset(panX, panY);
     }
 
-    winrt::fire_and_forget MainWindow::SaveImageAsync()
+    winrt::fire_and_forget MainWindow::SaveImageAsync(SaveReference ref)
     {
         auto strong = get_strong();
+        const bool isJxr = (ref == SaveReference::HdrJxr);
 
         winrt::Windows::Storage::Pickers::FileSavePicker picker;
         picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
@@ -5283,8 +5354,10 @@ namespace winrt::ShaderLab::implementation
             if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' || ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|')
                 ch = L'_';
         picker.SuggestedFileName(winrt::hstring(suggestedName));
-        picker.FileTypeChoices().Insert(L"JPEG XR (HDR)", winrt::single_threaded_vector<winrt::hstring>({ L".jxr" }));
-        picker.FileTypeChoices().Insert(L"PNG Image (SDR)", winrt::single_threaded_vector<winrt::hstring>({ L".png" }));
+        if (isJxr)
+            picker.FileTypeChoices().Insert(L"JPEG XR (HDR)", winrt::single_threaded_vector<winrt::hstring>({ L".jxr" }));
+        else
+            picker.FileTypeChoices().Insert(L"PNG Image (SDR)", winrt::single_threaded_vector<winrt::hstring>({ L".png" }));
 
         auto file = co_await picker.PickSaveFileAsync();
         if (!file) co_return;
@@ -5298,6 +5371,40 @@ namespace winrt::ShaderLab::implementation
 
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) co_return;
+
+        // Presentation→file re-referencing: the scene is linear scRGB
+        // where the OS presents SDR reference white at SdrWhiteNits.
+        // An SDR file's 1.0 must mean "SDR reference white", so scale by
+        // 80/SdrWhiteNits in linear space before the sRGB encode; DWM
+        // multiplies it back on display. Respects a simulated profile
+        // (CachedCapabilities prefers it).
+        float presentationScale = 1.0f;
+        if (ref == SaveReference::PresentationPng)
+        {
+            const float sdrWhite =
+                m_displayMonitor.CachedCapabilities().sdrWhiteLevelNits;
+            if (sdrWhite > 80.0f)
+                presentationScale = 80.0f / sdrWhite;
+        }
+        winrt::com_ptr<ID2D1Effect> scaleFx;
+        winrt::com_ptr<ID2D1Image> scaledImage;
+        ID2D1Image* imageToSave = previewImage;
+        if (presentationScale != 1.0f &&
+            SUCCEEDED(dc->CreateEffect(CLSID_D2D1ColorMatrix, scaleFx.put())))
+        {
+            scaleFx->SetInput(0, previewImage);
+            const float s = presentationScale;
+            D2D1_MATRIX_5X4_F m = D2D1::Matrix5x4F(
+                s, 0, 0, 0,
+                0, s, 0, 0,
+                0, 0, s, 0,
+                0, 0, 0, 1,
+                0, 0, 0, 0);
+            scaleFx->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, m);
+            scaleFx->GetOutput(scaledImage.put());
+            if (scaledImage)
+                imageToSave = scaledImage.get();
+        }
 
         try
         {
@@ -5316,14 +5423,15 @@ namespace winrt::ShaderLab::implementation
             dc->SetDpi(oldDpiX, oldDpiY);
             if (w == 0 || h == 0) co_return;
 
-            auto fileExt = std::wstring(file.FileType().c_str());
-            bool isJxr = (fileExt == L".jxr" || fileExt == L".wdp");
-
-            // JXR: render in FP16 scRGB for full HDR fidelity.
-            // PNG: render in 8-bit BGRA (SDR clamp).
+            // JXR: render in FP16 scRGB for full HDR fidelity (linear,
+            // scene-referred — no transfer encode wanted).
+            // PNG: render in 8-bit BGRA with the _SRGB variant so the
+            // scene's linear values are gamma-ENCODED on write; plain
+            // UNORM wrote linear bytes that viewers then sRGB-decoded,
+            // producing a crushed, far-too-dark image.
             DXGI_FORMAT renderFormat = isJxr
                 ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                : DXGI_FORMAT_B8G8R8A8_UNORM;
+                : DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
             D2D1_ALPHA_MODE alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
 
             winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
@@ -5337,7 +5445,7 @@ namespace winrt::ShaderLab::implementation
             dc->SetTarget(renderBitmap.get());
             dc->BeginDraw();
             dc->Clear(D2D1::ColorF(0, 0, 0, 1.0f));
-            dc->DrawImage(previewImage);
+            dc->DrawImage(imageToSave);
             dc->EndDraw();
             dc->SetTarget(oldTarget.get());
 
@@ -5475,7 +5583,8 @@ namespace winrt::ShaderLab::implementation
         if (nodeId == m_previewNodeId)
             return;
         if (m_previewNodeId != 0)
-            m_previewViews[m_previewNodeId] = { m_previewZoom, m_previewPanX, m_previewPanY };
+            m_previewViews[m_previewNodeId] = { m_previewZoom, m_previewPanX, m_previewPanY,
+                                                m_previewAutoFit.load(std::memory_order_acquire) };
         m_previewNodeId = nodeId;
         auto it = (nodeId != 0) ? m_previewViews.find(nodeId) : m_previewViews.end();
         if (it != m_previewViews.end())
@@ -5483,10 +5592,12 @@ namespace winrt::ShaderLab::implementation
             m_previewZoom = it->second.zoom;
             m_previewPanX = it->second.panX;
             m_previewPanY = it->second.panY;
-            m_needsFitPreview = false;
+            m_previewAutoFit = it->second.autoFit;
+            m_needsFitPreview = it->second.autoFit;
         }
         else
         {
+            m_previewAutoFit = true;
             m_needsFitPreview = true;
         }
     }
@@ -5572,19 +5683,23 @@ namespace winrt::ShaderLab::implementation
                     s->nodeId) != closedNodeIds.end();
             });
         }
-        for (uint32_t nodeId : closedNodeIds)
+        if (!closedNodeIds.empty())
         {
-            m_graph.RemoveNode(nodeId);
-            m_graphEvaluator.InvalidateNode(nodeId);
-            // The deleted node owned a cachedOutput pointer that downstream
-            // nodes may have inherited via cached effect chains. Be paranoid:
-            // null every node's cachedOutput so the next evaluate rebuilds them.
-            for (auto& n : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-            {
-                n.cachedOutput = nullptr;
-                n.dirty = true;
-            }
-            m_nodeGraphController.RebuildLayout();
+            // Graph writes and layout belong to the render thread (the
+            // graph-access rule). RemoveNode dirties the removed node's edge
+            // and binding consumers, which is all that can change: it used
+            // to null EVERY node's cachedOutput and dirty the whole graph, so
+            // closing one window re-ran every compute node. Consumers' D2D
+            // effects hold their own references to the old input image, so
+            // nothing dangles meanwhile.
+            m_renderDispatcher.DispatchSync([this, &closedNodeIds] {
+                for (uint32_t nodeId : closedNodeIds)
+                {
+                    m_graph.RemoveNode(nodeId);
+                    m_graphEvaluator.InvalidateNode(nodeId);
+                }
+                m_nodeGraphController.RebuildLayout();
+            });
             PopulatePreviewNodeSelector();
         }
         if (!closedNodeIds.empty())
@@ -5594,17 +5709,22 @@ namespace winrt::ShaderLab::implementation
             MarkUnsaved();
         }
 
+        if (m_outputWindows.empty()) return;
+        const auto tStart = std::chrono::high_resolution_clock::now();
+
         // Canonical status string + tooltip pushed to every output window.
         std::wstring statusText  = BuildFpsStatusText();
         std::wstring tooltipText = BuildFpsTooltipText();
+        // UI thread: names come from the per-frame snapshot, never the live
+        // graph the render worker is writing (the graph-access rule).
+        const auto snapshot = CurrentGraphSnapshot();
 
         for (auto& window : m_outputWindows)
         {
             if (!window->IsReady())
                 continue;
 
-            auto* node = m_graph.FindNode(window->NodeId());
-            if (node)
+            if (const auto* node = snapshot ? snapshot->FindNode(window->NodeId()) : nullptr)
                 window->SetTitle(node->name);
             window->SetStatusText(statusText);
             window->SetStatusTooltip(tooltipText);
@@ -5613,6 +5733,12 @@ namespace winrt::ShaderLab::implementation
             window->SyncSinkFromUi();
             window->BlitAndPresent(m_uiD2dContext.get());
         }
+
+        // Its own line in the perf readout (it was declared but never written,
+        // so the cost hid inside uiTickUs at a permanent 0.00 ms).
+        const double us = std::chrono::duration<double, std::micro>(
+            std::chrono::high_resolution_clock::now() - tStart).count();
+        m_frameTiming.outputWindowsUs = m_frameTiming.outputWindowsUs * 0.9 + us * 0.1;
     }
 
     void MainWindow::OpenLogWindow(uint32_t nodeId)
@@ -5705,7 +5831,163 @@ namespace winrt::ShaderLab::implementation
         if (m_lastVideoFps > 0.1f)
             text += std::format(L"\n\n  video decode    {:>6.0f} fps", m_lastVideoFps);
 
+        // GPU block. Everything above is CPU wall-clock around an ASYNCHRONOUS
+        // API -- it measures how long RECORDING the commands took, not how long
+        // the GPU spent running them. For shader work the two are unrelated, so
+        // the numbers above cannot answer "is my tone mapper slow". These can.
+        if (!ft.gpuAvailable)
+        {
+            text += L"\n\n  GPU time: unavailable (no timestamp queries)";
+        }
+        else if (!ft.gpuEnabled)
+        {
+            text += L"\n\n  GPU time: OFF -- the phase times above are CPU-side"
+                    L"\n            command recording, not GPU execution."
+                    L"\n            Enable with MCP perf_gpu_timing.";
+        }
+        else if (ft.gpuFramesResolved == 0)
+        {
+            text += L"\n\n  GPU time: sampling (waiting for first frame)";
+        }
+        else
+        {
+            text += std::format(
+                L"\n\n  GPU time (D3D11 timestamps, real execution):\n"
+                L"    sources prep    {:>6.2f} ms\n"
+                L"    eval            {:>6.2f} ms\n"
+                L"    compute         {:>6.2f} ms\n"
+                L"    draw            {:>6.2f} ms   <- effect chain runs here\n"
+                L"    -----------------------------\n"
+                L"    frame           {:>6.2f} ms",
+                ft.gpuSourcesPrepMs, ft.gpuEvaluateMs,
+                ft.gpuDeferredComputeMs, ft.gpuDrawMs, ft.gpuFrameMs);
+            if (ft.gpuDisjointDrops > 0)
+                text += std::format(
+                    L"\n    {} sample(s) voided by a GPU clock change",
+                    ft.gpuDisjointDrops);
+        }
         return text;
+    }
+
+    // ---- Performance flyout toggles ------------------------------------
+    //
+    // All three change how the app is MEASURED rather than what it renders,
+    // and each exists because its absence produced a misleading reading that
+    // cost real debugging time.
+
+    void MainWindow::OnGpuTimingToggled(
+        winrt::Windows::Foundation::IInspectable const& sender,
+        winrt::Microsoft::UI::Xaml::RoutedEventArgs const&)
+    {
+        auto box = sender.try_as<winrt::Microsoft::UI::Xaml::Controls::CheckBox>();
+        if (!box) return;
+        const bool on = box.IsChecked() && box.IsChecked().Value();
+        m_renderEngine.Timer().SetEnabled(on);
+        UpdateFpsTooltip();
+    }
+
+    void MainWindow::OnForceRedrawToggled(
+        winrt::Windows::Foundation::IInspectable const& sender,
+        winrt::Microsoft::UI::Xaml::RoutedEventArgs const&)
+    {
+        auto box = sender.try_as<winrt::Microsoft::UI::Xaml::Controls::CheckBox>();
+        if (!box) return;
+        const bool on = box.IsChecked() && box.IsChecked().Value();
+        // Atomic: the render worker reads this every tick. As a plain bool the
+        // worker never observed the write on ARM64 -- the same weak-memory
+        // failure the GPU timer's enable flag had.
+        m_forceContinuousRedraw.store(on, std::memory_order_release);
+        UpdateFpsTooltip();
+    }
+
+    void MainWindow::OnUnthrottledToggled(
+        winrt::Windows::Foundation::IInspectable const& sender,
+        winrt::Microsoft::UI::Xaml::RoutedEventArgs const&)
+    {
+        auto box = sender.try_as<winrt::Microsoft::UI::Xaml::Controls::CheckBox>();
+        if (!box) return;
+        const bool on = box.IsChecked() && box.IsChecked().Value();
+        ::ShaderLab::Performance::SetUnthrottledRenderEnabled(on);
+        // Wake the worker so the change takes effect on this tick rather than
+        // after one more 16 ms wait -- turning it ON while the worker is
+        // parked in that wait would otherwise look like a lag.
+        m_renderDispatcher.Wake();
+        UpdateFpsTooltip();
+    }
+
+    void MainWindow::OnNodeGpuStatsToggled(
+        winrt::Windows::Foundation::IInspectable const& sender,
+        winrt::Microsoft::UI::Xaml::RoutedEventArgs const&)
+    {
+        auto box = sender.try_as<winrt::Microsoft::UI::Xaml::Controls::CheckBox>();
+        if (!box) return;
+        const bool on = box.IsChecked() && box.IsChecked().Value();
+        m_nodeGraphController.SetShowNodeGpuStats(on);
+        // The annotations are only meaningful while the timer is running, and
+        // asking for them is a clear enough statement of intent to turn it on
+        // -- silently drawing "not measured" on every node would look like the
+        // feature was broken. Turning them off does NOT turn the timer back
+        // off: the user may have enabled it deliberately.
+        if (on && GpuTimingCheck() && !(GpuTimingCheck().IsChecked() &&
+                                        GpuTimingCheck().IsChecked().Value()))
+        {
+            GpuTimingCheck().IsChecked(true);   // fires OnGpuTimingToggled
+        }
+        UpdateFpsTooltip();
+    }
+
+    void MainWindow::OnAnalysisRefreshChanged(
+        winrt::Windows::Foundation::IInspectable const& sender,
+        winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const&)
+    {
+        auto combo = sender.try_as<winrt::Microsoft::UI::Xaml::Controls::ComboBox>();
+        if (!combo) return;
+        // Display refresh only. Skip-unneeded-readback stays ON in every mode,
+        // so a GPU-bound parameter never forces a readback; this only sets
+        // which nodes count as "displayed" and how often they are re-read.
+        // (Its predecessor, "Keep analysis values live", turned the skip OFF,
+        // which also re-imposed the ~10 ms/frame Map() stall that GPU bindings
+        // exist to remove.)
+        // Item order matches the presets in Performance.h.
+        if (::ShaderLab::Performance::SetAnalysisReadoutPreset(combo.SelectedIndex()))
+            UpdateFpsTooltip();
+    }
+
+    void MainWindow::OnGpuBindingsToggled(
+        winrt::Windows::Foundation::IInspectable const& sender,
+        winrt::Microsoft::UI::Xaml::RoutedEventArgs const&)
+    {
+        auto box = sender.try_as<winrt::Microsoft::UI::Xaml::Controls::CheckBox>();
+        if (!box) return;
+        const bool on = box.IsChecked() && box.IsChecked().Value();
+        // Engine default is OFF, and until now nothing in the GUI ever turned
+        // it on -- SetGpuBindingsEnabled was reachable only from headless's
+        // --enable-gpu-bindings. So CanServeBindingViaGpu returned false on its
+        // first line for every binding in the app, and every analysis consumer
+        // forced a readback no matter how it was wired.
+        // Already in that mode: nothing to invalidate. This is the common case
+        // for the construction-time IsChecked() sync and for the MCP route,
+        // which applies the mode itself before mirroring the box.
+        if (::ShaderLab::Performance::IsGpuBindingsEnabled() == on) return;
+        ApplyGpuBindingsMode(on);
+        UpdateFpsTooltip();
+    }
+
+    void MainWindow::ApplyGpuBindingsMode(bool on)
+    {
+        ::ShaderLab::Performance::SetGpuBindingsEnabled(on);
+        // Binding mode is baked into each effect's compiled shader via the
+        // _SLPARAM_<name>_GPU defines, so flipping this has to invalidate the
+        // effect cache or the graph keeps running the old variants.
+        //
+        // On the render thread: ReleaseCache frees effects and nulls every
+        // node's cachedOutput, and the worker is the graph's single writer.
+        // This used to run inline on the UI thread, racing a live Evaluate.
+        m_renderDispatcher.DispatchSync([this] {
+            m_graphEvaluator.ReleaseCache(m_graph);
+            m_graph.MarkAllDirty();
+            m_forceRender = true;
+        });
     }
 
     std::wstring MainWindow::BuildFpsStatusText() const

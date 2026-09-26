@@ -211,6 +211,20 @@ namespace ShaderLab::Graph
         CustomShaderType shaderType{ CustomShaderType::PixelShader };
         std::wstring hlslSource;                        // Full HLSL source code.
         std::vector<std::wstring> inputNames;           // Named inputs (textures).
+        // How many TRAILING inputNames are lookup tables rather than images.
+        //
+        // A lookup input is sampled at coordinates the shader computes, not
+        // at this pixel's own position -- a gamut-boundary table indexed by
+        // (hue, I), say. Two things follow, and both are wrong for it if it is
+        // treated as an ordinary image input:
+        //   * it must not contribute to the output rect (a 256x128 table would
+        //     otherwise shape where a 2880x1800 effect draws), and
+        //   * a D2D tile query must be answered with the WHOLE table, since
+        //     the shader reads arbitrary texels of it from every tile.
+        // Unconnected, a lookup pin is fed a 1x1 zero bitmap rather than left
+        // null (D2D will not render an effect with a null input); its alpha of
+        // 0 is how the shader tells "no table wired" and falls back.
+        uint32_t lookupInputCount{ 0 };
         std::vector<ParameterDefinition> parameters;    // Declared cbuffer parameters.
 
         // ShaderLab built-in effect identity (empty for user-authored effects).
@@ -290,6 +304,42 @@ namespace ShaderLab::Graph
         std::wstring wholeArraySourceFieldName;
     };
 
+    // How to read a node's `lastGpuMs`.
+    //
+    // A bare "no number" is ambiguous in exactly the way the dispatch counter
+    // once was: a node doing no work and a node whose work is real but
+    // unattributable look identical. These states say which, so the canvas can
+    // report the reason instead of a dash.
+    enum class GpuNodeState : uint8_t
+    {
+        // GPU timing is off, or this node took no part in the frame.
+        Unmeasured = 0,
+        // lastGpuMs is a real measurement of this node: its own compute
+        // dispatch, or -- for the node at the end of a Direct2D chain -- the
+        // whole chain that feeds it.
+        Measured,
+        // A D2D image node in the middle of a chain. Direct2D fuses the chain
+        // and evaluates it lazily at DrawImage, so this node's cost is real
+        // but is already counted inside a downstream chain end's figure.
+        // Separating it out would mean materialising the node on its own,
+        // which changes the workload being measured.
+        Fused,
+        // Needed this frame, but did no GPU work: a clean compute node served
+        // from its cached result. Zero cost is the correct answer here, not a
+        // missing measurement.
+        Cached,
+        // Not needed this frame, so the evaluator skipped it entirely --
+        // nothing downstream consumes its output. Distinct from Cached: a
+        // cached node would have run if its input had changed; this one would
+        // not have run either way. Wiring or binding it is what makes it
+        // measurable, and saying so beats a blank the reader has to guess at.
+        Idle,
+        // Produces no GPU work by construction: a parameter node (Clock, Float
+        // Parameter, ...) with no image output. Zero is not an approximation
+        // here -- there is no GPU work to attribute in the first place.
+        CpuOnly,
+    };
+
     // A node in the effect graph DAG.
     // Each node represents a D2D image source, a built-in D2D effect,
     // a custom pixel/compute shader, or the final output.
@@ -339,7 +389,26 @@ namespace ShaderLab::Graph
         // Clock node: time-based animation source.
         bool isClock{ false };
         bool isPlaying{ false };   // runtime: toggled by on-node Play/Pause
+        // runtime: GPU milliseconds attributed to this node on the last
+        // measured frame, or -1 when it was not measured.
+        //
+        // A COMPUTE node's figure is its own dispatch: exact, because each is
+        // its own submission. A D2D IMAGE node has no figure of its own --
+        // Direct2D fuses a chain and evaluates it lazily at DrawImage -- so
+        // only the node at the END of a chain carries one, and it is the cost
+        // of the whole chain feeding it. Attributing intermediates would mean
+        // materialising each separately, which changes the workload being
+        // measured.
+        double lastGpuMs{ -1.0 };
+        // runtime: why lastGpuMs looks the way it does. See GpuNodeState.
+        GpuNodeState gpuState{ GpuNodeState::Unmeasured };
+
         double clockTime{ 0.0 };   // runtime: accumulated time in seconds
+        // runtime: which UpdateRate bucket clockTime last landed in. -1 =
+        // none yet. Only used when UpdateRate > 0; it is what lets the
+        // clock dirty its consumers at a chosen rate instead of every
+        // frame. Not serialized -- it is a tick artefact, not graph state.
+        long long clockTickBucket{ -1 };
 
         // Set by the host before evaluation: true if this node feeds a visible
         // output (Output node, output window, preview, or data-only analysis).

@@ -439,7 +439,10 @@ void main(uint3 id : SV_DispatchThreadID)
         {
             std::lock_guard lock(m_bufferMutex);
             std::swap(m_frontBuffer, m_backBuffer);
-            m_lastPitch = m_stride;
+            // A hardware-decoded first frame arrives as a GPU sample, not bytes.
+            std::swap(m_frontGpu, m_backGpu);
+            m_backGpu = {};
+            if (!m_frontGpu.tex) m_lastPitch = m_stride;
             m_frameReady = true;
         }
 
@@ -463,6 +466,12 @@ void main(uint3 id : SV_DispatchThreadID)
             m_decodeThread.join();
         }
 
+        // Held samples pin decoder surfaces: release them before the reader.
+        m_frontGpu = {};
+        m_backGpu = {};
+        m_texPlanar = nullptr; m_srvPlanarY = nullptr; m_srvPlanarUV = nullptr;
+        m_zeroCopyFailed = false;
+        m_lastSeekTarget = std::numeric_limits<double>::quiet_NaN();
         m_reader = nullptr;
         m_dxgiDeviceManager = nullptr;
         m_bitmap = nullptr;
@@ -636,7 +645,54 @@ void main(uint3 id : SV_DispatchThreadID)
         return true;
     }
 
-    void VideoSourceProvider::RunConversionShader(ID3D11DeviceContext* ctx)
+    bool VideoSourceProvider::EnsurePlanarTexture(ID3D11Texture2D* decoderTexture)
+    {
+        if (m_texPlanar) return true;
+        if (!decoderTexture || !m_d3dDevice) return false;
+        D3D11_TEXTURE2D_DESC sd{};
+        decoderTexture->GetDesc(&sd);
+        DXGI_FORMAT lumaFmt, chromaFmt;
+        if (sd.Format == DXGI_FORMAT_NV12)      { lumaFmt = DXGI_FORMAT_R8_UNORM;  chromaFmt = DXGI_FORMAT_R8G8_UNORM; }
+        else if (sd.Format == DXGI_FORMAT_P010) { lumaFmt = DXGI_FORMAT_R16_UNORM; chromaFmt = DXGI_FORMAT_R16G16_UNORM; }
+        else return false;
+        // The conversion shader was chosen for the reader's output subtype, so
+        // the decoder surface has to match it.
+        if ((sd.Format == DXGI_FORMAT_NV12) != (m_outputFormat == OutputFormat::NV12)) return false;
+
+        UINT support = 0;
+        if (FAILED(m_d3dDevice->CheckFormatSupport(sd.Format, &support)) ||
+            !(support & D3D11_FORMAT_SUPPORT_TEXTURE2D) ||
+            !(support & D3D11_FORMAT_SUPPORT_SHADER_LOAD))
+            return false;
+
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = m_width;
+        td.Height = m_height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = sd.Format;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        winrt::com_ptr<ID3D11Texture2D> tex;
+        if (FAILED(m_d3dDevice->CreateTexture2D(&td, nullptr, tex.put()))) return false;
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+        vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        vd.Texture2D.MipLevels = 1;
+        winrt::com_ptr<ID3D11ShaderResourceView> srvY, srvUV;
+        vd.Format = lumaFmt;
+        if (FAILED(m_d3dDevice->CreateShaderResourceView(tex.get(), &vd, srvY.put()))) return false;
+        vd.Format = chromaFmt;
+        if (FAILED(m_d3dDevice->CreateShaderResourceView(tex.get(), &vd, srvUV.put()))) return false;
+
+        m_texPlanar = std::move(tex);
+        m_srvPlanarY = std::move(srvY);
+        m_srvPlanarUV = std::move(srvUV);
+        return true;
+    }
+
+    void VideoSourceProvider::RunConversionShader(ID3D11DeviceContext* ctx, bool planar)
     {
         // Set shader.
         ID3D11ComputeShader* cs = nullptr;
@@ -655,6 +711,11 @@ void main(uint3 id : SV_DispatchThreadID)
         {
             ID3D11ShaderResourceView* srvs[] = { m_srvRGB.get() };
             ctx->CSSetShaderResources(0, 1, srvs);
+        }
+        else if (planar)
+        {
+            ID3D11ShaderResourceView* srvs[] = { m_srvPlanarY.get(), m_srvPlanarUV.get() };
+            ctx->CSSetShaderResources(0, 2, srvs);
         }
         else
         {
@@ -705,6 +766,7 @@ void main(uint3 id : SV_DispatchThreadID)
         m_endOfStream = false;
         m_accumulatedTime = 0.0;
         m_currentPositionSeconds = seconds;
+        m_lastSeekTarget = seconds;
         m_frameNeeded = true;  // Force decode at the new position.
         m_decodeCV.notify_one();
     }
@@ -734,6 +796,8 @@ void main(uint3 id : SV_DispatchThreadID)
             m_accumulatedTime -= m_frameDuration;
             if (m_accumulatedTime > m_frameDuration * 2)
                 m_accumulatedTime = 0.0;
+            // Playback moves the position away from any requested target.
+            m_lastSeekTarget = std::numeric_limits<double>::quiet_NaN();
             m_frameNeeded = true;
             m_decodeCV.notify_one();
         }
@@ -747,6 +811,7 @@ void main(uint3 id : SV_DispatchThreadID)
             if (m_loop) { Seek(0.0); m_playing = true; }
             return;
         }
+        m_lastSeekTarget = std::numeric_limits<double>::quiet_NaN();
         if (!m_frameNeeded.exchange(true))
             m_decodeCV.notify_one();
     }
@@ -764,12 +829,43 @@ void main(uint3 id : SV_DispatchThreadID)
         // Upload raw bytes from the front buffer to GPU textures.
         std::vector<BYTE> uploadBuf;
         LONG pitch;
+        GpuFrame gpu;
         {
             std::lock_guard lock(m_bufferMutex);
             uploadBuf.swap(m_frontBuffer);
             pitch = m_lastPitch;
+            gpu = std::move(m_frontGpu);
+            m_frontGpu = {};
             m_frameReady = false;
         }
+
+        if (gpu.tex)
+        {
+            // Zero-copy: the decoder surface is already on this device. One
+            // GPU copy into the planar texture (D3D11 copies both planes of
+            // an NV12/P010 subresource together), then convert from it.
+            if (EnsurePlanarTexture(gpu.tex.get()))
+            {
+                D3D11_BOX box = { 0, 0, 0, m_width, m_height, 1 };
+                m_d3dContext->CopySubresourceRegion(m_texPlanar.get(), 0, 0, 0, 0,
+                    gpu.tex.get(), gpu.subresource, &box);
+                RunConversionShader(m_d3dContext, /*planar*/ true);
+                m_lastUploadZeroCopy = true;
+                std::lock_guard lock(m_bufferMutex);
+                m_frontBuffer.swap(uploadBuf);
+                return true;   // `gpu` releases the sample -> surface back to the decoder
+            }
+            // Unsupported here: fall back to the CPU path for good, and
+            // re-decode this position so the frame is not simply lost.
+            m_zeroCopyFailed = true;
+            {
+                std::lock_guard lock(m_bufferMutex);
+                m_frontBuffer.swap(uploadBuf);
+            }
+            Seek(m_currentPositionSeconds);
+            return false;
+        }
+        m_lastUploadZeroCopy = false;
 
         if (m_outputFormat == OutputFormat::P010)
         {
@@ -828,6 +924,7 @@ void main(uint3 id : SV_DispatchThreadID)
             }
             if (token.stop_requested()) break;
 
+            double discardBefore = -1.0;
             if (m_seekPending)
             {
                 double target;
@@ -836,6 +933,7 @@ void main(uint3 id : SV_DispatchThreadID)
                     target = m_seekTarget;
                     m_seekPending = false;
                 }
+                discardBefore = target;
                 PROPVARIANT var;
                 PropVariantInit(&var);
                 var.vt = VT_I8;
@@ -848,32 +946,49 @@ void main(uint3 id : SV_DispatchThreadID)
             if (m_frameNeeded)
             {
                 m_frameNeeded = false;
-                if (DecodeOneFrame())
+                if (DecodeOneFrame(discardBefore))
                 {
                     m_decodeCount++;
                     std::lock_guard lock(m_bufferMutex);
                     std::swap(m_frontBuffer, m_backBuffer);
+                    std::swap(m_frontGpu, m_backGpu);
+                    m_backGpu = {};
                     m_frameReady = true;
                 }
             }
         }
     }
 
-    bool VideoSourceProvider::DecodeOneFrame()
+    bool VideoSourceProvider::DecodeOneFrame(double discardBefore)
     {
         if (!m_reader) return false;
 
         DWORD streamIndex = 0, flags = 0;
         LONGLONG timestamp = 0;
         winrt::com_ptr<IMFSample> sample;
+        HRESULT hr = S_OK;
 
-        HRESULT hr = m_reader->ReadSample(
-            static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM),
-            0, &streamIndex, &flags, &timestamp, sample.put());
-        if (FAILED(hr)) return false;
-
-        if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { m_endOfStream = true; return false; }
-        if (!sample) return false;
+        // Frame-accurate seek: SetCurrentPosition lands on the keyframe at or
+        // before the target, so decode forward and keep the first sample that
+        // is still showing at the target. Without this the position stayed at
+        // the keyframe, the caller saw "not at target yet" and sought again --
+        // every tick, forever, for any time that was not a keyframe.
+        for (;;)
+        {
+            sample = nullptr;
+            hr = m_reader->ReadSample(
+                static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM),
+                0, &streamIndex, &flags, &timestamp, sample.put());
+            if (FAILED(hr)) return false;
+            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { m_endOfStream = true; return false; }
+            if (!sample) return false;
+            if (discardBefore < 0.0) break;
+            LONGLONG dur = 0;
+            const double durSec = (SUCCEEDED(sample->GetSampleDuration(&dur)) && dur > 0)
+                ? static_cast<double>(dur) / 10'000'000.0 : m_frameDuration;
+            const double ts = static_cast<double>(timestamp) / 10'000'000.0;
+            if (ts + durSec > discardBefore + 1e-6) break;
+        }
 
         m_currentPositionSeconds = static_cast<double>(timestamp) / 10'000'000.0;
 
@@ -889,6 +1004,25 @@ void main(uint3 id : SV_DispatchThreadID)
             hr = sample->ConvertToContiguousBuffer(buffer.put());
         if (FAILED(hr) || !buffer) return false;
 
+        // Hardware decode: hand the decoder texture over instead of reading it
+        // back (see GpuFrame).
+        if (m_zeroCopyAllowed && !m_zeroCopyFailed && m_outputFormat != OutputFormat::RGB32)
+        {
+            winrt::com_ptr<IMFDXGIBuffer> dxgiBuffer;
+            if (buffer.try_as(dxgiBuffer))
+            {
+                GpuFrame f;
+                if (SUCCEEDED(dxgiBuffer->GetResource(IID_PPV_ARGS(f.tex.put()))) &&
+                    SUCCEEDED(dxgiBuffer->GetSubresourceIndex(&f.subresource)) && f.tex)
+                {
+                    f.sample = sample;
+                    m_backGpu = std::move(f);
+                    return true;
+                }
+            }
+        }
+        m_backGpu = {};
+
         winrt::com_ptr<IMF2DBuffer> buffer2D;
         buffer.try_as(buffer2D);
 
@@ -901,10 +1035,15 @@ void main(uint3 id : SV_DispatchThreadID)
             hr = buffer2D->Lock2D(&data, &pitch);
             locked2D = SUCCEEDED(hr);
         }
-        if (!locked2D)
+        DWORD lockedLength = 0;   // bytes behind `data`, when known
+        if (locked2D)
         {
-            DWORD maxLen = 0, curLen = 0;
-            hr = buffer->Lock(&data, &maxLen, &curLen);
+            buffer2D->GetContiguousLength(&lockedLength);
+        }
+        else
+        {
+            DWORD maxLen = 0;
+            hr = buffer->Lock(&data, &maxLen, &lockedLength);
             if (FAILED(hr)) return false;
             pitch = static_cast<LONG>(m_stride);
         }
@@ -943,7 +1082,23 @@ void main(uint3 id : SV_DispatchThreadID)
         if (m_backBuffer.size() < totalSize)
             m_backBuffer.resize(totalSize);
 
-        if (pitch > 0)
+        // The chroma plane follows the ALLOCATED luma rows, not the frame's.
+        // Decoders round the surface height up to their block size -- 1080 is
+        // stored as 1088, 180 as 192 -- so reading chroma at pitch * height
+        // took it from luma padding and misregistered colour by 16 px at
+        // 1080p. Every hardware-decoded video used this path until the
+        // zero-copy upload existed, and software decode still does. The
+        // allocated height is recoverable from the buffer size: luma rows
+        // plus half as many chroma rows, one pitch each.
+        uint32_t surfaceRows = m_height;
+        if (m_outputFormat != OutputFormat::RGB32 && absPitch > 0 && lockedLength > 0)
+        {
+            const uint64_t rows = (static_cast<uint64_t>(lockedLength) * 2) /
+                                  (static_cast<uint64_t>(absPitch) * 3);
+            if (rows >= m_height) surfaceRows = static_cast<uint32_t>(rows);
+        }
+
+        if (pitch > 0 && surfaceRows == m_height)
         {
             std::memcpy(m_backBuffer.data(), data, totalSize);
         }
@@ -951,17 +1106,18 @@ void main(uint3 id : SV_DispatchThreadID)
         {
             for (uint32_t y = 0; y < m_height; ++y)
             {
-                const BYTE* srcRow = data + y * pitch;
-                BYTE* dstRow = m_backBuffer.data() + y * absPitch;
+                const BYTE* srcRow = data + static_cast<ptrdiff_t>(y) * pitch;
+                BYTE* dstRow = m_backBuffer.data() + static_cast<size_t>(y) * absPitch;
                 std::memcpy(dstRow, srcRow, absPitch);
             }
             if (m_outputFormat != OutputFormat::RGB32)
             {
-                const BYTE* uvSrc = data + static_cast<ptrdiff_t>(m_height) * pitch;
+                const BYTE* uvSrc = data + static_cast<ptrdiff_t>(surfaceRows) * pitch;
                 BYTE* uvDst = m_backBuffer.data() + yPlaneSize;
                 for (uint32_t y = 0; y < m_height / 2; ++y)
                 {
-                    std::memcpy(uvDst + y * absPitch, uvSrc + y * pitch, absPitch);
+                    std::memcpy(uvDst + static_cast<size_t>(y) * absPitch,
+                                uvSrc + static_cast<ptrdiff_t>(y) * pitch, absPitch);
                 }
             }
         }

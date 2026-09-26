@@ -58,6 +58,95 @@ namespace ShaderLab::Effects
         }
     }
 
+    std::vector<std::wstring> ImageLoader::SupportedExtensions()
+    {
+        // WIC reports each decoder's extensions as one comma-separated string,
+        // e.g. ".jpeg,.jpg,.jpe,.jfif,.exif". Enumerating the registered
+        // decoders is the only way to see codecs that arrived as OS extensions
+        // (HEIF, AVIF) or third-party RAW packages.
+        std::set<std::wstring> unique;
+
+        winrt::com_ptr<IWICImagingFactory2> factory;
+        HRESULT hr = CoCreateInstance(
+            CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(factory.put()));
+
+        winrt::com_ptr<IEnumUnknown> components;
+        if (SUCCEEDED(hr) && factory)
+        {
+            hr = factory->CreateComponentEnumerator(
+                WICDecoder, WICComponentEnumerateDefault, components.put());
+        }
+
+        if (SUCCEEDED(hr) && components)
+        {
+            // Raw IUnknown*, not com_ptr: com_ptr::put() asserts the pointer is
+            // already null, which it is not on the second loop iteration.
+            IUnknown* raw = nullptr;
+            ULONG fetched = 0;
+            while (components->Next(1, &raw, &fetched) == S_OK && fetched == 1)
+            {
+                winrt::com_ptr<IUnknown> unk;
+                unk.attach(raw);
+                raw = nullptr;
+
+                auto info = unk.try_as<IWICBitmapDecoderInfo>();
+                if (!info) continue;
+
+                UINT needed = 0;
+                if (FAILED(info->GetFileExtensions(0, nullptr, &needed)) || needed == 0)
+                    continue;
+                std::wstring buffer(needed, L'\0');
+                if (FAILED(info->GetFileExtensions(needed, buffer.data(), &needed)))
+                    continue;
+                // `needed` counts the terminating NUL on the second call.
+                buffer.resize(needed > 0 ? needed - 1 : 0);
+
+                size_t start = 0;
+                while (start <= buffer.size())
+                {
+                    const size_t comma = buffer.find(L',', start);
+                    std::wstring token = buffer.substr(
+                        start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+
+                    // Trim, lowercase, and require a well-formed ".ext":
+                    // FileOpenPicker throws E_INVALIDARG on a malformed filter
+                    // entry, which would take out the whole dialog over one
+                    // badly-registered third-party codec.
+                    while (!token.empty() && iswspace(token.front())) token.erase(token.begin());
+                    while (!token.empty() && iswspace(token.back()))  token.pop_back();
+                    std::transform(token.begin(), token.end(), token.begin(),
+                        [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+
+                    const bool wellFormed =
+                        token.size() > 1 && token.front() == L'.' &&
+                        token.find_first_of(L" \t\\/:*?\"<>|") == std::wstring::npos;
+                    if (wellFormed) unique.insert(token);
+
+                    if (comma == std::wstring::npos) break;
+                    start = comma + 1;
+                }
+            }
+            if (raw) raw->Release();
+        }
+
+        if (unique.empty())
+        {
+            // Enumeration failed (no WIC, locked-down session). Fall back to the
+            // codecs Windows has always shipped in-box.
+            //
+            // NOT the list that was hardcoded here before: that one offered
+            // ".exr" and ".hdr", which no in-box WIC decoder handles and this
+            // loader has no special case for -- so picking one could only fail.
+            // It is the same defect as the missing .heic, pointing the other
+            // way: a hand-maintained list drifts from what WIC can do in both
+            // directions at once.
+            return { L".bmp", L".dib", L".gif", L".ico", L".jpeg", L".jpg",
+                     L".jxr", L".png", L".tif", L".tiff", L".wdp" };
+        }
+        return { unique.begin(), unique.end() };
+    }
+
     ImageLoader::ImageLoader()
     {
         winrt::check_hresult(

@@ -13,23 +13,33 @@
 //     ShaderLabHeadless --graph PATH --node ID --output PNG_PATH [options]
 //
 // Required arguments:
-//     --graph PATH    .effectgraph JSON file (zip/embedded media not yet supported)
+//     --graph PATH    .effectgraph archive or bare graph JSON. A ZIP archive
+//                     has its embedded media/ extracted to a temp directory
+//                     and "media://" tokens rewritten, then cleaned up on exit.
 //     --node ID       Numeric node id from the graph to render
-//     --output PATH   PNG output path
+//     --output PATH   Output image path. The extension picks the encoder:
+//                     .jxr / .wdp -> JPEG XR, 64bpp RGBA half, lossless, HDR
+//                     preserved (no clamp, no transfer encoding);
+//                     anything else -> PNG, 8-bit sRGB, clamped to [0,1].
 //
 // Options:
 //     --width N       Output width in pixels (default: 1024)
 //     --height N      Output height in pixels (default: 1024)
 //     --adapter X     'warp' or 'default' (default: 'default'; CI uses warp)
-//     --mcp-session   Register with the broker hub as an MCP session
+//     --pixels        FP32 RGBA readback to stdout instead of a PNG
+//
+// Batch / MCP modes (mutually exclusive with a plain --output render):
+//     --script PATH --script-output PATH
+//                     JSON batch script of MCP-shaped ops; results written as JSON.
+//     --mcp-session [--pipe NAME] [--session-id ID] [--session-label TEXT]
+//                     Register with the broker hub as an MCP session and serve
+//                     requests until terminated.
+//
+// Other flags: --input-peak-nits / --output-peak-nits, --no-tonemap,
+// --enable-gpu-bindings / --disable-gpu-bindings, --reap-shader-cache
+// [--reap-shader-cache-stale-sec N], --clear-shader-cache, --help.
 //
 // Exit code: 0 on success, non-zero on any failure.
-//
-// **Not yet implemented (queued for future work):**
-//   * .effectgraph zip archives with embedded media (only plain JSON for v1)
-//   * MCP HTTP server (the full move from MainWindow.McpRoutes.cpp is queued)
-//   * --script JSON file for batch parameter sweeps
-//   * HDR-preserving JXR output (PNG truncates above 1.0 scRGB)
 //
 // What it DOES prove: the engine, graph evaluator, custom-effect cache,
 // and pixel readback path all work without any UI thread or swap chain.
@@ -38,7 +48,9 @@
 #include "EngineExport.h"
 #include "Graph/EffectGraph.h"
 #include "Rendering/GraphEvaluator.h"
+#include "Rendering/GpuTimer.h"
 #include "Rendering/DisplayMonitor.h"
+#include "Rendering/WorkingSpaceSync.h"
 #include "Effects/EffectRegistry.h"
 #include "Effects/SourceNodeFactory.h"
 #include "Effects/ShaderLabEffects.h"
@@ -46,6 +58,11 @@
 #include "Effects/Performance.h"
 #include "Rendering/PixelReadback.h"
 #include "Rendering/PipelineFormat.h"
+#include "Rendering/EffectGraphFile.h"
+#include "Rendering/VideoExport.h"
+
+// XMConvertFloatToHalf for the JXR (64bpp RGBA half) encode path.
+#include <DirectXPackedVector.h>
 #include "Engine/Mcp/McpRouter.h"
 #include "Engine/Mcp/McpJsonRpc.h"
 #include "Engine/Mcp/McpSessionClient.h"
@@ -72,6 +89,17 @@ namespace
         uint32_t     width{ 1024 };
         uint32_t     height{ 1024 };
         bool         useWarp{ false };
+        // Enable D3D11 timestamp sampling so the gpu-bench script op can
+        // report real GPU execution time. Off by default because closing a
+        // GPU span around D2D work needs a Flush, which perturbs the frame.
+        bool         gpuTiming{ false };
+        // Model the GUI's readback policy. MainWindow enables
+        // SetSkipUnneededCpuReadbackEnabled(true); headless deliberately
+        // does not, because probing wants fresh analysis fields every
+        // frame. That difference is fine for correctness work and WRONG
+        // for perf work -- benchmarking headless without it measures a
+        // GPU->CPU round trip the real app does not perform.
+        bool         skipUnneededReadback{ false };
         // D2D HdrToneMap parameters: InputMaxLuminance is the peak nit
         // value of the source content; OutputMaxLuminance is the peak
         // nit value the SDR PNG can represent (80 == scRGB 1.0). The
@@ -84,6 +112,27 @@ namespace
         // when the graph already produced SDR-range output and we
         // don't want HdrToneMap's mid-tone lift muddying the result.
         bool         skipToneMap{ false };
+        // Set when --input-peak-nits / --output-peak-nits was passed. A JXR
+        // output skips the tone map by default (see RunRender), but an
+        // explicit peak request means the caller wants tone mapping and is
+        // choosing the target peak -- e.g. 4000-nit content into a 1000-nit
+        // HDR deliverable -- so it must win over that default.
+        bool         toneMapExplicit{ false };
+
+        // Display-profile pin. Without one, every headless mode binds to
+        // the LIVE primary monitor (InitializeForPrimaryMonitor), so a
+        // graph containing a Working Space node renders differently on
+        // two machines -- and differently on the SAME machine after the
+        // user drags the Windows "SDR content brightness" slider, which
+        // moves sdrWhiteLevelNits. That is correct for interactive probing
+        // and wrong for golden images: it makes a byte comparison against
+        // a checked-in reference a test of the tester's display settings.
+        // --display-profile picks a fully-determined preset; the two
+        // override flags pin just the luminance anchors on top of whatever
+        // base is in effect (the live profile when no preset is named).
+        std::wstring displayProfile;            // preset id; empty -> live
+        float        displaySdrWhite{ 0.0f };   // >0 -> override
+        float        displayPeakNits{ 0.0f };   // >0 -> override
         // FP32 RGBA pixel-region readback (alternate output mode).
         // When set, --output is interpreted as a raw FP32 binary blob
         // (extension .bin / .raw) or a CSV file (extension .csv). No
@@ -126,25 +175,67 @@ namespace
         // for the duration of this run. Persists no state; affects only
         // this process. Defaults to engine default (off for v1.6).
         std::optional<bool> enableGpuBindings;
+
+        // Video export (--video PATH). Frames are rendered on a fixed
+        // timeline and encoded by an external ffmpeg; see
+        // Rendering/VideoExport.h for the pipeline and its decisions.
+        std::wstring videoPath;
+        std::wstring videoFormat{ L"hdr10" };   // hdr10 | sdr
+        std::wstring videoCodec;                // hevc | av1 | h264; empty -> per-format default
+        double       videoFps{ 60.0 };
+        double       videoStart{ 0.0 };
+        std::optional<double> videoDuration;    // unset -> longest Clock
+        int          videoCrf{ -1 };
+        std::wstring videoPreset;
+        bool         videoLossless{ false };
+        std::wstring videoMastering{ L"p3-1000" };  // p3-1000 | working-space | none
+        std::optional<uint32_t> videoMaxCll;
+        std::optional<uint32_t> videoMaxFall;
+        std::wstring ffmpegPath;                // empty -> search PATH
+
+        // --time T: set every Clock to export-timeline time T before an
+        // --output / --pixels render, so one frame of an animation renders
+        // exactly as --video would render it (and can be compared with it).
+        std::optional<double> time;
     };
 
     void PrintUsage(const wchar_t* exeName)
     {
         std::wprintf(
-L"Usage: %ls --graph PATH --node ID --output PNG_PATH [options]\n"
+L"Usage: %ls --graph PATH --node ID --output IMAGE_PATH [options]\n"
 L"\n"
 L"Required:\n"
-L"  --graph PATH    .effectgraph JSON file\n"
+L"  --graph PATH    .effectgraph archive (ZIP; embedded media supported)\n"
+L"                  or a bare graph JSON file\n"
 L"  --node ID       Numeric node id to render\n"
-L"  --output PATH   PNG output path\n"
+L"  --output PATH   Output image. The extension picks the encoder:\n"
+L"                    .jxr/.wdp  JPEG XR, 64bpp RGBA half, lossless, HDR\n"
+L"                               preserved (implies --no-tonemap unless a\n"
+L"                               peak is named explicitly)\n"
+L"                    otherwise  PNG, 8-bit sRGB, clamped to [0,1]\n"
 L"\n"
 L"Options:\n"
 L"  --width N                Output width (default: 1024)\n"
 L"  --height N               Output height (default: 1024)\n"
 L"  --adapter X              'warp' or 'default' (default: default)\n"
+L"  --gpu-timing             Sample REAL GPU time via D3D11 timestamp queries\n"
+L"                           and enable the gpu-bench script op. Off by\n"
+L"                           default: it Flushes D2D, which perturbs the\n"
+L"                           very frame being measured.\n"
 L"  --input-peak-nits N      D2D HdrToneMap input peak (default: 1000)\n"
 L"  --output-peak-nits N     D2D HdrToneMap output peak (default: 80 = SDR)\n"
 L"  --no-tonemap             Skip HdrToneMap, raw scRGB -> sRGB clamp\n"
+L"\n"
+L"Display-profile pin (reproducible golden images):\n"
+L"  --display-profile NAME   Pin the display profile a Working Space node\n"
+L"                           reports instead of reading the live monitor.\n"
+L"                           One of: srgb-sdr, srgb-270, p3-600, p3-1000,\n"
+L"                           bt2020-1000, bt2020-4000, adobergb.\n"
+L"  --display-sdr-white N    Override SDR white level (nits) on top of the\n"
+L"                           preset, or on top of the live profile when no\n"
+L"                           --display-profile is given.\n"
+L"  --display-peak-nits N    Override display peak luminance (nits); same\n"
+L"                           layering as --display-sdr-white.\n"
 L"\n"
 L"Pixel-region readback mode (raw FP32 RGBA, no tonemap):\n"
 L"  --pixels x,y,w,h         Read a region from the node's output as\n"
@@ -154,6 +245,31 @@ L"                           (W,H header as two uint32, then floats);\n"
 L"                           .csv -> text 'x,y,r,g,b,a' rows.\n"
 L"                           Designed for MCP-driven full-accuracy\n"
 L"                           sampling. Region is clipped to image bounds.\n"
+L"\n"
+L"Video export (fixed timeline, encoded by an external ffmpeg):\n"
+L"  --video PATH             Render --node over time and write a video\n"
+L"                           (.mp4 / .mkv / .mov). Needs --graph and --node;\n"
+L"                           --output is not used.\n"
+L"  --format hdr10|sdr       hdr10 (default): BT.2020 + PQ, 10-bit 4:2:0,\n"
+L"                           absolute nits (scRGB 1.0 = 80 nits).\n"
+L"                           sdr: BT.709, sRGB curve on [0,1], 8-bit.\n"
+L"                           No tone mapping: export the node you want.\n"
+L"  --codec hevc|av1|h264    Default hevc for hdr10, h264 for sdr.\n"
+L"  --fps N                  Frame rate (default 60; 29.97 etc. accepted).\n"
+L"  --start S                Export-timeline start in seconds (default 0).\n"
+L"  --duration S             Length in seconds (default: the longest\n"
+L"                           Clock's Start..Stop span at its Speed).\n"
+L"  --crf N / --preset P     Encoder quality / speed (per-codec defaults).\n"
+L"  --lossless               Lossless HEVC / H.264 (for verification).\n"
+L"  --mastering M            HDR10 static metadata: p3-1000 (default,\n"
+L"                           P3-D65 1000/0.005-nit display), working-space\n"
+L"                           (the graph's Working Space node), or none.\n"
+L"                           MaxCLL/MaxFALL are MEASURED from the frames\n"
+L"                           (one extra render-only pass) unless given:\n"
+L"  --max-cll CLL,FALL       Use these instead of measuring.\n"
+L"  --ffmpeg PATH            ffmpeg.exe (or its folder). Default: PATH.\n"
+L"  --time T                 For --output / --pixels: set every Clock to\n"
+L"                           timeline time T first (one frame of --video).\n"
 L"\n"
 L"Script batch mode (parameter sweeps without HTTP round-trips):\n"
 L"  --script PATH            JSON file with an array of MCP ops to run\n"
@@ -183,9 +299,10 @@ L"GPU-binding fast path (Phase 8 feature flag, default ON in v1.6):\n"
 L"  --enable-gpu-bindings    Force GPU bindings on (default).\n"
 L"                           The evaluator routes upstream-effect SRVs\n"
 L"                           directly to D3D11 compute consumers'\n"
-L"                           t-slots; pixel shader consumers fall back\n"
-L"                           to CPU readback gracefully. Telemetry via\n"
-L"                           Performance::GpuBindingDetections().\n"
+L"                           t-slots; pixel shader consumers receive\n"
+L"                           them as a 1-row analysis texture on an\n"
+L"                           extra input pin (lane 3). Either way the\n"
+L"                           CPU readback is skipped.\n"
 L"  --disable-gpu-bindings   Force GPU bindings off; every binding goes\n"
 L"                           through CPU readback (the pre-v1.6 path).\n",
             exeName);
@@ -194,6 +311,72 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
     // Bare-bones argv parsing. Each flag takes one positional argument.
     // Unknown flags fail closed with a usage hint so typos don't silently
     // produce wrong output.
+
+    // --display-profile preset table. Kept next to ParseArgs so an unknown
+    // name is a usage error (exit 1, no GPU init) rather than a silent
+    // fallback to the live display -- a silent fallback would defeat the
+    // whole point of the flag, which is to make a render independent of
+    // the machine it runs on.
+    constexpr const wchar_t* kDisplayPresetNames =
+        L"srgb-sdr, srgb-270, p3-600, p3-1000, bt2020-1000, bt2020-4000, adobergb";
+
+    std::optional<ShaderLab::Rendering::DisplayProfile>
+    DisplayPresetByName(std::wstring_view name)
+    {
+        using namespace ShaderLab::Rendering;
+        if (name == L"srgb-sdr")    return PresetSrgbSdr();
+        if (name == L"srgb-270")    return PresetSrgb270();
+        if (name == L"p3-600")      return PresetP3_600();
+        if (name == L"p3-1000")     return PresetP3_1000();
+        if (name == L"bt2020-1000") return PresetBT2020_1000();
+        if (name == L"bt2020-4000") return PresetBT2020_4000();
+        if (name == L"adobergb")    return PresetAdobeRGB();
+        return std::nullopt;
+    }
+
+    // Apply the --display-* pin to a freshly-initialized DisplayMonitor.
+    // No-op when no pin was requested, so the default stays "track the
+    // live monitor" for interactive probing.
+    //
+    // Layering: --display-profile picks a fully-determined base; the two
+    // override flags then pin the luminance anchors on top of it, or on
+    // top of the LIVE profile when no preset was named (so a caller who
+    // pins only SDR white keeps the real panel's peak and primaries).
+    //
+    // The preset factories already call StampSimulatedColorMode, and a
+    // live profile is coherent by construction, so nothing here re-derives
+    // activeColorMode / the *Supported flags -- overriding a luminance
+    // anchor does not change which advanced-color kind is active.
+    void ApplyDisplayPin(const Args& args, ShaderLab::Rendering::DisplayMonitor& monitor)
+    {
+        const bool wantsPreset   = !args.displayProfile.empty();
+        const bool wantsOverride = args.displaySdrWhite > 0.0f || args.displayPeakNits > 0.0f;
+        if (!wantsPreset && !wantsOverride) return;
+
+        // ParseArgs already rejected an unknown preset name, so the
+        // value_or here can only fire if that validation is bypassed.
+        auto p = wantsPreset
+            ? DisplayPresetByName(args.displayProfile).value_or(monitor.LiveProfile())
+            : monitor.LiveProfile();
+
+        if (args.displaySdrWhite > 0.0f)
+            p.caps.sdrWhiteLevelNits = args.displaySdrWhite;
+        if (args.displayPeakNits > 0.0f)
+        {
+            p.caps.maxLuminanceNits = args.displayPeakNits;
+            // Presets keep maxFullFrame <= peak; preserve that rather than
+            // leaving a full-frame cap above the newly-lowered peak.
+            if (p.caps.maxFullFrameLuminanceNits > args.displayPeakNits)
+                p.caps.maxFullFrameLuminanceNits = args.displayPeakNits;
+        }
+
+        p.isSimulated = true;
+        p.profileName = p.profileName.empty()
+            ? std::wstring(L"CLI display pin")
+            : p.profileName + L" (CLI pin)";
+        monitor.SetSimulatedProfile(p);
+    }
+
     bool ParseArgs(int argc, wchar_t* argv[], Args& out)
     {
         for (int i = 1; i < argc; ++i)
@@ -211,10 +394,20 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
             else if (a == L"--output")  { auto v = needNext(L"--output"); if (!v) return false; out.outputPath = v; }
             else if (a == L"--width")   { auto v = needNext(L"--width"); if (!v) return false; out.width = static_cast<uint32_t>(std::wcstoul(v, nullptr, 10)); }
             else if (a == L"--height")  { auto v = needNext(L"--height"); if (!v) return false; out.height = static_cast<uint32_t>(std::wcstoul(v, nullptr, 10)); }
+            else if (a == L"--gpu-timing") { out.gpuTiming = true; }
+            else if (a == L"--skip-unneeded-readback") { out.skipUnneededReadback = true; }
             else if (a == L"--adapter") { auto v = needNext(L"--adapter"); if (!v) return false; out.useWarp = (std::wstring_view{v} == L"warp"); }
-            else if (a == L"--input-peak-nits")  { auto v = needNext(L"--input-peak-nits"); if (!v) return false; out.inputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); }
-            else if (a == L"--output-peak-nits") { auto v = needNext(L"--output-peak-nits"); if (!v) return false; out.outputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); }
+            else if (a == L"--input-peak-nits")  { auto v = needNext(L"--input-peak-nits"); if (!v) return false; out.inputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); out.toneMapExplicit = true; }
+            else if (a == L"--output-peak-nits") { auto v = needNext(L"--output-peak-nits"); if (!v) return false; out.outputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); out.toneMapExplicit = true; }
             else if (a == L"--no-tonemap") { out.skipToneMap = true; }
+            else if (a == L"--display-profile")   { auto v = needNext(L"--display-profile"); if (!v) return false;
+                                                   if (!DisplayPresetByName(v).has_value()) {
+                                                       std::wprintf(L"ERROR: unknown --display-profile '%ls'. Expected one of: %ls\n", v, kDisplayPresetNames);
+                                                       return false;
+                                                   }
+                                                   out.displayProfile = v; }
+            else if (a == L"--display-sdr-white") { auto v = needNext(L"--display-sdr-white"); if (!v) return false; out.displaySdrWhite = static_cast<float>(std::wcstod(v, nullptr)); }
+            else if (a == L"--display-peak-nits") { auto v = needNext(L"--display-peak-nits"); if (!v) return false; out.displayPeakNits = static_cast<float>(std::wcstod(v, nullptr)); }
             else if (a == L"--pixels")
             {
                 auto v = needNext(L"--pixels"); if (!v) return false;
@@ -262,6 +455,28 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
             }
             else if (a == L"--enable-gpu-bindings")  { out.enableGpuBindings = true;  }
             else if (a == L"--disable-gpu-bindings") { out.enableGpuBindings = false; }
+            else if (a == L"--video")    { auto v = needNext(L"--video"); if (!v) return false; out.videoPath = v; }
+            else if (a == L"--format")   { auto v = needNext(L"--format"); if (!v) return false; out.videoFormat = v; }
+            else if (a == L"--codec")    { auto v = needNext(L"--codec"); if (!v) return false; out.videoCodec = v; }
+            else if (a == L"--fps")      { auto v = needNext(L"--fps"); if (!v) return false; out.videoFps = std::wcstod(v, nullptr); }
+            else if (a == L"--start")    { auto v = needNext(L"--start"); if (!v) return false; out.videoStart = std::wcstod(v, nullptr); }
+            else if (a == L"--duration") { auto v = needNext(L"--duration"); if (!v) return false; out.videoDuration = std::wcstod(v, nullptr); }
+            else if (a == L"--crf")      { auto v = needNext(L"--crf"); if (!v) return false; out.videoCrf = static_cast<int>(std::wcstol(v, nullptr, 10)); }
+            else if (a == L"--preset")   { auto v = needNext(L"--preset"); if (!v) return false; out.videoPreset = v; }
+            else if (a == L"--lossless") { out.videoLossless = true; }
+            else if (a == L"--mastering"){ auto v = needNext(L"--mastering"); if (!v) return false; out.videoMastering = v; }
+            else if (a == L"--max-cll")
+            {
+                auto v = needNext(L"--max-cll"); if (!v) return false;
+                unsigned cll = 0, fall = 0;
+                if (swscanf_s(v, L"%u,%u", &cll, &fall) != 2) {
+                    std::wprintf(L"ERROR: --max-cll requires 'CLL,FALL' (got '%ls')\n", v);
+                    return false;
+                }
+                out.videoMaxCll = cll; out.videoMaxFall = fall;
+            }
+            else if (a == L"--ffmpeg")   { auto v = needNext(L"--ffmpeg"); if (!v) return false; out.ffmpegPath = v; }
+            else if (a == L"--time")     { auto v = needNext(L"--time"); if (!v) return false; out.time = std::wcstod(v, nullptr); }
             else if (a == L"--help" || a == L"-h" || a == L"-?") { PrintUsage(argv[0]); return false; }
             else { std::wprintf(L"ERROR: unknown argument '%ls'\n", argv[i]); return false; }
         }
@@ -277,6 +492,13 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
         {
             if (out.graphPath.empty()) {
                 std::wprintf(L"ERROR: --graph is required (script / mcp-session mode)\n");
+                return false;
+            }
+        }
+        else if (!out.videoPath.empty())
+        {
+            if (out.graphPath.empty() || !out.hasNodeId) {
+                std::wprintf(L"ERROR: --video needs --graph and --node\n");
                 return false;
             }
         }
@@ -309,10 +531,128 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
         return s;
     }
 
+    // Result of loading a graph from either container form.
+    struct LoadedGraph
+    {
+        ShaderLab::Graph::EffectGraph graph;
+        // Non-empty when the source was a zip: the temp directory holding
+        // extracted media. The graph's source-node paths point into it, so it
+        // must outlive rendering; RemoveExtractDir() clears it afterwards.
+        std::wstring extractDir;
+        bool ok{ false };
+        int  exitCode{ 0 };     // meaningful only when !ok
+    };
+
+    void RemoveExtractDir(const std::wstring& dir)
+    {
+        if (dir.empty()) return;
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);   // best effort: temp dir
+    }
+
+    // Deletes the extracted-media temp directory on every exit path.
+    // Declare it BEFORE the evaluator / source factory so it destructs AFTER
+    // them -- those hold file handles into the directory while rendering.
+    struct ExtractDirGuard
+    {
+        std::wstring dir;
+        explicit ExtractDirGuard(std::wstring d) : dir(std::move(d)) {}
+        ~ExtractDirGuard() { RemoveExtractDir(dir); }
+        ExtractDirGuard(const ExtractDirGuard&) = delete;
+        ExtractDirGuard& operator=(const ExtractDirGuard&) = delete;
+    };
+
+    // Load a graph from either container form:
+    //   * a .effectgraph ZIP (what the GUI's Save produces) -- graph.json plus
+    //     optional embedded media under media/, and
+    //   * a bare .json graph (what the test fixtures and older files are).
+    //
+    // Detected by the PKZIP local-file-header magic rather than by extension,
+    // because .effectgraph is used for both forms historically.
+    //
+    // Media handling mirrors MainWindow.GraphFileIo.cpp: source nodes carry a
+    // "media://<name>" token which is rewritten to the extracted temp path, in
+    // BOTH shaderPath and the mirrored "shaderPath" property, so the existing
+    // image / video pipeline resolves them with no further special-casing.
+    LoadedGraph LoadGraphFromPath(const std::wstring& path)
+    {
+        LoadedGraph result;
+
+        std::string raw = ReadFileUtf8(path);
+        if (raw.empty())
+        {
+            std::wprintf(L"FATAL: could not read graph file '%ls'\n", path.c_str());
+            result.exitCode = 4;
+            return result;
+        }
+
+        std::wstring graphJsonW;
+        std::map<std::wstring, std::wstring> mediaMap;
+
+        const bool isZip = raw.size() >= 4 && raw[0] == 'P' && raw[1] == 'K' &&
+                           raw[2] == '\x03' && raw[3] == '\x04';
+        if (isZip)
+        {
+            wchar_t tempRoot[MAX_PATH]{};
+            GetTempPathW(MAX_PATH, tempRoot);
+            auto loaded = ShaderLab::Rendering::EffectGraphFile::Load(path, tempRoot);
+            if (!loaded.has_value())
+            {
+                std::wprintf(L"FATAL: could not read graph from .effectgraph archive '%ls'\n",
+                    path.c_str());
+                result.exitCode = 4;
+                return result;
+            }
+            graphJsonW         = loaded->graphJson;
+            mediaMap           = std::move(loaded->mediaMap);
+            result.extractDir  = loaded->extractDir;
+        }
+        else
+        {
+            int wcCount = MultiByteToWideChar(CP_UTF8, 0, raw.data(),
+                static_cast<int>(raw.size()), nullptr, 0);
+            graphJsonW.resize(wcCount, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, raw.data(),
+                static_cast<int>(raw.size()), graphJsonW.data(), wcCount);
+        }
+
+        try {
+            result.graph = ShaderLab::Graph::EffectGraph::FromJson(winrt::hstring(graphJsonW));
+            ShaderLab::Effects::ShaderLabEffects::RestoreRuntimeFlags(result.graph);
+        } catch (winrt::hresult_error const& e) {
+            std::wprintf(L"FATAL: graph JSON parse failed (0x%08X): %ls\n",
+                static_cast<uint32_t>(e.code()), e.message().c_str());
+            RemoveExtractDir(result.extractDir);
+            result.extractDir.clear();
+            result.exitCode = 5;
+            return result;
+        }
+
+        if (!mediaMap.empty())
+        {
+            auto& nodes = const_cast<std::vector<ShaderLab::Graph::EffectNode>&>(
+                result.graph.Nodes());
+            for (auto& n : nodes)
+            {
+                if (n.type != ShaderLab::Graph::NodeType::Source) continue;
+                if (!n.shaderPath.has_value()) continue;
+                auto it = mediaMap.find(*n.shaderPath);
+                if (it == mediaMap.end()) continue;
+                n.shaderPath = it->second;
+                auto pit = n.properties.find(L"shaderPath");
+                if (pit != n.properties.end())
+                    pit->second = it->second;
+            }
+        }
+
+        result.ok = true;
+        return result;
+    }
+
     // Encode an FP32 RGBA buffer as PNG via WIC. PNG is 8-bit per channel;
     // values are gamma-encoded sRGB after a clamp to [0, 1]. This is lossy
-    // for HDR scRGB output (anything above 1.0 saturates to 255). For HDR
-    // fidelity, switch to JXR (D2D's native FP16 path) -- queued.
+    // for HDR scRGB output (anything above 1.0 saturates to 255) -- use a
+    // .jxr output path for HDR fidelity (SaveFp32AsJxr below).
     HRESULT SaveFp32AsPng(IWICImagingFactory* wic,
         const float* rgba, uint32_t w, uint32_t h, uint32_t pitchBytes,
         const std::wstring& path)
@@ -371,6 +711,105 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
         if (FAILED(hr)) return hr;
         return encoder->Commit();
     }
+
+    // Encode an FP32 RGBA buffer as JPEG XR (.jxr / .wdp) via WIC, preserving
+    // HDR. Unlike the PNG path there is NO clamp and NO transfer encoding: the
+    // pipeline's scRGB linear values are written as-is into a 64bpp RGBA-half
+    // frame, so values above 1.0 (above SDR white) and the negative components
+    // that express wide-gamut colour both survive the round trip.
+    //
+    // FP32 -> FP16 is not a precision loss in practice: the pipeline is
+    // R16G16B16A16_FLOAT, so these values originated as halves.
+    //
+    // Mirrors the GUI's OutputWindow::SaveImageAsync JXR branch
+    // (GUID_ContainerFormatWmp + Lossless), so a node saved from an output
+    // window and the same node captured headless produce the same file.
+    HRESULT SaveFp32AsJxr(IWICImagingFactory* wic,
+        const float* rgba, uint32_t w, uint32_t h, uint32_t pitchBytes,
+        const std::wstring& path)
+    {
+        using DirectX::PackedVector::XMConvertFloatToHalf;
+
+        // 64bpp RGBA half, tightly packed.
+        std::vector<uint16_t> halfRgba(static_cast<size_t>(w) * h * 4);
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            const float* srcRow = reinterpret_cast<const float*>(
+                reinterpret_cast<const uint8_t*>(rgba) + y * pitchBytes);
+            uint16_t* dstRow = halfRgba.data() + static_cast<size_t>(y) * w * 4;
+            for (uint32_t x = 0; x < w * 4; ++x)
+                dstRow[x] = XMConvertFloatToHalf(srcRow[x]);
+        }
+
+        winrt::com_ptr<IWICStream> stream;
+        HRESULT hr = wic->CreateStream(stream.put());
+        if (FAILED(hr)) return hr;
+        hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+        if (FAILED(hr)) return hr;
+
+        winrt::com_ptr<IWICBitmapEncoder> encoder;
+        hr = wic->CreateEncoder(GUID_ContainerFormatWmp, nullptr, encoder.put());
+        if (FAILED(hr)) return hr;
+        hr = encoder->Initialize(stream.get(), WICBitmapEncoderNoCache);
+        if (FAILED(hr)) return hr;
+
+        winrt::com_ptr<IWICBitmapFrameEncode> frame;
+        winrt::com_ptr<IPropertyBag2> encoderOptions;
+        hr = encoder->CreateNewFrame(frame.put(), encoderOptions.put());
+        if (FAILED(hr)) return hr;
+
+        // Lossless: the point of this path is fidelity, not file size.
+        if (encoderOptions)
+        {
+            PROPBAG2 option{};
+            option.pstrName = const_cast<LPOLESTR>(L"Lossless");
+            VARIANT val{};
+            val.vt = VT_BOOL;
+            val.boolVal = VARIANT_TRUE;
+            encoderOptions->Write(1, &option, &val);
+        }
+
+        hr = frame->Initialize(encoderOptions.get());
+        if (FAILED(hr)) return hr;
+        hr = frame->SetSize(w, h);
+        if (FAILED(hr)) return hr;
+
+        WICPixelFormatGUID fmt = GUID_WICPixelFormat64bppRGBAHalf;
+        hr = frame->SetPixelFormat(&fmt);
+        if (FAILED(hr)) return hr;
+        // WIC may negotiate a different format; refuse rather than silently
+        // writing something that is not the half-float data we promised.
+        if (fmt != GUID_WICPixelFormat64bppRGBAHalf) return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
+
+        const uint32_t stride = w * 4 * sizeof(uint16_t);
+        hr = frame->WritePixels(h, stride, stride * h,
+            reinterpret_cast<BYTE*>(halfRgba.data()));
+        if (FAILED(hr)) return hr;
+        hr = frame->Commit();
+        if (FAILED(hr)) return hr;
+        return encoder->Commit();
+    }
+
+    // True when the output path asks for the HDR-preserving encoder.
+    bool IsHdrOutputPath(const std::wstring& path)
+    {
+        auto dot = path.rfind(L'.');
+        if (dot == std::wstring::npos) return false;
+        std::wstring ext = path.substr(dot);
+        for (auto& c : ext) c = static_cast<wchar_t>(towlower(c));
+        return ext == L".jxr" || ext == L".wdp";
+    }
+
+    // Pick the encoder from the output file's extension. PNG is the default
+    // for anything unrecognized, matching the historical behavior.
+    HRESULT SaveFp32Image(IWICImagingFactory* wic,
+        const float* rgba, uint32_t w, uint32_t h, uint32_t pitchBytes,
+        const std::wstring& path)
+    {
+        if (IsHdrOutputPath(path))
+            return SaveFp32AsJxr(wic, rgba, w, h, pitchBytes, path);
+        return SaveFp32AsPng(wic, rgba, w, h, pitchBytes, path);
+    }
 }
 
 int wmain(int argc, wchar_t* argv[]);
@@ -381,6 +820,57 @@ int RunScript(const Args& args);
 // GraphEvaluator, com_ptrs) destruct cleanly before wmain calls
 // MFShutdown / uninit_apartment. The dangling order otherwise produced
 // hangs on D2D device teardown.
+namespace
+{
+    // Shared by --video and the /render/video route: strings -> enums, with a
+    // readable error for anything unrecognised.
+    bool ParseVideoEnums(const std::wstring& format, const std::wstring& codec, const std::wstring& mastering,
+                         ShaderLab::Rendering::VideoExportRequest& req, std::wstring& error)
+    {
+        using namespace ShaderLab::Rendering;
+        if (format == L"hdr10" || format.empty()) req.format = VideoFormat::Hdr10;
+        else if (format == L"sdr") req.format = VideoFormat::Sdr;
+        else { error = L"format must be hdr10 or sdr (got '" + format + L"')"; return false; }
+        if (codec.empty()) req.codec = VideoCodec::Default;
+        else if (codec == L"hevc" || codec == L"h265") req.codec = VideoCodec::Hevc;
+        else if (codec == L"av1") req.codec = VideoCodec::Av1;
+        else if (codec == L"h264" || codec == L"avc") req.codec = VideoCodec::H264;
+        else { error = L"codec must be hevc, av1 or h264 (got '" + codec + L"')"; return false; }
+        if (mastering == L"p3-1000" || mastering.empty()) req.mastering = MasteringMode::P3D65_1000;
+        else if (mastering == L"working-space") req.mastering = MasteringMode::WorkingSpace;
+        else if (mastering == L"none") req.mastering = MasteringMode::None;
+        else { error = L"mastering must be p3-1000, working-space or none (got '" + mastering + L"')"; return false; }
+        return true;
+    }
+
+    std::string VideoResultJson(const ShaderLab::Rendering::VideoExportResult& r)
+    {
+        namespace WDJ = winrt::Windows::Data::Json;
+        WDJ::JsonObject o;
+        o.Insert(L"ok", WDJ::JsonValue::CreateBooleanValue(r.ok));
+        if (!r.ok) o.Insert(L"error", WDJ::JsonValue::CreateStringValue(r.error));
+        o.Insert(L"ffmpegPath", WDJ::JsonValue::CreateStringValue(r.ffmpegPath));
+        o.Insert(L"encoder", WDJ::JsonValue::CreateStringValue(r.encoder));
+        o.Insert(L"commandLine", WDJ::JsonValue::CreateStringValue(r.commandLine));
+        o.Insert(L"width", WDJ::JsonValue::CreateNumberValue(r.width));
+        o.Insert(L"height", WDJ::JsonValue::CreateNumberValue(r.height));
+        o.Insert(L"frames", WDJ::JsonValue::CreateNumberValue(r.frames));
+        o.Insert(L"fps", WDJ::JsonValue::CreateNumberValue(r.fps));
+        o.Insert(L"start", WDJ::JsonValue::CreateNumberValue(r.start));
+        o.Insert(L"duration", WDJ::JsonValue::CreateNumberValue(r.duration));
+        o.Insert(L"maxCll", WDJ::JsonValue::CreateNumberValue(r.maxCll));
+        o.Insert(L"maxFall", WDJ::JsonValue::CreateNumberValue(r.maxFall));
+        o.Insert(L"staticMetadataWritten", WDJ::JsonValue::CreateBooleanValue(r.staticMetadataWritten));
+        o.Insert(L"seconds", WDJ::JsonValue::CreateNumberValue(r.seconds));
+        WDJ::JsonArray w;
+        for (const auto& s : r.warnings) w.Append(WDJ::JsonValue::CreateStringValue(s));
+        o.Insert(L"warnings", w);
+        if (!r.ok && !r.ffmpegLogTail.empty())
+            o.Insert(L"ffmpegLogTail", WDJ::JsonValue::CreateStringValue(winrt::to_hstring(r.ffmpegLogTail)));
+        return winrt::to_string(o.Stringify());
+    }
+}
+
 int RunRender(const Args& args)
 {
     UINT d3dFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -426,26 +916,12 @@ int RunRender(const Args& args)
     ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
 
     // ---- Load the graph ----------------------------------------------------
-    auto graphJson = ReadFileUtf8(args.graphPath);
-    if (graphJson.empty()) {
-        std::wprintf(L"FATAL: could not read graph file '%ls'\n", args.graphPath.c_str());
-        return 4;
-    }
-    // Convert UTF-8 to UTF-16 for FromJson (winrt::hstring).
-    int wcCount = MultiByteToWideChar(CP_UTF8, 0, graphJson.data(),
-        static_cast<int>(graphJson.size()), nullptr, 0);
-    std::wstring graphJsonW(wcCount, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, graphJson.data(),
-        static_cast<int>(graphJson.size()), graphJsonW.data(), wcCount);
-
-    ShaderLab::Graph::EffectGraph graph;
-    try {
-        graph = ShaderLab::Graph::EffectGraph::FromJson(winrt::hstring(graphJsonW));
-    } catch (winrt::hresult_error const& e) {
-        std::wprintf(L"FATAL: graph JSON parse failed (0x%08X): %ls\n",
-            static_cast<uint32_t>(e.code()), e.message().c_str());
-        return 5;
-    }
+    // Handles both a .effectgraph ZIP (media extracted to a temp dir, which
+    // must survive until rendering is done) and a bare JSON graph.
+    auto loaded = LoadGraphFromPath(args.graphPath);
+    if (!loaded.ok) return loaded.exitCode;
+    auto& graph = loaded.graph;
+    ExtractDirGuard extractGuard{ loaded.extractDir };
 
     if (!graph.FindNode(args.nodeId)) {
         std::wprintf(L"FATAL: node id %u not found in graph\n", args.nodeId);
@@ -473,17 +949,76 @@ int RunRender(const Args& args)
             }
         }
     }
-    // Two-pass evaluate inside an active D2D draw session so that
-    // DispatchUserD3D11Compute's internal DrawImage actually renders.
-    // (Outside BeginDraw/EndDraw, DrawImage silently no-ops and any
-    // D3D11 compute analysis reads black input.)
+    // Working Space nodes need the active display profile here too. RunScript
+    // pumps this in runEval; this path had no DisplayMonitor at all, so a saved
+    // graph containing a Working Space node rendered against the 80-nit
+    // hiddenDefaults -- and this is the `--output` / `--pixels` path, i.e.
+    // exactly the golden-image case.
+    ShaderLab::Rendering::DisplayMonitor renderDisplayMonitor;
+    renderDisplayMonitor.InitializeForPrimaryMonitor();
+    ApplyDisplayPin(args, renderDisplayMonitor);
+    ShaderLab::Rendering::UpdateWorkingSpaceNodes(graph, renderDisplayMonitor);
+
+    if (args.time.has_value())
+        ShaderLab::Rendering::SetClocksToTime(graph, *args.time);
+
+    if (!args.videoPath.empty())
+    {
+        ShaderLab::Rendering::VideoExportRequest req;
+        std::wstring perr;
+        if (!ParseVideoEnums(args.videoFormat, args.videoCodec, args.videoMastering, req, perr)) {
+            std::wprintf(L"FATAL: %ls\n", perr.c_str());
+            return 2;
+        }
+        req.nodeId = args.nodeId;
+        req.outputPath = args.videoPath;
+        req.fps = args.videoFps;
+        req.start = args.videoStart;
+        req.duration = args.videoDuration;
+        req.crf = args.videoCrf;
+        req.preset = args.videoPreset;
+        req.lossless = args.videoLossless;
+        req.maxCll = args.videoMaxCll;
+        req.maxFall = args.videoMaxFall;
+        req.ffmpegPath = args.ffmpegPath;
+        auto res = ShaderLab::Rendering::ExportVideo(req, graph, evaluator, sourceFactory,
+            &renderDisplayMonitor, dc.get(), d3dDevice.get(), d3dContext.get());
+        for (const auto& w : res.warnings) std::wprintf(L"WARNING: %ls\n", w.c_str());
+        if (!res.ok) {
+            std::wprintf(L"FATAL: video export failed: %ls\n", res.error.c_str());
+            if (!res.ffmpegLogTail.empty())
+                std::printf("---- ffmpeg log (tail) ----\n%s\n", res.ffmpegLogTail.c_str());
+            return 8;
+        }
+        std::wprintf(L"OK: wrote %ls -- %ux%u, %u frames @ %.3f fps (%.3f s), %ls, MaxCLL %.1f / MaxFALL %.1f nits%ls, %.1f s\n",
+            args.videoPath.c_str(), res.width, res.height, res.frames, res.fps, res.duration,
+            res.encoder.c_str(), res.maxCll, res.maxFall,
+            res.staticMetadataWritten ? L" (in headers)" : L"", res.seconds);
+        return 0;
+    }
+
+    // Evaluate OUTSIDE the draw session, ProcessDeferredCompute INSIDE it --
+    // the same split RunScript's runEval uses, and the structure of
+    // MainWindow::RenderFrameToOffscreen. Evaluate() can open its OWN
+    // BeginDraw/EndDraw (histogram and custom-analysis readbacks), and
+    // nesting that inside an outer session fails with D2DERR_WRONG_STATE
+    // (0x88990001). ProcessDeferredCompute itself DOES need an active
+    // session -- it calls dc->DrawImage internally, which silently no-ops
+    // outside one (CLAUDE.md records this trap).
     dc->SetTarget(nullptr);
-    dc->BeginDraw();
     evaluator.Evaluate(graph, dc.get());
-    evaluator.Evaluate(graph, dc.get());
-    evaluator.ProcessDeferredCompute(graph, dc.get());
     if (graph.HasDirtyNodes())
         evaluator.Evaluate(graph, dc.get());
+    dc->BeginDraw();
+    evaluator.ProcessDeferredCompute(graph, dc.get());
+    // Frozen so this in-session sweep cannot re-queue a compute node and
+    // re-enter the nested-BeginDraw path just avoided.
+    if (graph.HasDirtyNodes())
+    {
+        evaluator.SetDeferredComputeFrozen(true);
+        evaluator.Evaluate(graph, dc.get());
+        evaluator.SetDeferredComputeFrozen(false);
+    }
     dc->EndDraw();
 
     auto* node = graph.FindNode(args.nodeId);
@@ -604,10 +1139,24 @@ int RunRender(const Args& args)
     // visual-inspection output we want the lift; for raw scRGB pixel
     // sampling use --no-tonemap (or, future work, the FP16 readback
     // path tracked as p7-headless-fp16-pixel-readback).
+    // A .jxr / .wdp output exists to preserve HDR, so tone mapping to SDR
+    // would defeat it: the default HdrToneMap (OUTPUT_MAX_LUMINANCE = 80)
+    // maps a 800-nit source down to ~1.0 scRGB, and the encoder would then
+    // faithfully store an SDR image in an HDR container. So HDR output
+    // implies --no-tonemap, UNLESS the caller named a peak explicitly --
+    // tone mapping INTO an HDR deliverable (e.g. 4000-nit source to a
+    // 1000-nit target) is a legitimate request and must still win.
+    const bool hdrOutput = IsHdrOutputPath(args.outputPath);
+    const bool skipToneMap = args.skipToneMap || (hdrOutput && !args.toneMapExplicit);
+    if (hdrOutput && !args.skipToneMap && !args.toneMapExplicit)
+        std::wprintf(L"NOTE: HDR output (%ls) -- skipping HdrToneMap to preserve "
+                     L"values above 1.0. Pass --output-peak-nits to tone map anyway.\n",
+                     args.outputPath.c_str());
+
     winrt::com_ptr<ID2D1Effect> toneMap;
     winrt::com_ptr<ID2D1Image> toneMappedOut;
     ID2D1Image* renderInput = node->cachedOutput;
-    if (!args.skipToneMap)
+    if (!skipToneMap)
     {
         hr = dc->CreateEffect(CLSID_D2D1HdrToneMap, toneMap.put());
         if (FAILED(hr)) {
@@ -665,13 +1214,13 @@ int RunRender(const Args& args)
         return 13;
     }
 
-    hr = SaveFp32AsPng(wic.get(),
+    hr = SaveFp32Image(wic.get(),
         reinterpret_cast<const float*>(mapped.bits),
         args.width, args.height, mapped.pitch,
         args.outputPath);
     staging->Unmap();
     if (FAILED(hr)) {
-        std::wprintf(L"FATAL: SaveFp32AsPng failed 0x%08X\n", static_cast<uint32_t>(hr));
+        std::wprintf(L"FATAL: image encode failed 0x%08X\n", static_cast<uint32_t>(hr));
         return 14;
     }
 
@@ -777,33 +1326,32 @@ int RunScript(const Args& args)
     ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
 
     // ---- Load graph -------------------------------------------------------
-    auto graphJson = ReadFileUtf8(args.graphPath);
-    if (graphJson.empty()) {
-        std::wprintf(L"FATAL: could not read graph file '%ls'\n", args.graphPath.c_str());
-        return 4;
-    }
-    int wcCount = MultiByteToWideChar(CP_UTF8, 0, graphJson.data(),
-        static_cast<int>(graphJson.size()), nullptr, 0);
-    std::wstring graphJsonW(wcCount, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, graphJson.data(),
-        static_cast<int>(graphJson.size()), graphJsonW.data(), wcCount);
-
-    ShaderLab::Graph::EffectGraph graph;
-    try {
-        graph = ShaderLab::Graph::EffectGraph::FromJson(winrt::hstring(graphJsonW));
-    } catch (winrt::hresult_error const& e) {
-        std::wprintf(L"FATAL: graph JSON parse failed (0x%08X): %ls\n",
-            static_cast<uint32_t>(e.code()), e.message().c_str());
-        return 5;
-    }
+    // Same dual-form loader as RunRender: .effectgraph ZIP or bare JSON.
+    auto loaded = LoadGraphFromPath(args.graphPath);
+    if (!loaded.ok) return loaded.exitCode;
+    auto& graph = loaded.graph;
+    ExtractDirGuard extractGuard{ loaded.extractDir };
 
     ShaderLab::Effects::SourceNodeFactory sourceFactory;
     ShaderLab::Rendering::GraphEvaluator evaluator;
+    // GPU-side span timing. Headless is where perf sweeps actually run, so it
+    // gets the same instrument as the GUI. Off unless --gpu-timing.
+    ShaderLab::Rendering::GpuTimer gpuTimer;
+    gpuTimer.Initialize(d3dDevice.get());
+    gpuTimer.SetEnabled(args.gpuTiming);
+    // Same wiring the GUI uses, so a crash in the per-node path reproduces
+    // here -- where there is stderr and a fast edit/run loop -- instead of
+    // only inside a packaged app.
+    evaluator.SetGpuTimer(&gpuTimer);
+    if (args.gpuTiming && !gpuTimer.IsInitialized())
+        std::fwprintf(stderr, L"[ShaderLab] --gpu-timing requested but this device has "
+                              L"no timestamp queries; GPU times will be absent\n");
     // Snapshot the primary monitor's real advanced-color caps (no change
     // events — headless runs no DispatcherQueue). Falls back to struct
     // defaults when no display is reachable (CI, session 0).
     ShaderLab::Rendering::DisplayMonitor displayMonitor;
     displayMonitor.InitializeForPrimaryMonitor();
+    ApplyDisplayPin(args, displayMonitor);
 
     // Prep source nodes once (loads media off disk). Properties on
     // source nodes are typically static (file path); set-property on
@@ -822,9 +1370,23 @@ int RunScript(const Args& args)
     }
 
     auto runEval = [&]() {
+        // Refresh Working Space nodes from the active display profile, the
+        // same way MainWindow::RenderWorkerLoop does (the pump lives on the
+        // render worker, not in the frame draw). The /display/profile
+        // routes sync on change, but a Working Space node ADDED while a
+        // profile is already active never saw one -- it kept its 80-nit
+        // hiddenDefaults, so anything bound to SdrWhiteNits silently
+        // anchored SDR white 2.5x too low. Pumping it here is what the
+        // header prescribes: the helper dead-bands each field and only
+        // marks the node dirty when a value actually changed, so a stable
+        // profile costs a graph walk and nothing else. Must run BEFORE the
+        // BFS below so a changed field propagates to binding consumers in
+        // the same evaluation.
+        ShaderLab::Rendering::UpdateWorkingSpaceNodes(graph, displayMonitor);
+
         // Propagate dirty flags downstream so D3D11 compute effects
         // re-dispatch when upstream sources change. Mirrors the BFS
-        // walk in MainWindow::OnRenderTick -- without this, a
+        // walk in MainWindow::RenderFrameToOffscreen -- without this, a
         // set-property on an upstream node only re-evaluates that
         // node, leaving downstream analysis nodes' cached output
         // stale.
@@ -846,22 +1408,38 @@ int RunScript(const Args& args)
             }
         }
 
-        // Wrap the evaluator passes in a D2D draw session.
-        // DispatchUserD3D11Compute internally calls dc->DrawImage to
-        // pre-render the upstream chain into an FP32 bitmap before
-        // handing the texture off to D3D11. Without an active
-        // BeginDraw/EndDraw, that DrawImage silently no-ops and the
-        // compute shader reads a black texture (Min/Max/Mean = 0).
-        // Mirrors MainWindow::RenderFrame's structure.
+        // Evaluate OUTSIDE the draw session, ProcessDeferredCompute INSIDE
+        // it -- the exact structure of MainWindow::RenderFrameToOffscreen.
+        //
+        // Evaluate() can open its OWN BeginDraw/EndDraw (the D2D Histogram
+        // and custom-analysis readbacks do), and nesting that inside an
+        // outer session fails with D2DERR_WRONG_STATE. It used to be worse:
+        // Evaluate also pre-rendered compute inputs that way, and every
+        // compute effect then read black after the first set-property in a
+        // --script run. That pre-render now happens only inside
+        // ProcessDeferredCompute, which DOES need an active draw session --
+        // it calls dc->DrawImage internally, which silently no-ops outside
+        // one (CLAUDE.md records this as a trap). Hence the split.
+        //
+        // Second pass only when the first left something dirty, like the
+        // GUI: an unconditional one re-queued every binding consumer of a
+        // compute node queued in the first, dispatching it twice.
         dc->SetTarget(nullptr);
-        dc->BeginDraw();
         evaluator.Evaluate(graph, dc.get());
-        evaluator.Evaluate(graph, dc.get());  // two-pass for late init
-        evaluator.ProcessDeferredCompute(graph, dc.get());
-        // Some compute nodes mark downstream dirty; one more sweep
-        // picks those up while the draw session is still active.
         if (graph.HasDirtyNodes())
+            evaluator.Evaluate(graph, dc.get());  // second pass for new effects
+        dc->BeginDraw();
+        evaluator.ProcessDeferredCompute(graph, dc.get());
+        // Some compute nodes mark downstream dirty; one more sweep picks
+        // those up. Frozen so this pass cannot re-queue a compute node and
+        // re-enter the nested-BeginDraw path just avoided -- again mirroring
+        // MainWindow::RenderFrameToOffscreen.
+        if (graph.HasDirtyNodes())
+        {
+            evaluator.SetDeferredComputeFrozen(true);
             evaluator.Evaluate(graph, dc.get());
+            evaluator.SetDeferredComputeFrozen(false);
+        }
         dc->EndDraw();
     };
     runEval();  // initial frame so capture/pixel-region routes have something to read
@@ -886,6 +1464,72 @@ int RunScript(const Args& args)
 
     ShaderLab::McpRouter server;
     ShaderLab::Mcp::RegisterEngineRoutes(server, sink);
+
+    // POST /render/video -- headless only. The GUI does not register it: an
+    // export holds the render thread for the whole encode, which the live
+    // app cannot give up (and its dispatches time out at 30 s).
+    server.AddRoute(L"POST", L"/render/video",
+        [&](const std::wstring&, const std::wstring&, const std::string& body) -> ShaderLab::Mcp::Response
+        {
+            namespace WDJ = winrt::Windows::Data::Json;
+            WDJ::JsonObject j{ nullptr };
+            if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), j))
+                return { 400, R"({"ok":false,"error":"body must be a JSON object"})" };
+            // Untyped MCP args may arrive as strings ("60", "true") -- the
+            // coercion rule in CLAUDE.md -- so every getter accepts both.
+            auto str = [&](const wchar_t* k) -> std::wstring {
+                if (!j.HasKey(k)) return {};
+                auto v = j.GetNamedValue(k);
+                if (v.ValueType() == WDJ::JsonValueType::String) return std::wstring(v.GetString());
+                if (v.ValueType() == WDJ::JsonValueType::Number) return std::to_wstring(v.GetNumber());
+                return {};
+            };
+            auto num = [&](const wchar_t* k) -> std::optional<double> {
+                if (!j.HasKey(k)) return std::nullopt;
+                auto v = j.GetNamedValue(k);
+                if (v.ValueType() == WDJ::JsonValueType::Number) return v.GetNumber();
+                if (v.ValueType() == WDJ::JsonValueType::String) {
+                    std::wstring sv(v.GetString());
+                    wchar_t* end = nullptr;
+                    double d = std::wcstod(sv.c_str(), &end);
+                    if (end && end != sv.c_str()) return d;
+                }
+                return std::nullopt;
+            };
+            auto flag = [&](const wchar_t* k) -> bool {
+                if (!j.HasKey(k)) return false;
+                auto v = j.GetNamedValue(k);
+                if (v.ValueType() == WDJ::JsonValueType::Boolean) return v.GetBoolean();
+                if (v.ValueType() == WDJ::JsonValueType::String) { auto sv = std::wstring(v.GetString()); return sv == L"true" || sv == L"1"; }
+                if (v.ValueType() == WDJ::JsonValueType::Number) return v.GetNumber() != 0.0;
+                return false;
+            };
+
+            ShaderLab::Rendering::VideoExportRequest req;
+            std::wstring perr;
+            if (!ParseVideoEnums(str(L"format"), str(L"codec"), str(L"mastering"), req, perr))
+                return { 400, VideoResultJson({ false, perr }) };
+            auto node = num(L"nodeId");
+            req.outputPath = str(L"outputPath");
+            if (!node || req.outputPath.empty())
+                return { 400, R"({"ok":false,"error":"nodeId and outputPath are required"})" };
+            req.nodeId = static_cast<uint32_t>(*node);
+            if (auto v = num(L"fps")) req.fps = *v;
+            if (auto v = num(L"start")) req.start = *v;
+            if (auto v = num(L"duration")) req.duration = *v;
+            if (auto v = num(L"crf")) req.crf = static_cast<int>(*v);
+            req.preset = str(L"preset");
+            req.lossless = flag(L"lossless");
+            auto cll = num(L"maxCll"), fall = num(L"maxFall");
+            if (cll && fall) { req.maxCll = static_cast<uint32_t>(*cll); req.maxFall = static_cast<uint32_t>(*fall); }
+            req.ffmpegPath = str(L"ffmpegPath");
+
+            ShaderLab::Mcp::EngineContext ctx;
+            sink.populateContext(ctx);
+            auto res = ShaderLab::Rendering::ExportVideo(req, *ctx.graph, *ctx.evaluator, *ctx.sourceFactory,
+                ctx.displayMonitor, ctx.dc, ctx.d3dDevice, ctx.d3dContext);
+            return { static_cast<uint16_t>(res.ok ? 200 : 500), VideoResultJson(res) };
+        });
 
     // ---- MCP session mode (stdio-migration Step 6) ------------------------
     // Register with the broker hub as a session; the McpSessionClient
@@ -1040,6 +1684,208 @@ int RunScript(const Args& args)
                     ? static_cast<uint32_t>(stepObj.GetNamedNumber(L"nodeId")) : 0;
                 path = L"/analysis/" + std::to_wstring(id);
                 body.clear();
+            }
+            else if (op == L"gpu-bench")     {
+                // Purpose-built shader benchmark. Answers "how many GPU
+                // milliseconds does this node chain cost per frame", which is
+                // the question none of the pre-existing timings can answer.
+                //
+                // Three things it does that the obvious approach gets wrong:
+                //  1. It DRAWS the node. D2D evaluates an effect chain lazily
+                //     at DrawImage time, so a bare `render` rasterizes nothing
+                //     and a naive sweep ends up timing an empty command stream.
+                //  2. It draws into a full-size offscreen target, not a small
+                //     readback tile -- D2D shades only the pixels asked for, so
+                //     reading a 2x1 pixel-region makes any shader look free.
+                //  3. It re-dirties the SOURCE every iteration, which is the
+                //     real video workload: a new frame invalidates the whole
+                //     chain so nothing can be served from cache.
+                // It reports GPU time, so the PNG encode and process noise that
+                // swamped earlier wall-clock attempts are simply absent.
+                uint32_t benchNode = args.nodeId;
+                if (stepObj.HasKey(L"nodeId"))
+                    benchNode = static_cast<uint32_t>(stepObj.GetNamedNumber(L"nodeId"));
+                uint32_t iters = 20;
+                if (stepObj.HasKey(L"iterations"))
+                    iters = static_cast<uint32_t>(stepObj.GetNamedNumber(L"iterations"));
+                iters = (std::max)(1u, (std::min)(iters, 500u));
+
+                WDJ::JsonObject body;
+                auto* bn = graph.FindNode(benchNode);
+                if (!gpuTimer.IsEnabled())
+                {
+                    body.Insert(L"error", WDJ::JsonValue::CreateStringValue(
+                        L"GPU timing is off -- pass --gpu-timing"));
+                }
+                else if (!bn)
+                {
+                    body.Insert(L"error", WDJ::JsonValue::CreateStringValue(L"node not found"));
+                }
+                else
+                {
+                    // Target sized to the node output so we measure the real
+                    // pixel count; overridable to project the same content to
+                    // another resolution (4K, say).
+                    uint32_t bw = 0, bh = 0;
+                    if (bn->cachedOutput)
+                    {
+                        D2D1_RECT_F lb{};
+                        if (SUCCEEDED(dc->GetImageLocalBounds(bn->cachedOutput, &lb)))
+                        {
+                            bw = static_cast<uint32_t>((std::max)(0.0f, lb.right - lb.left));
+                            bh = static_cast<uint32_t>((std::max)(0.0f, lb.bottom - lb.top));
+                        }
+                    }
+                    if (stepObj.HasKey(L"width"))
+                        bw = static_cast<uint32_t>(stepObj.GetNamedNumber(L"width"));
+                    if (stepObj.HasKey(L"height"))
+                        bh = static_cast<uint32_t>(stepObj.GetNamedNumber(L"height"));
+                    if (bw == 0 || bh == 0) { bw = args.width; bh = args.height; }
+
+                    winrt::com_ptr<ID2D1Bitmap1> target;
+                    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+                        D2D1_BITMAP_OPTIONS_TARGET,
+                        D2D1::PixelFormat(DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                          D2D1_ALPHA_MODE_PREMULTIPLIED));
+                    HRESULT hrT = dc->CreateBitmap(D2D1::SizeU(bw, bh), nullptr, 0, &bp,
+                                                   target.put());
+                    if (FAILED(hrT))
+                    {
+                        body.Insert(L"error", WDJ::JsonValue::CreateStringValue(
+                            L"could not create bench target"));
+                    }
+                    else
+                    {
+                        std::vector<double> samples, frameSamples, evalSamples, cpuEvalMs, cpuFrameMs;
+                        // Per compute node: exact dispatch time (the evaluator
+                        // brackets each dispatch as its own submission).
+                        std::map<uint32_t, std::vector<double>> nodeSamples;
+                        samples.reserve(iters);
+                        frameSamples.reserve(iters);
+                        evalSamples.reserve(iters);
+                        for (uint32_t k = 0; k < iters; ++k)
+                        {
+                            for (auto& nd : const_cast<std::vector<ShaderLab::Graph::EffectNode>&>(graph.Nodes()))
+                                if (nd.type == ShaderLab::Graph::NodeType::Source) nd.dirty = true;
+
+                            // Frame span covers the WHOLE per-frame cost a video
+                            // would pay: source upload, graph evaluation and the
+                            // compute reductions in ProcessDeferredCompute, plus
+                            // the draw. The Draw span nested inside it isolates
+                            // just the pixel-shader chain.
+                            gpuTimer.BeginFrame();
+                            gpuTimer.Begin(ShaderLab::Rendering::GpuSpan::Frame);
+                            // CPU wall-clock of the evaluation walk, alongside its
+                            // GPU span. These measure different things and the gap
+                            // between them is the point: the walk is mostly CPU
+                            // work (property re-application, cache lookups, binding
+                            // resolution) that submits very little to the GPU.
+                            auto cpuEvalT0 = std::chrono::steady_clock::now();
+                            runEval();
+                            auto cpuEvalT1 = std::chrono::steady_clock::now();
+                            cpuEvalMs.push_back(
+                                std::chrono::duration<double, std::milli>(cpuEvalT1 - cpuEvalT0).count());
+                            gpuTimer.End(ShaderLab::Rendering::GpuSpan::Evaluate, dc.get());
+
+                            auto* img = bn->cachedOutput;
+                            if (!img) break;
+                            winrt::com_ptr<ID2D1Image> prev;
+                            dc->GetTarget(prev.put());
+                            dc->SetTarget(target.get());
+                            gpuTimer.Begin(ShaderLab::Rendering::GpuSpan::Draw);
+                            dc->BeginDraw();
+                            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+                            dc->DrawImage(img);
+                            HRESULT hrE = dc->EndDraw();   // flushes, so the span can close
+                            // CPU wall-clock of eval + draw submission. EndDraw does
+                            // not wait for the GPU, so this is CPU work plus any
+                            // synchronous GPU waits inside the frame (readback Maps).
+                            cpuFrameMs.push_back(std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - cpuEvalT0).count());
+                            gpuTimer.End(ShaderLab::Rendering::GpuSpan::Draw);
+                            gpuTimer.End(ShaderLab::Rendering::GpuSpan::Frame);
+                            gpuTimer.EndFrame();
+                            dc->SetTarget(prev.get());
+                            if (FAILED(hrE)) break;
+                            // Block for THIS iteration's result. Sampling
+                            // without waiting records the previous frame's
+                            // number repeatedly (min == median == max), and
+                            // polling with DONOTFLUSH at a 4-frame lag lands
+                            // only a handful of times in 60 iterations.
+                            if (gpuTimer.CollectBlocking())
+                            {
+                                samples.push_back(gpuTimer.SpanMs(ShaderLab::Rendering::GpuSpan::Draw));
+                                frameSamples.push_back(gpuTimer.SpanMs(ShaderLab::Rendering::GpuSpan::Frame));
+                                evalSamples.push_back(gpuTimer.SpanMs(ShaderLab::Rendering::GpuSpan::Evaluate));
+                                for (const auto& nd : graph.Nodes())
+                                    if (nd.type == ShaderLab::Graph::NodeType::ComputeShader)
+                                        if (double ms = gpuTimer.NodeMs(nd.id); ms > 0.0)
+                                            nodeSamples[nd.id].push_back(ms);
+                            }
+                        }
+                        double mpx = static_cast<double>(bw) * static_cast<double>(bh) / 1e6;
+                        body.Insert(L"nodeId", WDJ::JsonValue::CreateNumberValue(benchNode));
+                        body.Insert(L"width", WDJ::JsonValue::CreateNumberValue(bw));
+                        body.Insert(L"height", WDJ::JsonValue::CreateNumberValue(bh));
+                        body.Insert(L"megapixels", WDJ::JsonValue::CreateNumberValue(mpx));
+                        body.Insert(L"iterations", WDJ::JsonValue::CreateNumberValue(iters));
+                        body.Insert(L"samples", WDJ::JsonValue::CreateNumberValue(
+                            static_cast<double>(samples.size())));
+                        body.Insert(L"disjointDrops", WDJ::JsonValue::CreateNumberValue(
+                            gpuTimer.DisjointDrops()));
+                        if (!samples.empty())
+                        {
+                            std::vector<double> sorted = samples;
+                            std::sort(sorted.begin(), sorted.end());
+                            double sum = 0.0;
+                            for (double v : sorted) sum += v;
+                            body.Insert(L"gpuMinMs", WDJ::JsonValue::CreateNumberValue(sorted.front()));
+                            body.Insert(L"gpuMedianMs", WDJ::JsonValue::CreateNumberValue(
+                                sorted[sorted.size() / 2]));
+                            body.Insert(L"gpuMeanMs", WDJ::JsonValue::CreateNumberValue(
+                                sum / static_cast<double>(sorted.size())));
+                            body.Insert(L"gpuMaxMs", WDJ::JsonValue::CreateNumberValue(sorted.back()));
+                            if (mpx > 0.0)
+                                body.Insert(L"gpuMsPerMpx", WDJ::JsonValue::CreateNumberValue(
+                                    sorted.front() / mpx));
+                        }
+                        auto minOf = [](std::vector<double>& v) {
+                            return v.empty() ? 0.0 : *std::min_element(v.begin(), v.end());
+                        };
+                        if (!frameSamples.empty())
+                        {
+                            // Whole video frame: eval + compute reductions + draw.
+                            body.Insert(L"gpuFrameMinMs", WDJ::JsonValue::CreateNumberValue(
+                                minOf(frameSamples)));
+                            body.Insert(L"gpuEvalMinMs", WDJ::JsonValue::CreateNumberValue(
+                                minOf(evalSamples)));
+                            body.Insert(L"cpuEvalMinMs", WDJ::JsonValue::CreateNumberValue(
+                                minOf(cpuEvalMs)));
+                            auto medianOf = [](std::vector<double> v) {
+                                if (v.empty()) return 0.0;
+                                std::sort(v.begin(), v.end());
+                                return v[v.size() / 2];
+                            };
+                            body.Insert(L"gpuFrameMedianMs", WDJ::JsonValue::CreateNumberValue(
+                                medianOf(frameSamples)));
+                            body.Insert(L"cpuEvalMedianMs", WDJ::JsonValue::CreateNumberValue(
+                                medianOf(cpuEvalMs)));
+                            body.Insert(L"cpuFrameMedianMs", WDJ::JsonValue::CreateNumberValue(
+                                medianOf(cpuFrameMs)));
+                            WDJ::JsonObject perNode;
+                            for (auto& [nid, v] : nodeSamples)
+                                perNode.Insert(std::to_wstring(nid),
+                                    WDJ::JsonValue::CreateNumberValue(medianOf(v)));
+                            body.Insert(L"computeNodeMedianMs", perNode);
+                        }
+                    }
+                }
+                WDJ::JsonObject ok;
+                ok.Insert(L"step", WDJ::JsonValue::CreateNumberValue(i));
+                ok.Insert(L"status", WDJ::JsonValue::CreateNumberValue(200));
+                ok.Insert(L"body", body);
+                results.Append(ok);
+                continue;
             }
             else if (op == L"render")        {
                 // Internal: force a fresh evaluation. Useful as a
@@ -1207,6 +2053,14 @@ int wmain(int argc, wchar_t* argv[])
     // sees the correct flag state. Engine default is OFF for v1.6.
     if (args.enableGpuBindings.has_value())
         ShaderLab::Performance::SetGpuBindingsEnabled(*args.enableGpuBindings);
+
+    // Model the GUI's readback policy for perf work. MainWindow turns this on
+    // at startup; headless leaves it off so probing sees fresh analysis fields
+    // every frame. Benchmarking without it measures a GPU->CPU round trip the
+    // shipping app does not perform, which inflates every frame time that
+    // involves a compute-analysis node.
+    if (args.skipUnneededReadback)
+        ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(true);
 
     // Run all engine work inside an inner scope so the GraphEvaluator
     // and other engine objects destruct before MFShutdown / apartment
