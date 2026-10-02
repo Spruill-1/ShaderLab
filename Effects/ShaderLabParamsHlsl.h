@@ -35,7 +35,9 @@ namespace ShaderLab::Effects
     // (as SHADERLAB_REDUCE_* defines -- a test asserts they match) and
     // D3D11ComputeRunner, which binds the scratch buffer and sizes the
     // dispatch. A D3D11 compute shader opts in by writing
-    // SHADERLAB_REDUCE_SCRATCH at file scope; reflection detects the
+    // SHADERLAB_REDUCE_SCRATCH at file scope (or, when its own groupshared is
+    // already at the limit, SHADERLAB_REDUCE_SCRATCH_SHARED_FLAG(flag), which
+    // keeps the completion flag in the shader's own storage); reflection detects the
     // `_SLScratch` UAV, and the runner then
     //   * binds a uint scratch buffer of kReduceScratchUints at u2,
     //   * zeroes ONLY its first kReduceScratchClearedUints words before

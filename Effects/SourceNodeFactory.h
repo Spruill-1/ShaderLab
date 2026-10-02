@@ -89,6 +89,16 @@ namespace ShaderLab::Effects
         // Get total video upload count across all providers.
         uint64_t TotalVideoUploads() const;
 
+        // Drop every cached provider / bitmap whose node is gone or is no
+        // longer that kind of source. The caches below are keyed by node id and
+        // used to be evicted only on device loss, so a deleted Desktop
+        // Duplication node kept copying every desktop present and forcing
+        // renders, a deleted video kept decoding, and a node id reused by a
+        // loaded graph was taken over by the old provider. Run at the top of
+        // each per-tick loop, which makes it cover every removal path --
+        // delete, clear, load, file open -- without each one remembering to.
+        void PruneOrphans(const std::vector<Graph::EffectNode>& nodes);
+
     private:
         ImageLoader m_imageLoader;
 
@@ -114,15 +124,5 @@ namespace ShaderLab::Effects
         // Clock so the video doesn't free-run when the bound Time stops
         // advancing. NaN means "no prior sample".
         std::unordered_map<uint32_t, double> m_lastClockTime;
-
-        // Drop every cached provider / bitmap whose node is gone or is no
-        // longer that kind of source. Everything above is keyed by node id and
-        // used to be evicted only on device loss, so a deleted Desktop
-        // Duplication node kept copying every desktop present and forcing
-        // renders, a deleted video kept decoding, and a node id reused by a
-        // loaded graph was taken over by the old provider. Run at the top of
-        // each per-tick loop, which makes it cover every removal path --
-        // delete, clear, load, file open -- without each one remembering to.
-        void PruneOrphans(const std::vector<Graph::EffectNode>& nodes);
     };
 }

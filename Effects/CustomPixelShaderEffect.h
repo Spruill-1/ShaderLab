@@ -134,6 +134,12 @@ namespace ShaderLab::Effects
         // D2D's PrepareForRender change detection.
         HRESULT ForceUploadConstantBuffer();
 
+        // Load bytecode set by LoadShaderBytecode now, not at the next
+        // PrepareForRender. D2D calls PrepareForRender only after a property
+        // change, so a node dirty every frame would keep its old shader while
+        // ForceUploadConstantBuffer sends it the new shader's cbuffer layout.
+        HRESULT ForceLoadShader();
+
         // Check if shader bytecode needs initial loading.
         bool NeedsShaderLoad() const { return m_shaderBytecode.empty(); }
 

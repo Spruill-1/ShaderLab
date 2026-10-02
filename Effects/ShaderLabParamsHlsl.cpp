@@ -82,6 +82,23 @@ namespace ShaderLab::Effects
 #define _SLLOAD_2(type, name) \
     type name = _SL_VEC_##type(_SLTex_##name.Load(int3((int)_SLIdx_##name, 0, 0)));
 
+// ---- Option specialisation --------------------------------------------------
+// A `specialize` option parameter is compiled once per option value, with the
+// value a compile-time constant. Usage:
+//   SHADERLAB_OPTION(uint, TargetGamut)        // inside the cbuffer
+//   SHADERLAB_OPTION_VALUE(uint, TargetGamut)  // at file scope, after it
+// The host defines _SLOPT_<name>_MODE (0 = cbuffer read, 1 = fixed) and
+// _SLOPT_<name> (the option index). A fixed variant keeps a same-typed
+// placeholder in the cbuffer so later members keep their offsets.
+#define SHADERLAB_OPTION(type, name) \
+    _SLPARAM_CAT(_SLOPTDECL_, _SLOPT_##name##_MODE)(type, name)
+#define _SLOPTDECL_0(type, name) type name;
+#define _SLOPTDECL_1(type, name) type _SLOptSlot_##name;
+#define SHADERLAB_OPTION_VALUE(type, name) \
+    _SLPARAM_CAT(_SLOPTVAL_, _SLOPT_##name##_MODE)(type, name)
+#define _SLOPTVAL_0(type, name)
+#define _SLOPTVAL_1(type, name) static const type name = (type)(_SLOPT_##name);
+
 // Direct access, for an effect that wants a whole analysis row rather than
 // one parameter at a time. `index` is the field's position in the producing
 // node's analysisFields list.
@@ -126,6 +143,26 @@ float ShaderLabAnalysisField(Texture2D<float4> tex, uint index)
         } \
         GroupMemoryBarrierWithGroupSync(); \
         return _SLIsLastGroup != 0; \
+    }
+// The same, for a shader whose own groupshared already fills the 32 KB limit:
+// the completion flag is stored in `flag`, a groupshared uint the shader
+// declares first and does not need across the call. The extra barrier keeps
+// the shader from overwriting it before every thread has read it.
+#define SHADERLAB_REDUCE_SCRATCH_SHARED_FLAG(flag) \
+    globallycoherent RWByteAddressBuffer _SLScratch : register(u2); \
+    bool ShaderLabReduceIsLastGroup(uint tid) \
+    { \
+        DeviceMemoryBarrierWithGroupSync(); \
+        if (tid == 0) \
+        { \
+            uint prev; \
+            _SLScratch.InterlockedAdd(0, 1u, prev); \
+            flag = (prev == SHADERLAB_REDUCE_GROUPS - 1) ? 1u : 0u; \
+        } \
+        GroupMemoryBarrierWithGroupSync(); \
+        bool isLastGroup = flag != 0; \
+        GroupMemoryBarrierWithGroupSync(); \
+        return isLastGroup; \
     }
 #define ShaderLabScratchStore(word, value)  _SLScratch.Store((word) * 4, (value))
 #define ShaderLabScratchLoad(word)          _SLScratch.Load((word) * 4)

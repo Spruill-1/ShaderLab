@@ -22,12 +22,12 @@ namespace ShaderLab::Effects
         // Stable identifier and version for upgrade detection.
         std::wstring effectId;          // Stable ID (survives renames)
         uint32_t effectVersion{ 1 };   // Increment when HLSL or params change.
-        // Scoping note: a saved graph stores `colorMath + <effect HLSL>` and
-        // recompiles from that stored string, so a change to the SHARED
-        // ColorMath library changes the stored text of all ~23 effects that
-        // prepend it. Bump the ones whose BEHAVIOUR changes, not all 23 -- an
-        // upgrade prompt is only useful where taking it changes output, and
-        // blanket-bumping trains users to dismiss the badge. When you touch
+        // Scoping note: a saved graph stores the effect HLSL and recompiles
+        // from it. The ~23 effects that #include "shaderlab_colormath.hlsli"
+        // pick up a ColorMath change directly; graphs that carry an inline
+        // copy keep the math they were saved with until upgraded. Bump the
+        // effects whose BEHAVIOUR changes, not all 23 -- an upgrade prompt is
+        // only useful where taking it changes output. When you touch
         // ColorMath, map the changed function to its call sites and bump those.
 
         // Embedded HLSL source — compiled on first use.
@@ -54,6 +54,10 @@ namespace ShaderLab::Effects
         // Trailing inputNames that are lookup tables. See
         // CustomEffectDefinition::lookupInputCount.
         uint32_t lookupInputCount{ 0 };
+
+        // inputNames is the maximum; the node shows the pins in use plus one.
+        // See CustomEffectDefinition::variadicInputs.
+        bool variadicInputs{ false };
 
         // Host-computed cbuffer contents ("derived constants"). For values
         // that depend only on the node's parameters but are expensive --
@@ -82,9 +86,31 @@ namespace ShaderLab::Effects
 
         // Clock nodes are time-based animation sources (special render loop handling).
         bool isClock{ false };
+
+        // File a user effect was loaded from; empty for built-ins.
+        std::wstring sourcePath;
+        bool IsUserEffect() const { return !sourcePath.empty(); }
     };
 
-    // Registry of all ShaderLab pre-built effects.
+    // Result of LoadUserEffects. Every file that did not load has an entry
+    // in `errors`.
+    struct UserEffectLoadReport
+    {
+        std::vector<std::wstring> directories;  // every directory scanned
+        std::vector<std::wstring> loaded;       // effect names now registered
+        std::vector<std::wstring> errors;       // "<file>: <reason>"
+    };
+
+    // What to do when a user effect's id or name matches one already
+    // registered.
+    enum class UserEffectConflict
+    {
+        Reject,     // keep the existing effect; report the incoming one as an error
+        Replace,    // the incoming definition takes the existing one's place
+    };
+
+    // Registry of all ShaderLab pre-built effects, plus any user effects
+    // registered from outside the build (LoadUserEffects).
     class SHADERLAB_API ShaderLabEffects
     {
     public:
@@ -94,12 +120,14 @@ namespace ShaderLab::Effects
         const ShaderLabEffectDescriptor* FindById(std::wstring_view effectId) const;
         const std::vector<ShaderLabEffectDescriptor>& All() const { return m_effects; }
 
-        // Computed library version: sum of all effect versions.
+        // Computed library version: sum of all built-in effect versions.
+        // User effects are excluded so the number identifies the build.
         uint32_t LibraryVersion() const
         {
-            uint32_t v = 0;
-            for (const auto& e : m_effects) v += e.effectVersion;
-            return v;
+            uint32_t version = 0;
+            for (const auto& effect : m_effects)
+                if (!effect.IsUserEffect()) version += effect.effectVersion;
+            return version;
         }
         std::vector<const ShaderLabEffectDescriptor*> ByCategory(std::wstring_view category) const;
         std::vector<std::wstring> Categories() const;
@@ -114,12 +142,31 @@ namespace ShaderLab::Effects
         // it. Only the GUI's file-open path used to do this.
         static void RestoreRuntimeFlags(Graph::EffectGraph& graph);
 
+        // User effects
+        // Register every shader node in each saved graph (*.json) in
+        // `directory` as an effect. An optional top-level "category" picks the
+        // menu group (default "User"). Effects that fail to compile are
+        // reported, not added. A missing directory is not an error.
+        // Call at startup, before any descriptor pointer is held: this appends
+        // to the registry and may replace entries in place.
+        const UserEffectLoadReport& LoadUserEffects(const std::wstring& directory);
+        const UserEffectLoadReport& UserEffectReport() const { return m_userReport; }
+
+        // %LOCALAPPDATA%\ShaderLab\effects, or empty if it cannot be resolved.
+        static std::wstring DefaultUserEffectsDirectory();
+
     private:
         ShaderLabEffects();
         void RegisterAll();
 
         std::vector<ShaderLabEffectDescriptor> m_effects;
+        UserEffectLoadReport m_userReport;
     };
+
+    // The conflict policy LoadUserEffects applies; public so tests can call it.
+    SHADERLAB_API UserEffectConflict ResolveUserEffectConflict(
+        const ShaderLabEffectDescriptor& existing,
+        const ShaderLabEffectDescriptor& incoming);
 
     SHADERLAB_API void RegisterEngineD2DEffects(ID2D1Factory1* factory);
 
@@ -139,6 +186,14 @@ namespace ShaderLab::Effects
         std::wstring rootPath,
         uint64_t staleThresholdSec = 90ull * 24 * 60 * 60);
 
-    // Shared HLSL color math functions (prepended to all ShaderLab shaders).
+    // Shared HLSL color math functions. Shaders get them with
+    // #include "shaderlab_colormath.hlsli"; the text has an include guard.
+    inline constexpr const char* cColorMathIncludeName = "shaderlab_colormath.hlsli";
     SHADERLAB_API const std::string& GetColorMathHLSL();
+
+    // Gamut boundary search and the ICtCp Gamut Boundary LUT's geometry,
+    // stamp and reader, as #include "shaderlab_gamut.hlsli". It includes the
+    // color math itself and has an include guard.
+    inline constexpr const char* cGamutIncludeName = "shaderlab_gamut.hlsli";
+    SHADERLAB_API const std::string& GetGamutHLSL();
 }

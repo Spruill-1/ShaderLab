@@ -39,11 +39,16 @@ namespace ShaderLab::Graph
             if (e.sourceNodeId == nodeId)
                 if (auto* dst = FindNode(e.destNodeId)) dst->dirty = true;
 
-        // Remove all edges referencing this node.
+        // Remove all edges referencing this node, then refit the pins of the
+        // nodes it fed.
+        std::vector<uint32_t> consumerIds;
+        for (const auto& e : m_edges)
+            if (e.sourceNodeId == nodeId) consumerIds.push_back(e.destNodeId);
         std::erase_if(m_edges, [nodeId](const EffectEdge& e)
         {
             return e.sourceNodeId == nodeId || e.destNodeId == nodeId;
         });
+        for (uint32_t consumerId : consumerIds) FitVariadicPins(consumerId);
 
         // Remove property bindings referencing this node as a source.
         for (auto& node : m_nodes)
@@ -100,6 +105,7 @@ namespace ShaderLab::Graph
 
         m_edges.push_back({ srcId, srcPin, dstId, dstPin });
         FindNode(dstId)->dirty = true;
+        FitVariadicPins(dstId);
         return true;
     }
 
@@ -112,6 +118,7 @@ namespace ShaderLab::Graph
             m_edges.erase(it);
             if (auto* dst = FindNode(dstId))
                 dst->dirty = true;
+            FitVariadicPins(dstId);
             return true;
         }
         return false;
@@ -125,6 +132,24 @@ namespace ShaderLab::Graph
         });
         if (removed)
             if (auto* dst = FindNode(dstId)) dst->dirty = true;
+        FitVariadicPins(dstId);
+    }
+
+    void EffectGraph::FitVariadicPins(uint32_t nodeId)
+    {
+        auto* node = FindNode(nodeId);
+        if (!node || !node->customEffect.has_value() || !node->customEffect->variadicInputs)
+            return;
+        const uint32_t maxPins = static_cast<uint32_t>(node->customEffect->inputNames.size());
+        uint32_t highestPin = 0;
+        bool anyConnected = false;
+        for (const auto& e : m_edges)
+            if (e.destNodeId == nodeId) { highestPin = (std::max)(highestPin, e.destPin); anyConnected = true; }
+        const uint32_t pinCount = (std::min)(maxPins, (std::max)(2u, anyConnected ? highestPin + 2 : 2u));
+        if (node->inputPins.size() == pinCount) return;
+        node->inputPins.clear();
+        for (uint32_t i = 0; i < pinCount; ++i)
+            node->inputPins.push_back({ std::format(L"I{}", i), i });
     }
 
     std::vector<const EffectEdge*> EffectGraph::GetInputEdges(uint32_t nodeId) const
@@ -734,6 +759,8 @@ namespace ShaderLab::Graph
                         po.SetNamedValue(L"visibleWhen", WDJ::JsonValue::CreateStringValue(p.visibleWhen));
                     if (p.gpuBindable)
                         po.SetNamedValue(L"gpuBindable", WDJ::JsonValue::CreateBooleanValue(true));
+                    if (p.specialize)
+                        po.SetNamedValue(L"specialize", WDJ::JsonValue::CreateBooleanValue(true));
                     params.Append(po);
                 }
                 ced.SetNamedValue(L"parameters", params);
@@ -741,6 +768,8 @@ namespace ShaderLab::Graph
                 if (def.lookupInputCount > 0)
                     ced.SetNamedValue(L"lookupInputCount",
                         WDJ::JsonValue::CreateNumberValue(def.lookupInputCount));
+                if (def.variadicInputs)
+                    ced.SetNamedValue(L"variadicInputs", WDJ::JsonValue::CreateBooleanValue(true));
                 ced.SetNamedValue(L"threadGroupX", WDJ::JsonValue::CreateNumberValue(def.threadGroupX));
                 ced.SetNamedValue(L"threadGroupY", WDJ::JsonValue::CreateNumberValue(def.threadGroupY));
                 ced.SetNamedValue(L"threadGroupZ", WDJ::JsonValue::CreateNumberValue(def.threadGroupZ));
@@ -984,11 +1013,15 @@ namespace ShaderLab::Graph
                         pd.visibleWhen = std::wstring(po.GetNamedString(L"visibleWhen"));
                     if (po.HasKey(L"gpuBindable"))
                         pd.gpuBindable = po.GetNamedBoolean(L"gpuBindable");
+                    if (po.HasKey(L"specialize"))
+                        pd.specialize = po.GetNamedBoolean(L"specialize");
                     def.parameters.push_back(std::move(pd));
                 }
 
                 if (ced.HasKey(L"lookupInputCount"))
                     def.lookupInputCount = static_cast<uint32_t>(ced.GetNamedNumber(L"lookupInputCount"));
+                if (ced.HasKey(L"variadicInputs"))
+                    def.variadicInputs = ced.GetNamedBoolean(L"variadicInputs");
                 def.threadGroupX = static_cast<uint32_t>(ced.GetNamedNumber(L"threadGroupX"));
                 def.threadGroupY = static_cast<uint32_t>(ced.GetNamedNumber(L"threadGroupY"));
                 def.threadGroupZ = static_cast<uint32_t>(ced.GetNamedNumber(L"threadGroupZ"));
@@ -1054,6 +1087,9 @@ namespace ShaderLab::Graph
                 {
                     if (ch == '\r') ch = '\n';
                 }
+                // No variant macros: a shader using shaderlab_params.hlsli fails
+                // here at the preprocessor, and the evaluator compiles it later
+                // with the right macros instead of blocking the load.
                 auto compileResult = ::ShaderLab::Effects::ShaderCompiler::CompileFromString(
                     hlslUtf8, "GraphLoad", "main", target);
                 if (compileResult.succeeded && compileResult.bytecode)
@@ -1226,6 +1262,10 @@ namespace ShaderLab::Graph
         }
 
         graph.m_nextId = static_cast<uint32_t>(root.GetNamedNumber(L"nextId"));
+
+        // A variadic node's pins derive from its edges.
+        for (const auto& n : graph.m_nodes)
+            graph.FitVariadicPins(n.id);
 
         return graph;
     }

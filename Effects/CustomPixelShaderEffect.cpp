@@ -4,6 +4,21 @@
 
 namespace ShaderLab::Effects
 {
+    namespace
+    {
+        // Output extent for an edge no input bounds (Flood, Tile, Border,
+        // Turbulence). Bounded inputs keep their own size.
+        constexpr LONG cUnboundedOutputExtent = 4096;
+
+        // D2D reports an infinite edge as a value near the LONG limits.
+        constexpr LONG cUnboundedEdge = 1L << 24;
+
+        bool IsUnboundedEdge(LONG edge)
+        {
+            return edge <= -cUnboundedEdge || edge >= cUnboundedEdge;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Property bindings table (used by D2D effect registration)
     // -----------------------------------------------------------------------
@@ -144,25 +159,8 @@ namespace ShaderLab::Effects
             return E_FAIL;
 
         // If the shader bytecode changed, load it into D2D.
-        if (m_shaderDirty && !m_shaderBytecode.empty())
-        {
-            if (m_shaderGuid == GUID{})
-                CoCreateGuid(&m_shaderGuid);
-
-            HRESULT hr = m_effectContext->LoadPixelShader(
-                m_shaderGuid,
-                m_shaderBytecode.data(),
-                static_cast<UINT32>(m_shaderBytecode.size()));
-
-            if (SUCCEEDED(hr))
-                hr = m_drawInfo->SetPixelShader(m_shaderGuid,
-                    D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING);
-
-            if (FAILED(hr))
-                return hr;
-
-            m_shaderDirty = false;
-        }
+        if (HRESULT hr = ForceLoadShader(); FAILED(hr))
+            return hr;
 
         // If the constant buffer data changed, push it to the GPU.
         if (m_cbDirty && !m_constantBuffer.empty())
@@ -242,10 +240,24 @@ namespace ShaderLab::Effects
                 outputRect->bottom = (std::max)(outputRect->bottom, inputRects[i].bottom);
             }
 
-            outputRect->left   = (std::max)(outputRect->left,   0L);
-            outputRect->top    = (std::max)(outputRect->top,    0L);
-            outputRect->right  = (std::min)(outputRect->right,  4096L);
-            outputRect->bottom = (std::min)(outputRect->bottom, 4096L);
+            // TEXCOORD is normalized over this rect, so an infinite one maps
+            // every pixel to the same texel. Unbounded edges are pinned to
+            // the origin and to the widest bounded input or the default.
+            LONG boundedRight = 0;
+            LONG boundedBottom = 0;
+            for (UINT32 i = 0; i < imageInputs; ++i)
+            {
+                if (!IsUnboundedEdge(inputRects[i].right))
+                    boundedRight = (std::max)(boundedRight, inputRects[i].right);
+                if (!IsUnboundedEdge(inputRects[i].bottom))
+                    boundedBottom = (std::max)(boundedBottom, inputRects[i].bottom);
+            }
+            outputRect->left = (std::max)(outputRect->left, 0L);
+            outputRect->top  = (std::max)(outputRect->top,  0L);
+            if (IsUnboundedEdge(outputRect->right))
+                outputRect->right = (std::max)(cUnboundedOutputExtent, boundedRight);
+            if (IsUnboundedEdge(outputRect->bottom))
+                outputRect->bottom = (std::max)(cUnboundedOutputExtent, boundedBottom);
 
             m_lastOutputRect = *outputRect;
         }
@@ -394,6 +406,28 @@ namespace ShaderLab::Effects
     {
         m_constantBuffer.assign(data, data + dataSize);
         m_cbDirty = true;
+    }
+
+    HRESULT CustomPixelShaderEffect::ForceLoadShader()
+    {
+        if (!m_shaderDirty || m_shaderBytecode.empty())
+            return S_OK;
+        // Before D2D has initialised the effect, its first PrepareForRender loads it.
+        if (!m_effectContext || !m_drawInfo)
+            return S_OK;
+        if (m_shaderGuid == GUID{})
+            CoCreateGuid(&m_shaderGuid);
+
+        HRESULT hr = m_effectContext->LoadPixelShader(
+            m_shaderGuid,
+            m_shaderBytecode.data(),
+            static_cast<UINT32>(m_shaderBytecode.size()));
+        if (SUCCEEDED(hr))
+            hr = m_drawInfo->SetPixelShader(m_shaderGuid, D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING);
+        if (FAILED(hr))
+            return hr;
+        m_shaderDirty = false;
+        return S_OK;
     }
 
     HRESULT CustomPixelShaderEffect::ForceUploadConstantBuffer()

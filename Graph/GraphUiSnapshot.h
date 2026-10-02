@@ -59,6 +59,10 @@ namespace ShaderLab::Graph
         // O(1) lookup by node id.
         std::unordered_map<std::uint32_t, std::size_t> nodeIndexById;
 
+        // Node ids in EffectGraph::TopologicalSort order; empty when the
+        // graph has a cycle.
+        std::vector<std::uint32_t> topologicalOrder;
+
         // Currently-selected preview node. 0 means no preview.
         std::uint32_t previewNodeId{ 0 };
 

@@ -469,7 +469,10 @@ namespace ShaderLab::Effects
                     if (auto* b = std::get_if<bool>(&loopIt->second)) loop = *b;
 
                 if (loop && provider->Duration() > 0)
+                {
                     seekTime = std::fmod(seekTime, provider->Duration());
+                    if (seekTime < 0.0) seekTime += provider->Duration();
+                }
 
                 // Past end of video with looping off → show black.
                 if (!loop && provider->Duration() > 0 && seekTime >= provider->Duration())
@@ -537,8 +540,18 @@ namespace ShaderLab::Effects
                     provider->Seek(seekTime);
             }
 
-            // Always update analysis output (Duration/Position) regardless
-            // of whether a new frame was uploaded this tick.
+            if (provider->UploadIfReady(dc))
+            {
+                anyNewFrame = true;
+                if (nodePtr)
+                {
+                    nodePtr->cachedOutput = provider->CurrentBitmap();
+                    nodePtr->dirty = true;
+                }
+            }
+
+            // Always update analysis output, after the upload so FrameTime
+            // matches cachedOutput.
             if (nodePtr)
             {
                 nodePtr->analysisOutput.type = Graph::AnalysisOutputType::Typed;
@@ -564,21 +577,16 @@ namespace ShaderLab::Effects
                 attFv.name = L"UploadAttempts"; attFv.type = Graph::AnalysisFieldType::Float;
                 attFv.components[0] = static_cast<float>(provider->UploadAttempts());
                 nodePtr->analysisOutput.fields.push_back(std::move(attFv));
+                // Timestamp of the last uploaded frame; see UploadedFrameTime().
+                Graph::AnalysisFieldValue frameTimeField;
+                frameTimeField.name = L"FrameTime"; frameTimeField.type = Graph::AnalysisFieldType::Float;
+                frameTimeField.components[0] = static_cast<float>(provider->UploadedFrameTime());
+                nodePtr->analysisOutput.fields.push_back(std::move(frameTimeField));
                 // Format: 0=RGB32, 1=NV12, 2=P010
                 Graph::AnalysisFieldValue fmtFv;
                 fmtFv.name = L"Format"; fmtFv.type = Graph::AnalysisFieldType::Float;
                 fmtFv.components[0] = static_cast<float>(static_cast<int>(provider->GetOutputFormat()));
                 nodePtr->analysisOutput.fields.push_back(std::move(fmtFv));
-            }
-
-            if (provider->UploadIfReady(dc))
-            {
-                anyNewFrame = true;
-                if (nodePtr)
-                {
-                    nodePtr->cachedOutput = provider->CurrentBitmap();
-                    nodePtr->dirty = true;
-                }
             }
         }
         return anyNewFrame;

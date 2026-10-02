@@ -32,6 +32,15 @@ namespace ShaderLab::Graph
         snap->edges.reserve(srcEdges.size());
         for (const auto& e : srcEdges) snap->edges.push_back(e);
 
+        try
+        {
+            snap->topologicalOrder = graph.TopologicalSort();
+        }
+        catch (const std::logic_error&)
+        {
+            // A cycle has no order; the empty vector says so.
+        }
+
         return snap;
     }
 }

@@ -38,6 +38,11 @@ namespace ShaderLab::Graph
         // Removes all edges connected to a given input pin (ensures single input).
         void DisconnectInput(uint32_t dstId, uint32_t dstPin);
 
+        // Size a variadic node's pins to the highest connected pin plus one
+        // spare, between 2 and the declared maximum. Call it after replacing
+        // a node's pins (e.g. an effect upgrade); edge edits call it already.
+        void FitVariadicPins(uint32_t nodeId);
+
         // --- Queries ---
 
         // Returns edges that feed into a given node.

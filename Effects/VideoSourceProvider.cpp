@@ -185,6 +185,8 @@ void main(uint3 id : SV_DispatchThreadID)
         m_filePath = filePath;
         m_d3dDevice = d3dDevice;
         m_d3dContext = d3dContext;
+        if (d3dDevice && FAILED(d3dDevice->CreateDeferredContext(0, m_convertCtx.put())))
+            m_convertCtx = nullptr;   // falls back to the immediate context
 
         if (filePath.empty())
         {
@@ -442,6 +444,9 @@ void main(uint3 id : SV_DispatchThreadID)
             // A hardware-decoded first frame arrives as a GPU sample, not bytes.
             std::swap(m_frontGpu, m_backGpu);
             m_backGpu = {};
+            m_frontFrameTime = m_backFrameTime;
+            m_frontFrameDuration = m_backFrameDuration;
+            m_firstFrameTime = m_backFrameTime;
             if (!m_frontGpu.tex) m_lastPitch = m_stride;
             m_frameReady = true;
         }
@@ -480,7 +485,7 @@ void main(uint3 id : SV_DispatchThreadID)
         m_texOutput = nullptr;
         m_srvY = nullptr; m_srvUV = nullptr; m_srvRGB = nullptr;
         m_uavOutput = nullptr; m_cbParams = nullptr;
-        m_d3dDevice = nullptr; m_d3dContext = nullptr;
+        m_d3dDevice = nullptr; m_d3dContext = nullptr; m_convertCtx = nullptr;
         m_width = 0; m_height = 0; m_stride = 0;
         m_frameRate = 0.0; m_durationSeconds = 0.0;
         m_currentPositionSeconds = 0.0; m_frameDuration = 0.0;
@@ -488,6 +493,13 @@ void main(uint3 id : SV_DispatchThreadID)
         m_accumulatedTime = 0.0;
         m_frameReady = false; m_frameNeeded = false;
         m_firstFrameLogged = false;
+        m_backFrameTime = -1.0;
+        m_frontFrameTime = -1.0;
+        m_uploadedFrameTime = -1.0;
+        m_backFrameDuration = 0.0;
+        m_frontFrameDuration = 0.0;
+        m_uploadedFrameDuration = 0.0;
+        m_firstFrameTime = 0.0;
 
         if (m_mfInitialized) { ReleaseMF(); m_mfInitialized = false; }
     }
@@ -692,51 +704,82 @@ void main(uint3 id : SV_DispatchThreadID)
         return true;
     }
 
-    void VideoSourceProvider::RunConversionShader(ID3D11DeviceContext* ctx, bool planar)
+    bool VideoSourceProvider::RunConversionShader(bool planar, ID3D11Texture2D* decoderTex,
+                                                  UINT decoderSubresource)
     {
         // Set shader.
         ID3D11ComputeShader* cs = nullptr;
         if (m_outputFormat == OutputFormat::P010) cs = m_csP010.get();
         else if (m_outputFormat == OutputFormat::NV12) cs = m_csNV12.get();
         else cs = m_csRGB32.get();
-        if (!cs) return;
+        if (!cs)
+        {
+            m_lastError = L"No conversion shader for the output format";
+            return false;
+        }
 
-        ctx->CSSetShader(cs, nullptr, 0);
+        ID3D11DeviceContext* context = m_convertCtx ? m_convertCtx.get() : m_d3dContext;
+
+        // Zero-copy: copy both planes of the decoder surface into the planar
+        // texture, recorded with the conversion so the two run together.
+        if (decoderTex)
+        {
+            D3D11_BOX box = { 0, 0, 0, m_width, m_height, 1 };
+            context->CopySubresourceRegion(m_texPlanar.get(), 0, 0, 0, 0,
+                decoderTex, decoderSubresource, &box);
+        }
+
+        context->CSSetShader(cs, nullptr, 0);
 
         // Bind resources.
         ID3D11Buffer* cbs[] = { m_cbParams.get() };
-        ctx->CSSetConstantBuffers(0, 1, cbs);
+        context->CSSetConstantBuffers(0, 1, cbs);
 
         if (m_outputFormat == OutputFormat::RGB32)
         {
             ID3D11ShaderResourceView* srvs[] = { m_srvRGB.get() };
-            ctx->CSSetShaderResources(0, 1, srvs);
+            context->CSSetShaderResources(0, 1, srvs);
         }
         else if (planar)
         {
             ID3D11ShaderResourceView* srvs[] = { m_srvPlanarY.get(), m_srvPlanarUV.get() };
-            ctx->CSSetShaderResources(0, 2, srvs);
+            context->CSSetShaderResources(0, 2, srvs);
         }
         else
         {
             ID3D11ShaderResourceView* srvs[] = { m_srvY.get(), m_srvUV.get() };
-            ctx->CSSetShaderResources(0, 2, srvs);
+            context->CSSetShaderResources(0, 2, srvs);
         }
 
         ID3D11UnorderedAccessView* uavs[] = { m_uavOutput.get() };
-        ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+        context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
 
         // Dispatch: 16x16 thread groups.
         UINT gx = (m_width + 15) / 16;
         UINT gy = (m_height + 15) / 16;
-        ctx->Dispatch(gx, gy, 1);
+        context->Dispatch(gx, gy, 1);
 
         // Unbind.
         ID3D11ShaderResourceView* nullSRVs[2] = {};
         ID3D11UnorderedAccessView* nullUAVs[1] = {};
-        ctx->CSSetShaderResources(0, 2, nullSRVs);
-        ctx->CSSetUnorderedAccessViews(0, 1, nullUAVs, nullptr);
-        ctx->CSSetShader(nullptr, nullptr, 0);
+        context->CSSetShaderResources(0, 2, nullSRVs);
+        context->CSSetUnorderedAccessViews(0, 1, nullUAVs, nullptr);
+        context->CSSetShader(nullptr, nullptr, 0);
+
+        if (m_convertCtx)
+        {
+            winrt::com_ptr<ID3D11CommandList> commandList;
+            const HRESULT hr = m_convertCtx->FinishCommandList(FALSE, commandList.put());
+            if (FAILED(hr) || !commandList)
+            {
+                m_lastError = std::format(L"FinishCommandList failed: 0x{:08X}", static_cast<uint32_t>(hr));
+                return false;
+            }
+            // TRUE keeps the immediate context's state, which D2D on
+            // another thread may be in the middle of setting.
+            m_d3dContext->ExecuteCommandList(commandList.get(), TRUE);
+        }
+        return true;
     }
 
     // -----------------------------------------------------------------------
@@ -824,12 +867,12 @@ void main(uint3 id : SV_DispatchThreadID)
     {
         m_uploadAttempts++;
         if (!m_frameReady || !m_d3dContext || !dc) return false;
-        m_uploadSuccesses++;
 
         // Upload raw bytes from the front buffer to GPU textures.
         std::vector<BYTE> uploadBuf;
         LONG pitch;
         GpuFrame gpu;
+        double frameTime, frameDuration;
         {
             std::lock_guard lock(m_bufferMutex);
             uploadBuf.swap(m_frontBuffer);
@@ -837,6 +880,8 @@ void main(uint3 id : SV_DispatchThreadID)
             gpu = std::move(m_frontGpu);
             m_frontGpu = {};
             m_frameReady = false;
+            frameTime = m_frontFrameTime;
+            frameDuration = m_frontFrameDuration;
         }
 
         if (gpu.tex)
@@ -846,13 +891,16 @@ void main(uint3 id : SV_DispatchThreadID)
             // an NV12/P010 subresource together), then convert from it.
             if (EnsurePlanarTexture(gpu.tex.get()))
             {
-                D3D11_BOX box = { 0, 0, 0, m_width, m_height, 1 };
-                m_d3dContext->CopySubresourceRegion(m_texPlanar.get(), 0, 0, 0, 0,
-                    gpu.tex.get(), gpu.subresource, &box);
-                RunConversionShader(m_d3dContext, /*planar*/ true);
+                const bool converted = RunConversionShader(/*planar*/ true, gpu.tex.get(), gpu.subresource);
                 m_lastUploadZeroCopy = true;
-                std::lock_guard lock(m_bufferMutex);
-                m_frontBuffer.swap(uploadBuf);
+                {
+                    std::lock_guard lock(m_bufferMutex);
+                    m_frontBuffer.swap(uploadBuf);
+                }
+                if (!converted) return false;
+                m_uploadSuccesses++;
+                m_uploadedFrameDuration = frameDuration;
+                m_uploadedFrameTime = frameTime;
                 return true;   // `gpu` releases the sample -> surface back to the decoder
             }
             // Unsupported here: fall back to the CPU path for good, and
@@ -896,7 +944,9 @@ void main(uint3 id : SV_DispatchThreadID)
                 static_cast<UINT>(pitch), 0);
         }
 
-        RunConversionShader(m_d3dContext);
+        // The uploads above can stay on the immediate context: each is a single
+        // call, and they are ordered before the conversion.
+        const bool converted = RunConversionShader();
 
         // Return buffer for reuse.
         {
@@ -904,6 +954,10 @@ void main(uint3 id : SV_DispatchThreadID)
             m_frontBuffer.swap(uploadBuf);
         }
 
+        if (!converted) return false;
+        m_uploadSuccesses++;
+        m_uploadedFrameDuration = frameDuration;
+        m_uploadedFrameTime = frameTime;
         return true;
     }
 
@@ -953,6 +1007,8 @@ void main(uint3 id : SV_DispatchThreadID)
                     std::swap(m_frontBuffer, m_backBuffer);
                     std::swap(m_frontGpu, m_backGpu);
                     m_backGpu = {};
+                    m_frontFrameTime = m_backFrameTime;
+                    m_frontFrameDuration = m_backFrameDuration;
                     m_frameReady = true;
                 }
             }
@@ -991,6 +1047,10 @@ void main(uint3 id : SV_DispatchThreadID)
         }
 
         m_currentPositionSeconds = static_cast<double>(timestamp) / 10'000'000.0;
+        m_backFrameTime = m_currentPositionSeconds;
+        LONGLONG sampleDuration = 0;
+        m_backFrameDuration = (SUCCEEDED(sample->GetSampleDuration(&sampleDuration)) && sampleDuration > 0)
+            ? static_cast<double>(sampleDuration) / 10'000'000.0 : m_frameDuration;
 
         // Lock buffer and copy raw bytes — GPU shader handles all color conversion.
         // With DXVA2 (DXGI device manager), the buffer may be a GPU texture;

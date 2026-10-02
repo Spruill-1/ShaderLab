@@ -1,5 +1,6 @@
 #include "pch_engine.h"
 #include "EffectGraphFile.h"
+#include "../Graph/EffectGraph.h"
 
 // miniz: vendored at build time by EnsureMiniz.ps1 -> third_party/miniz.
 // We use only its DEFLATE codec (tdefl_compress_mem_to_heap /
@@ -34,12 +35,12 @@
 //
 // Compression: every entry is offered to miniz DEFLATE. Per-entry
 // fallback: if the deflated bytes aren't smaller than the raw bytes,
-// TryCompressEntry resets the entry to method 0 (stored) so the
+// Compress() keeps the entry at method 0 (stored) so the
 // archive never grows. This means already-compressed inputs (MP4 /
-// PNG / JPEG / JXR / ...) cost a one-time deflate pass and end up
-// stored, while compressible inputs (BMP, uncompressed TIFF, raw
-// HDR/EXR, ICC, JSON) get real savings without us maintaining a
-// per-extension allowlist.
+// PNG / JPEG / JXR / ...) end up stored (large ones on the evidence
+// of a sampled deflate, see WorthDeflating), while compressible inputs
+// (BMP, uncompressed TIFF, raw HDR/EXR, ICC, JSON) get real savings
+// without us maintaining a per-extension allowlist.
 //
 //   * Compression uses miniz's tdefl_compress_mem_to_heap with the
 //     default probe count (~zlib level 6). The output is raw DEFLATE
@@ -52,35 +53,51 @@
 
 namespace
 {
-	// CRC-32/IEEE 802.3 polynomial 0xEDB88320 (reflected). The same
-	// CRC is required by both the local file header and the central
-	// directory record. Standard table-driven implementation; cached
-	// on first use to avoid recomputing 256 entries per Save call.
-	const uint32_t* GetCrcTable()
+	// CRC-32/IEEE 802.3 polynomial 0xEDB88320 (reflected), as the ZIP headers require.
+	// Slicing-by-8, because every save hashes each embedded media file.
+	const uint32_t (&GetCrcTables())[8][256]
 	{
-		static uint32_t table[256];
-		static bool initialized = false;
-		if (!initialized)
+		static uint32_t sTables[8][256];
+		static std::once_flag sTablesBuilt;
+		std::call_once(sTablesBuilt, []
 		{
 			for (uint32_t i = 0; i < 256; ++i)
 			{
 				uint32_t c = i;
 				for (int k = 0; k < 8; ++k)
 					c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-				table[i] = c;
+				sTables[0][i] = c;
 			}
-			initialized = true;
+			for (int t = 1; t < 8; ++t)
+				for (uint32_t i = 0; i < 256; ++i)
+					sTables[t][i] = (sTables[t - 1][i] >> 8) ^ sTables[0][sTables[t - 1][i] & 0xFF];
+		});
+		return sTables;
+	}
+
+	// Running CRC: pass 0xFFFFFFFF first, XOR the final value with it.
+	uint32_t Crc32Update(uint32_t crc, const uint8_t* data, size_t size)
+	{
+		const auto& tables = GetCrcTables();
+		while (size >= 8)
+		{
+			uint32_t low, high;
+			std::memcpy(&low, data, 4);
+			std::memcpy(&high, data + 4, 4);
+			low ^= crc;
+			crc = tables[7][low & 0xFF] ^ tables[6][(low >> 8) & 0xFF] ^ tables[5][(low >> 16) & 0xFF] ^ tables[4][low >> 24] ^
+				  tables[3][high & 0xFF] ^ tables[2][(high >> 8) & 0xFF] ^ tables[1][(high >> 16) & 0xFF] ^ tables[0][high >> 24];
+			data += 8;
+			size -= 8;
 		}
-		return table;
+		while (size--)
+			crc = tables[0][(crc ^ *data++) & 0xFF] ^ (crc >> 8);
+		return crc;
 	}
 
 	uint32_t Crc32(const uint8_t* data, size_t size)
 	{
-		const uint32_t* table = GetCrcTable();
-		uint32_t crc = 0xFFFFFFFFu;
-		for (size_t i = 0; i < size; ++i)
-			crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
-		return crc ^ 0xFFFFFFFFu;
+		return Crc32Update(0xFFFFFFFFu, data, size) ^ 0xFFFFFFFFu;
 	}
 
 #pragma pack(push, 1)
@@ -138,6 +155,7 @@ namespace
 	constexpr uint32_t kLocalSig = 0x04034b50;
 	constexpr uint32_t kCentralSig = 0x02014b50;
 	constexpr uint32_t kEocdSig = 0x06054b50;
+	constexpr uint16_t cDosDate1980 = (1 << 9) | (1 << 5) | 1; // 1980-01-01, fixed
 
 	// UTF-16 -> UTF-8 conversion via WideCharToMultiByte (no third-party
 	// dependency). Used for ZIP entry names (which we mark as UTF-8 via
@@ -187,111 +205,124 @@ namespace
 		return true;
 	}
 
-	// Append one stored ZIP entry (name + bytes). Tracks where it
-	// landed in the file so the central directory can point back.
-	struct PendingEntry
+	bool Seek(HANDLE h, uint64_t offset)
 	{
-		std::string name;            // UTF-8, may contain '/' and end with '/'
-		std::vector<uint8_t> data;   // uncompressed payload (empty for dir markers)
-		std::vector<uint8_t> compressed; // populated when method != 0; written instead of data
-		uint16_t method{ 0 };        // ZIP compression method (0 = store, 8 = deflate, ...)
-		uint32_t crc{};
-		uint32_t localHeaderOffset{};
+		LARGE_INTEGER position{};
+		position.QuadPart = static_cast<LONGLONG>(offset);
+		return ::SetFilePointerEx(h, position, nullptr, FILE_BEGIN) != 0;
+	}
 
-		// Bytes actually written for this entry's payload.
-		uint32_t PayloadSize() const noexcept
-		{
-			return static_cast<uint32_t>(method == 0 ? data.size() : compressed.size());
-		}
-		const uint8_t* PayloadData() const noexcept
-		{
-			return method == 0 ? data.data() : compressed.data();
-		}
-	};
-
-	// Pick which entries to attempt compression on. We try everything
-	// and let TryCompressEntry's "did it actually shrink?" check do
-	// the per-entry filtering. Deflating already-compressed media
-	// (MP4/PNG/JPEG/JXR) typically expands by <0.1% before being
-	// rejected, so the CPU cost is bounded and we never bloat the
-	// archive. Files that DO compress well (BMP, uncompressed TIFF,
-	// raw HDR/EXR, ICC profiles, JSON, ...) get the savings without
-	// us having to maintain an extension allowlist.
-	bool ShouldCompress(std::wstring_view /*filename*/)
+	bool ReadAt(HANDLE h, uint64_t offset, void* dst, size_t size)
 	{
+		if (!Seek(h, offset)) return false;
+		uint8_t* p = static_cast<uint8_t*>(dst);
+		while (size > 0)
+		{
+			DWORD chunk = static_cast<DWORD>(std::min<size_t>(size, 0x10000000));
+			DWORD got = 0;
+			if (!::ReadFile(h, p, chunk, &got, nullptr) || got == 0) return false;
+			p += got;
+			size -= got;
+		}
 		return true;
 	}
 
-	// Decide on a compression method for this entry. Returns 8 (deflate)
-	// for entries that ShouldCompress flags as worth it; the caller is
-	// responsible for filling PendingEntry.compressed via miniz before
-	// writing. Returns 0 (store) otherwise.
-	uint16_t PickMethodFor(std::wstring_view filename)
+	// One entry as the central directory describes it.
+	struct EntryRecord
 	{
-		return ShouldCompress(filename) ? 8 : 0;
-	}
+		std::string name;             // UTF-8, may contain '/' and end with '/'
+		uint16_t method{ 0 };         // 0 = store, 8 = deflate
+		uint32_t crc{ 0 };            // over the UNCOMPRESSED bytes, per the spec
+		uint32_t compressedSize{ 0 };
+		uint32_t uncompressedSize{ 0 };
+		uint32_t localHeaderOffset{ 0 };
+		uint64_t dataOffset{ 0 };     // existing archives only: where the payload starts
+	};
 
-	// Try to compress e.data into e.compressed via miniz raw DEFLATE
-	// (which is exactly what ZIP method 8 expects). Falls back to
-	// method 0 (store) when the deflated output isn't actually smaller
-	// or the compressor errors out -- ZIP allows mixing methods, so a
-	// noisy file just stays stored.
-	void TryCompressEntry(PendingEntry& e)
+	// Index an archive from its central directory. Empty when the file is not
+	// an archive this writer produced; the save then starts fresh.
+	// Our writer never emits an archive comment, so the end-of-central-directory
+	// record is exactly the last 22 bytes.
+	std::vector<EntryRecord> ReadDirectory(HANDLE h)
 	{
-		if (e.method == 0 || e.data.empty()) return;
+		LARGE_INTEGER fileSize{};
+		if (!::GetFileSizeEx(h, &fileSize) || fileSize.QuadPart < (LONGLONG)sizeof(EndOfCentralDirectory))
+			return {};
+		EndOfCentralDirectory eocd{};
+		if (!ReadAt(h, fileSize.QuadPart - sizeof(eocd), &eocd, sizeof(eocd)) || eocd.signature != kEocdSig)
+			return {};
+		if (uint64_t(eocd.centralDirOffset) + eocd.centralDirSize > uint64_t(fileSize.QuadPart))
+			return {};
+		std::vector<uint8_t> centralDir(eocd.centralDirSize);
+		if (!centralDir.empty() && !ReadAt(h, eocd.centralDirOffset, centralDir.data(), centralDir.size()))
+			return {};
 
-		size_t outSize = 0;
-		// TDEFL_DEFAULT_MAX_PROBES (~128) is the same balance zlib level 6
-		// uses; good ratio without becoming slow on large media. We do NOT
-		// pass TDEFL_WRITE_ZLIB_HEADER -- ZIP method 8 stores raw DEFLATE
-		// streams, not zlib-wrapped ones.
-		void* deflated = tdefl_compress_mem_to_heap(
-			e.data.data(), e.data.size(), &outSize,
-			TDEFL_DEFAULT_MAX_PROBES);
-		if (!deflated || outSize == 0 || outSize >= e.data.size())
+		std::vector<EntryRecord> entries;
+		size_t pos = 0;
+		for (uint16_t i = 0; i < eocd.totalEntries; ++i)
 		{
-			if (deflated) mz_free(deflated);
-			e.method = 0;
-			e.compressed.clear();
-			return;
+			CentralDirectoryHeader header{};
+			if (pos + sizeof(header) > centralDir.size()) return {};
+			std::memcpy(&header, centralDir.data() + pos, sizeof(header));
+			if (header.signature != kCentralSig) return {};
+			if (pos + sizeof(header) + header.fileNameLength > centralDir.size()) return {};
+			EntryRecord entry;
+			entry.name.assign(reinterpret_cast<const char*>(centralDir.data() + pos + sizeof(header)), header.fileNameLength);
+			entry.method = header.compressionMethod;
+			entry.crc = header.crc32;
+			entry.compressedSize = header.compressedSize;
+			entry.uncompressedSize = header.uncompressedSize;
+			entry.localHeaderOffset = header.localHeaderOffset;
+			LocalFileHeader localHeader{};
+			if (!ReadAt(h, header.localHeaderOffset, &localHeader, sizeof(localHeader)) || localHeader.signature != kLocalSig)
+				return {};
+			entry.dataOffset = uint64_t(header.localHeaderOffset) + sizeof(localHeader)
+				+ localHeader.fileNameLength + localHeader.extraFieldLength;
+			if (entry.dataOffset + entry.compressedSize > uint64_t(fileSize.QuadPart)) return {};
+			entries.push_back(std::move(entry));
+			pos += sizeof(header) + header.fileNameLength + header.extraFieldLength + header.fileCommentLength;
 		}
-
-		e.compressed.assign(
-			static_cast<const uint8_t*>(deflated),
-			static_cast<const uint8_t*>(deflated) + outSize);
-		mz_free(deflated);
+		return entries;
 	}
 
-	bool WriteLocalEntry(HANDLE h, PendingEntry& e, uint32_t& cursor)
+	// CRC-32 of a whole file, streamed. Returns false if it cannot be read.
+	bool FileCrc32(const std::wstring& path, uint64_t& size, uint32_t& crc)
 	{
-		e.localHeaderOffset = cursor;
-		// CRC32 is always over the uncompressed bytes per ZIP spec,
-		// regardless of method.
-		e.crc = Crc32(e.data.data(), e.data.size());
+		winrt::file_handle file{ ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+			OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr) };
+		if (!file) return false;
+		LARGE_INTEGER fileSize{};
+		bool ok = ::GetFileSizeEx(file.get(), &fileSize) != 0;
+		size = ok ? uint64_t(fileSize.QuadPart) : 0;
+		std::vector<uint8_t> buffer(8u << 20);
+		uint32_t running = 0xFFFFFFFFu;
+		while (ok)
+		{
+			DWORD got = 0;
+			if (!::ReadFile(file.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &got, nullptr)) { ok = false; break; }
+			if (got == 0) break;
+			running = Crc32Update(running, buffer.data(), got);
+		}
+		crc = running ^ 0xFFFFFFFFu;
+		return ok;
+	}
 
+	bool WriteLocalHeader(HANDLE h, const EntryRecord& e)
+	{
 		LocalFileHeader hdr{};
 		hdr.signature = kLocalSig;
 		hdr.versionNeeded = 20;
 		hdr.generalPurposeFlag = 0x0800; // UTF-8 names
 		hdr.compressionMethod = e.method;
-		hdr.lastModFileTime = 0;
-		hdr.lastModFileDate = (1 << 9) | (1 << 5) | 1; // 1980-01-01
+		hdr.lastModFileDate = cDosDate1980;
 		hdr.crc32 = e.crc;
-		hdr.compressedSize = e.PayloadSize();
-		hdr.uncompressedSize = static_cast<uint32_t>(e.data.size());
+		hdr.compressedSize = e.compressedSize;
+		hdr.uncompressedSize = e.uncompressedSize;
 		hdr.fileNameLength = static_cast<uint16_t>(e.name.size());
-		hdr.extraFieldLength = 0;
-
-		if (!WriteAll(h, &hdr, sizeof(hdr))) return false;
-		if (!WriteAll(h, e.name.data(), e.name.size())) return false;
-		const uint32_t payloadSize = e.PayloadSize();
-		if (payloadSize > 0 && !WriteAll(h, e.PayloadData(), payloadSize)) return false;
-
-		cursor += sizeof(hdr) + static_cast<uint32_t>(e.name.size()) + payloadSize;
-		return true;
+		return WriteAll(h, &hdr, sizeof(hdr)) && WriteAll(h, e.name.data(), e.name.size());
 	}
 
-	bool WriteCentralEntry(HANDLE h, const PendingEntry& e, uint32_t& cursor)
+	bool WriteCentralEntry(HANDLE h, const EntryRecord& e)
 	{
 		CentralDirectoryHeader cd{};
 		cd.signature = kCentralSig;
@@ -299,139 +330,287 @@ namespace
 		cd.versionNeeded = 20;
 		cd.generalPurposeFlag = 0x0800;
 		cd.compressionMethod = e.method;
-		cd.lastModFileTime = 0;
-		cd.lastModFileDate = (1 << 9) | (1 << 5) | 1;
+		cd.lastModFileDate = cDosDate1980;
 		cd.crc32 = e.crc;
-		cd.compressedSize = e.PayloadSize();
-		cd.uncompressedSize = static_cast<uint32_t>(e.data.size());
+		cd.compressedSize = e.compressedSize;
+		cd.uncompressedSize = e.uncompressedSize;
 		cd.fileNameLength = static_cast<uint16_t>(e.name.size());
 		// External attributes: directory entry sets the MS-DOS dir bit
 		// (0x10) so unzip tools render it as a folder.
 		cd.externalFileAttrs = (!e.name.empty() && e.name.back() == '/') ? 0x10u : 0u;
 		cd.localHeaderOffset = e.localHeaderOffset;
+		return WriteAll(h, &cd, sizeof(cd)) && WriteAll(h, e.name.data(), e.name.size());
+	}
 
-		if (!WriteAll(h, &cd, sizeof(cd))) return false;
-		if (!WriteAll(h, e.name.data(), e.name.size())) return false;
+	// Whether deflating a 1 MB sample from the middle of `data` saves at least 2%.
+	// Deflate runs at tens of MB/s, so a large already-compressed file (video,
+	// PNG, JPEG) is stored on the sample's evidence instead of deflated whole.
+	// The middle, because an MP4's compressible index often sits at the start.
+	bool WorthDeflating(const std::vector<uint8_t>& data)
+	{
+		constexpr size_t cSampleBytes = 1u << 20;
+		if (data.size() < 8 * cSampleBytes) return true;
+		const uint8_t* sample = data.data() + (data.size() - cSampleBytes) / 2;
+		size_t deflatedSize = 0;
+		void* deflated = tdefl_compress_mem_to_heap(sample, cSampleBytes, &deflatedSize, TDEFL_DEFAULT_MAX_PROBES);
+		if (!deflated) return true;
+		mz_free(deflated);
+		return deflatedSize < cSampleBytes - cSampleBytes / 50;
+	}
 
-		cursor += sizeof(cd) + static_cast<uint32_t>(e.name.size());
-		return true;
+	// Deflate `data` with miniz (raw DEFLATE, no zlib header, as ZIP method 8 expects).
+	// Store it (method 0) instead when deflate does not make it smaller.
+	void Compress(const std::vector<uint8_t>& data, EntryRecord& entry, std::vector<uint8_t>& out)
+	{
+		entry.crc = Crc32(data.data(), data.size());
+		entry.uncompressedSize = static_cast<uint32_t>(data.size());
+		entry.method = 0;
+		out.clear();
+		if (!data.empty() && WorthDeflating(data))
+		{
+			size_t outSize = 0;
+			void* deflated = tdefl_compress_mem_to_heap(data.data(), data.size(), &outSize, TDEFL_DEFAULT_MAX_PROBES);
+			if (deflated && outSize > 0 && outSize < data.size())
+			{
+				out.assign(static_cast<const uint8_t*>(deflated), static_cast<const uint8_t*>(deflated) + outSize);
+				entry.method = 8;
+			}
+			if (deflated) mz_free(deflated);
+		}
+		entry.compressedSize = static_cast<uint32_t>(entry.method == 8 ? out.size() : data.size());
+	}
+
+	// Sequential archive writer with a 4 GB cap (no ZIP64).
+	struct ArchiveWriter
+	{
+		winrt::file_handle file;
+		uint64_t cursor{ 0 };
+		uint64_t written{ 0 };                // bytes this save actually wrote
+		std::vector<EntryRecord> directory;   // every entry, in file order
+
+		bool Fits(uint64_t more) const { return cursor + more <= 0xFFFFFFFFull; }
+
+		// A new entry from bytes in memory.
+		bool AddBytes(const std::string& name, const std::vector<uint8_t>& data)
+		{
+			EntryRecord entry;
+			entry.name = name;
+			std::vector<uint8_t> packed;
+			Compress(data, entry, packed);
+			const std::vector<uint8_t>& payload = (entry.method == 8) ? packed : data;
+			const uint64_t entrySize = sizeof(LocalFileHeader) + entry.name.size() + payload.size();
+			if (!Fits(entrySize)) return false;
+			entry.localHeaderOffset = static_cast<uint32_t>(cursor);
+			if (!WriteLocalHeader(file.get(), entry) || (!payload.empty() && !WriteAll(file.get(), payload.data(), payload.size())))
+				return false;
+			cursor += entrySize;
+			written += entrySize;
+			directory.push_back(std::move(entry));
+			return true;
+		}
+
+		// An entry copied byte for byte from another archive, without recompressing.
+		bool AddCopied(const EntryRecord& from, HANDLE source)
+		{
+			EntryRecord entry = from;
+			const uint64_t entrySize = sizeof(LocalFileHeader) + entry.name.size() + entry.compressedSize;
+			if (!Fits(entrySize)) return false;
+			entry.localHeaderOffset = static_cast<uint32_t>(cursor);
+			if (!WriteLocalHeader(file.get(), entry)) return false;
+			const uint64_t payloadStart = cursor + sizeof(LocalFileHeader) + entry.name.size();
+			std::vector<uint8_t> buffer(8u << 20);
+			for (uint64_t done = 0; done < entry.compressedSize;)
+			{
+				const size_t chunk = static_cast<size_t>(std::min<uint64_t>(buffer.size(), entry.compressedSize - done));
+				if (!ReadAt(source, from.dataOffset + done, buffer.data(), chunk)) return false;
+				if (!Seek(file.get(), payloadStart + done) || !WriteAll(file.get(), buffer.data(), chunk)) return false;
+				done += chunk;
+			}
+			cursor += entrySize;
+			written += entrySize;
+			directory.push_back(std::move(entry));
+			return true;
+		}
+
+		// An entry already in place in this file; it is only listed in the directory.
+		void AddKept(const EntryRecord& entry)
+		{
+			directory.push_back(entry);
+			cursor = (std::max)(cursor, entry.dataOffset + entry.compressedSize);
+		}
+
+		bool Finish()
+		{
+			const uint64_t cdStart = cursor;
+			for (const auto& entry : directory)
+			{
+				if (!WriteCentralEntry(file.get(), entry)) return false;
+				cursor += sizeof(CentralDirectoryHeader) + entry.name.size();
+			}
+			EndOfCentralDirectory eocd{};
+			eocd.signature = kEocdSig;
+			eocd.entriesOnDisk = static_cast<uint16_t>(directory.size());
+			eocd.totalEntries = static_cast<uint16_t>(directory.size());
+			eocd.centralDirSize = static_cast<uint32_t>(cursor - cdStart);
+			eocd.centralDirOffset = static_cast<uint32_t>(cdStart);
+			if (!Fits(sizeof(eocd)) || !WriteAll(file.get(), &eocd, sizeof(eocd))) return false;
+			written += (cursor - cdStart) + sizeof(eocd);
+			return ::SetEndOfFile(file.get()) != 0;
+		}
+	};
+
+	bool ReadWholeFile(const std::wstring& path, std::vector<uint8_t>& out)
+	{
+		winrt::file_handle file{ ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr) };
+		if (!file) return false;
+		LARGE_INTEGER fileSize{};
+		const bool ok = ::GetFileSizeEx(file.get(), &fileSize) && fileSize.QuadPart <= 0xFFFFFFFFLL; // no ZIP64
+		if (ok) out.resize(static_cast<size_t>(fileSize.QuadPart));
+		return ok && (out.empty() || ReadAt(file.get(), 0, out.data(), out.size()));
 	}
 }
 
 namespace ShaderLab::Rendering
 {
+	// Layout: media entries, then the "media/" folder marker, then graph.json.
+	// With the media first, an unchanged media set is a prefix of the old file,
+	// so a re-save only rewrites the tail. Load accepts entries in any order.
 	bool EffectGraphFile::Save(const std::wstring& path,
 							   const std::wstring& graphJson,
 							   const std::vector<MediaEntry>& media,
-							   const ProgressCallback& progress)
+							   const ProgressCallback& progress,
+							   SaveStats* stats)
 	{
+		SaveStats localStats;
+		SaveStats& result = stats ? *stats : localStats;
+		result = {};
 		const std::string jsonUtf8 = Utf16ToUtf8(graphJson);
+		const std::vector<uint8_t> jsonBytes(jsonUtf8.begin(), jsonUtf8.end());
 
-		// Total step count for progress: 1 (graph.json) + N media files.
-		const uint32_t total = 1 + static_cast<uint32_t>(media.size());
+		// Steps: check each media file, write or copy each one, graph.json, done.
+		const uint32_t mediaCount = static_cast<uint32_t>(media.size());
+		const uint32_t total = 2 * mediaCount + 2;
 		uint32_t step = 0;
 		auto report = [&](const std::wstring& msg) -> bool
 		{
-			if (progress) return progress(step, total, msg);
-			return true;
+			return progress ? progress(step, total, msg) : true;
 		};
 
-		// Build the in-memory entry list. graph.json + optional media.
-		std::vector<PendingEntry> entries;
-		entries.reserve(2 + media.size());
+		// Index the file being overwritten, if there is one.
+		winrt::file_handle oldFile{ ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr) };
+		std::vector<EntryRecord> existing;
+		if (oldFile) existing = ReadDirectory(oldFile.get());
 
-		++step;
-		if (!report(L"graph.json")) return false;
-		{
-			PendingEntry e;
-			e.name = "graph.json";
-			e.data.assign(jsonUtf8.begin(), jsonUtf8.end());
-			entries.push_back(std::move(e));
-		}
-		{
-			// Always emit the media/ folder marker -- even when no
-			// files are embedded -- so external zip tools render the
-			// folder consistently.
-			PendingEntry e;
-			e.name = "media/";
-			entries.push_back(std::move(e));
-		}
-
-		for (const auto& m : media)
+		// A media file is unchanged when an entry has the same name, size and CRC-32.
+		std::vector<const EntryRecord*> reuse(media.size(), nullptr);
+		for (size_t i = 0; i < media.size(); ++i)
 		{
 			++step;
-			if (!report(std::filesystem::path(m.sourcePath).filename().wstring()))
-				return false;
-
-			PendingEntry e;
-			e.name = Utf16ToUtf8(m.zipEntryName);
-
-			// Read the source file into memory. Media files (images
-			// / video) can be tens or hundreds of MB; we still slurp
-			// them whole because writing a stored ZIP entry needs the
-			// CRC and size up front. If this becomes a problem we
-			// can stream by hashing first then re-reading.
-			HANDLE hf = ::CreateFileW(m.sourcePath.c_str(),
-				GENERIC_READ, FILE_SHARE_READ, nullptr,
-				OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-			if (hf == INVALID_HANDLE_VALUE) return false;
-			LARGE_INTEGER fsz{};
-			if (!::GetFileSizeEx(hf, &fsz) || fsz.QuadPart > 0xFFFFFFFFLL)
-			{
-				::CloseHandle(hf);
-				return false; // 4 GB cap (no ZIP64)
-			}
-			e.data.resize(static_cast<size_t>(fsz.QuadPart));
-			DWORD rd = 0;
-			if (!::ReadFile(hf, e.data.data(), static_cast<DWORD>(e.data.size()), &rd, nullptr)
-				|| rd != e.data.size())
-			{
-				::CloseHandle(hf);
-				return false;
-			}
-			::CloseHandle(hf);
-			entries.push_back(std::move(e));
+			const std::wstring fileName = std::filesystem::path(media[i].sourcePath).filename().wstring();
+			if (!report(L"Checking " + fileName)) return false;
+			const std::string entryName = Utf16ToUtf8(media[i].zipEntryName);
+			auto match = std::find_if(existing.begin(), existing.end(),
+				[&](const EntryRecord& entry) { return entry.name == entryName; });
+			if (match == existing.end()) continue;
+			std::error_code ec;
+			const uint64_t onDisk = std::filesystem::file_size(media[i].sourcePath, ec);
+			if (ec || onDisk != match->uncompressedSize) continue;   // size differs, so skip the hash
+			uint64_t hashedSize = 0;
+			uint32_t hashedCrc = 0;
+			if (FileCrc32(media[i].sourcePath, hashedSize, hashedCrc) && hashedSize == match->uncompressedSize && hashedCrc == match->crc)
+				reuse[i] = &*match;
 		}
 
-		// Pick a compression method per entry, then run miniz on the
-		// ones that ShouldCompress flagged. PickMethodFor returns 8 for
-		// compressible types; TryCompressEntry falls back to method 0
-		// per-entry if deflate doesn't actually shrink the bytes.
-		for (auto& e : entries)
+		// Update in place when every media file is unchanged and the old file
+		// starts with exactly those entries, in order, back to back.
+		bool inPlace = !media.empty() && std::all_of(reuse.begin(), reuse.end(), [](auto* entry) { return entry != nullptr; });
+		if (inPlace)
 		{
-			const std::wstring nameW = std::filesystem::path(
-				std::string_view(e.name)).filename().wstring();
-			e.method = PickMethodFor(nameW);
-			TryCompressEntry(e);
+			std::vector<const EntryRecord*> byOffset;
+			for (const auto& entry : existing) byOffset.push_back(&entry);
+			std::sort(byOffset.begin(), byOffset.end(),
+				[](auto* a, auto* b) { return a->localHeaderOffset < b->localHeaderOffset; });
+			uint64_t expectedOffset = 0;
+			for (size_t i = 0; inPlace && i < media.size(); ++i)
+			{
+				inPlace = i < byOffset.size() && byOffset[i] == reuse[i] && byOffset[i]->localHeaderOffset == expectedOffset;
+				if (inPlace) expectedOffset = byOffset[i]->dataOffset + byOffset[i]->compressedSize;
+			}
 		}
 
-		HANDLE h = ::CreateFileW(
-			path.c_str(),
-			GENERIC_WRITE, 0, nullptr,
-			CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-		if (h == INVALID_HANDLE_VALUE) return false;
+		// Deletes the temp file on any exit that does not rename it into place.
+		// Declared before the writer so the writer's handle closes first.
+		struct TempFile
+		{
+			std::wstring path;
+			~TempFile() { if (!path.empty()) ::DeleteFileW(path.c_str()); }
+		} tempFile;
 
-		uint32_t cursor = 0;
-		bool ok = true;
+		ArchiveWriter writer;
+		if (inPlace)
+		{
+			// Rewrite only the tail. A crash during this small write leaves the file without a directory.
+			oldFile.close();
+			writer.file.attach(::CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+				OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+			if (!writer.file) return false;
+			for (const auto* entry : reuse) writer.AddKept(*entry);
+			if (!Seek(writer.file.get(), writer.cursor)) return false;
+			step += mediaCount;
+		}
+		else
+		{
+			// Build a new file beside the old one and swap it in once complete,
+			// so an interrupted save leaves the previous file intact.
+			const std::wstring tempPath = path + L".saving";
+			writer.file.attach(::CreateFileW(tempPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+				CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+			if (!writer.file) return false;
+			tempFile.path = tempPath;
+			for (size_t i = 0; i < media.size(); ++i)
+			{
+				++step;
+				const std::wstring fileName = std::filesystem::path(media[i].sourcePath).filename().wstring();
+				if (reuse[i])
+				{
+					if (!report(L"Copying " + fileName + L" (unchanged)") || !writer.AddCopied(*reuse[i], oldFile.get()))
+						return false;
+				}
+				else
+				{
+					std::vector<uint8_t> data;
+					if (!report(L"Writing " + fileName) || !ReadWholeFile(media[i].sourcePath, data)
+						|| !writer.AddBytes(Utf16ToUtf8(media[i].zipEntryName), data))
+						return false;
+				}
+			}
+		}
 
-		for (auto& e : entries)
-			ok = ok && WriteLocalEntry(h, e, cursor);
+		// The tail. The folder marker is always written so unzip tools show the folder.
+		++step;
+		if (!report(L"graph.json")
+			|| !writer.AddBytes("media/", {})
+			|| !writer.AddBytes("graph.json", jsonBytes)
+			|| !writer.Finish()
+			|| !::FlushFileBuffers(writer.file.get()))
+			return false;
+		writer.file.close();
+		oldFile.close();
+		if (!inPlace)
+		{
+			if (!::MoveFileExW(tempFile.path.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+				return false;
+			tempFile.path.clear();
+		}
 
-		const uint32_t cdStart = cursor;
-		for (auto& e : entries)
-			ok = ok && WriteCentralEntry(h, e, cursor);
-		const uint32_t cdSize = cursor - cdStart;
-
-		EndOfCentralDirectory eocd{};
-		eocd.signature = kEocdSig;
-		eocd.entriesOnDisk = static_cast<uint16_t>(entries.size());
-		eocd.totalEntries = static_cast<uint16_t>(entries.size());
-		eocd.centralDirSize = cdSize;
-		eocd.centralDirOffset = cdStart;
-		ok = ok && WriteAll(h, &eocd, sizeof(eocd));
-
-		::CloseHandle(h);
-		return ok;
+		result.inPlace = inPlace;
+		result.bytesWritten = writer.written;
+		for (auto* entry : reuse) (entry ? result.mediaUnchanged : result.mediaWritten)++;
+		step = total;
+		report(L"Saved");   // the save is already complete, so a cancel here is ignored
+		return true;
 	}
 
 	std::optional<EffectGraphFile::LoadResult> EffectGraphFile::Load(
@@ -443,28 +622,22 @@ namespace ShaderLab::Rendering
 		// hit hundreds of MB (HDR clips, etc.) but we still expect to
 		// fit in RAM -- streaming would complicate the central-dir
 		// walk for no real benefit on modern hardware.
-		HANDLE h = ::CreateFileW(
+		winrt::file_handle file{ ::CreateFileW(
 			path.c_str(),
 			GENERIC_READ, FILE_SHARE_READ, nullptr,
-			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-		if (h == INVALID_HANDLE_VALUE) return std::nullopt;
+			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr) };
+		if (!file) return std::nullopt;
 
 		LARGE_INTEGER size{};
-		if (!::GetFileSizeEx(h, &size) || size.QuadPart < (LONGLONG)sizeof(EndOfCentralDirectory))
-		{
-			::CloseHandle(h);
+		if (!::GetFileSizeEx(file.get(), &size) || size.QuadPart < (LONGLONG)sizeof(EndOfCentralDirectory))
 			return std::nullopt;
-		}
 
 		std::vector<uint8_t> buf(static_cast<size_t>(size.QuadPart));
 		DWORD read = 0;
-		if (!::ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &read, nullptr)
+		if (!::ReadFile(file.get(), buf.data(), static_cast<DWORD>(buf.size()), &read, nullptr)
 			|| read != buf.size())
-		{
-			::CloseHandle(h);
 			return std::nullopt;
-		}
-		::CloseHandle(h);
+		file.close();
 
 		// First pass: count entries and find graph.json so we can
 		// report meaningful progress totals.
@@ -574,6 +747,18 @@ namespace ShaderLab::Rendering
 		LoadResult result;
 		result.graphJson = std::move(*graphJson);
 		result.extractDir = extractDir;
+		result.package = true;
+
+		// Removes a half-extracted directory on any failure below.
+		struct ExtractCleanup
+		{
+			std::wstring dir;
+			~ExtractCleanup()
+			{
+				std::error_code ec;
+				if (!dir.empty()) std::filesystem::remove_all(dir, ec);   // best effort: temp dir
+			}
+		} cleanup;
 
 		// Count media files for progress reporting.
 		uint32_t mediaCount = 0;
@@ -596,7 +781,10 @@ namespace ShaderLab::Rendering
 		{
 			// Create the extraction directory only if we actually
 			// have files to extract -- avoids spamming temp.
-			std::filesystem::create_directories(extractDir);
+			std::error_code ec;
+			std::filesystem::create_directories(extractDir, ec);
+			if (ec) return std::nullopt;
+			cleanup.dir = extractDir;
 		}
 
 		for (const auto& e : parsed)
@@ -631,7 +819,147 @@ namespace ShaderLab::Rendering
 			result.mediaMap[L"media://" + fileName] = outPath;
 		}
 
+		cleanup.dir.clear();
 		return result;
+	}
+
+	std::optional<EffectGraphFile::LoadResult> EffectGraphFile::LoadAny(
+		const std::wstring& path,
+		const std::wstring& extractDirRoot,
+		std::wstring& error,
+		const ProgressCallback& progress)
+	{
+		error.clear();
+
+		// Sniff the PKZIP local-file-header magic.
+		uint32_t magic = 0;
+		{
+			winrt::file_handle file{ ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+				OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr) };
+			if (!file)
+			{
+				error = std::format(L"cannot open '{}' (Win32 error {})", path, ::GetLastError());
+				return std::nullopt;
+			}
+			LARGE_INTEGER fileSize{};
+			if (::GetFileSizeEx(file.get(), &fileSize) && fileSize.QuadPart == 0)
+			{
+				error = std::format(L"'{}' is empty", path);
+				return std::nullopt;
+			}
+			if (fileSize.QuadPart >= 4)
+				ReadAt(file.get(), 0, &magic, sizeof(magic));
+		}
+		if (magic == kLocalSig)
+		{
+			auto loaded = Load(path, extractDirRoot, progress);
+			if (!loaded)
+				error = std::format(L"'{}' is not a readable .effectgraph package", path);
+			return loaded;
+		}
+
+		std::vector<uint8_t> bytes;
+		if (!ReadWholeFile(path, bytes))
+		{
+			error = std::format(L"cannot read '{}' (Win32 error {})", path, ::GetLastError());
+			return std::nullopt;
+		}
+
+		// Bare JSON; skip a UTF-8 byte order mark.
+		size_t start = 0;
+		if (bytes.size() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+			start = 3;
+		LoadResult result;
+		result.graphJson = Utf8ToUtf16(reinterpret_cast<const char*>(bytes.data()) + start, bytes.size() - start);
+		return result;
+	}
+
+	void EffectGraphFile::ResolveMediaTokens(Graph::EffectGraph& graph,
+		const std::map<std::wstring, std::wstring>& mediaMap)
+	{
+		if (mediaMap.empty()) return;
+		for (auto& node : const_cast<std::vector<Graph::EffectNode>&>(graph.Nodes()))
+		{
+			if (node.type != Graph::NodeType::Source || !node.shaderPath.has_value()) continue;
+			auto it = mediaMap.find(*node.shaderPath);
+			if (it == mediaMap.end()) continue;
+			node.shaderPath = it->second;
+			auto propertyIt = node.properties.find(L"shaderPath");
+			if (propertyIt != node.properties.end())
+				propertyIt->second = it->second;
+		}
+	}
+
+	std::wstring EffectGraphFile::SerializeForSave(Graph::EffectGraph graph, bool embedMedia,
+		std::vector<MediaEntry>& media)
+	{
+		if (!embedMedia)
+			return std::wstring(graph.ToJson());
+
+		std::set<std::wstring> usedNames;
+		for (auto& node : const_cast<std::vector<Graph::EffectNode>&>(graph.Nodes()))
+		{
+			if (node.type != Graph::NodeType::Source) continue;
+			if (!node.shaderPath.has_value()) continue;
+			const std::wstring path = node.shaderPath.value();
+			if (path.empty() || path.starts_with(L"media://")) continue;
+			// Skip missing files rather than failing the whole save.
+			std::error_code ec;
+			if (!std::filesystem::exists(path, ec)) continue;
+
+			// Keep the basename when possible; suffix -2, -3 on collision.
+			std::wstring base = std::filesystem::path(path).filename().wstring();
+			std::wstring name = base;
+			int suffix = 2;
+			while (usedNames.count(name))
+			{
+				auto stem = std::filesystem::path(base).stem().wstring();
+				auto extension = std::filesystem::path(base).extension().wstring();
+				name = stem + L"-" + std::to_wstring(suffix++) + extension;
+			}
+			usedNames.insert(name);
+
+			MediaEntry entry;
+			entry.zipEntryName = L"media/" + name;
+			entry.sourcePath = path;
+			media.push_back(std::move(entry));
+
+			const std::wstring token = L"media://" + name;
+			node.shaderPath = token;
+			auto propertyIt = node.properties.find(L"shaderPath");
+			if (propertyIt != node.properties.end())
+				propertyIt->second = token;
+		}
+		return std::wstring(graph.ToJson());
+	}
+
+	bool EffectGraphFile::SaveJson(const std::wstring& path, const std::wstring& graphJson,
+		uint64_t* bytesWritten)
+	{
+		const std::string utf8 = Utf16ToUtf8(graphJson);
+		const std::wstring tempPath = path + L".saving";
+		{
+			winrt::file_handle file{ ::CreateFileW(tempPath.c_str(), GENERIC_WRITE, 0, nullptr,
+				CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr) };
+			if (!file) return false;
+			if (!WriteAll(file.get(), utf8.data(), utf8.size()) || !::FlushFileBuffers(file.get()))
+			{
+				const DWORD writeError = ::GetLastError();
+				file.close();
+				::DeleteFileW(tempPath.c_str());
+				::SetLastError(writeError);
+				return false;
+			}
+		}
+		if (!::MoveFileExW(tempPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+		{
+			const DWORD moveError = ::GetLastError();
+			::DeleteFileW(tempPath.c_str());
+			::SetLastError(moveError);
+			return false;
+		}
+		if (bytesWritten) *bytesWritten = utf8.size();
+		return true;
 	}
 }
 

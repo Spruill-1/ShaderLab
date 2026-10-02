@@ -49,6 +49,11 @@ namespace ShaderLab::Graph
         // binds the upstream SRV to the corresponding t-slot.
         // Default false: parameter is cbuffer-only, current behavior.
         bool gpuBindable{ false };
+
+        // Compile one shader variant per option value (needs enumLabels, not
+        // gpuBindable; declared with SHADERLAB_OPTION in shaderlab_params.hlsli).
+        // A value outside the labels uses the generic build. See ShaderVariants.h.
+        bool specialize{ false };
     };
 
     // Evaluate a visibleWhen condition against current property values.
@@ -225,6 +230,13 @@ namespace ShaderLab::Graph
         // null (D2D will not render an effect with a null input); its alpha of
         // 0 is how the shader tells "no table wired" and falls back.
         uint32_t lookupInputCount{ 0 };
+
+        // Variadic image inputs (pixel shaders). inputNames is the maximum and
+        // the D2D effect always has that many inputs; the node shows only the
+        // pins in use plus one spare (EffectGraph::FitVariadicPins).
+        // Unconnected inputs get the 1x1 zero placeholder, and an `InputMask`
+        // cbuffer field, if declared, receives the connected pins (bit i = pin i).
+        bool variadicInputs{ false };
         std::vector<ParameterDefinition> parameters;    // Declared cbuffer parameters.
 
         // ShaderLab built-in effect identity (empty for user-authored effects).
@@ -382,6 +394,14 @@ namespace ShaderLab::Graph
 
         // Runtime error message (e.g., effect creation failure). Not serialized.
         std::wstring runtimeError;
+
+        // The baseline shader is compiling in the background, so the node has
+        // no output yet (GraphEvaluator::SetAsyncCompile). Not serialized.
+        bool compilePending{ false };
+
+        // Option variants still compiling in the background. The node renders
+        // with the generic shader meanwhile. Not serialized.
+        uint32_t variantsCompiling{ 0 };
 
         // Dirty flag -- set when properties change, cleared after evaluation.
         bool dirty{ true };

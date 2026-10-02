@@ -46,6 +46,7 @@ namespace winrt::ShaderLab::implementation
 
         try
         {
+        m_compileProgress.Update(CurrentGraphSnapshot(), Content().XamlRoot());
         // Compute frame delta time (used by the render-tick body for clock
         // node advancement and frame timing).
         auto now = std::chrono::steady_clock::now();
@@ -498,12 +499,8 @@ namespace winrt::ShaderLab::implementation
                 }
 
                 // Publish snapshot.
-                const uint64_t frameGen =
-                    m_frameGeneration.fetch_add(1, std::memory_order_release) + 1;
-                auto snap = ::ShaderLab::Graph::BuildGraphUiSnapshot(
-                    m_graph, m_previewNodeId, m_graphGeneration, frameGen);
-                std::atomic_store(&m_uiGraphSnapshot,
-                    std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>(snap));
+                m_frameGeneration.fetch_add(1, std::memory_order_release);
+                PublishGraphSnapshot();
             }
             catch (const winrt::hresult_error& ex)
             {
@@ -517,6 +514,15 @@ namespace winrt::ShaderLab::implementation
         }
 
         m_renderDispatcher.Drain();
+    }
+
+    void MainWindow::PublishGraphSnapshot()
+    {
+        auto snapshot = ::ShaderLab::Graph::BuildGraphUiSnapshot(
+            m_graph, m_previewNodeId, m_graphGeneration,
+            m_frameGeneration.load(std::memory_order_acquire));
+        std::atomic_store(&m_uiGraphSnapshot,
+            std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>(std::move(snapshot)));
     }
 
     // -------------------------------------------------------------------------
@@ -661,6 +667,8 @@ namespace winrt::ShaderLab::implementation
             }
             if (m_previewNodeId != 0)
                 roots.push_back(m_previewNodeId);
+            if (m_readbackNodeId != 0)
+                roots.push_back(m_readbackNodeId);
             for (const auto& window : m_outputWindows)
                 roots.push_back(window->NodeId());
             std::unordered_set<uint32_t> visited;

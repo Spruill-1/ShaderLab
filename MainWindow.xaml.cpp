@@ -26,6 +26,55 @@ using namespace Microsoft::UI::Xaml;
 
 namespace winrt::ShaderLab::implementation
 {
+    // Static helpers
+
+    // Replace a ShaderLab effect node's definition, pins and properties with
+    // the descriptor's, keeping the values of properties that still exist.
+    // Render thread only: it writes the live graph.
+    static bool UpgradeNodeToDescriptor(
+        ::ShaderLab::Graph::EffectGraph& graph,
+        ::ShaderLab::Graph::EffectNode& node,
+        const ::ShaderLab::Effects::ShaderLabEffectDescriptor& descriptor)
+    {
+        auto freshNode = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(descriptor);
+        if (!freshNode.customEffect.has_value()) return false;
+
+        auto savedProperties = node.properties;
+        node.customEffect = std::move(freshNode.customEffect.value());
+        node.inputPins = std::move(freshNode.inputPins);
+        graph.FitVariadicPins(node.id);   // pins are derived from the edges
+        node.outputPins = std::move(freshNode.outputPins);
+        node.isClock = freshNode.isClock;
+        node.properties = std::move(freshNode.properties);
+        for (const auto& [key, value] : savedProperties)
+        {
+            auto it = node.properties.find(key);
+            if (it != node.properties.end())
+                it->second = value;
+        }
+        node.dirty = true;
+        node.cachedOutput = nullptr; // raw pointer is now dangling
+        return true;
+    }
+
+    // Apply an edit to an existing property and mark its node dirty. The edit
+    // returns false to leave the node untouched. Render thread only.
+    template <class Edit>
+    static bool EditNodeProperty(
+        ::ShaderLab::Graph::EffectGraph& graph,
+        uint32_t nodeId,
+        const std::wstring& key,
+        Edit&& edit)
+    {
+        auto* node = graph.FindNode(nodeId);
+        if (!node) return false;
+        auto it = node->properties.find(key);
+        if (it == node->properties.end()) return false;
+        if (!edit(it->second)) return false;
+        node->dirty = true;
+        return true;
+    }
+
     MainWindow::MainWindow()
     {
         InitializeComponent();
@@ -149,45 +198,43 @@ namespace winrt::ShaderLab::implementation
             // user had zoomed/panned the canvas off-screen.
             m_nodeGraphController.SetZoom(1.0f);
             m_nodeGraphController.SetPanOffset(0.0f, 0.0f);
-            m_nodeGraphController.AutoLayout();
+            m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.AutoLayout(); });
             m_nodeGraphController.SetNeedsRedraw();
             m_forceRender = true;
         });
         UpdateAllEffectsButton().Click([this](auto&&, auto&&)
         {
-            auto& registry = ::ShaderLab::Effects::ShaderLabEffects::Instance();
-            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+            // Graph writes and layout belong to the render thread.
+            m_renderDispatcher.DispatchSync([this]
             {
-                if (!node.customEffect.has_value() || node.customEffect->shaderLabEffectId.empty())
-                    continue;
-                auto* desc = registry.FindById(node.customEffect->shaderLabEffectId);
-                if (!desc || desc->effectVersion <= node.customEffect->shaderLabEffectVersion)
-                    continue;
-
-                auto savedProps = node.properties;
-                auto freshNode = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*desc);
-                if (!freshNode.customEffect.has_value()) continue;
-
-                node.customEffect = std::move(freshNode.customEffect.value());
-                node.inputPins = std::move(freshNode.inputPins);
-                node.outputPins = std::move(freshNode.outputPins);
-                node.isClock = freshNode.isClock;
-                node.properties = std::move(freshNode.properties);
-                for (const auto& [key, val] : savedProps)
+                auto& registry = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+                for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
                 {
-                    auto it = node.properties.find(key);
-                    if (it != node.properties.end())
-                        it->second = val;
+                    if (!node.customEffect.has_value() || node.customEffect->shaderLabEffectId.empty())
+                        continue;
+                    auto* desc = registry.FindById(node.customEffect->shaderLabEffectId);
+                    if (!desc || desc->effectVersion <= node.customEffect->shaderLabEffectVersion)
+                        continue;
+                    if (UpgradeNodeToDescriptor(m_graph, node, *desc))
+                        m_graphEvaluator.InvalidateNode(node.id);
                 }
-                node.dirty = true;
-                node.cachedOutput = nullptr; // raw pointer is now dangling
-                m_graphEvaluator.InvalidateNode(node.id);
-            }
-            m_nodeGraphController.RebuildLayout();
+                m_nodeGraphController.RebuildLayout();
+            });
+            m_forceRender = true;
             PopulatePreviewNodeSelector();
             UpdatePropertiesPanel();
             UpdateOutdatedEffectsButton();
         });
+        // Register user effects before the flyout is built and before the render worker exists.
+        {
+            auto& library = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+            const auto& report = library.LoadUserEffects(
+                ::ShaderLab::Effects::ShaderLabEffects::DefaultUserEffectsDirectory());
+            for (const auto& name : report.loaded)
+                OutputDebugStringW((L"[UserEffects] loaded " + name + L"\n").c_str());
+            for (const auto& err : report.errors)
+                OutputDebugStringW((L"[UserEffects] " + err + L"\n").c_str());
+        }
         // Populate the Add Node flyout with effects from the registry.
         PopulateAddNodeFlyout();
 
@@ -241,14 +288,20 @@ namespace winrt::ShaderLab::implementation
                 }
                 m_nodeClipboard.clear();
                 m_edgeClipboard.clear();
+                const auto snapshot = CurrentGraphSnapshot();
+                if (!snapshot)
+                {
+                    args.Handled(true);
+                    return;
+                }
                 for (uint32_t nodeId : m_nodeGraphController.SelectedNodes())
                 {
-                    auto* node = m_graph.FindNode(nodeId);
+                    auto* node = snapshot->FindNode(nodeId);
                     if (node)
                         m_nodeClipboard.push_back({ *node, nodeId });
                 }
                 // Copy internal edges (edges where both src and dst are in the selection).
-                for (const auto& edge : m_graph.Edges())
+                for (const auto& edge : snapshot->edges)
                 {
                     bool srcIn = m_nodeGraphController.SelectedNodes().count(edge.sourceNodeId) > 0;
                     bool dstIn = m_nodeGraphController.SelectedNodes().count(edge.destNodeId) > 0;
@@ -283,15 +336,17 @@ namespace winrt::ShaderLab::implementation
                 }
 
                 // Reconnect internal edges with new IDs.
-                for (const auto& edge : m_edgeClipboard)
+                m_renderDispatcher.DispatchSync([this, &idMap]
                 {
-                    auto srcIt = idMap.find(edge.sourceNodeId);
-                    auto dstIt = idMap.find(edge.destNodeId);
-                    if (srcIt != idMap.end() && dstIt != idMap.end())
-                        m_graph.Connect(srcIt->second, edge.sourcePin, dstIt->second, edge.destPin);
-                }
-
-                m_nodeGraphController.RebuildLayout();
+                    for (const auto& edge : m_edgeClipboard)
+                    {
+                        auto srcIt = idMap.find(edge.sourceNodeId);
+                        auto dstIt = idMap.find(edge.destNodeId);
+                        if (srcIt != idMap.end() && dstIt != idMap.end())
+                            m_graph.Connect(srcIt->second, edge.sourcePin, dstIt->second, edge.destPin);
+                    }
+                    m_nodeGraphController.RebuildLayout();
+                });
                 PopulatePreviewNodeSelector();
                 args.Handled(true);
                 return;
@@ -300,7 +355,7 @@ namespace winrt::ShaderLab::implementation
             // Ctrl+L: auto-arrange graph layout.
             if (ctrlDown && key == winrt::Windows::System::VirtualKey::L)
             {
-                m_nodeGraphController.AutoLayout();
+                m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.AutoLayout(); });
                 m_forceRender = true;
                 args.Handled(true);
                 return;
@@ -313,7 +368,8 @@ namespace winrt::ShaderLab::implementation
                 // If only a single node is selected via click (not multi-select), select it for deletion.
                 if (m_nodeGraphController.SelectedNodes().empty() && m_selectedNodeId != 0)
                 {
-                    const auto* node = m_graph.FindNode(m_selectedNodeId);
+                    const auto snapshot = CurrentGraphSnapshot();
+                    const auto* node = snapshot ? snapshot->FindNode(m_selectedNodeId) : nullptr;
                     if (node && node->type == ::ShaderLab::Graph::NodeType::Output)
                         return;
                     m_nodeGraphController.SelectNode(m_selectedNodeId);
@@ -325,18 +381,21 @@ namespace winrt::ShaderLab::implementation
 
                 m_nodeGraphController.DeleteSelected();
                 m_selectedNodeId = 0;
-                m_nodeGraphController.RebuildLayout();
+                m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.RebuildLayout(); });
                 PopulatePreviewNodeSelector();
                 UpdatePropertiesPanel();
                 MarkUnsaved();
 
                 // Reset preview to Output node.
-                for (const auto& n : m_graph.Nodes())
+                if (const auto snapshot = CurrentGraphSnapshot())
                 {
-                    if (n.type == ::ShaderLab::Graph::NodeType::Output)
+                    for (const auto& n : snapshot->nodes)
                     {
-                        SelectPreviewNode(n.id);
-                        break;
+                        if (n.type == ::ShaderLab::Graph::NodeType::Output)
+                        {
+                            SelectPreviewNode(n.id);
+                            break;
+                        }
                     }
                 }
                 PreviewOverlayBorder().Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
@@ -537,6 +596,11 @@ namespace winrt::ShaderLab::implementation
         // Per-node GPU attribution. The evaluator brackets each compute
         // dispatch when this is set AND timing is enabled; no-op otherwise.
         m_graphEvaluator.SetGpuTimer(&m_renderEngine.Timer());
+        // Compile shaders on the cache's worker threads, not the render thread,
+        // so a slow compile cannot stall UI actions that dispatch to it.
+        m_graphEvaluator.SetAsyncCompile(true);
+        // Option variants report on a status line rather than the compile dialog.
+        m_compileProgress.SetVariantStatusText(VariantCompileText());
         // Reflect that default in the flyout, so the checkbox is not
         // showing the opposite of what the engine is doing.
         if (AnalysisRefreshCombo()) AnalysisRefreshCombo().SelectedIndex(0);
@@ -639,8 +703,9 @@ namespace winrt::ShaderLab::implementation
             [this] { return CurrentGraphSnapshot(); });
         m_nodeGraphController.SetConnectionCallback(
             [this](uint32_t srcId, uint32_t srcPin, uint32_t dstId, uint32_t dstPin, bool isData) {
-                auto* srcNode = m_graph.FindNode(srcId);
-                auto* dstNode = m_graph.FindNode(dstId);
+                const auto snapshot = CurrentGraphSnapshot();
+                auto* srcNode = snapshot ? snapshot->FindNode(srcId) : nullptr;
+                auto* dstNode = snapshot ? snapshot->FindNode(dstId) : nullptr;
                 std::wstring srcName = srcNode ? srcNode->name : std::format(L"Node {}", srcId);
                 std::wstring dstName = dstNode ? dstNode->name : std::format(L"Node {}", dstId);
                 if (isData)
@@ -677,6 +742,12 @@ namespace winrt::ShaderLab::implementation
         // of the UI thread, drawing into a double-buffered offscreen target.
         // UI thread blits the latest published buffer into the SwapChainPanel-
         // bound swap chain in OnRenderTick.
+        //
+        // Publish a snapshot before the worker exists so UI reads never see
+        // nullptr once it runs, and republish after every dispatched closure
+        // so a UI read that follows a dispatched write sees it.
+        PublishGraphSnapshot();
+        m_renderDispatcher.SetAfterSyncClosure([this] { PublishGraphSnapshot(); });
         m_renderShouldStop.store(false, std::memory_order_release);
         m_renderWorker = std::jthread([this](std::stop_token stop){
             this->RenderWorkerLoop(stop);
@@ -1029,6 +1100,7 @@ namespace winrt::ShaderLab::implementation
         }
 
         // ---- RELOAD GRAPH ----
+        // The worker is stopped, so the graph is used directly until it restarts.
         try
         {
             m_graph = ::ShaderLab::Graph::EffectGraph::FromJson(graphJson);
@@ -1049,58 +1121,12 @@ namespace winrt::ShaderLab::implementation
         m_previewPanX = savedPreviewPanX;
         m_previewPanY = savedPreviewPanY;
         m_needsFitPreview = false;
+        PublishGraphSnapshot();
         if (savedSelectedId != 0 && m_graph.FindNode(savedSelectedId))
         {
             m_selectedNodeId = savedSelectedId;
             m_nodeGraphController.SelectNode(savedSelectedId);
             UpdatePropertiesPanel();
-        }
-
-        // Re-prepare source nodes on the new device.
-        // Skip video sources — they can be reopened by the user via file picker.
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (dc)
-        {
-            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-            {
-                if (node.type == ::ShaderLab::Graph::NodeType::Source)
-                {
-                    bool isVideo = false;
-                    auto it = node.properties.find(L"IsVideo");
-                    if (it != node.properties.end())
-                        if (auto* b = std::get_if<bool>(&it->second)) isVideo = *b;
-
-                    if (isVideo)
-                    {
-                        // Defer video reload — give the new device time to settle.
-                        uint32_t videoNodeId = node.id;
-                        node.dirty = true;
-                        DispatcherQueue().TryEnqueue([this, videoNodeId]() {
-                            auto* vn = m_graph.FindNode(videoNodeId);
-                            auto* vdc = m_renderEngine.D2DDeviceContext();
-                            if (vn && vdc)
-                            {
-                                try {
-                                    m_sourceFactory.PrepareSourceNode(*vn, vdc, 0.0,
-                                        m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-                                    vn->runtimeError.clear();
-                                } catch (...) {
-                                    vn->runtimeError = L"Video reload failed after GPU switch";
-                                }
-                            }
-                        });
-                        continue;
-                    }
-
-                    node.dirty = true;
-                    try {
-                        m_sourceFactory.PrepareSourceNode(node, dc, 0.0,
-                            m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-                    } catch (...) {
-                        node.dirty = false;
-                    }
-                }
-            }
         }
 
         m_forceRender = true;
@@ -1116,11 +1142,65 @@ namespace winrt::ShaderLab::implementation
             this->RenderWorkerLoop(stop);
         });
 
-        // Reopen output windows.
-        auto outputIds = m_graph.GetOutputNodeIds();
-        for (uint32_t id : outputIds)
+        // Re-prepare source nodes on the new device, on the render thread with
+        // its own D2D context, as every other source preparation does. The
+        // worker drains this before its first frame. Video sources are only
+        // marked dirty here and reopened below, once the device has settled.
+        const auto videoNodeIds = m_renderDispatcher.DispatchSync([this]
         {
-            try { OpenOutputWindow(id); } catch (...) {}
+            std::vector<uint32_t> videoIds;
+            auto* dc = m_renderEngine.RenderD2DContext();
+            if (!dc) return videoIds;
+            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+            {
+                if (node.type != ::ShaderLab::Graph::NodeType::Source) continue;
+
+                bool isVideo = false;
+                auto it = node.properties.find(L"IsVideo");
+                if (it != node.properties.end())
+                    if (auto* b = std::get_if<bool>(&it->second)) isVideo = *b;
+
+                node.dirty = true;
+                if (isVideo)
+                {
+                    videoIds.push_back(node.id);
+                    continue;
+                }
+                try {
+                    m_sourceFactory.PrepareSourceNode(node, dc, 0.0,
+                        m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                } catch (...) {
+                    node.dirty = false;
+                }
+            }
+            return videoIds;
+        });
+        for (uint32_t videoNodeId : videoNodeIds)
+        {
+            DispatcherQueue().TryEnqueue([this, videoNodeId]() {
+                m_renderDispatcher.DispatchSync([this, videoNodeId] {
+                    auto* videoNode = m_graph.FindNode(videoNodeId);
+                    auto* dc = m_renderEngine.RenderD2DContext();
+                    if (!videoNode || !dc) return;
+                    try {
+                        m_sourceFactory.PrepareSourceNode(*videoNode, dc, 0.0,
+                            m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                        videoNode->runtimeError.clear();
+                    } catch (...) {
+                        videoNode->runtimeError = L"Video reload failed after GPU switch";
+                    }
+                });
+            });
+        }
+
+        // Reopen output windows.
+        if (const auto snapshot = CurrentGraphSnapshot())
+        {
+            for (const auto& node : snapshot->nodes)
+            {
+                if (node.type != ::ShaderLab::Graph::NodeType::Output) continue;
+                try { OpenOutputWindow(node.id); } catch (...) {}
+            }
         }
         // Restart render timer.
         if (m_renderTimer) m_renderTimer.Start();
@@ -1130,15 +1210,19 @@ namespace winrt::ShaderLab::implementation
         DispatcherQueue().TryEnqueue(
             winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low,
             [this]() {
-                for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+                // The worker is running again, so graph writes go through it.
+                m_renderDispatcher.DispatchSync([this]
                 {
-                    if (node.type == ::ShaderLab::Graph::NodeType::Source &&
-                        !node.runtimeError.empty())
+                    for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
                     {
-                        node.runtimeError.clear();
-                        node.dirty = true;
+                        if (node.type == ::ShaderLab::Graph::NodeType::Source &&
+                            !node.runtimeError.empty())
+                        {
+                            node.runtimeError.clear();
+                            node.dirty = true;
+                        }
                     }
-                }
+                });
                 m_forceRender = true;
             });
 
@@ -1205,14 +1289,12 @@ namespace winrt::ShaderLab::implementation
                         } catch (...) {}
                     }
                 }
+                m_nodeGraphController.AutoLayout();
                 return 0;
             });
         }
         catch (...) {}
 
-        // AutoLayout + PopulatePreviewNodeSelector touch XAML and
-        // controller state -- UI thread.
-        m_nodeGraphController.AutoLayout();
         PopulatePreviewNodeSelector();
         m_forceRender = true;
     }
@@ -1239,8 +1321,11 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::PopulatePreviewNodeSelector()
     {
         // Cache the topological order (used by graph evaluation and navigation).
-        try { m_topoOrder = m_graph.TopologicalSort(); }
-        catch (...) { m_topoOrder.clear(); }
+        const auto snapshot = CurrentGraphSnapshot();
+        if (snapshot)
+            m_topoOrder = snapshot->topologicalOrder;
+        else
+            m_topoOrder.clear();
 
         UpdateOutdatedEffectsButton();
     }
@@ -1249,13 +1334,16 @@ namespace winrt::ShaderLab::implementation
     {
         auto& registry = ::ShaderLab::Effects::ShaderLabEffects::Instance();
         uint32_t outdatedCount = 0;
-        for (const auto& node : m_graph.Nodes())
+        if (const auto snapshot = CurrentGraphSnapshot())
         {
-            if (!node.customEffect.has_value() || node.customEffect->shaderLabEffectId.empty())
-                continue;
-            auto* desc = registry.FindById(node.customEffect->shaderLabEffectId);
-            if (desc && desc->effectVersion > node.customEffect->shaderLabEffectVersion)
-                outdatedCount++;
+            for (const auto& node : snapshot->nodes)
+            {
+                if (!node.customEffect.has_value() || node.customEffect->shaderLabEffectId.empty())
+                    continue;
+                auto* desc = registry.FindById(node.customEffect->shaderLabEffectId);
+                if (desc && desc->effectVersion > node.customEffect->shaderLabEffectVersion)
+                    outdatedCount++;
+            }
         }
         if (outdatedCount > 0)
         {
@@ -1301,7 +1389,8 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::UpdatePreviewOverlay()
     {
-        const auto* node = m_graph.FindNode(m_previewNodeId);
+        const auto snapshot = CurrentGraphSnapshot();
+        const auto* node = snapshot ? snapshot->FindNode(m_previewNodeId) : nullptr;
         if (node)
         {
             PreviewOverlayText().Text(winrt::hstring(node->name));
@@ -1453,7 +1542,7 @@ namespace winrt::ShaderLab::implementation
                         if (!slDesc) return;
                         auto node = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*slDesc);
                         m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
-                        m_nodeGraphController.RebuildLayout();
+                        m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.RebuildLayout(); });
                         PopulatePreviewNodeSelector();
                         // Force a render tick that triggers the post-eval
                         // RebuildLayout, which is what reveals on-node UI
@@ -1531,6 +1620,23 @@ namespace winrt::ShaderLab::implementation
                 }
             }
 
+            // List user effect files that failed to load where the effect would be looked for.
+            const auto& userReport = slRegistry.UserEffectReport();
+            if (!userReport.errors.empty())
+            {
+                std::wstring details;
+                for (const auto& err : userReport.errors)
+                    details += (details.empty() ? L"" : L"\n") + err;
+                auto warnItem = MUX::MenuFlyoutItem();
+                warnItem.Text(std::to_wstring(userReport.errors.size()) +
+                    (userReport.errors.size() == 1 ? L" user effect failed to load"
+                                                   : L" user effects failed to load"));
+                warnItem.IsEnabled(false);
+                MUX::ToolTipService::SetToolTip(warnItem, winrt::box_value(winrt::hstring(details)));
+                slGroup.Items().Append(MUX::MenuFlyoutSeparator());
+                slGroup.Items().Append(warnItem);
+            }
+
             flyout.Items().Append(slGroup);
         }
 
@@ -1544,10 +1650,15 @@ namespace winrt::ShaderLab::implementation
             outputItem.Click([this](auto&&, auto&&)
             {
                 // Create a new Output node with auto-incrementing name.
-                auto outputIds = m_graph.GetOutputNodeIds();
+                size_t outputCount = 0;
+                if (const auto snapshot = CurrentGraphSnapshot())
+                {
+                    for (const auto& node : snapshot->nodes)
+                        if (node.type == ::ShaderLab::Graph::NodeType::Output) ++outputCount;
+                }
                 std::wstring name = L"Output";
-                if (!outputIds.empty())
-                    name = L"Output " + std::to_wstring(outputIds.size() + 1);
+                if (outputCount > 0)
+                    name = L"Output " + std::to_wstring(outputCount + 1);
 
                 ::ShaderLab::Graph::EffectNode outputNode;
                 outputNode.name = name;
@@ -1555,7 +1666,7 @@ namespace winrt::ShaderLab::implementation
                 outputNode.inputPins = { { L"Input", 0 } };
                 auto nodeId = m_nodeGraphController.AddNode(std::move(outputNode), { 0.0f, 0.0f });
 
-                m_nodeGraphController.RebuildLayout();
+                m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.RebuildLayout(); });
                 PopulatePreviewNodeSelector();
 
                 // Auto-open an output window for the new node.
@@ -1572,7 +1683,9 @@ namespace winrt::ShaderLab::implementation
             uint32_t sourceNodeId;
         };
         std::vector<CustomEffectTemplate> customTemplates;
-        for (const auto& node : m_graph.Nodes())
+        const auto graphSnapshot = CurrentGraphSnapshot();
+        const std::vector<::ShaderLab::Graph::EffectNode> noNodes;
+        for (const auto& node : graphSnapshot ? graphSnapshot->nodes : noNodes)
         {
             if ((node.type == ::ShaderLab::Graph::NodeType::PixelShader ||
                  node.type == ::ShaderLab::Graph::NodeType::ComputeShader) &&
@@ -1601,8 +1714,9 @@ namespace winrt::ShaderLab::implementation
                 auto capturedNodeId = tmpl.sourceNodeId;
                 menuItem.Click([this, capturedNodeId](auto&&, auto&&)
                 {
-                    // Deep-copy the custom effect from the source node.
-                    auto* srcNode = m_graph.FindNode(capturedNodeId);
+                    // Deep-copy the custom effect from the source node (UI thread: read the snapshot).
+                    const auto snapshot = CurrentGraphSnapshot();
+                    const auto* srcNode = snapshot ? snapshot->FindNode(capturedNodeId) : nullptr;
                     if (!srcNode || !srcNode->customEffect.has_value()) return;
 
                     ::ShaderLab::Graph::EffectNode newNode;
@@ -1618,7 +1732,7 @@ namespace winrt::ShaderLab::implementation
                     newNode.customEffect = std::move(def);
 
                     m_nodeGraphController.AddNode(std::move(newNode), { 0.0f, 0.0f });
-                    m_nodeGraphController.RebuildLayout();
+                    m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.RebuildLayout(); });
                     PopulatePreviewNodeSelector();
                     PopulateAddNodeFlyout(); // refresh custom effects list
                 });
@@ -1670,11 +1784,7 @@ namespace winrt::ShaderLab::implementation
         auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
 
         // Prepare the source (load the image bitmap).
-        auto* graphNode = m_graph.FindNode(nodeId);
-        if (graphNode && m_renderEngine.D2DDeviceContext())
-        {
-            m_sourceFactory.PrepareSourceNode(*graphNode, m_renderEngine.D2DDeviceContext(), 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-        }
+        PrepareSourceOnRenderThread(nodeId);
 
         OnNodeAdded(nodeId);
     }
@@ -1688,11 +1798,7 @@ namespace winrt::ShaderLab::implementation
 
         auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
 
-        auto* graphNode = m_graph.FindNode(nodeId);
-        if (graphNode && m_renderEngine.D2DDeviceContext())
-        {
-            m_sourceFactory.PrepareSourceNode(*graphNode, m_renderEngine.D2DDeviceContext(), 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-        }
+        PrepareSourceOnRenderThread(nodeId);
 
         OnNodeAdded(nodeId);
     }
@@ -1714,12 +1820,20 @@ namespace winrt::ShaderLab::implementation
         auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
         m_sourceFactory.RegisterGraphicsCaptureItem(nodeId, item);
 
-        if (auto* graphNode = m_graph.FindNode(nodeId); graphNode && m_renderEngine.D2DDeviceContext())
-        {
-            m_sourceFactory.PrepareSourceNode(*graphNode, m_renderEngine.D2DDeviceContext(), 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-        }
+        PrepareSourceOnRenderThread(nodeId);
 
         OnNodeAdded(nodeId);
+    }
+
+    void MainWindow::PrepareSourceOnRenderThread(uint32_t nodeId)
+    {
+        m_renderDispatcher.DispatchSync([this, nodeId]
+        {
+            auto* node = m_graph.FindNode(nodeId);
+            auto* dc = m_renderEngine.RenderD2DContext();
+            if (node && dc)
+                m_sourceFactory.PrepareSourceNode(*node, dc, 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+        });
     }
 
     void MainWindow::OnNodeAdded(uint32_t /*nodeId*/)
@@ -1727,7 +1841,7 @@ namespace winrt::ShaderLab::implementation
         // A new node starts dirty and nothing consumes it yet, so there is
         // nothing else to invalidate. (This used to MarkAllDirty: every
         // compute node re-dispatched and every D2D cache dropped per add.)
-        m_nodeGraphController.RebuildLayout();
+        m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.RebuildLayout(); });
         PopulatePreviewNodeSelector();
         MarkUnsaved();
     }
@@ -2672,22 +2786,33 @@ namespace winrt::ShaderLab::implementation
             canvasPoint.x, canvasPoint.y, m_nodeGraphController.SelectedNodes().size()).c_str());
 
         // Debug: dump all node positions
-        for (const auto& node : m_graph.Nodes())
+        const auto clickSnapshot = CurrentGraphSnapshot();
+        if (clickSnapshot)
         {
-            OutputDebugStringW(std::format(L"  node {} '{}' pos=({:.0f},{:.0f})\n",
-                node.id, node.name, node.position.x, node.position.y).c_str());
+            for (const auto& node : clickSnapshot->nodes)
+            {
+                OutputDebugStringW(std::format(L"  node {} '{}' pos=({:.0f},{:.0f})\n",
+                    node.id, node.name, node.position.x, node.position.y).c_str());
+            }
         }
 
         // Check for play button hit on clock nodes.
         uint32_t playNodeId = m_nodeGraphController.HitTestPlayButton(canvasPoint);
         if (playNodeId != 0)
         {
-            auto* node = m_graph.FindNode(playNodeId);
-            if (node)
+            // Returns the new playing state, or nothing if the node is gone.
+            const auto isPlaying = m_renderDispatcher.DispatchSync(
+                [this, playNodeId]() -> std::optional<bool>
+                {
+                    auto* node = m_graph.FindNode(playNodeId);
+                    if (!node) return std::nullopt;
+                    node->isPlaying = !node->isPlaying;
+                    return node->isPlaying;
+                });
+            if (isPlaying.has_value())
             {
-                node->isPlaying = !node->isPlaying;
                 m_nodeGraphController.SetNeedsRedraw();
-                m_nodeLogs[playNodeId].Info(node->isPlaying ? L"Clock started" : L"Clock paused");
+                m_nodeLogs[playNodeId].Info(*isPlaying ? L"Clock started" : L"Clock paused");
             }
             args.Handled(true);
             return;
@@ -2733,7 +2858,7 @@ namespace winrt::ShaderLab::implementation
                 auto hit = m_nodeGraphController.HitTestEdge(canvasPoint, 8.0f);
                 if (hit.found && m_nodeGraphController.RemoveEdge(hit))
                 {
-                    m_nodeGraphController.RebuildLayout();
+                    m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.RebuildLayout(); });
                     m_forceRender = true;
                     UpdatePropertiesPanel();
                     MarkUnsaved();
@@ -2785,7 +2910,7 @@ namespace winrt::ShaderLab::implementation
             NodeGraphContainer().Focus(winrt::Microsoft::UI::Xaml::FocusState::Programmatic);
 
             // Preview the clicked node (skip parameter, data-only, and histogram effects).
-            const auto* clickedNode = m_graph.FindNode(hitNodeId);
+            const auto* clickedNode = clickSnapshot ? clickSnapshot->FindNode(hitNodeId) : nullptr;
             bool isAnalysisEffect = clickedNode &&
                 clickedNode->effectClsid.has_value() &&
                 IsEqualGUID(clickedNode->effectClsid.value(), CLSID_D2D1Histogram);
@@ -2958,23 +3083,12 @@ namespace winrt::ShaderLab::implementation
             return;
         }
 
-        auto* node = m_graph.FindNode(m_selectedNodeId);
-        if (!node) return;
-
-        // For *displayed* runtime fields (runtimeError, analysisOutput), read
-        // from the published snapshot when available -- these fields are
-        // written by the evaluator and would race direct m_graph reads once
-        // the render thread spawns. The snapshot is a value copy of the
-        // graph state at the last frame boundary. We keep a local copy of
-        // the shared_ptr so the snapshot stays alive for the duration of
-        // this method (the panel is rebuilt synchronously here).
-        // Mutating reads (name change, property change, etc.) still operate
-        // on the live `node` pointer because their writes must hit the live
-        // graph through the dispatcher.
-        auto graphSnapshot = CurrentGraphSnapshot();
-        const ::ShaderLab::Graph::EffectNode* snapNode =
+        // The panel is built from the published snapshot, held for the whole
+        // rebuild. Edits made through the panel go to the render thread.
+        const auto graphSnapshot = CurrentGraphSnapshot();
+        const ::ShaderLab::Graph::EffectNode* node =
             graphSnapshot ? graphSnapshot->FindNode(m_selectedNodeId) : nullptr;
-        const ::ShaderLab::Graph::EffectNode* readNode = snapNode ? snapNode : node;
+        if (!node) return;
 
         uint32_t capturedId = m_selectedNodeId;
 
@@ -2989,21 +3103,27 @@ namespace winrt::ShaderLab::implementation
         nameBox.Margin({ 0, 2, 0, 8 });
         nameBox.LostFocus([this, capturedId](auto&&, auto&&)
         {
-            auto* n = m_graph.FindNode(capturedId);
-            if (!n) return;
-            PopulatePreviewNodeSelector();
-            m_nodeGraphController.RebuildLayout();
+            const bool exists = m_renderDispatcher.DispatchSync([this, capturedId]
+            {
+                if (!m_graph.FindNode(capturedId)) return false;
+                m_nodeGraphController.RebuildLayout();
+                return true;
+            });
+            if (exists)
+                PopulatePreviewNodeSelector();
         });
         nameBox.TextChanged([this, capturedId](auto&&, auto&&)
         {
-            auto* n = m_graph.FindNode(capturedId);
-            if (!n) return;
             auto p = PropertiesPanel();
-            if (p.Children().Size() > 1)
+            if (p.Children().Size() <= 1) return;
+            auto tb = p.Children().GetAt(1).try_as<Controls::TextBox>();
+            if (!tb) return;
+            std::wstring newName(tb.Text().c_str());
+            m_renderDispatcher.DispatchSync([this, capturedId, &newName]
             {
-                auto tb = p.Children().GetAt(1).try_as<Controls::TextBox>();
-                if (tb) n->name = std::wstring(tb.Text().c_str());
-            }
+                if (auto* n = m_graph.FindNode(capturedId))
+                    n->name = std::move(newName);
+            });
         });
         panel.Children().Append(nameBox);
 
@@ -3036,7 +3156,8 @@ namespace winrt::ShaderLab::implementation
             editBtn.Margin({ 0, 0, 0, 8 });
             editBtn.Click([this, capturedId](auto&&, auto&&)
             {
-                auto* n = m_graph.FindNode(capturedId);
+                const auto snapshot = CurrentGraphSnapshot();
+                const auto* n = snapshot ? snapshot->FindNode(capturedId) : nullptr;
                 if (!n || !n->customEffect.has_value()) return;
 
                 OpenEffectDesigner();
@@ -3079,10 +3200,15 @@ namespace winrt::ShaderLab::implementation
                     reloadBtn.Margin({ 0, 0, 0, 8 });
                     uint32_t reloadNodeId = capturedId;
                     reloadBtn.Click([this, reloadNodeId](auto&&, auto&&) {
-                        auto* n = m_graph.FindNode(reloadNodeId);
-                        if (!n) return;
-                        n->runtimeError.clear();
-                        n->dirty = true;
+                        const bool exists = m_renderDispatcher.DispatchSync([this, reloadNodeId]
+                        {
+                            auto* n = m_graph.FindNode(reloadNodeId);
+                            if (!n) return false;
+                            n->runtimeError.clear();
+                            n->dirty = true;
+                            return true;
+                        });
+                        if (!exists) return;
                         m_forceRender = true;
                         UpdatePropertiesPanel();
                     });
@@ -3201,9 +3327,12 @@ namespace winrt::ShaderLab::implementation
                 loopToggle.Toggled([this, capturedId](auto&& sender, auto&&)
                 {
                     auto toggle = sender.as<Controls::ToggleSwitch>();
-                    auto* node = m_graph.FindNode(capturedId);
-                    if (node)
-                        node->properties[L"Loop"] = toggle.IsOn();
+                    const bool loop = toggle.IsOn();
+                    m_renderDispatcher.DispatchSync([this, capturedId, loop]
+                    {
+                        if (auto* n = m_graph.FindNode(capturedId))
+                            n->properties[L"Loop"] = loop;
+                    });
                 });
                 panel.Children().Append(loopToggle);
             }
@@ -3279,11 +3408,17 @@ namespace winrt::ShaderLab::implementation
                 uint32_t mathId = capturedId;
                 exprBox.TextChanged([this, mathId](auto&& sender, auto&&)
                 {
-                    auto* n = m_graph.FindNode(mathId);
-                    if (!n) return;
                     auto box = sender.template as<Controls::TextBox>();
-                    n->properties[L"Expression"] = std::wstring(box.Text().c_str());
-                    n->dirty = true;
+                    std::wstring expression(box.Text().c_str());
+                    const bool exists = m_renderDispatcher.DispatchSync([this, mathId, &expression]
+                    {
+                        auto* n = m_graph.FindNode(mathId);
+                        if (!n) return false;
+                        n->properties[L"Expression"] = std::move(expression);
+                        n->dirty = true;
+                        return true;
+                    });
+                    if (!exists) return;
                     m_forceRender = true;
                     m_nodeGraphController.SetNeedsRedraw();
                 });
@@ -3418,7 +3553,7 @@ namespace winrt::ShaderLab::implementation
                         }
                     }
 
-                    auto* srcNode = m_graph.FindNode(primarySrcNodeId);
+                    auto* srcNode = graphSnapshot->FindNode(primarySrcNodeId);
 
                     // Look up source field type to determine component count.
                     uint32_t srcComponents = 1;
@@ -3467,27 +3602,23 @@ namespace winrt::ShaderLab::implementation
                             compPicker.Items().Append(winrt::box_value(winrt::hstring(compLabels[c])));
                         compPicker.SelectedIndex(static_cast<int32_t>(
                             (std::min)(primarySrcComponent, srcComponents - 1)));
-                        compPicker.SelectionChanged([this, capturedId, capturedKey](auto&&, auto&&)
-                        {
-                            auto* n = m_graph.FindNode(capturedId);
-                            if (!n) return;
-                            auto bit = n->propertyBindings.find(capturedKey);
-                            if (bit == n->propertyBindings.end()) return;
-                        });
-                        // Use a simpler click-based approach: rebuild panel on change.
                         compPicker.SelectionChanged([this, capturedId, capturedKey](
                             winrt::Windows::Foundation::IInspectable const& sender, auto&&)
                         {
                             auto combo = sender.as<Controls::ComboBox>();
-                            auto* n = m_graph.FindNode(capturedId);
-                            if (!n) return;
-                            auto bit = n->propertyBindings.find(capturedKey);
-                            if (bit == n->propertyBindings.end()) return;
-                            // Update the first component source's sourceComponent.
-                            auto& b = bit->second;
-                            if (!b.sources.empty() && b.sources[0].has_value())
-                                b.sources[0]->sourceComponent = static_cast<uint32_t>(combo.SelectedIndex());
-                            n->dirty = true;
+                            const auto component = static_cast<uint32_t>(combo.SelectedIndex());
+                            m_renderDispatcher.DispatchSync([this, capturedId, &capturedKey, component]
+                            {
+                                auto* n = m_graph.FindNode(capturedId);
+                                if (!n) return;
+                                auto bit = n->propertyBindings.find(capturedKey);
+                                if (bit == n->propertyBindings.end()) return;
+                                // Update the first component source's sourceComponent.
+                                auto& b = bit->second;
+                                if (!b.sources.empty() && b.sources[0].has_value())
+                                    b.sources[0]->sourceComponent = component;
+                                n->dirty = true;
+                            });
                         });
                         labelRow.Children().Append(compPicker);
                     }
@@ -3508,12 +3639,15 @@ namespace winrt::ShaderLab::implementation
                     unbindBtn.Padding({ 2, 0, 2, 0 });
                     unbindBtn.Click([this, capturedId, capturedKey](auto&&, auto&&)
                     {
-                        auto* n = m_graph.FindNode(capturedId);
-                        if (n) {
+                        const bool exists = m_renderDispatcher.DispatchSync([this, capturedId, &capturedKey]
+                        {
+                            if (!m_graph.FindNode(capturedId)) return false;
                             m_graph.UnbindProperty(capturedId, capturedKey);
                             m_nodeGraphController.RebuildLayout();
+                            return true;
+                        });
+                        if (exists)
                             UpdatePropertiesPanel();
-                        }
                     });
                     labelRow.Children().Append(unbindBtn);
                 }
@@ -3521,7 +3655,7 @@ namespace winrt::ShaderLab::implementation
                 {
                     // Bind button — only show if there are analysis sources available.
                     bool hasAnalysisSources = false;
-                    for (const auto& n : m_graph.Nodes())
+                    for (const auto& n : graphSnapshot->nodes)
                     {
                         if (n.id != capturedId &&
                             n.analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Typed &&
@@ -3543,7 +3677,7 @@ namespace winrt::ShaderLab::implementation
                         bindBtn.MinHeight(0);
 
                         auto flyout = Controls::MenuFlyout();
-                        for (const auto& srcNode : m_graph.Nodes())
+                        for (const auto& srcNode : graphSnapshot->nodes)
                         {
                             if (srcNode.id == capturedId) continue;
                             if (srcNode.analysisOutput.type != ::ShaderLab::Graph::AnalysisOutputType::Typed) continue;
@@ -3566,8 +3700,11 @@ namespace winrt::ShaderLab::implementation
                                     item.Text(winrt::hstring(fieldName));
                                     item.Click([this, capturedId, capturedKey, srcNodeId, fieldName](auto&&, auto&&)
                                     {
-                                        m_graph.BindProperty(capturedId, capturedKey, srcNodeId, fieldName, 0);
-                                        m_nodeGraphController.RebuildLayout();
+                                        m_renderDispatcher.DispatchSync([&]
+                                        {
+                                            m_graph.BindProperty(capturedId, capturedKey, srcNodeId, fieldName, 0);
+                                            m_nodeGraphController.RebuildLayout();
+                                        });
                                         UpdatePropertiesPanel();
                                     });
                                     subItem.Items().Append(item);
@@ -3583,8 +3720,11 @@ namespace winrt::ShaderLab::implementation
                                     wholeItem.Text(L"(all)");
                                     wholeItem.Click([this, capturedId, capturedKey, srcNodeId, fieldName](auto&&, auto&&)
                                     {
-                                        m_graph.BindProperty(capturedId, capturedKey, srcNodeId, fieldName, 0);
-                                        m_nodeGraphController.RebuildLayout();
+                                        m_renderDispatcher.DispatchSync([&]
+                                        {
+                                            m_graph.BindProperty(capturedId, capturedKey, srcNodeId, fieldName, 0);
+                                            m_nodeGraphController.RebuildLayout();
+                                        });
                                         UpdatePropertiesPanel();
                                     });
                                     fieldSub.Items().Append(wholeItem);
@@ -3597,8 +3737,11 @@ namespace winrt::ShaderLab::implementation
                                         auto capturedComp = c;
                                         compItem.Click([this, capturedId, capturedKey, srcNodeId, fieldName, capturedComp](auto&&, auto&&)
                                         {
-                                            m_graph.BindProperty(capturedId, capturedKey, srcNodeId, fieldName, capturedComp);
-                                            m_nodeGraphController.RebuildLayout();
+                                            m_renderDispatcher.DispatchSync([&]
+                                            {
+                                                m_graph.BindProperty(capturedId, capturedKey, srcNodeId, fieldName, capturedComp);
+                                                m_nodeGraphController.RebuildLayout();
+                                            });
                                             UpdatePropertiesPanel();
                                         });
                                         fieldSub.Items().Append(compItem);
@@ -3615,11 +3758,23 @@ namespace winrt::ShaderLab::implementation
 
                 panel.Children().Append(labelRow);
 
-                // Lambda to mark the node dirty after a property change.
+                // Edits this property on the render thread and marks the node
+                // dirty there. Returns whether the edit was applied.
+                auto editProperty = [this, capturedId, capturedKey](
+                    const std::function<bool(::ShaderLab::Graph::PropertyValue&)>& edit) -> bool
+                {
+                    return m_renderDispatcher.DispatchSync([&]
+                    {
+                        return EditNodeProperty(m_graph, capturedId, capturedKey, edit);
+                    });
+                };
+
+                // Logs a property change and refreshes dependent UI. The edit
+                // itself has already marked the node dirty.
                 auto markDirty = [this, capturedId, capturedKey]()
                 {
-                    auto* n = m_graph.FindNode(capturedId);
-                    if (n) n->dirty = true;
+                    const auto snapshot = CurrentGraphSnapshot();
+                    const auto* n = snapshot ? snapshot->FindNode(capturedId) : nullptr;
 
                     // Log the property change.
                     if (n)
@@ -3679,7 +3834,7 @@ namespace winrt::ShaderLab::implementation
                                 if (!m_isShuttingDown)
                                 {
                                     UpdatePropertiesPanel();
-                                    m_nodeGraphController.RebuildLayout();
+                                    m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.RebuildLayout(); });
                                     m_nodeGraphController.SetNeedsRedraw();
                                     m_forceRender = true;
                                 }
@@ -3735,15 +3890,12 @@ namespace winrt::ShaderLab::implementation
                         toggle.OnContent(winrt::box_value(L"True"));
                         toggle.OffContent(winrt::box_value(L"False"));
                         toggle.Margin({ 0, 0, 0, 4 });
-                        toggle.Toggled([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                        toggle.Toggled([editProperty, markDirty](auto&& sender, auto&&)
                         {
-                            auto* n = m_graph.FindNode(capturedId);
-                            if (!n) return;
-                            auto it = n->properties.find(capturedKey);
-                            if (it == n->properties.end()) return;
                             auto ts = sender.template as<Controls::ToggleSwitch>();
-                            it->second = ts.IsOn();
-                            markDirty();
+                            const bool isOn = ts.IsOn();
+                            if (editProperty([isOn](auto& property) { property = isOn; return true; }))
+                                markDirty();
                         });
                         panel.Children().Append(toggle);
                     }
@@ -3759,19 +3911,14 @@ namespace winrt::ShaderLab::implementation
                                 combo.SelectedIndex(static_cast<int32_t>(v));
                             combo.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
                             combo.Margin({ 0, 0, 0, 4 });
-                            combo.SelectionChanged([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                            combo.SelectionChanged([editProperty, markDirty](auto&& sender, auto&&)
                             {
-                                auto* n = m_graph.FindNode(capturedId);
-                                if (!n) return;
-                                auto it = n->properties.find(capturedKey);
-                                if (it == n->properties.end()) return;
                                 auto cb = sender.template as<Controls::ComboBox>();
                                 int32_t idx = cb.SelectedIndex();
-                                if (idx >= 0)
-                                {
-                                    it->second = static_cast<uint32_t>(idx);
+                                if (idx < 0) return;
+                                const auto selected = static_cast<uint32_t>(idx);
+                                if (editProperty([selected](auto& property) { property = selected; return true; }))
                                     markDirty();
-                                }
                             });
                             panel.Children().Append(combo);
                         }
@@ -3789,19 +3936,14 @@ namespace winrt::ShaderLab::implementation
                             nb.LargeChange(stepV * 10.0);
                             nb.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Inline);
                             nb.Margin({ 0, 0, 0, 4 });
-                            nb.ValueChanged([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                            nb.ValueChanged([editProperty, markDirty](auto&& sender, auto&&)
                             {
-                                auto* n = m_graph.FindNode(capturedId);
-                                if (!n) return;
-                                auto it = n->properties.find(capturedKey);
-                                if (it == n->properties.end()) return;
                                 auto box = sender.template as<Controls::NumberBox>();
                                 double val = box.Value();
-                                if (!std::isnan(val))
-                                {
-                                    it->second = static_cast<uint32_t>(val);
+                                if (std::isnan(val)) return;
+                                const auto newValue = static_cast<uint32_t>(val);
+                                if (editProperty([newValue](auto& property) { property = newValue; return true; }))
                                     markDirty();
-                                }
                             });
                             panel.Children().Append(nb);
                         }
@@ -3838,19 +3980,14 @@ namespace winrt::ShaderLab::implementation
                                 combo.SelectedIndex(static_cast<int32_t>(idx));
                             combo.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
                             combo.Margin({ 0, 0, 0, 4 });
-                            combo.SelectionChanged([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                            combo.SelectionChanged([editProperty, markDirty](auto&& sender, auto&&)
                             {
-                                auto* n = m_graph.FindNode(capturedId);
-                                if (!n) return;
-                                auto it = n->properties.find(capturedKey);
-                                if (it == n->properties.end()) return;
                                 auto cb = sender.template as<Controls::ComboBox>();
                                 int32_t idx = cb.SelectedIndex();
-                                if (idx >= 0)
-                                {
-                                    it->second = static_cast<float>(idx);
+                                if (idx < 0) return;
+                                const auto selected = static_cast<float>(idx);
+                                if (editProperty([selected](auto& property) { property = selected; return true; }))
                                     markDirty();
-                                }
                             });
                             panel.Children().Append(combo);
                         }
@@ -3876,27 +4013,20 @@ namespace winrt::ShaderLab::implementation
                             nb.Margin({ 0, 0, 0, 4 });
 
                             // Slider → NumberBox sync.
-                            slider.ValueChanged([nb, syncing, this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                            slider.ValueChanged([nb, syncing, editProperty, markDirty](auto&& sender, auto&&)
                             {
                                 if (*syncing) return;
                                 *syncing = true;
                                 auto sl = sender.template as<Controls::Slider>();
                                 nb.Value(sl.Value());
-                                auto* n = m_graph.FindNode(capturedId);
-                                if (n)
-                                {
-                                    auto it = n->properties.find(capturedKey);
-                                    if (it != n->properties.end())
-                                    {
-                                        it->second = static_cast<float>(sl.Value());
-                                        markDirty();
-                                    }
-                                }
+                                const auto newValue = static_cast<float>(sl.Value());
+                                if (editProperty([newValue](auto& property) { property = newValue; return true; }))
+                                    markDirty();
                                 *syncing = false;
                             });
 
                             // NumberBox → Slider sync.
-                            nb.ValueChanged([slider, syncing, this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                            nb.ValueChanged([slider, syncing, editProperty, markDirty](auto&& sender, auto&&)
                             {
                                 if (*syncing) return;
                                 *syncing = true;
@@ -3905,16 +4035,9 @@ namespace winrt::ShaderLab::implementation
                                 if (!std::isnan(val))
                                 {
                                     slider.Value(val);
-                                    auto* n = m_graph.FindNode(capturedId);
-                                    if (n)
-                                    {
-                                        auto it = n->properties.find(capturedKey);
-                                        if (it != n->properties.end())
-                                        {
-                                            it->second = static_cast<float>(val);
-                                            markDirty();
-                                        }
-                                    }
+                                    const auto newValue = static_cast<float>(val);
+                                    if (editProperty([newValue](auto& property) { property = newValue; return true; }))
+                                        markDirty();
                                 }
                                 *syncing = false;
                             });
@@ -3930,19 +4053,14 @@ namespace winrt::ShaderLab::implementation
                             nb.SmallChange(stepV);
                             nb.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Inline);
                             nb.Margin({ 0, 0, 0, 4 });
-                            nb.ValueChanged([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                            nb.ValueChanged([editProperty, markDirty](auto&& sender, auto&&)
                             {
-                                auto* n = m_graph.FindNode(capturedId);
-                                if (!n) return;
-                                auto it = n->properties.find(capturedKey);
-                                if (it == n->properties.end()) return;
                                 auto box = sender.template as<Controls::NumberBox>();
                                 double val = box.Value();
-                                if (!std::isnan(val))
-                                {
-                                    it->second = static_cast<float>(val);
+                                if (std::isnan(val)) return;
+                                const auto newValue = static_cast<float>(val);
+                                if (editProperty([newValue](auto& property) { property = newValue; return true; }))
                                     markDirty();
-                                }
                             });
                             panel.Children().Append(nb);
                         }
@@ -3959,19 +4077,14 @@ namespace winrt::ShaderLab::implementation
                         nb.SmallChange(stepV);
                         nb.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Inline);
                         nb.Margin({ 0, 0, 0, 4 });
-                        nb.ValueChanged([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                        nb.ValueChanged([editProperty, markDirty](auto&& sender, auto&&)
                         {
-                            auto* n = m_graph.FindNode(capturedId);
-                            if (!n) return;
-                            auto it = n->properties.find(capturedKey);
-                            if (it == n->properties.end()) return;
                             auto box = sender.template as<Controls::NumberBox>();
                             double val = box.Value();
-                            if (!std::isnan(val))
-                            {
-                                it->second = static_cast<int32_t>(val);
+                            if (std::isnan(val)) return;
+                            const auto newValue = static_cast<int32_t>(val);
+                            if (editProperty([newValue](auto& property) { property = newValue; return true; }))
                                 markDirty();
-                            }
                         });
                         panel.Children().Append(nb);
                     }
@@ -3980,15 +4093,12 @@ namespace winrt::ShaderLab::implementation
                         auto tb = Controls::TextBox();
                         tb.Text(winrt::hstring(v));
                         tb.Margin({ 0, 0, 0, 4 });
-                        tb.LostFocus([this, capturedId, capturedKey, markDirty](auto&& sender, auto&&)
+                        tb.LostFocus([editProperty, markDirty](auto&& sender, auto&&)
                         {
-                            auto* n = m_graph.FindNode(capturedId);
-                            if (!n) return;
-                            auto it = n->properties.find(capturedKey);
-                            if (it == n->properties.end()) return;
                             auto box = sender.template as<Controls::TextBox>();
-                            it->second = std::wstring(box.Text().c_str());
-                            markDirty();
+                            std::wstring text(box.Text().c_str());
+                            if (editProperty([&text](auto& property) { property = std::move(text); return true; }))
+                                markDirty();
                         });
                         panel.Children().Append(tb);
                     }
@@ -4042,22 +4152,22 @@ namespace winrt::ShaderLab::implementation
                                 nb.Width(70);
                                 nb.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
 
-                                nb.ValueChanged([this, capturedId, capturedKey, cellIdx, markDirty](auto&& sender, auto&&)
+                                nb.ValueChanged([editProperty, cellIdx, markDirty](auto&& sender, auto&&)
                                 {
-                                    auto* n = m_graph.FindNode(capturedId);
-                                    if (!n) return;
-                                    auto it = n->properties.find(capturedKey);
-                                    if (it == n->properties.end()) return;
                                     auto box = sender.template as<Controls::NumberBox>();
                                     double val = box.Value();
                                     if (std::isnan(val)) return;
-                                    auto* mat = std::get_if<D2D1_MATRIX_5X4_F>(&it->second);
-                                    if (mat)
+                                    const auto cellValue = static_cast<float>(val);
+                                    const bool applied = editProperty([cellIdx, cellValue](auto& property)
                                     {
+                                        auto* mat = std::get_if<D2D1_MATRIX_5X4_F>(&property);
+                                        if (!mat) return false;
                                         float* mp = &mat->_11;
-                                        mp[cellIdx] = static_cast<float>(val);
+                                        mp[cellIdx] = cellValue;
+                                        return true;
+                                    });
+                                    if (applied)
                                         markDirty();
-                                    }
                                 });
                                 row.Children().Append(nb);
                             }
@@ -4180,40 +4290,41 @@ namespace winrt::ShaderLab::implementation
                             nb.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
 
                             int compIdx = i;
-                            nb.ValueChanged([this, capturedId, capturedKey, compIdx, markDirty](auto&& sender, auto&&)
+                            nb.ValueChanged([editProperty, compIdx, markDirty](auto&& sender, auto&&)
                             {
-                                auto* n = m_graph.FindNode(capturedId);
-                                if (!n) return;
-                                auto it = n->properties.find(capturedKey);
-                                if (it == n->properties.end()) return;
                                 auto box = sender.template as<Controls::NumberBox>();
                                 double val = box.Value();
                                 if (std::isnan(val)) return;
                                 float fval = static_cast<float>(val);
 
-                                std::visit([compIdx, fval](auto& vec)
+                                const bool applied = editProperty([compIdx, fval](auto& property)
                                 {
-                                    using VT = std::decay_t<decltype(vec)>;
-                                    if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float2>)
+                                    std::visit([compIdx, fval](auto& vec)
                                     {
-                                        if (compIdx == 0) vec.x = fval;
-                                        else if (compIdx == 1) vec.y = fval;
-                                    }
-                                    else if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float3>)
-                                    {
-                                        if (compIdx == 0) vec.x = fval;
-                                        else if (compIdx == 1) vec.y = fval;
-                                        else if (compIdx == 2) vec.z = fval;
-                                    }
-                                    else if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float4>)
-                                    {
-                                        if (compIdx == 0) vec.x = fval;
-                                        else if (compIdx == 1) vec.y = fval;
-                                        else if (compIdx == 2) vec.z = fval;
-                                        else if (compIdx == 3) vec.w = fval;
-                                    }
-                                }, it->second);
-                                markDirty();
+                                        using VT = std::decay_t<decltype(vec)>;
+                                        if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float2>)
+                                        {
+                                            if (compIdx == 0) vec.x = fval;
+                                            else if (compIdx == 1) vec.y = fval;
+                                        }
+                                        else if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float3>)
+                                        {
+                                            if (compIdx == 0) vec.x = fval;
+                                            else if (compIdx == 1) vec.y = fval;
+                                            else if (compIdx == 2) vec.z = fval;
+                                        }
+                                        else if constexpr (std::is_same_v<VT, winrt::Windows::Foundation::Numerics::float4>)
+                                        {
+                                            if (compIdx == 0) vec.x = fval;
+                                            else if (compIdx == 1) vec.y = fval;
+                                            else if (compIdx == 2) vec.z = fval;
+                                            else if (compIdx == 3) vec.w = fval;
+                                        }
+                                    }, property);
+                                    return true;
+                                });
+                                if (applied)
+                                    markDirty();
                             });
                             compRow.Children().Append(nb);
                             row.Children().Append(compRow);
@@ -4281,11 +4392,11 @@ namespace winrt::ShaderLab::implementation
         }
 
         // ---- Analysis output visualization ----
-        if (readNode->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Histogram &&
-            !readNode->analysisOutput.data.empty())
+        if (node->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Histogram &&
+            !node->analysisOutput.data.empty())
         {
             auto histHeader = Controls::TextBlock();
-            histHeader.Text(winrt::hstring(readNode->analysisOutput.label));
+            histHeader.Text(winrt::hstring(node->analysisOutput.label));
             histHeader.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
             histHeader.Margin({ 0, 8, 0, 4 });
             panel.Children().Append(histHeader);
@@ -4299,7 +4410,7 @@ namespace winrt::ShaderLab::implementation
             canvas.Background(Media::SolidColorBrush(
                 winrt::Windows::UI::Color{ 255, 30, 30, 30 }));
 
-            const auto& bins = readNode->analysisOutput.data;
+            const auto& bins = node->analysisOutput.data;
             uint32_t numBins = static_cast<uint32_t>(bins.size());
             if (numBins > 0)
             {
@@ -4309,7 +4420,7 @@ namespace winrt::ShaderLab::implementation
 
                 // Choose bar color based on channel.
                 winrt::Windows::UI::Color barColor;
-                switch (readNode->analysisOutput.channelIndex)
+                switch (node->analysisOutput.channelIndex)
                 {
                 case 0: barColor = { 200, 255, 60, 60 }; break;   // Red
                 case 1: barColor = { 200, 60, 255, 60 }; break;   // Green
@@ -4338,8 +4449,8 @@ namespace winrt::ShaderLab::implementation
         }
 
         // ---- Typed analysis output ----
-        if (readNode->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Typed &&
-            !readNode->analysisOutput.fields.empty())
+        if (node->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Typed &&
+            !node->analysisOutput.fields.empty())
         {
             auto analysisHeader = Controls::TextBlock();
             analysisHeader.Text(L"Analysis Results");
@@ -4347,7 +4458,7 @@ namespace winrt::ShaderLab::implementation
             analysisHeader.Margin({ 0, 8, 0, 4 });
             panel.Children().Append(analysisHeader);
 
-            for (const auto& fv : readNode->analysisOutput.fields)
+            for (const auto& fv : node->analysisOutput.fields)
             {
                 auto row = Controls::StackPanel();
                 row.Orientation(Controls::Orientation::Horizontal);
@@ -4449,38 +4560,22 @@ namespace winrt::ShaderLab::implementation
                 upgradeBtn.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
                 upgradeBtn.Click([this, capturedId](auto&&, auto&&)
                 {
-                    auto* n = m_graph.FindNode(capturedId);
-                    if (!n || !n->customEffect.has_value()) return;
-
-                    auto& reg = ::ShaderLab::Effects::ShaderLabEffects::Instance();
-                    auto* desc = reg.FindById(n->customEffect->shaderLabEffectId);
-                    if (!desc) return;
-
-                    // Save current property values.
-                    auto savedProps = n->properties;
-
-                    // Create a fresh node from the latest descriptor.
-                    auto freshNode = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*desc);
-                    if (!freshNode.customEffect.has_value()) return;
-
-                    // Replace definition with fresh version.
-                    n->customEffect = std::move(freshNode.customEffect.value());
-                    n->inputPins = std::move(freshNode.inputPins);
-                    n->outputPins = std::move(freshNode.outputPins);
-                    n->isClock = freshNode.isClock;
-
-                    // Start with fresh default properties, then restore matching saved values.
-                    n->properties = std::move(freshNode.properties);
-                    for (const auto& [key, val] : savedProps)
+                    // Graph writes and layout belong to the render thread.
+                    const bool upgraded = m_renderDispatcher.DispatchSync([this, capturedId]
                     {
-                        auto it = n->properties.find(key);
-                        if (it != n->properties.end())
-                            it->second = val;
-                    }
+                        auto* liveNode = m_graph.FindNode(capturedId);
+                        if (!liveNode || !liveNode->customEffect.has_value()) return false;
 
-                    n->dirty = true;
-                    n->cachedOutput = nullptr; // raw pointer is now dangling
-                    m_graphEvaluator.InvalidateNode(capturedId);
+                        auto& registry = ::ShaderLab::Effects::ShaderLabEffects::Instance();
+                        auto* desc = registry.FindById(liveNode->customEffect->shaderLabEffectId);
+                        if (!desc || !UpgradeNodeToDescriptor(m_graph, *liveNode, *desc)) return false;
+
+                        m_graphEvaluator.InvalidateNode(capturedId);
+                        m_nodeGraphController.RebuildLayout();
+                        return true;
+                    });
+                    if (!upgraded) return;
+                    m_forceRender = true;
                     PopulatePreviewNodeSelector();
                     UpdatePropertiesPanel();
                 });
@@ -4523,60 +4618,71 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::AddMathExpressionInput(uint32_t nodeId)
     {
-        auto* node = m_graph.FindNode(nodeId);
-        if (!node || !node->customEffect.has_value()) return;
-        if (node->customEffect->shaderLabEffectId != L"Math Expression") return;
-
-        // Find the next unused single-letter name A..Z.
-        std::wstring nextName;
-        for (wchar_t ch = L'A'; ch <= L'Z'; ++ch)
+        const bool added = m_renderDispatcher.DispatchSync([this, nodeId]
         {
-            std::wstring candidate(1, ch);
-            if (node->properties.find(candidate) == node->properties.end())
+            auto* node = m_graph.FindNode(nodeId);
+            if (!node || !node->customEffect.has_value()) return false;
+            if (node->customEffect->shaderLabEffectId != L"Math Expression") return false;
+
+            // Find the next unused single-letter name A..Z.
+            std::wstring nextName;
+            for (wchar_t ch = L'A'; ch <= L'Z'; ++ch)
             {
-                nextName = candidate;
-                break;
+                std::wstring candidate(1, ch);
+                if (node->properties.find(candidate) == node->properties.end())
+                {
+                    nextName = candidate;
+                    break;
+                }
             }
-        }
-        if (nextName.empty()) return;  // 26 inputs already; bail out silently.
+            if (nextName.empty()) return false;  // 26 inputs already; bail out silently.
 
-        ::ShaderLab::Graph::ParameterDefinition pd;
-        pd.name = nextName;
-        pd.typeName = L"float";
-        pd.defaultValue = 0.0f;
-        pd.minValue = -100000.0f;
-        pd.maxValue = 100000.0f;
-        pd.step = 0.1f;
-        node->customEffect->parameters.push_back(std::move(pd));
-        node->properties[nextName] = 0.0f;
+            ::ShaderLab::Graph::ParameterDefinition pd;
+            pd.name = nextName;
+            pd.typeName = L"float";
+            pd.defaultValue = 0.0f;
+            pd.minValue = -100000.0f;
+            pd.maxValue = 100000.0f;
+            pd.step = 0.1f;
+            node->customEffect->parameters.push_back(std::move(pd));
+            node->properties[nextName] = 0.0f;
 
-        node->dirty = true;
-        m_nodeGraphController.RebuildLayout();
+            node->dirty = true;
+            m_nodeGraphController.RebuildLayout();
+            return true;
+        });
+        if (!added) return;
         m_forceRender = true;
         UpdatePropertiesPanel();
     }
 
     void MainWindow::RemoveMathExpressionInput(uint32_t nodeId, const std::wstring& paramName)
     {
-        auto* node = m_graph.FindNode(nodeId);
-        if (!node || !node->customEffect.has_value()) return;
-        if (node->customEffect->shaderLabEffectId != L"Math Expression") return;
         if (paramName == L"Expression") return;  // never remove the formula.
 
-        // Refuse to remove the last remaining input.
-        int floatInputs = 0;
-        for (const auto& p : node->customEffect->parameters)
-            if (p.typeName == L"float") ++floatInputs;
-        if (floatInputs <= 1) return;
+        const bool removed = m_renderDispatcher.DispatchSync([this, nodeId, &paramName]
+        {
+            auto* node = m_graph.FindNode(nodeId);
+            if (!node || !node->customEffect.has_value()) return false;
+            if (node->customEffect->shaderLabEffectId != L"Math Expression") return false;
 
-        // Drop the parameter definition + property + any binding on this slot.
-        std::erase_if(node->customEffect->parameters,
-            [&paramName](const auto& p) { return p.name == paramName; });
-        node->properties.erase(paramName);
-        m_graph.UnbindProperty(nodeId, paramName);
+            // Refuse to remove the last remaining input.
+            int floatInputs = 0;
+            for (const auto& p : node->customEffect->parameters)
+                if (p.typeName == L"float") ++floatInputs;
+            if (floatInputs <= 1) return false;
 
-        node->dirty = true;
-        m_nodeGraphController.RebuildLayout();
+            // Drop the parameter definition + property + any binding on this slot.
+            std::erase_if(node->customEffect->parameters,
+                [&paramName](const auto& p) { return p.name == paramName; });
+            node->properties.erase(paramName);
+            m_graph.UnbindProperty(nodeId, paramName);
+
+            node->dirty = true;
+            m_nodeGraphController.RebuildLayout();
+            return true;
+        });
+        if (!removed) return;
         m_forceRender = true;
         UpdatePropertiesPanel();
     }
@@ -4587,7 +4693,8 @@ namespace winrt::ShaderLab::implementation
         namespace Controls = winrt::Microsoft::UI::Xaml::Controls;
         namespace Media = winrt::Microsoft::UI::Xaml::Media;
 
-        auto* node = m_graph.FindNode(nodeId);
+        const auto snapshot = CurrentGraphSnapshot();
+        const auto* node = snapshot ? snapshot->FindNode(nodeId) : nullptr;
         if (!node) return;
         auto propIt = node->properties.find(propertyKey);
         if (propIt == node->properties.end()) return;
@@ -4754,53 +4861,60 @@ namespace winrt::ShaderLab::implementation
         dialog.PrimaryButtonClick([this, capturedNodeId, capturedKey, capturedMarkDirty,
             capturedCtrlPts, canvasW, canvasH](auto&&, auto&&)
         {
-            auto* n = m_graph.FindNode(capturedNodeId);
-            if (!n) return;
-            auto it = n->properties.find(capturedKey);
-            if (it == n->properties.end()) return;
-            auto* lut = std::get_if<std::vector<float>>(&it->second);
-            if (!lut) return;
-
-            // Interpolate control points into the full LUT array.
-            uint32_t lutSize = static_cast<uint32_t>(lut->size());
-            for (uint32_t i = 0; i < lutSize; ++i)
+            // The LUT is rewritten in place on the render thread.
+            const float curveWidth = canvasW;
+            const float curveHeight = canvasH;
+            const bool applied = m_renderDispatcher.DispatchSync([&]
             {
-                float x = static_cast<float>(i) / static_cast<float>(lutSize - 1) * canvasW;
-
-                // Find the two surrounding control points.
-                int cpIdx = 0;
-                for (int j = 1; j < static_cast<int>(capturedCtrlPts->size()); ++j)
+                return EditNodeProperty(m_graph, capturedNodeId, capturedKey, [&](auto& property)
                 {
-                    if ((*capturedCtrlPts)[j].X >= x)
+                    auto* lut = std::get_if<std::vector<float>>(&property);
+                    if (!lut) return false;
+
+                    // Interpolate control points into the full LUT array.
+                    uint32_t lutSize = static_cast<uint32_t>(lut->size());
+                    for (uint32_t i = 0; i < lutSize; ++i)
                     {
-                        cpIdx = j - 1;
-                        break;
-                    }
-                    cpIdx = j;
-                }
+                        float x = static_cast<float>(i) / static_cast<float>(lutSize - 1) * curveWidth;
 
-                float val;
-                if (cpIdx >= static_cast<int>(capturedCtrlPts->size()) - 1)
-                {
-                    val = 1.0f - (*capturedCtrlPts).back().Y / canvasH;
-                }
-                else
-                {
-                    float x0 = (*capturedCtrlPts)[cpIdx].X;
-                    float x1 = (*capturedCtrlPts)[cpIdx + 1].X;
-                    float y0 = (*capturedCtrlPts)[cpIdx].Y;
-                    float y1 = (*capturedCtrlPts)[cpIdx + 1].Y;
-                    float t = (x1 > x0) ? (x - x0) / (x1 - x0) : 0.0f;
-                    float yInterp = y0 + t * (y1 - y0);
-                    val = 1.0f - yInterp / canvasH;
-                }
-                (*lut)[i] = std::clamp(val, 0.0f, 1.0f);
-            }
+                        // Find the two surrounding control points.
+                        int cpIdx = 0;
+                        for (int j = 1; j < static_cast<int>(capturedCtrlPts->size()); ++j)
+                        {
+                            if ((*capturedCtrlPts)[j].X >= x)
+                            {
+                                cpIdx = j - 1;
+                                break;
+                            }
+                            cpIdx = j;
+                        }
+
+                        float val;
+                        if (cpIdx >= static_cast<int>(capturedCtrlPts->size()) - 1)
+                        {
+                            val = 1.0f - (*capturedCtrlPts).back().Y / curveHeight;
+                        }
+                        else
+                        {
+                            float x0 = (*capturedCtrlPts)[cpIdx].X;
+                            float x1 = (*capturedCtrlPts)[cpIdx + 1].X;
+                            float y0 = (*capturedCtrlPts)[cpIdx].Y;
+                            float y1 = (*capturedCtrlPts)[cpIdx + 1].Y;
+                            float t = (x1 > x0) ? (x - x0) / (x1 - x0) : 0.0f;
+                            float yInterp = y0 + t * (y1 - y0);
+                            val = 1.0f - yInterp / curveHeight;
+                        }
+                        (*lut)[i] = std::clamp(val, 0.0f, 1.0f);
+                    }
+                    return true;
+                });
+            });
+            if (!applied) return;
             capturedMarkDirty();
             UpdatePropertiesPanel();
         });
 
-        dialog.ShowAsync();
+        m_compileProgress.ShowDialogAsync(dialog);
     }
 
     winrt::fire_and_forget MainWindow::BrowseImageForSourceNode(uint32_t nodeId)
@@ -4820,19 +4934,26 @@ namespace winrt::ShaderLab::implementation
         auto file = co_await picker.PickSingleFileAsync();
         if (!file) co_return;
 
-        auto* node = m_graph.FindNode(nodeId);
-        if (!node) co_return;
+        std::wstring filePath(file.Path().c_str());
+        std::wstring fileName(file.Name().c_str());
+        const bool exists = m_renderDispatcher.DispatchSync([this, nodeId, &filePath, &fileName]
+        {
+            auto* node = m_graph.FindNode(nodeId);
+            if (!node) return false;
 
-        node->shaderPath = std::wstring(file.Path().c_str());
-        node->name = std::wstring(file.Name().c_str());
-        node->dirty = true;
+            node->shaderPath = std::move(filePath);
+            node->name = std::move(fileName);
+            node->dirty = true;
 
-        // Prepare the source (load the image bitmap).
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (dc)
-            m_sourceFactory.PrepareSourceNode(*node, dc, 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+            // Prepare the source (load the image bitmap).
+            if (auto* dc = m_renderEngine.RenderD2DContext())
+                m_sourceFactory.PrepareSourceNode(*node, dc, 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
 
-        m_nodeGraphController.RebuildLayout();
+            m_nodeGraphController.RebuildLayout();
+            return true;
+        });
+        if (!exists) co_return;
+
         PopulatePreviewNodeSelector();
         FitPreviewToView();
         UpdatePropertiesPanel();
@@ -4869,12 +4990,9 @@ namespace winrt::ShaderLab::implementation
         OnNodeAdded(nodeId);
 
         // Prepare immediately so first frame is decoded.
-        auto* graphNode = m_graph.FindNode(nodeId);
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (graphNode && dc)
-            m_sourceFactory.PrepareSourceNode(*graphNode, dc, 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+        PrepareSourceOnRenderThread(nodeId);
 
-        m_nodeGraphController.RebuildLayout();
+        m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.RebuildLayout(); });
         PopulatePreviewNodeSelector();
         FitPreviewToView();
     }
@@ -4901,21 +5019,26 @@ namespace winrt::ShaderLab::implementation
         auto filePath = std::wstring(file.Path().c_str());
         auto fileName = std::wstring(file.Name().c_str());
 
-        auto* node = m_graph.FindNode(nodeId);
-        if (!node) co_return;
+        const bool exists = m_renderDispatcher.DispatchSync([this, nodeId, &filePath, &fileName]
+        {
+            auto* node = m_graph.FindNode(nodeId);
+            if (!node) return false;
 
-        // Update the node's path and name.
-        node->shaderPath = filePath;
-        node->properties[L"shaderPath"] = filePath;
-        node->name = fileName;
-        node->dirty = true;
+            // Update the node's path and name.
+            node->shaderPath = filePath;
+            node->properties[L"shaderPath"] = filePath;
+            node->name = fileName;
+            node->dirty = true;
 
-        // Re-prepare to open the new video file.
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (dc)
-            m_sourceFactory.PrepareSourceNode(*node, dc, 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+            // Re-prepare to open the new video file.
+            if (auto* dc = m_renderEngine.RenderD2DContext())
+                m_sourceFactory.PrepareSourceNode(*node, dc, 0.0, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
 
-        m_nodeGraphController.RebuildLayout();
+            m_nodeGraphController.RebuildLayout();
+            return true;
+        });
+        if (!exists) co_return;
+
         PopulatePreviewNodeSelector();
         UpdatePropertiesPanel();
     }
@@ -4984,19 +5107,22 @@ namespace winrt::ShaderLab::implementation
             designerImpl->SetAddToGraphCallback([this](::ShaderLab::Graph::EffectNode node) -> uint32_t
             {
                 auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
-                m_nodeGraphController.RebuildLayout();
+                m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.RebuildLayout(); });
                 PopulatePreviewNodeSelector();
                 PopulateAddNodeFlyout(); // refresh custom effects list
                 return nodeId;
             });
             designerImpl->SetUpdateInGraphCallback([this](uint32_t nodeId, ::ShaderLab::Graph::CustomEffectDefinition def)
             {
-                auto* node = m_graph.FindNode(nodeId);
-                if (node)
+                // Graph writes belong to the render thread.
+                const bool hlslChanged = m_renderDispatcher.DispatchSync([this, nodeId, &def]
                 {
+                    auto* node = m_graph.FindNode(nodeId);
+                    if (!node) return false;
+
                     // Name enforcement: if HLSL changed and other nodes share
                     // this name with the OLD HLSL, this node must be renamed.
-                    bool hlslChanged = !node->customEffect.has_value() ||
+                    const bool changed = !node->customEffect.has_value() ||
                         node->customEffect->hlslSource != def.hlslSource;
 
                     node->customEffect = std::move(def);
@@ -5004,12 +5130,13 @@ namespace winrt::ShaderLab::implementation
                     node->cachedOutput = nullptr; // shader changed -> output may be released
                     m_graphEvaluator.UpdateNodeShader(nodeId, *node);
 
-                    if (hlslChanged)
-                    {
+                    if (changed)
                         EnforceCustomEffectNameUniqueness(nodeId);
-                        PopulateAddNodeFlyout();
-                    }
-                }
+                    return changed;
+                });
+                m_forceRender = true;
+                if (hlslChanged)
+                    PopulateAddNodeFlyout();
             });
 
             m_designerWindow.Closed([this](auto&&, auto&&) { m_designerWindow = nullptr; });
@@ -5193,7 +5320,7 @@ namespace winrt::ShaderLab::implementation
 
         // Layout may be stale (e.g., after MCP set-property) — rebuild before
         // measuring or drawing.
-        m_nodeGraphController.RebuildLayout();
+        m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.RebuildLayout(); });
 
         const uint32_t w = (std::max)(uint32_t{ 1 }, m_graphPanelWidth);
         const uint32_t h = (std::max)(uint32_t{ 1 }, m_graphPanelHeight);
@@ -5301,7 +5428,7 @@ namespace winrt::ShaderLab::implementation
     {
         // Layout may be stale (e.g., after MCP set-property) — rebuild before
         // measuring bounds.
-        m_nodeGraphController.RebuildLayout();
+        m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.RebuildLayout(); });
 
         D2D1_RECT_F b = m_nodeGraphController.ContentBounds();
         float contentW = b.right - b.left;
@@ -5347,8 +5474,10 @@ namespace winrt::ShaderLab::implementation
         picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::PicturesLibrary);
 
         // Use the previewed node's name as suggested filename.
-        auto* previewNode = m_graph.FindNode(m_previewNodeId);
-        std::wstring suggestedName = previewNode ? previewNode->name : L"output";
+        std::wstring suggestedName = L"output";
+        if (const auto snapshot = CurrentGraphSnapshot())
+            if (const auto* previewNode = snapshot->FindNode(m_previewNodeId))
+                suggestedName = previewNode->name;
         // Sanitize for filename
         for (auto& ch : suggestedName)
             if (ch == L'/' || ch == L'\\' || ch == L':' || ch == L'*' || ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|')
@@ -5361,16 +5490,6 @@ namespace winrt::ShaderLab::implementation
 
         auto file = co_await picker.PickSaveFileAsync();
         if (!file) co_return;
-
-        auto* previewImage = ResolveDisplayImage(m_previewNodeId);
-        if (!previewImage)
-        {
-            PipelineFormatText().Text(L"Error: No image to save");
-            co_return;
-        }
-
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) co_return;
 
         // Presentation→file re-referencing: the scene is linear scRGB
         // where the OS presents SDR reference white at SdrWhiteNits.
@@ -5386,69 +5505,135 @@ namespace winrt::ShaderLab::implementation
             if (sdrWhite > 80.0f)
                 presentationScale = 80.0f / sdrWhite;
         }
-        winrt::com_ptr<ID2D1Effect> scaleFx;
-        winrt::com_ptr<ID2D1Image> scaledImage;
-        ID2D1Image* imageToSave = previewImage;
-        if (presentationScale != 1.0f &&
-            SUCCEEDED(dc->CreateEffect(CLSID_D2D1ColorMatrix, scaleFx.put())))
+
+        // JXR: render in FP16 scRGB for full HDR fidelity (linear,
+        // scene-referred — no transfer encode wanted).
+        // PNG: render in 8-bit BGRA with the _SRGB variant so the
+        // scene's linear values are gamma-ENCODED on write; plain
+        // UNORM wrote linear bytes that viewers then sRGB-decoded,
+        // producing a crushed, far-too-dark image.
+        const DXGI_FORMAT renderFormat = isJxr
+            ? DXGI_FORMAT_R16G16B16A16_FLOAT
+            : DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        const D2D1_ALPHA_MODE alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+
+        // The preview image belongs to the render thread, so it is drawn and
+        // read back there with the render context; only the encode runs here.
+        struct SavedPixels
         {
-            scaleFx->SetInput(0, previewImage);
-            const float s = presentationScale;
-            D2D1_MATRIX_5X4_F m = D2D1::Matrix5x4F(
-                s, 0, 0, 0,
-                0, s, 0, 0,
-                0, 0, s, 0,
-                0, 0, 0, 1,
-                0, 0, 0, 0);
-            scaleFx->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, m);
-            scaleFx->GetOutput(scaledImage.put());
-            if (scaledImage)
-                imageToSave = scaledImage.get();
+            bool hasImage{ false };
+            uint32_t width{ 0 };
+            uint32_t height{ 0 };
+            uint32_t pitch{ 0 };
+            std::vector<uint8_t> bytes;
+        };
+        SavedPixels pixels;
+        try
+        {
+            pixels = m_renderDispatcher.DispatchSync([&]() -> SavedPixels
+            {
+                SavedPixels result;
+                auto* previewImage = ResolveDisplayImage(m_previewNodeId);
+                if (!previewImage) return result;
+                result.hasImage = true;
+
+                auto* dc = m_renderEngine.RenderD2DContext();
+                if (!dc) return result;
+
+                winrt::com_ptr<ID2D1Effect> scaleFx;
+                winrt::com_ptr<ID2D1Image> scaledImage;
+                ID2D1Image* imageToSave = previewImage;
+                if (presentationScale != 1.0f &&
+                    SUCCEEDED(dc->CreateEffect(CLSID_D2D1ColorMatrix, scaleFx.put())))
+                {
+                    scaleFx->SetInput(0, previewImage);
+                    const float scale = presentationScale;
+                    D2D1_MATRIX_5X4_F m = D2D1::Matrix5x4F(
+                        scale, 0, 0, 0,
+                        0, scale, 0, 0,
+                        0, 0, scale, 0,
+                        0, 0, 0, 1,
+                        0, 0, 0, 0);
+                    scaleFx->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, m);
+                    scaleFx->GetOutput(scaledImage.put());
+                    if (scaledImage)
+                        imageToSave = scaledImage.get();
+                }
+
+                // Reset DPI/transform to ensure clean bounds measurement.
+                float oldDpiX, oldDpiY;
+                dc->GetDpi(&oldDpiX, &oldDpiY);
+                D2D1_MATRIX_3X2_F oldTransform{};
+                dc->GetTransform(&oldTransform);
+                dc->SetDpi(96.0f, 96.0f);
+                dc->SetTransform(D2D1::Matrix3x2F::Identity());
+
+                // Get image bounds to determine size.
+                D2D1_RECT_F bounds{};
+                dc->GetImageLocalBounds(previewImage, &bounds);
+                const uint32_t w = static_cast<uint32_t>(bounds.right - bounds.left);
+                const uint32_t h = static_cast<uint32_t>(bounds.bottom - bounds.top);
+
+                dc->SetDpi(oldDpiX, oldDpiY);
+                if (w == 0 || h == 0)
+                {
+                    dc->SetTransform(oldTransform);
+                    return result;
+                }
+
+                winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
+                D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
+                    D2D1_BITMAP_OPTIONS_TARGET,
+                    D2D1::PixelFormat(renderFormat, alphaMode));
+                dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bmpProps, renderBitmap.put());
+
+                winrt::com_ptr<ID2D1Image> oldTarget;
+                dc->GetTarget(oldTarget.put());
+                dc->SetTarget(renderBitmap.get());
+                dc->BeginDraw();
+                dc->Clear(D2D1::ColorF(0, 0, 0, 1.0f));
+                dc->DrawImage(imageToSave);
+                dc->EndDraw();
+                dc->SetTarget(oldTarget.get());
+                dc->SetTransform(oldTransform);
+
+                // Read back pixels from GPU.
+                winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
+                D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
+                    D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                    D2D1::PixelFormat(renderFormat, alphaMode));
+                dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, cpuProps, cpuBitmap.put());
+                D2D1_POINT_2U destPoint = { 0, 0 };
+                D2D1_RECT_U srcRect = { 0, 0, w, h };
+                cpuBitmap->CopyFromBitmap(&destPoint, renderBitmap.get(), &srcRect);
+
+                D2D1_MAPPED_RECT mapped{};
+                winrt::check_hresult(cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped));
+                result.width = w;
+                result.height = h;
+                result.pitch = mapped.pitch;
+                result.bytes.assign(mapped.bits, mapped.bits + static_cast<size_t>(mapped.pitch) * h);
+                cpuBitmap->Unmap();
+                return result;
+            });
         }
+        catch (...)
+        {
+            PipelineFormatText().Text(L"Error: Failed to save image");
+            co_return;
+        }
+
+        if (!pixels.hasImage)
+        {
+            PipelineFormatText().Text(L"Error: No image to save");
+            co_return;
+        }
+        if (pixels.width == 0 || pixels.height == 0) co_return;
+        const uint32_t w = pixels.width;
+        const uint32_t h = pixels.height;
 
         try
         {
-            // Reset DPI/transform to ensure clean bounds measurement.
-            float oldDpiX, oldDpiY;
-            dc->GetDpi(&oldDpiX, &oldDpiY);
-            dc->SetDpi(96.0f, 96.0f);
-            dc->SetTransform(D2D1::Matrix3x2F::Identity());
-
-            // Get image bounds to determine size.
-            D2D1_RECT_F bounds{};
-            dc->GetImageLocalBounds(previewImage, &bounds);
-            uint32_t w = static_cast<uint32_t>(bounds.right - bounds.left);
-            uint32_t h = static_cast<uint32_t>(bounds.bottom - bounds.top);
-
-            dc->SetDpi(oldDpiX, oldDpiY);
-            if (w == 0 || h == 0) co_return;
-
-            // JXR: render in FP16 scRGB for full HDR fidelity (linear,
-            // scene-referred — no transfer encode wanted).
-            // PNG: render in 8-bit BGRA with the _SRGB variant so the
-            // scene's linear values are gamma-ENCODED on write; plain
-            // UNORM wrote linear bytes that viewers then sRGB-decoded,
-            // producing a crushed, far-too-dark image.
-            DXGI_FORMAT renderFormat = isJxr
-                ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                : DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-            D2D1_ALPHA_MODE alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
-
-            winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
-            D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_TARGET,
-                D2D1::PixelFormat(renderFormat, alphaMode));
-            dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bmpProps, renderBitmap.put());
-
-            winrt::com_ptr<ID2D1Image> oldTarget;
-            dc->GetTarget(oldTarget.put());
-            dc->SetTarget(renderBitmap.get());
-            dc->BeginDraw();
-            dc->Clear(D2D1::ColorF(0, 0, 0, 1.0f));
-            dc->DrawImage(imageToSave);
-            dc->EndDraw();
-            dc->SetTarget(oldTarget.get());
-
             // WIC encode.
             winrt::com_ptr<IWICImagingFactory> wicFactory;
             winrt::check_hresult(CoCreateInstance(
@@ -5500,20 +5685,8 @@ namespace winrt::ShaderLab::implementation
                 frame->SetColorContexts(1, ctxArray);
             }
 
-            // Read back pixels from GPU.
-            winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
-            D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                D2D1::PixelFormat(renderFormat, alphaMode));
-            dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, cpuProps, cpuBitmap.put());
-            D2D1_POINT_2U destPoint = { 0, 0 };
-            D2D1_RECT_U srcRect = { 0, 0, w, h };
-            cpuBitmap->CopyFromBitmap(&destPoint, renderBitmap.get(), &srcRect);
-
-            D2D1_MAPPED_RECT mapped{};
-            winrt::check_hresult(cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped));
-            winrt::check_hresult(frame->WritePixels(h, mapped.pitch, mapped.pitch * h, mapped.bits));
-            cpuBitmap->Unmap();
+            winrt::check_hresult(frame->WritePixels(h, pixels.pitch,
+                static_cast<UINT>(pixels.bytes.size()), pixels.bytes.data()));
 
             winrt::check_hresult(frame->Commit());
             winrt::check_hresult(encoder->Commit());
@@ -5619,7 +5792,8 @@ namespace winrt::ShaderLab::implementation
                 return;
         }
 
-        auto* node = m_graph.FindNode(nodeId);
+        const auto snapshot = CurrentGraphSnapshot();
+        const auto* node = snapshot ? snapshot->FindNode(nodeId) : nullptr;
         if (!node) return;
 
         auto window = std::make_unique<::ShaderLab::Controls::OutputWindow>();
@@ -5750,7 +5924,8 @@ namespace winrt::ShaderLab::implementation
                 return;
         }
 
-        auto* node = m_graph.FindNode(nodeId);
+        const auto snapshot = CurrentGraphSnapshot();
+        const auto* node = snapshot ? snapshot->FindNode(nodeId) : nullptr;
         if (!node) return;
 
         auto window = std::make_unique<::ShaderLab::Controls::LogWindow>();

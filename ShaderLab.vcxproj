@@ -123,6 +123,7 @@
     <ClInclude Include="Controls\LogWindow.h" />
     <ClInclude Include="Controls\PixelInspectorController.h" />
     <ClInclude Include="Controls\PixelTraceController.h" />
+    <ClInclude Include="Controls\CompileProgressController.h" />
     <ClInclude Include="Controls\ShaderEditorController.h" />
     <ClInclude Include="Effects\CustomComputeShaderEffect.h" />
     <ClInclude Include="Effects\CustomPixelShaderEffect.h" />
@@ -172,6 +173,7 @@
     <ClCompile Include="Controls\LogWindow.cpp" />
     <ClCompile Include="Controls\PixelInspectorController.cpp" />
     <ClCompile Include="Controls\PixelTraceController.cpp" />
+    <ClCompile Include="Controls\CompileProgressController.cpp" />
     <ClCompile Include="Controls\ShaderEditorController.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>

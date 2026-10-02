@@ -37,7 +37,14 @@
 //      and gains content-addressed variant/reflection memos, split analysis
 //      targets and async-readback bookkeeping; D3D11ComputeRunner's single
 //      staging buffer becomes a ring and its readback flag an enum.
-#define SHADERLAB_ENGINE_ABI_VERSION 5
+//   6: User effects and option variants. Layout changes to
+//      ShaderLabEffectDescriptor (sourcePath), ShaderLabEffects (load report),
+//      VideoSourceProvider (m_convertCtx), ParameterDefinition (specialize),
+//      EffectNode (variantsCompiling), BytecodeCompileKey (optionKey) and
+//      GraphEvaluator (variant state); a new IEngineCommandSink virtual
+//      (OnGraphMediaDirChanged), EffectGraphFile::LoadResult (package) and
+//      Mcp::EngineContext (renderFrameFor).
+#define SHADERLAB_ENGINE_ABI_VERSION 6
 
 // C-linkage entry so it can be GetProcAddress'd if a host wants to do a
 // version check before dynamically loading the DLL.

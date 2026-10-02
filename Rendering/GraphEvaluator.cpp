@@ -2,6 +2,7 @@
 #include "GraphEvaluator.h"
 #include "../Effects/ShaderCompiler.h"
 #include "../Effects/BytecodeCache.h"
+#include "../Effects/ShaderVariants.h"
 #include "../Effects/Performance.h"
 #include "../Effects/IEngineComputeOutput.h"
 #include "MathExpression.h"
@@ -59,29 +60,67 @@ namespace ShaderLab::Rendering
     // order; today no built-in effect sets gpuBindable=true so the list is
     // empty and the bitset is 0 (= the baseline variant).
     namespace {
-        Effects::BytecodeCacheResult CompileViaCache(
+        // The cache request for one variant of a definition. Option names go
+        // with every compile, the baseline included: SHADERLAB_OPTION needs
+        // _SLOPT_<name>_MODE defined even for the generic build.
+        Effects::BytecodeCompileRequest MakeCompileRequest(
             const std::wstring& effectId,
             uint32_t            effectVersion,
-            const std::wstring& hlslSource,
+            std::string         canonical,
             const std::string&  target,
             uint32_t            macroBitset,
-            const std::vector<std::string>& gpuBindableNames)
+            const std::vector<std::string>& gpuBindableNames,
+            uint64_t            optionKey,
+            const std::vector<std::string>& optionNames)
         {
-            std::string canonical = Effects::CanonicalizeHlslSource(hlslSource);
-
             Effects::BytecodeCompileRequest req;
             req.key.sourceHash         = Effects::HashCanonicalSource(canonical);
-            req.key.paramSignatureHash = Effects::HashParamSignature(gpuBindableNames);
+            req.key.paramSignatureHash = Effects::HashParamSignature(gpuBindableNames, optionNames);
             req.key.includeLibraryHash = Effects::IncludeLibraryHash();
             req.key.macroBitset        = macroBitset;
+            req.key.optionKey          = optionKey;
             req.key.entryPoint         = "main";
             req.key.target             = target;
             req.metadata.effectId      = effectId;
             req.metadata.version       = effectVersion;
             req.hlslSource             = std::move(canonical);
             req.gpuBindableParamNames  = gpuBindableNames;
+            req.optionParamNames       = optionNames;
+            return req;
+        }
 
-            return Effects::BytecodeCache::Instance().GetOrCompile(std::move(req));
+        Effects::BytecodeCacheResult CompileViaCache(
+            const std::wstring& effectId,
+            uint32_t            effectVersion,
+            const std::wstring& hlslSource,
+            const std::string&  target,
+            uint32_t            macroBitset,
+            const std::vector<std::string>& gpuBindableNames,
+            bool                async,
+            uint64_t            optionKey = 0,
+            const std::vector<std::string>& optionNames = {},
+            bool                urgent = false,
+            Effects::BytecodeCompileKey* outKey = nullptr)
+        {
+            auto request = MakeCompileRequest(effectId, effectVersion,
+                Effects::CanonicalizeHlslSource(hlslSource), target,
+                macroBitset, gpuBindableNames, optionKey, optionNames);
+            if (outKey) *outKey = request.key;
+
+            auto& cache = Effects::BytecodeCache::Instance();
+            if (async)
+            {
+                // Take what the cache has, or queue the compile and report Pending.
+                auto existing = cache.TryGet(request.key);
+                if (existing.status == Effects::BytecodeStatus::Ready ||
+                    existing.status == Effects::BytecodeStatus::Failed)
+                    return existing;
+                cache.RequestCompile(std::move(request), urgent);   // idempotent while Pending
+                Effects::BytecodeCacheResult pending;
+                pending.status = Effects::BytecodeStatus::Pending;
+                return pending;
+            }
+            return cache.GetOrCompile(std::move(request));
         }
 
         // Filter a definition's parameters to those flagged gpuBindable,
@@ -123,6 +162,9 @@ namespace ShaderLab::Rendering
 
         // Effects created on the previous frame are now fully initialized.
         m_justCreated.clear();
+
+        // Re-dirty nodes whose wanted variant finished compiling.
+        PollVariantCompiles(graph);
 
         // NOTE on deferred-compute ownership:
         //   `DeferredCompute::inputImages` holds owning `winrt::com_ptr<ID2D1Image>`
@@ -241,6 +283,11 @@ namespace ShaderLab::Rendering
             // stale output; that is why every edit site used to MarkAllDirty.
             // EffectGraph::HasDirtyNodes ignores unneeded nodes, so a parked
             // change does not keep the host rendering.
+            // A node waits on its baseline only while it has none and is rendered.
+            if (node->compilePending &&
+                (!node->needed || !node->customEffect.has_value() || node->customEffect->isCompiled()))
+                node->compilePending = false;
+
             if (!node->needed)
                 continue;
 
@@ -429,6 +476,24 @@ namespace ShaderLab::Rendering
                         if (m_analysisDummyBitmap)
                             inputImages.emplace_back().copy_from(
                                 static_cast<ID2D1Image*>(m_analysisDummyBitmap.get()));
+                    }
+                    // An unwired lookup input gets the same placeholder, as on
+                    // the pixel path: its alpha of 0 is how the shader reads
+                    // "no table". A wired pin whose producer has no output yet
+                    // stays empty.
+                    if (const uint32_t lookupCount = node->customEffect->lookupInputCount; lookupCount > 0)
+                    {
+                        const uint32_t declared = static_cast<uint32_t>(node->customEffect->inputNames.size());
+                        const uint32_t firstLookup = declared - (std::min)(lookupCount, declared);
+                        for (uint32_t pin = firstLookup; pin < declared && pin < inputImages.size(); ++pin)
+                        {
+                            const bool wired = std::any_of(inputs.begin(), inputs.end(),
+                                [pin](const auto* edge) { return edge->destPin == pin; });
+                            if (wired) continue;
+                            EnsureAnalysisDummy(dc);
+                            if (m_analysisDummyBitmap)
+                                inputImages[pin].copy_from(static_cast<ID2D1Image*>(m_analysisDummyBitmap.get()));
+                        }
                     }
                     ID2D1Image* primaryInput = inputImages.empty() ? nullptr : inputImages[0].get();
                     bool hasImageOutput = !node->outputPins.empty();
@@ -734,9 +799,22 @@ namespace ShaderLab::Rendering
                     std::string target = (def.shaderType == CustomShaderType::PixelShader)
                         ? "ps_5_0" : "cs_5_0";
                     auto gpuNames = ExtractGpuBindableNames(def);
+                    // Urgent: without its baseline the node has no output, so
+                    // it goes ahead of queued option variants. Those are queued
+                    // later, in ApplyCustomEffect, once the GPU bindings are known.
                     auto cached = CompileViaCache(
                         node->name, /*effectVersion*/ 1u,
-                        def.hlslSource, target, /*macroBitset*/ 0u, gpuNames);
+                        def.hlslSource, target, /*macroBitset*/ 0u, gpuNames, m_asyncCompile,
+                        /*optionKey*/ 0, Effects::SpecializedOptionNames(def), /*urgent*/ true);
+                    if (cached.status == Effects::BytecodeStatus::Pending)
+                    {
+                        // No output yet; the node stays dirty so the next frame looks again.
+                        node->compilePending = true;
+                        node->cachedOutput = nullptr;
+                        m_outputCache.erase(nodeId);
+                        break;
+                    }
+                    node->compilePending = false;
                     if (cached.status == Effects::BytecodeStatus::Ready)
                     {
                         def.compiledBytecode = std::move(cached.bytecode);
@@ -748,7 +826,10 @@ namespace ShaderLab::Rendering
                         // to a gpuBindable param. Idempotent (the cache
                         // dedupes by key); fires once per node per session
                         // since this branch runs only on !isCompiled().
-                        if (!gpuNames.empty())
+                        // Skipped for an effect with option variants: those are
+                        // precompiled for the binding shape in use, and these
+                        // option-generic shapes would only be fallbacks.
+                        if (!gpuNames.empty() && Effects::SpecializedOptionNames(def).empty())
                         {
                             Effects::BytecodeCacheMetadata meta;
                             meta.effectId = node->name;
@@ -798,14 +879,26 @@ namespace ShaderLab::Rendering
                     // anything that needs the true output rect (e.g. Split
                     // Comparisons center-of-image pivot). The shader uses
                     // these values instead.
-                    bool declaresOutputDims = false;
-                    if (node->customEffect->shaderType == Graph::CustomShaderType::PixelShader)
+                    // By property name: declared parameters and hidden defaults
+                    // both land in node->properties.
+                    const bool declaresOutputDims =
+                        node->customEffect->shaderType == Graph::CustomShaderType::PixelShader &&
+                        (node->properties.count(L"OutputW") || node->properties.count(L"OutputH"));
+
+                    // Tell a shader with an InputMask field which pins carry an
+                    // image; the rest hold the placeholder.
+                    if (node->customEffect->shaderType == Graph::CustomShaderType::PixelShader &&
+                        node->properties.count(L"InputMask"))
                     {
-                        for (const auto& p : node->customEffect->parameters)
+                        uint32_t inputMask = 0;
+                        for (const auto* edge : graph.GetInputEdges(nodeId))
                         {
-                            if (p.name == L"OutputW" || p.name == L"OutputH")
-                            { declaresOutputDims = true; break; }
+                            const auto* sourceNode = graph.FindNode(edge->sourceNodeId);
+                            if (sourceNode && sourceNode->cachedOutput && edge->destPin < 32)
+                                inputMask |= 1u << edge->destPin;
                         }
+                        effectiveProps[L"InputMask"] = static_cast<float>(inputMask);
+                        node->properties[L"InputMask"] = static_cast<float>(inputMask);
                     }
                     if (declaresOutputDims)
                     {
@@ -965,12 +1058,17 @@ namespace ShaderLab::Rendering
                     {
                         ApplyCustomEffect(effect, *node, effectiveProps, graph, dc);
 
-                        // Force-upload the cbuffer directly to the GPU.
+                        // Force-upload the cbuffer directly to the GPU, with the
+                        // shader its layout was reflected from.
                         auto implIt = m_customImplCache.find(node->id);
                         if (implIt != m_customImplCache.end())
                         {
                             if (node->type == NodeType::PixelShader && implIt->second.pixelImpl)
+                            {
+                                if (FAILED(implIt->second.pixelImpl->ForceLoadShader()))
+                                    node->runtimeError = L"Loading the pixel shader variant failed";
                                 implIt->second.pixelImpl->ForceUploadConstantBuffer();
+                            }
                             else if (node->type == NodeType::ComputeShader && implIt->second.computeImpl)
                                 implIt->second.computeImpl->ForceUploadConstantBuffer();
                         }
@@ -1200,6 +1298,10 @@ namespace ShaderLab::Rendering
                             if (srcOpt.has_value() && !AnalysisBitmap(srcOpt->sourceNodeId))
                                 served = false;
                     }
+                    // A consumer on a fallback build while its variant compiles
+                    // reads the cbuffer, so it still needs this frame's value.
+                    if (served && !IsBindingGpuApplied(consumerNode, propName))
+                        served = false;
                     if (served) continue;
                     for (const auto& srcOpt : binding.sources)
                     {
@@ -1418,6 +1520,13 @@ namespace ShaderLab::Rendering
                     L"Crop it before feeding a compute effect.", failedPin);
                 continue;
             }
+            if (preRenderHr == D2DERR_MAX_TEXTURE_SIZE_EXCEEDED)
+            {
+                node->runtimeError = std::format(
+                    L"Input {} is larger than {} px, the largest texture a compute effect can read. "
+                    L"Scale or crop it first.", failedPin, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
+                continue;
+            }
 
             const bool readback = isReadbackNeeded(node->id);
             // Exact per-node attribution: this dispatch is its own D3D11
@@ -1544,28 +1653,202 @@ namespace ShaderLab::Rendering
         return id;
     }
 
+    GUID GraphEvaluator::ShaderGuidFor(const GUID& definitionGuid, const std::vector<uint8_t>& bytecode)
+    {
+        static_assert(sizeof(GUID) == sizeof(BytecodeId));
+        const BytecodeId id = IdOfBytecode(bytecode);
+        GUID guid = definitionGuid;
+        auto* guidBytes = reinterpret_cast<uint8_t*>(&guid);
+        for (size_t index = 0; index < id.size(); ++index)
+            guidBytes[index] ^= id[index];
+        return guid;
+    }
+
     std::shared_ptr<const std::vector<uint8_t>> GraphEvaluator::GetVariantBytecode(
-        const EffectNode& node, const std::wstring& effectId, uint32_t effectVersion,
-        const std::string& target, uint32_t bits)
+        EffectNode& node, const std::wstring& effectId, uint32_t effectVersion,
+        const std::string& target, uint32_t bits, uint64_t options, bool urgent,
+        std::optional<Effects::BytecodeCompileKey>& pendingKey)
     {
         const auto& def = node.customEffect.value();
         if (def.compiledBytecode.empty()) return nullptr;
         // Keyed by the BASELINE's checksum: the variant is a pure function of
         // the source the baseline was compiled from plus the bitset, so a
         // recompile (new baseline) can never be served an old variant.
-        const VariantKey key{ IdOfBytecode(def.compiledBytecode), bits };
+        const VariantKey key{ IdOfBytecode(def.compiledBytecode), bits, options };
         auto it = m_variantMemo.find(key);
         if (it != m_variantMemo.end()) return it->second;
 
         auto gpuNames = ExtractGpuBindableNames(def);
+        Effects::BytecodeCompileKey cacheKey;
         auto variant = CompileViaCache(effectId, effectVersion,
-                                       def.hlslSource, target, bits, gpuNames);
+                                       def.hlslSource, target, bits, gpuNames, m_asyncCompile,
+                                       options, Effects::SpecializedOptionNames(def),
+                                       urgent, &cacheKey);
+        if (variant.status == Effects::BytecodeStatus::Pending && !pendingKey)
+            pendingKey = cacheKey;
         if (variant.status != Effects::BytecodeStatus::Ready || variant.bytecode.empty())
             return nullptr;   // not memoized: a background compile may finish later
         if (m_variantMemo.size() > 256) m_variantMemo.clear();
         auto bytes = std::make_shared<const std::vector<uint8_t>>(std::move(variant.bytecode));
         m_variantMemo[key] = bytes;
         return bytes;
+    }
+
+    GraphEvaluator::VariantChoice GraphEvaluator::SelectVariant(
+        EffectNode& node, const std::wstring& effectId, uint32_t effectVersion,
+        const std::string& target, uint32_t bits, uint64_t options)
+    {
+        // The wanted variant is urgent; fallbacks queue behind it. The node is
+        // re-dirtied when the first pending one in this order finishes.
+        std::optional<Effects::BytecodeCompileKey> pendingKey;
+        VariantChoice choice{ GetVariantBytecode(node, effectId, effectVersion, target, bits, options,
+                                                 /*urgent*/ true, pendingKey),
+                              bits, options };
+        // Keep the GPU routing without the options.
+        if (!choice.bytes && options != 0 && bits != 0)
+        {
+            choice.bytes = GetVariantBytecode(node, effectId, effectVersion, target, bits, 0,
+                                              /*urgent*/ false, pendingKey);
+            if (choice.bytes) choice.options = 0;
+        }
+        // Drop the GPU routing, keeping the options.
+        if (!choice.bytes && bits != 0)
+        {
+            choice.bits = 0;
+            if (options != 0)
+                choice.bytes = GetVariantBytecode(node, effectId, effectVersion, target, 0, options,
+                                                  /*urgent*/ false, pendingKey);
+        }
+        if (pendingKey)
+            m_wantedVariant[node.id] = *pendingKey;
+        // Nothing specialised is ready: the generic baseline.
+        if (!choice.bytes || choice.bytes->empty())
+            choice.options = 0;
+        return choice;
+    }
+
+    uint32_t GraphEvaluator::IntendedGpuBits(const EffectNode& node, bool pixel) const
+    {
+        // The binding shape the node will run once its sources have output:
+        // every single-source binding on a gpu-bindable parameter, in the
+        // stage's GPU mode. The per-frame plan reports 0 until then.
+        if (!Performance::IsGpuBindingsEnabled() || !node.customEffect.has_value()) return 0;
+        uint32_t bits = 0, gpuBindableIndex = 0;
+        const uint32_t mode = pixel ? 2u : 1u;
+        for (const auto& p : node.customEffect->parameters)
+        {
+            if (!p.gpuBindable) continue;
+            const uint32_t paramIndex = gpuBindableIndex++;
+            auto bindingIt = node.propertyBindings.find(p.name);
+            if (bindingIt == node.propertyBindings.end()) continue;
+            const auto& binding = bindingIt->second;
+            if (binding.wholeArray || binding.sources.size() != 1 || !binding.sources[0].has_value()) continue;
+            bits |= mode << (2u * paramIndex);
+        }
+        return bits;
+    }
+
+    void GraphEvaluator::QueueOptionVariants(EffectNode& node, const std::string& target, uint32_t gpuBits)
+    {
+        // Interactive hosts only; headless compiles just what it renders.
+        if (!m_asyncCompile || !node.customEffect.has_value()) return;
+        const auto& def = node.customEffect.value();
+        // Wait for the baseline so it never queues behind these.
+        if (def.compiledBytecode.empty()) return;
+        // The baseline's identity changes with any edit that changes the compiled shader.
+        // Toggling a parameter's "specialize" flag leaves the baseline unchanged,
+        // so the specialised names are part of the check too.
+        const BytecodeId baseline = IdOfBytecode(def.compiledBytecode);
+        auto optionNames = Effects::SpecializedOptionNames(def);
+        auto& precompile = m_optionPrecompile[node.id];
+        if (precompile.baseline == baseline && precompile.gpuBits == gpuBits &&
+            precompile.optionNames == optionNames &&
+            (precompile.done || !precompile.keys.empty()))
+            return;   // already queued for this baseline, binding shape and option set
+        precompile = OptionPrecompile{};
+        precompile.baseline    = baseline;
+        precompile.gpuBits     = gpuBits;
+        precompile.optionNames = optionNames;
+        node.variantsCompiling = 0;
+
+        auto optionKeys = Effects::AllOptionKeys(def);
+        if (optionKeys.empty()) { precompile.done = true; return; }   // nothing specialised, or too many
+        // The combination the node shows now goes first.
+        const uint64_t currentKey = Effects::OptionKeyFor(def, node.properties);
+        std::stable_partition(optionKeys.begin(), optionKeys.end(),
+            [&](uint64_t optionKey) { return optionKey == currentKey; });
+
+        const auto gpuNames    = ExtractGpuBindableNames(def);
+        const std::string canonical = Effects::CanonicalizeHlslSource(def.hlslSource);
+        auto& cache = Effects::BytecodeCache::Instance();
+        for (uint64_t optionKey : optionKeys)
+        {
+            auto request = MakeCompileRequest(node.name, 1u, canonical, target,
+                                              gpuBits, gpuNames, optionKey, optionNames);
+            precompile.keys.push_back(request.key);
+            // TryGet first: it loads from the disk cache, where RequestCompile would recompile.
+            if (cache.TryGet(request.key).status == Effects::BytecodeStatus::NotRequested)
+                cache.RequestCompile(std::move(request), /*urgent*/ optionKey == currentKey);
+        }
+    }
+
+    void GraphEvaluator::PollVariantCompiles(EffectGraph& graph)
+    {
+        auto& cache = Effects::BytecodeCache::Instance();
+        for (auto it = m_wantedVariant.begin(); it != m_wantedVariant.end();)
+        {
+            if (cache.GetStatus(it->second) == Effects::BytecodeStatus::Pending) { ++it; continue; }
+            // Ready, failed or evicted: evaluate the node again.
+            if (auto* node = graph.FindNode(it->first)) node->dirty = true;
+            it = m_wantedVariant.erase(it);
+        }
+        for (auto it = m_optionPrecompile.begin(); it != m_optionPrecompile.end();)
+        {
+            auto* node = graph.FindNode(it->first);
+            if (!node) { it = m_optionPrecompile.erase(it); continue; }
+            auto& precompile = it->second;
+            if (!precompile.done)
+            {
+                uint32_t pending = 0;
+                for (const auto& key : precompile.keys)
+                    if (cache.GetStatus(key) == Effects::BytecodeStatus::Pending) ++pending;
+                node->variantsCompiling = pending;
+                if (pending == 0) precompile.done = true;
+            }
+            ++it;
+        }
+        for (auto it = m_pixelLoadedVariant.begin(); it != m_pixelLoadedVariant.end();)
+        {
+            if (graph.FindNode(it->first)) ++it;
+            else it = m_pixelLoadedVariant.erase(it);
+        }
+        for (auto it = m_appliedGpuBits.begin(); it != m_appliedGpuBits.end();)
+        {
+            if (graph.FindNode(it->first)) ++it;
+            else it = m_appliedGpuBits.erase(it);
+        }
+    }
+
+    bool GraphEvaluator::IsBindingGpuApplied(const EffectNode& consumer, const std::wstring& paramName) const
+    {
+        auto applied = m_appliedGpuBits.find(consumer.id);
+        if (applied == m_appliedGpuBits.end() || !consumer.customEffect.has_value()) return false;
+        uint32_t gpuBindableIndex = 0;
+        for (const auto& param : consumer.customEffect->parameters)
+        {
+            if (!param.gpuBindable) continue;
+            if (param.name == paramName) return ((applied->second >> (2u * gpuBindableIndex)) & 3u) != 0;
+            ++gpuBindableIndex;
+        }
+        return false;
+    }
+
+    void GraphEvaluator::ForgetVariantState(uint32_t nodeId)
+    {
+        m_appliedGpuBits.erase(nodeId);
+        m_pixelLoadedVariant.erase(nodeId);
+        m_optionPrecompile.erase(nodeId);
+        m_wantedVariant.erase(nodeId);
     }
 
     std::shared_ptr<const GraphEvaluator::ReflectedCb> GraphEvaluator::ReflectComputeCb(
@@ -1797,9 +2080,19 @@ namespace ShaderLab::Rendering
         if (def.compiledBytecode.empty())
         {
             auto gpuNames = ExtractGpuBindableNames(def);
+            // Urgent; option variants are queued below once the bindings are known.
             auto cached = CompileViaCache(
                 node.name, /*effectVersion*/ 1u,
-                def.hlslSource, "cs_5_0", /*macroBitset*/ 0u, gpuNames);
+                def.hlslSource, "cs_5_0", /*macroBitset*/ 0u, gpuNames, m_asyncCompile,
+                /*optionKey*/ 0, Effects::SpecializedOptionNames(def), /*urgent*/ true);
+            if (cached.status == Effects::BytecodeStatus::Pending)
+            {
+                // Skip this dispatch and look again next frame.
+                node.compilePending = true;
+                node.dirty = true;
+                return;
+            }
+            node.compilePending = false;
             if (cached.status != Effects::BytecodeStatus::Ready)
             {
                 node.runtimeError = cached.errorMessage.empty()
@@ -1811,9 +2104,8 @@ namespace ShaderLab::Rendering
             bridge->SetCompiledBytecode(def.compiledBytecode.data(),
                 static_cast<UINT32>(def.compiledBytecode.size()));
             node.runtimeError.clear();
-            // Phase 8 eager precompile (mirror of the ShaderLab built-in
-            // case in EvaluateNode).
-            if (!gpuNames.empty())
+            // Eager precompile of the GPU-binding shapes, as in EvaluateNode.
+            if (!gpuNames.empty() && Effects::SpecializedOptionNames(def).empty())
             {
                 Effects::BytecodeCacheMetadata meta;
                 meta.effectId = node.name;
@@ -1923,28 +2215,26 @@ namespace ShaderLab::Rendering
                 // double-count here.)
             }
 
-            // If we're routing any binding GPU-side, swap to the
-            // variant bytecode (compiled with _SLPARAM_<name>_GPU=1
-            // for the bits set). Eagerly precompiled at first encounter
-            // (commit 74eb9a5), so this is typically a cache hit.
-            if (macroBitset != 0)
+        }
+
+        // Pick the variant for the GPU-routed bindings (_SLPARAM_<name>_GPU=1)
+        // and specialised options. The generic baseline is the last fallback
+        // and is always correct (cbuffer values).
+        QueueOptionVariants(node, "cs_5_0", IntendedGpuBits(node, /*pixel*/ false));
+        {
+            const uint64_t optionKey = Effects::OptionKeyFor(def, node.properties);
+            if (macroBitset != 0 || optionKey != 0)
             {
-                variantBytecode = GetVariantBytecode(
-                    node, node.name, 1u, "cs_5_0", macroBitset);
-                if (variantBytecode)
-                {
-                    reflectBytecode = variantBytecode.get();
-                }
-                else
-                {
-                    // Variant unavailable -- gracefully fall back to
-                    // baseline (cbuffer mode for all params; CPU
-                    // readback path stays as the source of truth).
+                const auto choice = SelectVariant(node, node.name, 1u, "cs_5_0", macroBitset, optionKey);
+                if (macroBitset != 0 && choice.bits == 0)
                     bindingPlan.clear();
-                    macroBitset = 0;
-                }
+                macroBitset     = choice.bits;
+                variantBytecode = choice.bytes;
+                if (variantBytecode)
+                    reflectBytecode = variantBytecode.get();
             }
         }
+        m_appliedGpuBits[node.id] = macroBitset;
 
         // Install whatever the plan implies -- baseline or variant -- before
         // every dispatch. The bridge compares by DXBC checksum, so this is a
@@ -2321,6 +2611,10 @@ namespace ShaderLab::Rendering
         m_cacheEnabled.clear();
         m_queuedComputeThisEval.clear();
         m_dummySourceBitmap = nullptr;
+        m_pixelLoadedVariant.clear();
+        m_appliedGpuBits.clear();
+        m_optionPrecompile.clear();
+        m_wantedVariant.clear();
 
         // P7: also drop any deferred-compute entries that the previous
         // Evaluate left pending for ProcessDeferredCompute. They hold raw
@@ -2341,6 +2635,7 @@ namespace ShaderLab::Rendering
         {
             node.cachedOutput = nullptr;
             node.dirty = true;
+            node.variantsCompiling = 0;
         }
     }
 
@@ -2352,6 +2647,7 @@ namespace ShaderLab::Rendering
         m_bridgeImplCache.erase(nodeId);
         m_cacheEnabled.erase(nodeId);
         m_asyncReadbackPending.erase(nodeId);
+        ForgetVariantState(nodeId);
         // Note: caller must also clear EffectNode::cachedOutput on the node
         // (the raw pointer it holds is now dangling). Prefer the graph-aware
         // overload below.
@@ -2364,6 +2660,7 @@ namespace ShaderLab::Rendering
         {
             node->cachedOutput = nullptr;
             node->dirty = true;
+            node->variantsCompiling = 0;
         }
     }
 
@@ -2432,14 +2729,15 @@ namespace ShaderLab::Rendering
         // Non-structural recompile: update bytecode in place.
         if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
         {
-            implIt->second.pixelImpl->SetShaderGuid(def.shaderGuid);
+            implIt->second.pixelImpl->SetShaderGuid(ShaderGuidFor(def.shaderGuid, def.compiledBytecode));
             implIt->second.pixelImpl->LoadShaderBytecode(
                 def.compiledBytecode.data(),
                 static_cast<UINT32>(def.compiledBytecode.size()));
+            m_pixelLoadedVariant[nodeId] = IdOfBytecode(def.compiledBytecode);
         }
         else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
         {
-            implIt->second.computeImpl->SetShaderGuid(def.shaderGuid);
+            implIt->second.computeImpl->SetShaderGuid(ShaderGuidFor(def.shaderGuid, def.compiledBytecode));
             implIt->second.computeImpl->LoadShaderBytecode(
                 def.compiledBytecode.data(),
                 static_cast<UINT32>(def.compiledBytecode.size()));
@@ -2497,12 +2795,14 @@ namespace ShaderLab::Rendering
         else if ((node.type == NodeType::PixelShader || node.type == NodeType::ComputeShader) &&
             node.customEffect.has_value() && node.customEffect->isCompiled())
         {
-            clsid = node.customEffect->shaderGuid;
             // D2D custom effects require at least 1 input. Source effects
             // (empty inputNames) get a hidden input fed by a dummy bitmap.
             // Declared image inputs plus one reserved pin per gpu-bindable
             // parameter (pixel shaders only). See TotalInputCount.
             UINT32 inputCount = TotalInputCount(node, node.customEffect.value());
+            // A CLSID registers once, so each input count gets its own.
+            clsid = node.customEffect->shaderGuid;
+            clsid.Data1 ^= inputCount;
 
             // Register this specific CLSID if not already registered.
             winrt::com_ptr<ID2D1Factory> factory;
@@ -2796,8 +3096,10 @@ namespace ShaderLab::Rendering
             // so leaving an optional table pin empty would blank the node. The
             // placeholder's alpha of 0 is how the shader reads "no table".
             // (ApplyCustomEffect creates it before this runs.)
+            // So do a variadic node's unconnected pins, shown or not.
+            const bool variadic = destNode.customEffect.has_value() && destNode.customEffect->variadicInputs;
             ID2D1Image* fill = nullptr;
-            if (i >= firstLookup && m_analysisDummyBitmap)
+            if ((i >= firstLookup || variadic) && m_analysisDummyBitmap)
                 fill = static_cast<ID2D1Image*>(m_analysisDummyBitmap.get());
             setInputIfChanged(i, fill);
         }
@@ -3190,33 +3492,31 @@ namespace ShaderLab::Rendering
         // Pick the bytecode the plan implies. Falling back to baseline on a
         // cache miss keeps the node rendering (cbuffer mode, CPU values)
         // rather than failing.
+        // Specialised options apply to pixel shaders only; a D2D-tiled compute
+        // node always runs its generic build.
         const std::vector<uint8_t>* activeBytecode = &def.compiledBytecode;
         std::shared_ptr<const std::vector<uint8_t>> variantBytes;
-        GUID activeGuid = def.shaderGuid;
-        if (gpuModeBits != 0)
+        uint64_t optionKey = 0;
+        if (node.type == NodeType::PixelShader)
         {
-            variantBytes = GetVariantBytecode(
-                node,
-                def.shaderLabEffectId.empty() ? node.name : def.shaderLabEffectId,
-                def.shaderLabEffectVersion ? def.shaderLabEffectVersion : 1u,
-                "ps_5_0", gpuModeBits);
-            if (variantBytes && !variantBytes->empty())
-            {
-                activeBytecode = variantBytes.get();
-                // A DISTINCT GUID is mandatory, not cosmetic: Direct2D ignores
-                // LoadPixelShader when a shader with the same GUID is already
-                // loaded, so reusing def.shaderGuid would silently keep
-                // running the cbuffer-mode bytecode while the host believed it
-                // had switched -- the parameter would read whatever the
-                // unbound cbuffer slot happened to hold.
-                activeGuid.Data1 ^= (0xA5A50000u ^ gpuModeBits);
-            }
-            else
-            {
-                analysisBinds.clear();
-                gpuModeBits = 0;
-            }
+            QueueOptionVariants(node, "ps_5_0", IntendedGpuBits(node, /*pixel*/ true));
+            optionKey = Effects::OptionKeyFor(def, effectiveProps);
         }
+        if (gpuModeBits != 0 || optionKey != 0)
+        {
+            const std::wstring variantEffectId = def.shaderLabEffectId.empty() ? node.name : def.shaderLabEffectId;
+            const uint32_t variantEffectVersion = def.shaderLabEffectVersion ? def.shaderLabEffectVersion : 1u;
+            const auto choice = SelectVariant(node, variantEffectId, variantEffectVersion, "ps_5_0",
+                                              gpuModeBits, optionKey);
+            if (gpuModeBits != 0 && choice.bits == 0)
+                analysisBinds.clear();
+            gpuModeBits  = choice.bits;
+            optionKey    = choice.options;
+            variantBytes = choice.bytes;
+            if (variantBytes && !variantBytes->empty())
+                activeBytecode = variantBytes.get();
+        }
+        m_appliedGpuBits[node.id] = gpuModeBits;
 
         // Fill EVERY reserved pin -- bound ones with their analysis bitmap,
         // the rest with a 1x1 dummy. Direct2D will not render a custom effect
@@ -3227,7 +3527,7 @@ namespace ShaderLab::Rendering
         // no bindings at all rendered nothing the moment the pins existed.
         // WireInputs (which runs next) fills unwired lookup pins with the
         // placeholder, and has no device context to create it with.
-        if (effect && node.type == NodeType::PixelShader && def.lookupInputCount > 0)
+        if (effect && node.type == NodeType::PixelShader && (def.lookupInputCount > 0 || def.variadicInputs))
             EnsureAnalysisDummy(dc);
 
         if (effect && node.type == NodeType::PixelShader && node.customEffect.has_value())
@@ -3259,20 +3559,22 @@ namespace ShaderLab::Rendering
         bool needsShaderLoad = false;
         if (node.type == NodeType::PixelShader && implIt->second.pixelImpl)
         {
-            uint32_t& loadedMode = m_pixelGpuModeBits[node.id];
-            if (implIt->second.pixelImpl->NeedsShaderLoad() || loadedMode != gpuModeBits)
+            const BytecodeId wanted = IdOfBytecode(*activeBytecode);
+            auto loaded = m_pixelLoadedVariant.find(node.id);
+            if (implIt->second.pixelImpl->NeedsShaderLoad() || loaded == m_pixelLoadedVariant.end() ||
+                loaded->second != wanted)
             {
-                implIt->second.pixelImpl->SetShaderGuid(activeGuid);
+                implIt->second.pixelImpl->SetShaderGuid(ShaderGuidFor(def.shaderGuid, *activeBytecode));
                 implIt->second.pixelImpl->LoadShaderBytecode(
                     activeBytecode->data(),
                     static_cast<UINT32>(activeBytecode->size()));
-                loadedMode = gpuModeBits;
+                m_pixelLoadedVariant[node.id] = wanted;
                 needsShaderLoad = true;
             }
         }
         else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
         {
-            implIt->second.computeImpl->SetShaderGuid(def.shaderGuid);
+            implIt->second.computeImpl->SetShaderGuid(ShaderGuidFor(def.shaderGuid, def.compiledBytecode));
             implIt->second.computeImpl->LoadShaderBytecode(
                 def.compiledBytecode.data(),
                 static_cast<UINT32>(def.compiledBytecode.size()));
@@ -3500,7 +3802,7 @@ namespace ShaderLab::Rendering
         D2D1_RECT_L px{};
         if (FAILED(Effects::SnapComputeInputRect(bounds, px)))
         {
-            node.runtimeError = L"histogram input has unbounded or empty extent; crop it first";
+            node.runtimeError = L"histogram input is unbounded, empty or larger than 16384 px; crop it first";
             return;
         }
         uint32_t w = (std::min)(static_cast<uint32_t>(px.right - px.left), 4096u);

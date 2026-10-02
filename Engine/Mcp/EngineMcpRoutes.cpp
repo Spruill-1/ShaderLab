@@ -10,10 +10,12 @@
 #include "../../Rendering/DisplayProfile.h"
 #include "../../Rendering/IccProfileParser.h"
 #include "../../Rendering/WorkingSpaceSync.h"
+#include "../../Rendering/EffectGraphFile.h"
 #include "../../Effects/EffectRegistry.h"
 #include "../../Effects/ShaderLabEffects.h"
 #include "../../Effects/SourceNodeFactory.h"
 #include "../../Effects/ShaderCompiler.h"
+#include "../../Effects/ShaderVariants.h"
 #include "../../Effects/CustomComputeShaderEffect.h"
 #include "../../Effects/CustomPixelShaderEffect.h"
 #include "../../Effects/Performance.h"
@@ -75,6 +77,72 @@ namespace ShaderLab::Mcp
             r.body = body;
             r.contentType = "application/json";
             return r;
+        }
+
+        // Force a fresh frame that includes nodeId, for a readback of that node.
+        void RenderFrameFor(EngineContext& ctx, uint32_t nodeId)
+        {
+            if (ctx.renderFrameFor)
+                ctx.renderFrameFor(nodeId);
+            else if (ctx.renderFrame)
+                ctx.renderFrame();
+        }
+
+        // Names of the node and every node it depends on (through edges or
+        // property bindings) whose shader is still compiling in the background.
+        std::vector<std::wstring> CompilingDependencies(const Graph::EffectGraph& graph, uint32_t nodeId)
+        {
+            std::vector<std::wstring> compiling;
+            std::set<uint32_t> visited;
+            std::vector<uint32_t> pending{ nodeId };
+            while (!pending.empty())
+            {
+                const uint32_t currentId = pending.back();
+                pending.pop_back();
+                if (!visited.insert(currentId).second)
+                    continue;
+                const auto* node = graph.FindNode(currentId);
+                if (!node)
+                    continue;
+                if (node->compilePending)
+                    compiling.push_back(node->name);
+
+                for (const auto& edge : graph.Edges())
+                {
+                    if (edge.destNodeId == currentId)
+                        pending.push_back(edge.sourceNodeId);
+                }
+                for (const auto& [property, binding] : node->propertyBindings)
+                {
+                    if (binding.wholeArray)
+                        pending.push_back(binding.wholeArraySourceNodeId);
+                    for (const auto& source : binding.sources)
+                    {
+                        if (source.has_value())
+                            pending.push_back(source->sourceNodeId);
+                    }
+                }
+            }
+            return compiling;
+        }
+
+        // 409 for a readback that failed because shaders are still compiling,
+        // or nullopt when nothing upstream is compiling.
+        std::optional<Response> CompilingResponse(const Graph::EffectGraph& graph, uint32_t nodeId)
+        {
+            const auto compiling = CompilingDependencies(graph, nodeId);
+            if (compiling.empty())
+                return std::nullopt;
+
+            std::string names;
+            for (const auto& name : compiling)
+            {
+                if (!names.empty()) names += ",";
+                names += "\"" + JsonEscape(WideToUtf8(name)) + "\"";
+            }
+            return Json(409, "{\"error\":\"Node " + std::to_string(nodeId)
+                + " is waiting on shader compiles; retry in a few seconds\","
+                + "\"notReady\":true,\"compiling\":[" + names + "]}");
         }
 
         Response Error(uint16_t status, const std::string& msg)
@@ -313,12 +381,26 @@ namespace ShaderLab::Mcp
                     if (i > 0) json += ",";
                     auto& p = def.parameters[i];
                     json += std::format(
-                        "{{\"name\":\"{}\",\"type\":\"{}\",\"min\":{:.4f},\"max\":{:.4f},\"step\":{:.4f}}}",
+                        "{{\"name\":\"{}\",\"type\":\"{}\",\"min\":{:.4f},\"max\":{:.4f},\"step\":{:.4f}",
                         JsonEscape(WideToUtf8(p.name)),
                         JsonEscape(WideToUtf8(p.typeName)),
                         p.minValue, p.maxValue, p.step);
+                    if (!p.enumLabels.empty())
+                    {
+                        json += ",\"options\":[";
+                        for (size_t j = 0; j < p.enumLabels.size(); ++j)
+                            json += (j ? ",\"" : "\"") + JsonEscape(WideToUtf8(p.enumLabels[j])) + "\"";
+                        json += "]";
+                    }
+                    if (p.gpuBindable) json += ",\"gpuBindable\":true";
+                    if (p.specialize)  json += ",\"specialize\":true";
+                    json += "}";
                 }
                 json += "]";
+                // How many option variants the definition prebuilds, and how many are still compiling.
+                if (const size_t combinations = ::ShaderLab::Effects::OptionCombinationCount(def))
+                    json += std::format(",\"optionVariants\":{},\"variantsCompiling\":{}",
+                        combinations, node.variantsCompiling);
 
                 json += ",\"hlslSource\":\"" + JsonEscape(WideToUtf8(def.hlslSource)) + "\"";
 
@@ -502,7 +584,19 @@ namespace ShaderLab::Mcp
                         json += "]";
                         firstCat = false;
                     }
-                    json += "}}";
+                    // User effects are listed in their categories above; this adds
+                    // where they were loaded from and what failed to load.
+                    auto list = [](const std::vector<std::wstring>& values)
+                    {
+                        std::string out = "[";
+                        for (size_t i = 0; i < values.size(); ++i)
+                            out += (i ? ",\"" : "\"") + JsonEscape(WideToUtf8(values[i])) + "\"";
+                        return out + "]";
+                    };
+                    const auto& user = sl.UserEffectReport();
+                    json += "},\"user\":{\"directories\":" + list(user.directories) +
+                            ",\"loaded\":" + list(user.loaded) +
+                            ",\"errors\":" + list(user.errors) + "}}";
                     return Json(200, json);
                 });
         }
@@ -1041,6 +1135,84 @@ namespace ShaderLab::Mcp
                 });
         }
 
+        // ---- Graph load / save helpers ----------------------------------------
+
+        // Parse graph JSON and restore the runtime flags the file does not carry.
+        std::optional<Graph::EffectGraph> ParseGraph(const std::wstring& json, std::string& error)
+        {
+            try
+            {
+                auto graph = Graph::EffectGraph::FromJson(winrt::hstring(json));
+                Effects::ShaderLabEffects::RestoreRuntimeFlags(graph);
+                return graph;
+            }
+            catch (const winrt::hresult_error& ex) { error = WideToUtf8(std::wstring(ex.message())); }
+            catch (const std::exception& ex)       { error = ex.what(); }
+            if (error.empty()) error = "invalid graph JSON";
+            return std::nullopt;
+        }
+
+        // Replace the graph the way File > Open does and prepare its sources.
+        // Runs inside Dispatch.
+        void AdoptLoadedGraph(EngineContext& ctx, IEngineCommandSink& sink,
+            Graph::EffectGraph&& loaded, const std::wstring& mediaDir)
+        {
+            if (ctx.evaluator) ctx.evaluator->ReleaseCache();
+            *ctx.graph = std::move(loaded);
+            ctx.graph->MarkAllDirty();
+            if (ctx.sourceFactory)
+            {
+                // Close the old graph's providers before its media directory is deleted.
+                ctx.sourceFactory->PruneOrphans(ctx.graph->Nodes());
+                if (ctx.dc)
+                {
+                    for (auto& node : const_cast<std::vector<Graph::EffectNode>&>(ctx.graph->Nodes()))
+                    {
+                        if (node.type != Graph::NodeType::Source) continue;
+                        try
+                        {
+                            ctx.sourceFactory->PrepareSourceNode(node,
+                                static_cast<ID2D1DeviceContext5*>(ctx.dc), 0.0,
+                                ctx.d3dDevice, ctx.d3dContext);
+                        }
+                        catch (...)
+                        {
+                            node.runtimeError = L"Source preparation failed";
+                        }
+                    }
+                }
+            }
+            sink.OnGraphMediaDirChanged(mediaDir);
+            sink.OnGraphLoaded();
+        }
+
+        // Parse a { "path": "<absolute path>" } body. Returns the 400 to send on failure.
+        std::optional<Response> ReadPathArgument(const std::string& body, std::wstring& path, WDJ::JsonObject& request)
+        {
+            if (!WDJ::JsonObject::TryParse(winrt::to_hstring(body), request))
+                return Error(400, "body must be a JSON object with a path");
+            if (!request.HasKey(L"path") || request.GetNamedValue(L"path").ValueType() != WDJ::JsonValueType::String)
+                return Error(400, "path (an absolute file path) is required");
+            path = std::wstring(request.GetNamedString(L"path"));
+            if (path.empty() || !std::filesystem::path(path).is_absolute())
+                return Error(400, JsonEscape(WideToUtf8(L"path must be absolute: " + path)));
+            path = std::filesystem::path(path).lexically_normal().wstring();
+            return std::nullopt;
+        }
+
+        std::wstring TempRoot()
+        {
+            wchar_t buffer[MAX_PATH + 1]{};
+            const DWORD length = ::GetTempPathW(MAX_PATH + 1, buffer);
+            return std::wstring(buffer, length);
+        }
+
+        void RemoveExtractDir(const std::wstring& dir)
+        {
+            std::error_code ec;
+            if (!dir.empty()) std::filesystem::remove_all(dir, ec);   // best effort: temp dir
+        }
+
         // ---- POST /graph/clear ---------------------------------------------
         // Engine drops graph state and the evaluator cache. The OnGraphCleared
         // event runs the host's UI cleanup (output windows, preview selector
@@ -1054,6 +1226,8 @@ namespace ShaderLab::Mcp
                         ctx.evaluator->ReleaseCache();
                         ctx.graph->Clear();
                         ctx.graph->MarkAllDirty();
+                        if (ctx.sourceFactory) ctx.sourceFactory->PruneOrphans(ctx.graph->Nodes());
+                        sink.OnGraphMediaDirChanged({});
                         sink.OnGraphCleared();
                         return Json(200, R"({"ok":true})");
                     });
@@ -1072,23 +1246,181 @@ namespace ShaderLab::Mcp
                 {
                     // Parse on the listener thread; assignment requires the
                     // dispatch thread (it owns m_graph).
-                    Graph::EffectGraph loaded;
-                    try
-                    {
-                        loaded = Graph::EffectGraph::FromJson(winrt::to_hstring(body));
-                        Effects::ShaderLabEffects::RestoreRuntimeFlags(loaded);
-                    }
-                    catch (const std::exception& ex)
-                    {
-                        return Json(400, std::string(R"({"error":")") + ex.what() + R"("})");
-                    }
+                    std::string parseError;
+                    auto loaded = ParseGraph(std::wstring(winrt::to_hstring(body)), parseError);
+                    if (!loaded)
+                        return Error(400, JsonEscape(parseError));
                     return sink.Dispatch([&loaded, &sink](EngineContext& ctx) -> Response {
-                        ctx.evaluator->ReleaseCache();
-                        *ctx.graph = std::move(loaded);
-                        ctx.graph->MarkAllDirty();
-                        sink.OnGraphLoaded();
+                        AdoptLoadedGraph(ctx, sink, std::move(*loaded), {});
                         return Json(200, R"({"ok":true})");
                     });
+                });
+        }
+
+        // ---- POST /graph/load-file -----------------------------------------
+        // Body { path }. Reads a .effectgraph package or bare graph JSON, told
+        // apart by content. The file is read and its media extracted on the
+        // listener thread; only the swap runs inside Dispatch, so a large
+        // package does not hold the render thread.
+        void RegisterLoadFile(McpRouter& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/graph/load-file",
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
+                {
+                    std::wstring path;
+                    WDJ::JsonObject request{ nullptr };
+                    if (auto failure = ReadPathArgument(body, path, request))
+                        return *failure;
+                    std::error_code ec;
+                    if (!std::filesystem::is_regular_file(path, ec))
+                        return Error(400, JsonEscape(WideToUtf8(L"file not found: " + path)));
+
+                    std::wstring loadError;
+                    auto file = Rendering::EffectGraphFile::LoadAny(path, TempRoot(), loadError);
+                    if (!file)
+                        return Error(400, JsonEscape(WideToUtf8(loadError)));
+
+                    std::string parseError;
+                    auto loaded = ParseGraph(file->graphJson, parseError);
+                    if (!loaded)
+                    {
+                        RemoveExtractDir(file->extractDir);
+                        return Error(400, JsonEscape(WideToUtf8(L"'" + path + L"' is not a valid graph: ")) + JsonEscape(parseError));
+                    }
+                    Rendering::EffectGraphFile::ResolveMediaTokens(*loaded, file->mediaMap);
+                    // Load names a directory even when there was no media to put in it.
+                    const std::wstring mediaDir = file->mediaMap.empty() ? std::wstring() : file->extractDir;
+
+                    // If Dispatch throws (a timeout), the closure may still run
+                    // and adopt the directory, so it is not deleted here.
+                    return sink.Dispatch([&](EngineContext& ctx) -> Response {
+                        AdoptLoadedGraph(ctx, sink, std::move(*loaded), mediaDir);
+
+                        std::string nodes;
+                        std::string errors;
+                        for (const auto& node : ctx.graph->Nodes())
+                        {
+                            if (!nodes.empty()) nodes += ",";
+                            nodes += std::format(R"({{"id":{},"name":"{}","type":"{}"}})",
+                                node.id, JsonEscape(WideToUtf8(node.name)), NodeTypeStr(node.type));
+
+                            std::wstring nodeError = node.runtimeError;
+                            if (nodeError.empty() && node.type == Graph::NodeType::Source
+                                && node.shaderPath.has_value() && !node.shaderPath->empty())
+                            {
+                                std::error_code existsError;
+                                if (!std::filesystem::exists(*node.shaderPath, existsError))
+                                    nodeError = L"source file not found: " + *node.shaderPath;
+                            }
+                            if (nodeError.empty()) continue;
+                            if (!errors.empty()) errors += ",";
+                            errors += std::format(R"({{"nodeId":{},"name":"{}","error":"{}"}})",
+                                node.id, JsonEscape(WideToUtf8(node.name)), JsonEscape(WideToUtf8(nodeError)));
+                        }
+                        return Json(200, std::format(
+                            R"({{"ok":true,"path":"{}","format":"{}","nodeCount":{},"nodes":[{}],"mediaFiles":{},"extractDir":"{}","errors":[{}]}})",
+                            JsonEscape(WideToUtf8(path)), file->package ? "package" : "json",
+                            ctx.graph->Nodes().size(), nodes, file->mediaMap.size(),
+                            JsonEscape(WideToUtf8(mediaDir)), errors));
+                    });
+                });
+        }
+
+        // ---- POST /graph/save-file -----------------------------------------
+        // Body { path, embedMedia? }. A path ending in .json is written as bare
+        // graph JSON, anything else as a package; embedMedia defaults to true
+        // for a package. The graph is serialized inside Dispatch and written
+        // after it returns, so the write does not hold the render thread.
+        void RegisterSaveFile(McpRouter& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/graph/save-file",
+                [&sink](const std::wstring&, const std::wstring&, const std::string& body) -> Response
+                {
+                    std::wstring path;
+                    WDJ::JsonObject request{ nullptr };
+                    if (auto failure = ReadPathArgument(body, path, request))
+                        return *failure;
+
+                    std::wstring extension = std::filesystem::path(path).extension().wstring();
+                    for (auto& c : extension) c = static_cast<wchar_t>(::towlower(c));
+                    const bool package = extension != L".json";
+
+                    bool embedMedia = package;
+                    if (request.HasKey(L"embedMedia"))
+                    {
+                        const auto value = request.GetNamedValue(L"embedMedia");
+                        bool parsed = false;
+                        switch (value.ValueType())
+                        {
+                        case WDJ::JsonValueType::Boolean: embedMedia = value.GetBoolean(); parsed = true; break;
+                        case WDJ::JsonValueType::Number:  embedMedia = value.GetNumber() != 0.0; parsed = true; break;
+                        case WDJ::JsonValueType::String:  parsed = CoerceStringToBool(std::wstring(value.GetString()), embedMedia); break;
+                        case WDJ::JsonValueType::Null:    parsed = true; break;
+                        default: break;
+                        }
+                        if (!parsed)
+                            return Error(400, "embedMedia must be a boolean");
+                    }
+                    if (embedMedia && !package)
+                        return Error(400, "embedMedia needs a package; use a .effectgraph path");
+
+                    std::error_code ec;
+                    const auto parent = std::filesystem::path(path).parent_path();
+                    if (!std::filesystem::is_directory(parent, ec))
+                        return Error(400, JsonEscape(WideToUtf8(L"folder not found: " + parent.wstring())));
+                    if (std::filesystem::is_directory(path, ec))
+                        return Error(400, JsonEscape(WideToUtf8(L"path is a folder: " + path)));
+
+                    // Serialize on the dispatch thread, the graph's single writer.
+                    std::wstring graphJson;
+                    std::vector<Rendering::EffectGraphFile::MediaEntry> media;
+                    std::vector<std::wstring> warnings;
+                    size_t nodeCount = 0;
+                    Response serialized = sink.Dispatch([&](EngineContext& ctx) -> Response {
+                        nodeCount = ctx.graph->Nodes().size();
+                        graphJson = Rendering::EffectGraphFile::SerializeForSave(*ctx.graph, embedMedia, media);
+                        const std::wstring extractedPrefix = TempRoot() + L"ShaderLab-";
+                        for (const auto& node : ctx.graph->Nodes())
+                        {
+                            if (node.type != Graph::NodeType::Source || !node.shaderPath.has_value()) continue;
+                            const std::wstring& sourcePath = *node.shaderPath;
+                            if (sourcePath.empty() || sourcePath.starts_with(L"media://")) continue;
+                            std::error_code existsError;
+                            if (!std::filesystem::exists(sourcePath, existsError))
+                                warnings.push_back(std::format(L"node {}: source file not found, saved as a path: {}", node.id, sourcePath));
+                            else if (!embedMedia && sourcePath.starts_with(extractedPrefix))
+                                warnings.push_back(std::format(L"node {}: source is extracted package media in the temp folder, which is deleted when this graph is replaced; embed it to keep it: {}", node.id, sourcePath));
+                        }
+                        return Json(200, "{}");
+                    });
+                    if (serialized.statusCode != 200)
+                        return serialized;
+
+                    Rendering::EffectGraphFile::SaveStats stats;
+                    bool saved = false;
+                    if (package)
+                    {
+                        saved = Rendering::EffectGraphFile::Save(path, graphJson, media, {}, &stats);
+                    }
+                    else
+                    {
+                        saved = Rendering::EffectGraphFile::SaveJson(path, graphJson, &stats.bytesWritten);
+                    }
+                    if (!saved)
+                        return Error(500, JsonEscape(WideToUtf8(std::format(L"could not write '{}' (Win32 error {})", path, ::GetLastError()))));
+
+                    std::string warningsJson;
+                    for (const auto& warning : warnings)
+                    {
+                        if (!warningsJson.empty()) warningsJson += ",";
+                        warningsJson += "\"" + JsonEscape(WideToUtf8(warning)) + "\"";
+                    }
+                    const uint64_t fileSize = std::filesystem::file_size(path, ec);
+                    return Json(200, std::format(
+                        R"({{"ok":true,"path":"{}","format":"{}","embedMedia":{},"nodeCount":{},"mediaEmbedded":{},"mediaUnchanged":{},"mediaWritten":{},"inPlace":{},"bytesWritten":{},"fileSize":{},"warnings":[{}]}})",
+                        JsonEscape(WideToUtf8(path)), package ? "package" : "json", embedMedia ? "true" : "false",
+                        nodeCount, media.size(), stats.mediaUnchanged, stats.mediaWritten,
+                        stats.inPlace ? "true" : "false", stats.bytesWritten, ec ? 0 : fileSize, warningsJson));
                 });
         }
 
@@ -1372,9 +1704,10 @@ namespace ShaderLab::Mcp
                         // Helper: write a JSON value into an EffectNode property,
                         // mirroring /graph/set-property's number/bool/string/array
                         // type-fanout. Used for both the per-node `properties`
-                        // block at create time and any later patch.
+                        // block at create time and any later patch. Returns the
+                        // error response for a value it cannot store.
                         auto writeProperty = [&](Graph::EffectNode& node,
-                            const std::wstring& key, WDJ::IJsonValue const& val)
+                            const std::wstring& key, WDJ::IJsonValue const& val) -> std::optional<Response>
                         {
                             switch (val.ValueType())
                             {
@@ -1484,6 +1817,7 @@ namespace ShaderLab::Mcp
                                 if (auto* sv = std::get_if<std::wstring>(&node.properties[key]))
                                     node.shaderPath = *sv;
                             }
+                            return std::nullopt;
                         };
 
                         // ---- nodes -----------------------------------------------
@@ -1566,7 +1900,10 @@ namespace ShaderLab::Mcp
                                 {
                                     auto propsObj = entry.GetNamedObject(L"properties");
                                     for (auto kv : propsObj)
-                                        writeProperty(node, std::wstring(kv.Key()), kv.Value());
+                                    {
+                                        if (auto error = writeProperty(node, std::wstring(kv.Key()), kv.Value()))
+                                            return *error;
+                                    }
                                 }
 
                                 auto id = ctx.graph->AddNode(std::move(node));
@@ -1770,9 +2107,15 @@ namespace ShaderLab::Mcp
                         // readback. Headless sets renderFrame to runEval, so
                         // this is a full evaluation, not a no-op -- load-bearing
                         // for anyone counting evaluations in a probe script.
-                        if (ctx.renderFrame) ctx.renderFrame();
+                        RenderFrameFor(ctx, nodeId);
 
                         auto rr = Rendering::ReadPixelRegion(*ctx.graph, nodeId, x, y, w, h, ctx.dc);
+                        if (rr.status != Rendering::ReadPixelRegionStatus::Success &&
+                            rr.status != Rendering::ReadPixelRegionStatus::NotFound)
+                        {
+                            if (auto compiling = CompilingResponse(*ctx.graph, nodeId))
+                                return *compiling;
+                        }
                         switch (rr.status)
                         {
                         case Rendering::ReadPixelRegionStatus::NotFound:
@@ -2022,7 +2365,7 @@ namespace ShaderLab::Mcp
                         if (!jo.HasKey(L"nodeId"))
                             return Json(400, R"({"error":"'nodeId' is required"})");
                         uint32_t nodeId = static_cast<uint32_t>(jo.GetNamedNumber(L"nodeId"));
-                        if (ctx.renderFrame) ctx.renderFrame();
+                        RenderFrameFor(ctx, nodeId);
                         auto* node = ctx.graph->FindNode(nodeId);
                         if (!node || !node->cachedOutput)
                             return Json(404, R"({"error":"Node not ready"})");
@@ -2071,11 +2414,16 @@ namespace ShaderLab::Mcp
 
                         // Force a fresh frame so dirty nodes evaluate before
                         // capture. Headless sets renderFrame to runEval: a full evaluation.
-                        if (ctx.renderFrame) ctx.renderFrame();
+                        RenderFrameFor(ctx, nodeId);
 
                         auto cap = ::ShaderLab::Rendering::CaptureNodeAsPng(
                             *ctx.graph, nodeId, ctx.dc, maxDim);
                         using S = ::ShaderLab::Rendering::CaptureNodeStatus;
+                        if (cap.status != S::Success && cap.status != S::NotFound)
+                        {
+                            if (auto compiling = CompilingResponse(*ctx.graph, nodeId))
+                                return *compiling;
+                        }
                         switch (cap.status)
                         {
                         case S::NotFound:
@@ -2160,8 +2508,14 @@ namespace ShaderLab::Mcp
                             std::string target =
                                 (node->customEffect->shaderType == CST::PixelShader)
                                 ? "ps_5_0" : "cs_5_0";
+                            // Compile the generic build only; the evaluator
+                            // builds the variants from this definition afterwards.
+                            const auto macroDefs =
+                                ::ShaderLab::Effects::GenericVariantMacros(*node->customEffect);
+                            std::vector<::ShaderLab::Effects::ShaderCompiler::MacroDef> macros;
+                            for (const auto& [name, value] : macroDefs) macros.push_back({ name.c_str(), value.c_str() });
                             auto result = ::ShaderLab::Effects::ShaderCompiler::CompileFromString(
-                                hlslUtf8, "McpCompile", "main", target);
+                                hlslUtf8, "McpCompile", "main", target, macros);
 
                             if (!result.succeeded)
                             {
@@ -2513,6 +2867,8 @@ namespace ShaderLab::Mcp
         RegisterUnbindProperty(server, sink);
         RegisterClear(server, sink);
         RegisterLoad(server, sink);
+        RegisterLoadFile(server, sink);
+        RegisterSaveFile(server, sink);
         RegisterSetProperty(server, sink);
         RegisterApply(server, sink);
         RegisterPixelRegion(server, sink);

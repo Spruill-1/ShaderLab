@@ -1,6 +1,7 @@
 #include "pch_engine.h"
 #include "BytecodeCache.h"
 #include "ShaderLabParamsHlsl.h"
+#include "ShaderLabEffects.h"
 
 #include <algorithm>
 #include <chrono>
@@ -45,31 +46,50 @@ namespace ShaderLab::Effects
         return FNV1a64(buf.data(), buf.size());
     }
 
+    uint64_t HashParamSignature(const std::vector<std::string>& gpuNames,
+                                const std::vector<std::string>& optionNames)
+    {
+        if (optionNames.empty()) return HashParamSignature(gpuNames);
+        // Pack as "gpu0\0gpu1\0\x01opt0\0opt1\0". The separator keeps a name
+        // that moves from one list to the other from hashing the same.
+        std::string buf;
+        for (const auto& name : gpuNames)    { buf.append(name); buf.push_back('\0'); }
+        buf.push_back('\x01');
+        for (const auto& name : optionNames) { buf.append(name); buf.push_back('\0'); }
+        return FNV1a64(buf.data(), buf.size());
+    }
+
+    uint64_t IncludeLibraryHashOf(std::string_view paramsText, std::string_view colorMathText,
+                                  std::string_view gamutText)
+    {
+        // Cache schema version: bump when the cache layout, key fields or
+        // compile flags change in a way that should invalidate existing
+        // entries (in-memory and on disk). Edits to the embedded includes
+        // change the hash on their own.
+        constexpr uint32_t kCacheSchemaVersion = 5;
+        std::string buffer;
+        buffer.reserve(paramsText.size() + colorMathText.size() + gamutText.size() + 32);
+        auto appendSized = [&buffer](std::string_view text)
+        {
+            const uint64_t size = text.size();
+            buffer.append(reinterpret_cast<const char*>(&size), sizeof(size));
+            buffer.append(text);
+        };
+        buffer.append(reinterpret_cast<const char*>(&kCacheSchemaVersion), sizeof(kCacheSchemaVersion));
+        appendSized(paramsText);
+        appendSized(colorMathText);
+        appendSized(gamutText);
+        return FNV1a64(buffer.data(), buffer.size());
+    }
+
     uint64_t IncludeLibraryHash()
     {
-        // The library is compiled into the binary and never changes at run
-        // time, so hash it once. This ran on every CompileViaCache call --
-        // a ~4 KB string copy plus a byte-wise hash per dispatch.
-        static const uint64_t s_hash = []
-        {
-        // Cache schema version: bump when the cache layout, key fields,
-        // or any embedded include changes in a way that should invalidate
-        // existing entries (in-memory and on disk).
-        // v3: ShaderCompiler::CompileFromString now always optimizes
-        //     (D3DCOMPILE_OPTIMIZATION_LEVEL3) even in debug builds.
-        //     Old v2 cached entries used SKIP_OPTIMIZATION in debug
-        //     -- those bytecodes are 5-10x slower at runtime. Bump
-        //     so they fall out and re-compile at the new opt level.
-        constexpr uint32_t kCacheSchemaVersion = 4;
-        const char* libPtr = GetShaderLabParamsHLSL();
-        size_t libLen = libPtr ? GetShaderLabParamsHLSLLength() : 0;
-        std::string buf;
-        buf.reserve(libLen + 8);
-        buf.append(reinterpret_cast<const char*>(&kCacheSchemaVersion), sizeof(kCacheSchemaVersion));
-        if (libPtr) buf.append(libPtr, libLen);
-        return FNV1a64(buf.data(), buf.size());
-        }();
-        return s_hash;
+        // The includes are compiled into the binary, so hash them once.
+        static const uint64_t sHash = IncludeLibraryHashOf(
+            std::string_view(GetShaderLabParamsHLSL(), GetShaderLabParamsHLSLLength()),
+            GetColorMathHLSL(),
+            GetGamutHLSL());
+        return sHash;
     }
 
     static std::string CanonicalizeImpl(const char* src, size_t len)
@@ -135,6 +155,7 @@ namespace ShaderLab::Effects
             && paramSignatureHash == o.paramSignatureHash
             && includeLibraryHash == o.includeLibraryHash
             && macroBitset        == o.macroBitset
+            && optionKey          == o.optionKey
             && entryPoint         == o.entryPoint
             && target             == o.target;
     }
@@ -151,6 +172,7 @@ namespace ShaderLab::Effects
         mix(k.paramSignatureHash);
         mix(k.includeLibraryHash);
         mix(static_cast<uint64_t>(k.macroBitset));
+        mix(k.optionKey);
         mix(FNV1a64(k.entryPoint.data(), k.entryPoint.size()));
         mix(FNV1a64(k.target.data(),     k.target.size()));
         return static_cast<size_t>(h);
@@ -174,11 +196,13 @@ namespace ShaderLab::Effects
 
     BytecodeCache::BytecodeCache()
     {
-        // Spin up worker threads. We deliberately keep this small (2):
-        // typical compile is short, and we'd rather not flood D3DCompile.
-        constexpr size_t kWorkerCount = 2;
-        m_workers.reserve(kWorkerCount);
-        for (size_t i = 0; i < kWorkerCount; ++i)
+        // Worker threads: half the cores, clamped to 2..6. Option variants
+        // are precompiled in parallel here; the cap bounds D3DCompile's
+        // memory use and leaves a core for the render thread.
+        const size_t coreCount = (std::max)(std::thread::hardware_concurrency(), 1u);
+        const size_t workerCount = (std::min)((std::max)(coreCount / 2, size_t{ 2 }), size_t{ 6 });
+        m_workers.reserve(workerCount);
+        for (size_t i = 0; i < workerCount; ++i)
         {
             m_workers.emplace_back([this](std::stop_token stop) {
                 t_isWorkerThread = true;
@@ -266,7 +290,7 @@ namespace ShaderLab::Effects
     // Enqueue
     // -----------------------------------------------------------------------
 
-    void BytecodeCache::RequestCompile(BytecodeCompileRequest request)
+    void BytecodeCache::RequestCompile(BytecodeCompileRequest request, bool urgent)
     {
         if (m_shutdown.load()) return;
 
@@ -275,8 +299,20 @@ namespace ShaderLab::Effects
             auto it = m_entries.find(request.key);
             if (it != m_entries.end())
             {
-                // Already known -- no-op for Pending/Ready/Failed. Failure
-                // retry requires explicit Invalidate.
+                // Already known -- no-op for Ready/Failed. Failure retry
+                // requires explicit Invalidate. An urgent request for a
+                // queued compile moves it to the front.
+                if (urgent && it->second.status == BytecodeStatus::Pending)
+                {
+                    auto queued = std::find_if(m_workQueue.begin(), m_workQueue.end(),
+                        [&](const PendingWork& work) { return work.request.key == request.key; });
+                    if (queued != m_workQueue.end() && queued != m_workQueue.begin())
+                    {
+                        PendingWork work = std::move(*queued);
+                        m_workQueue.erase(queued);
+                        m_workQueue.push_front(std::move(work));
+                    }
+                }
                 return;
             }
             // Insert a Pending placeholder so a subsequent identical
@@ -284,9 +320,18 @@ namespace ShaderLab::Effects
             Entry& e = m_entries[request.key];
             e.status         = BytecodeStatus::Pending;
             e.insertionOrder = m_nextInsertionOrder++;
-            m_workQueue.push_back({ std::move(request) });
+            if (urgent) m_workQueue.push_front({ std::move(request) });
+            else        m_workQueue.push_back({ std::move(request) });
         }
         m_workCv.notify_one();
+    }
+
+    std::optional<size_t> BytecodeCache::QueuePosition(const BytecodeCompileKey& key) const
+    {
+        std::lock_guard<std::mutex> g(m_mutex);
+        for (size_t index = 0; index < m_workQueue.size(); ++index)
+            if (m_workQueue[index].request.key == key) return index;
+        return std::nullopt;
     }
 
     // -----------------------------------------------------------------------
@@ -475,10 +520,13 @@ namespace ShaderLab::Effects
 
         // Baseline (all params in cbuffer mode).
         enqueueShape(0u);
-        // One variant per gpu-bindable param flipped to GPU mode.
-        const size_t bits = std::min<size_t>(paramCount, 32);
-        for (size_t i = 0; i < bits; ++i)
-            enqueueShape(static_cast<uint32_t>(1u) << i);
+        // One variant per gpu-bindable param flipped to GPU mode, two bits
+        // per param. A pixel shader takes GPU values as an input image
+        // (mode 2), a compute shader as an SRV (mode 1).
+        const uint32_t gpuMode = (target.rfind("ps", 0) == 0) ? 2u : 1u;
+        const size_t shapeCount = std::min<size_t>(paramCount, 16);
+        for (size_t i = 0; i < shapeCount; ++i)
+            enqueueShape(gpuMode << (2u * static_cast<uint32_t>(i)));
     }
 
     // -----------------------------------------------------------------------
@@ -935,6 +983,17 @@ namespace ShaderLab::Effects
             const uint32_t mode = (req.key.macroBitset >> (2u * i)) & 3u;
             defNames.push_back("_SLPARAM_" + req.gpuBindableParamNames[i] + "_GPU");
             defValues.push_back(mode == 2u ? "2" : (mode == 1u ? "1" : "0"));
+        }
+        // Define both option macros for every specialised parameter, in every
+        // variant: _SLOPT_<name>_MODE (1 = fixed, 0 = cbuffer read) and
+        // _SLOPT_<name> (the fixed option index). See SHADERLAB_OPTION.
+        for (size_t i = 0; i < req.optionParamNames.size() && i < cMaxSpecializedOptions; ++i)
+        {
+            const uint32_t slot = OptionKeySlot(req.key.optionKey, i);
+            defNames.push_back("_SLOPT_" + req.optionParamNames[i] + "_MODE");
+            defValues.push_back(slot ? "1" : "0");
+            defNames.push_back("_SLOPT_" + req.optionParamNames[i]);
+            defValues.push_back(std::to_string(slot ? slot - 1u : 0u));
         }
         std::vector<ShaderCompiler::MacroDef> macros;
         macros.reserve(defNames.size());

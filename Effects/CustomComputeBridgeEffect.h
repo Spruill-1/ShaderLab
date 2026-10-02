@@ -22,7 +22,8 @@ namespace ShaderLab::Effects
     //     offset, so the compute read bilinearly resampled pixels rather
     //     than the image. Snapping outward to whole pixels and drawing at
     //     the integer origin fixes both.
-    // Extents above 8192 px are clamped, as before (legit large images).
+    // An extent past the D3D11 texture limit (16384) cannot be bound to a
+    // compute shader and returns D2DERR_MAX_TEXTURE_SIZE_EXCEEDED.
     inline HRESULT SnapComputeInputRect(const D2D1_RECT_F& b, D2D1_RECT_L& out)
     {
         constexpr float kHuge = 1.0e7f;
@@ -34,9 +35,8 @@ namespace ShaderLab::Effects
         LONG R = static_cast<LONG>(std::ceil(b.right));
         LONG B = static_cast<LONG>(std::ceil(b.bottom));
         if (R <= L || B <= T) return E_NOT_VALID_STATE;
-        constexpr LONG kMaxExtent = 8192;
-        R = (std::min)(R, L + kMaxExtent);
-        B = (std::min)(B, T + kMaxExtent);
+        constexpr LONG cMaxExtent = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+        if (R - L > cMaxExtent || B - T > cMaxExtent) return D2DERR_MAX_TEXTURE_SIZE_EXCEEDED;
         out = D2D1_RECT_L{ L, T, R, B };
         return S_OK;
     }

@@ -616,6 +616,8 @@ RunTest "Route.CatalogRoundTrip" {
         graph_set_property    = @{ nodeId = 999999; key = 'x'; value = 1 }
         graph_get_node        = @{ nodeId = $scratch }
         graph_load_json       = @{ json = '{"formatVersion":99}' }
+        graph_load_file       = @{ path = 'C:\ShaderLab-no-such-folder\missing.effectgraph' }
+        graph_save_file       = @{ path = 'C:\ShaderLab-no-such-folder\unwritten.effectgraph' }
         graph_bind_property   = @{ nodeId = 999999; propertyName = 'x'; sourceNodeId = 1; sourceFieldName = 'y' }
         graph_unbind_property = @{ nodeId = 999999; propertyName = 'x' }
         effect_compile        = @{ nodeId = 999999; hlsl = 'x' }

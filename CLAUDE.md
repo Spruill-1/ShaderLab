@@ -208,7 +208,12 @@ suite is the preferred path) and validated empirically with `Delta E Comparator`
 
 `ShaderLab::` namespaces mirror directories (`Graph`, `Rendering`, `Effects`,
 `Controls`); XAML types live in `winrt::ShaderLab::implementation`. Members are
-`m_`-prefixed, methods/types PascalCase. COM members are `winrt::com_ptr<T>`; custom
+`m_`-prefixed, methods/types PascalCase, locals descriptive camelCase. Constants take
+a `c` prefix, statics `s`, static consts `sc` (`cMaxOptionValues`, `scGamutLutWidth`);
+older code still uses `k`, so don't mass-rename it in passing. Comments are short and
+plain: what the next block does, or the one-line constraint that would surprise a
+reader. Change history and measurements belong in `CHANGELOG.md` and the decision log,
+not in code. COM members are `winrt::com_ptr<T>`; custom
 D2D effects hand-roll `IUnknown` refcounting on a `LONG m_refCount`. Init paths use
 `winrt::check_hresult`; hot paths use `SUCCEEDED`/`FAILED` with early return.
 
@@ -271,9 +276,9 @@ Content is part of the instrument. Also:
 - Caps: `render_capture_node` downscales to 2048 px; `read_pixel_region` is
   64×64 / 1024 px **and evaluates only the region asked for**, so neither can
   exercise D2D tiling.
-- Ablating a built-in via `effect_compile` needs the color-math prelude prepended
-  (`GetColorMathHLSL`) and the `SHADERLAB_GPU_BUFFER` / `SHADERLAB_PARAM` macros
-  replaced with plain cbuffer fields — the route supplies neither.
+- Ablating a built-in via `effect_compile` takes its source as-is: the route
+  resolves `shaderlab_colormath.hlsli` and `shaderlab_params.hlsli` and defines
+  the generic-variant macros (every GPU-bindable parameter in cbuffer mode).
 
 A metric harness worth trusting self-checks first (for example, cross-validating
 its own CPU ΔE ITP against the shader's) and refuses to report anything if the

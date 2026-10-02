@@ -59,10 +59,10 @@ ShaderLabEngine.dll (host-agnostic)
   │   ├── IccProfileParser      — mscms.dll-based ICC reader
   │   └── MathExpression        — ExprTk-backed expression evaluator (Numeric Expression node)
   ├── Effects/
-  │   ├── ShaderLabEffects      — 36 ShaderLab effects (analysis/source/tone-map/parameter) with embedded HLSL
+  │   ├── ShaderLabEffects      — 37 ShaderLab effects (analysis/source/tone-map/parameter) with embedded HLSL
   │   ├── ColorMath.cpp         — Shared HLSL color math library (BT.709/BT.2020/P3, PQ/HLG, ICtCp)
   │   ├── EffectRegistry        — 40+ wrapped D2D effects across 9 categories
-  │   ├── ShaderCompiler        — D3DCompile + D3DReflect + ID3DInclude resolver for shaderlab_params.hlsli
+  │   ├── ShaderCompiler        — D3DCompile + D3DReflect + ID3DInclude resolver for shaderlab_params.hlsli and shaderlab_colormath.hlsli
   │   ├── ShaderLabParamsHlsl   — Engine-embedded macro library for GPU-binding-aware parameters
   │   ├── IEngineComputeOutput  — COM interface for upstream effects exposing GPU-resident analysis
   │   ├── CustomPixelShaderEffect / CustomComputeShaderEffect — Custom-effect base classes
@@ -218,7 +218,7 @@ Active development centers on **tone-mapping and color-correction effects author
 - **Display monitoring**: Event-driven — `DisplayInformation` bound to the main window (`IDisplayInformationStaticsInterop::GetForWindow`) raises `AdvancedColorInfoChanged` for HDR toggles, the SDR-brightness slider, and monitor moves; one `AdvancedColorInfo` snapshot feeds all of `DisplayCapabilities`. Requires Win11 22H2 (10.0.22621 min OS). Headless snapshots the primary monitor via `GetForMonitor` (no events).
 - **Graph serialization**: `Windows.Data.Json` (zero extra dependencies). GUID fields use `StringFromGUID2`/`CLSIDFromString`.
 - **Effect registry**: Singleton with 40+ built-in D2D effects across 9 categories. Case-insensitive name lookup.
-- **ShaderLab effects library**: 36 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map + Scale), Source / Generator, Composition (Split Comparison), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use; bytecode cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` (decision #58 catalog → see [builtin-catalog.md](../docs/effects/builtin-catalog.md) for the full per-effect type table).
+- **ShaderLab effects library**: 37 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map + Scale), Source / Generator, Composition (Split Comparison), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use; bytecode cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` (decision #58 catalog → see [builtin-catalog.md](../docs/effects/builtin-catalog.md) for the full per-effect type table).
 - **MCP server**: JSON-RPC 2.0 (protocol 2025-06-18, batching rejected) over **stdio via the broker** — the embedded HTTP listener was deleted in stdio-migration Step 9 (decision #71, superseding #31/#58; engine ABI **3**). The router, dispatcher, 39-tool catalog + 25 engine-pure routes live in `Engine/Mcp/` (handlers take `(path, query, body)`); 16 app-side routes stay in `MainWindow.McpRoutes.cpp`. Each host registers as a hub **session** (`McpSessionClient`, GUID-identified); a client's shim (`ShaderLabMcpBroker --stdio`, unpackaged, distributed to `%LOCALAPPDATA%\ShaderLab\bin\`) activates the packaged hub and pins a session with `use_session`. Both hosts register the same engine-side route set through `IEngineCommandSink`: pure mutation closures dispatched via `sink.Dispatch`, with 8 event hooks (`OnNodeAdded`, `OnNodeRemoved`, `OnNodeChanged`, `OnGraphCleared`, `OnGraphLoaded`, `OnGraphStructureChanged`, `OnCustomEffectRecompiled`, `OnDisplayProfileChanged`) the GUI overrides to keep its UI in sync. CI drives `RunTests.ps1` through a shim against a headless `--mcp-session`.
 - **Versioning**: `Version.h` defines the app version and the graph format version (read them there rather than quoting numbers here). Both are stored in saved graphs. Forward compatibility check on load. `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` is independent — bumped manually on engine ABI breaks; mismatch between header and DLL aborts startup with a friendly message-box.
 - **Refresh-rate-driven render loop on the worker thread**: the render worker `std::jthread` runs the graph evaluate at the active monitor's refresh rate (clamped to 60–240 Hz). Dirty-gated: skips evaluate when no nodes changed, no output window is open, and `m_forceRender` is false. The UI thread runs a `DispatcherQueueTimer` at the same rate, but its body is just "drain dispatcher + blit offscreen + Present1" — sub-ms cost. The interval is re-applied on every display change so dragging the window across monitors picks up the new rate.
@@ -257,13 +257,13 @@ These are critical lessons learned during development. Any AI agent generating o
 The built-in effects library lives in `Effects/ShaderLabEffects.h/.cpp`:
 
 - **Embedded HLSL**: Each effect's shader code is stored as a `const char*` string constant. No external `.hlsl` files.
-- **Shared color math**: A common HLSL library (BT.709/BT.2020/P3 color matrices, PQ/HLG transfer functions, CIE XYZ↔xy conversions, luminance calculations) is prepended to each shader at compile time.
+- **Shared color math**: A common HLSL library (BT.709/BT.2020/P3 color matrices, PQ/HLG transfer functions, CIE XYZ↔xy conversions, luminance calculations) that shaders pull in with `#include "shaderlab_colormath.hlsli"`. Optional: a shader may paste the functions it needs instead, which pins it to that math.
 - **Auto-compile**: Effects are compiled via `ShaderCompiler` at first use (when added to graph). Compiled bytecode is cached.
-- **Categories** (36 effects total):
+- **Categories** (37 effects total):
   - **Analysis → Heatmaps** (D3D11 Compute with image output): Luminance Heatmap, Luminance Highlight, Delta E Comparator. **Pixel Shader**: Gamut Highlight, Nit Map.
   - **Analysis → Scopes**: CIE Histogram (D3D11 Compute), CIE Chromaticity Plot (Pixel Shader). (Vectorscope and Waveform Monitor were removed in Phase 8 — they no longer ship.)
   - **Analysis → Statistics** (D3D11 Compute, data-only): Channel Statistics, Luminance Statistics, Chromaticity Statistics, Image Info.
-  - **Analysis → Tone Mapping** (ICtCp suite): ICtCp Round-Trip Validator (PS), ICtCp Tone Map (D3D11 Compute), ICtCp Inverse Tone Map (D3D11 Compute), ICtCp Saturation (PS), ICtCp Highlight Desaturation (D3D11 Compute), ICtCp Gamut Boundary LUT (D3D11 Compute, generator).
+  - **Analysis → Tone Mapping** (ICtCp suite): ICtCp Round-Trip Validator (PS), ICtCp Tone Map (D3D11 Compute), ICtCp Inverse Tone Map (D3D11 Compute), ICtCp Saturation (PS), ICtCp Highlight Desaturation (D3D11 Compute), ICtCp Gamut Boundary LUT (D3D11 Compute, generator), Gamut LUT Viewer (D3D11 Compute).
   - **Analysis → Gamut**: Gamut Coverage (D3D11 Compute), ICtCp Boundary (PS).
   - **Color Processing** (PS): Gamut Map, ICtCp Gamut Map. **D3D11 Compute**: Scale.
   - **Source / Generator** (PS): Gamut Source, Color Checker, Zone Plate, Gradient Generator, HDR Test Pattern.

@@ -1,6 +1,7 @@
 #include "pch_engine.h"
 #include "../ShaderTestBench.h"
 #include "../TestCommon.h"
+#include "Effects/ColorMathCpu.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Rendering/VideoExport.h"
 
@@ -374,23 +375,13 @@ namespace ShaderLab::Tests
             // scan can step straight over a thin in-gamut window -- the
             // tangential vertex graze pure blue exhibits -- and that showed up
             // as 7 differing FP32 components on a real HDR frame, worst
-            // 4.88e-4 scRGB. This test slices the SHIPPED helpers out of the
-            // effect's own HLSL, so it cannot drift from the code it guards.
-            auto& lib = ::ShaderLab::Effects::ShaderLabEffects::Instance();
-            // The helpers ship inside the ICtCp Gamut Boundary LUT's source
-            // (colorMath + GamutBoundaryHLSL + the LUT's own kernel); slice
-            // them out up to where the kernel begins.
-            const auto* desc = lib.FindById(L"ICtCp Gamut Boundary LUT");
-            std::string pre;
-            if (desc)
-            {
-                const std::string& src = desc->hlslSource;
-                auto a = src.find("#define CUBE_EPS");
-                auto b = src.find("// ICtCp Gamut Boundary LUT - D3D11 Compute Shader");
-                if (a != std::string::npos && b != std::string::npos && b > a)
-                    pre = src.substr(a, b - a);
-            }
-            TEST("Gamut boundary search HLSL slice located", !pre.empty());
+            // 4.88e-4 scRGB. This test includes the SHIPPED helpers, the
+            // header the LUT generator and the tone mapper compile, so it
+            // cannot drift from the code it guards.
+            const std::string pre = std::string("#include \"") + ::ShaderLab::Effects::cGamutIncludeName + "\"\n";
+            const auto* desc = ::ShaderLab::Effects::ShaderLabEffects::Instance().FindById(L"ICtCp Gamut Boundary LUT");
+            TEST("Gamut boundary search HLSL is the LUT generator's include",
+                 desc && desc->hlslSource.find(pre) != std::string::npos);
 
             // Per target gamut: the invariant is about the search, and the
             // search now runs against whichever cube the target defines. The
@@ -549,6 +540,66 @@ namespace ShaderLab::Tests
                     ok && Near(m[4].x, m[4].y, 1e-4f * 2) && Near(m[4].y, m[4].z, 1e-4f * 2));
                 TEST("TargetXf: target white reads as luminance 1 (P3, BT.2020, D50-adapted)",
                     ok && Near(m[5].x, 1.0f, 1e-4f) && Near(m[5].y, 1.0f, 1e-4f) && Near(m[5].z, 1.0f, 1e-4f));
+            }
+
+            // DCI-P3 (gamut 4): P3 primaries under the DCI white, adapted to
+            // D65. Its normalised primary matrix is SMPTE RP 431-2's, and
+            // adaptation makes DCI white (1,1,1) land on scRGB white.
+            {
+                auto m = bench.Run(R"(
+                    TargetXf dci = MakeTargetXf(4, 0, 0, 0, 0);
+                    TargetXf p3  = MakeTargetXf(1, 0, 0, 0, 0);
+                    TargetXf s   = MakeTargetXf(0, 0, 0, 0, 0);
+                    bool ok;
+                    float3x3 npm = RgbToXyzFromPrimaries(GAMUT_P3_R, GAMUT_P3_G, GAMUT_P3_B, DCI_WHITE, ok);
+                    Result[0] = float4(npm[0], ok ? 1 : 0);
+                    Result[1] = float4(npm[1], 0);
+                    Result[2] = float4(npm[2], 0);
+                    Result[3] = float4(TargetToScRGB(dci, float3(1, 1, 1)), dci.identity ? 1 : 0);
+                    Result[4] = float4(ScRGBToTarget(dci, float3(3, 3, 3)), 0);
+                    Result[5] = float4(dci.fingerprint, p3.fingerprint, s.fingerprint, dot(float3(1,1,1), dci.lumaT));
+                    // Each primary's chromaticity in the working space, and the
+                    // library's constants for it.
+                    for (int i = 0; i < 3; ++i)
+                    {
+                        float3 xyz = ScRGBToXYZ(TargetToScRGB(dci, float3(i == 0, i == 1, i == 2)));
+                        float2 constant = (i == 0) ? GAMUT_DCIP3_R : (i == 1) ? GAMUT_DCIP3_G : GAMUT_DCIP3_B;
+                        Result[6 + i] = float4(xyz.xy / (xyz.x + xyz.y + xyz.z), constant);
+                    }
+                    Result[9] = float4(ScRGBToTarget(dci, float3(1, 0, 0)), 0);
+                )", 10, pre);
+                const bool ok = m.size() >= 10 && m[0].w == 1.0f;
+                TEST("DCI-P3: RGB->XYZ under DCI white matches SMPTE RP 431-2",
+                    ok && Near(m[0].x, 0.4451698f, 1e-5f) && Near(m[0].y, 0.2771344f, 1e-5f) && Near(m[0].z, 0.1722827f, 1e-5f)
+                       && Near(m[1].x, 0.2094917f, 1e-5f) && Near(m[1].y, 0.7215953f, 1e-5f) && Near(m[1].z, 0.0689131f, 1e-5f)
+                       && Near(m[2].x, 0.0f, 1e-5f)       && Near(m[2].y, 0.0470606f, 1e-5f) && Near(m[2].z, 0.9073554f, 1e-5f));
+                TEST("DCI-P3: adapted, DCI white (1,1,1) is scRGB white and scRGB white stays neutral",
+                    ok && m[3].w == 0.0f
+                       && Near(m[3].x, 1.0f, 1e-4f) && Near(m[3].y, 1.0f, 1e-4f) && Near(m[3].z, 1.0f, 1e-4f)
+                       && Near(m[4].x, 3.0f, 3e-4f) && Near(m[4].y, 3.0f, 3e-4f) && Near(m[4].z, 3.0f, 3e-4f)
+                       && Near(m[5].w, 1.0f, 1e-4f));
+                // Worked in double: sRGB red in adapted DCI-P3 is (0.86858, 0.03454, 0.01677).
+                TEST("DCI-P3: sRGB red -> adapted DCI-P3 matches (0.8686, 0.0345, 0.0168)",
+                    ok && Near(m[9].x, 0.86858f, 2e-4f) && Near(m[9].y, 0.03454f, 2e-4f) && Near(m[9].z, 0.01677f, 2e-4f));
+                // The stamp check allows 1e-5 of the fingerprint; sRGB is the nearest preset.
+                TEST("DCI-P3: fingerprint tells it from Display P3 and sRGB (LUT stamp)",
+                    ok && std::abs(m[5].x - m[5].y) > 1e-2f
+                       && std::abs(m[5].x - m[5].z) > 5.0f * 1e-5f * m[5].z);
+                bool constantsMatch = ok;
+                bool cpuMatches = ok;
+                const auto cpu = ShaderLab::Effects::ColorMathCpu::GamutPrimaries(4, {}, {}, {});
+                for (int i = 0; i < 3 && ok; ++i)
+                {
+                    constantsMatch = constantsMatch && Near(m[6 + i].x, m[6 + i].z, 2e-6f) && Near(m[6 + i].y, m[6 + i].w, 2e-6f);
+                    cpuMatches = cpuMatches && Near(static_cast<float>(cpu[i].x), m[6 + i].x, 2e-6f)
+                                            && Near(static_cast<float>(cpu[i].y), m[6 + i].y, 2e-6f);
+                }
+                printf("  [info] DCI-P3 adapted primaries: R (%.6f, %.6f) G (%.6f, %.6f) B (%.6f, %.6f)\n",
+                       m.size() >= 10 ? m[6].x : 0.0f, m.size() >= 10 ? m[6].y : 0.0f,
+                       m.size() >= 10 ? m[7].x : 0.0f, m.size() >= 10 ? m[7].y : 0.0f,
+                       m.size() >= 10 ? m[8].x : 0.0f, m.size() >= 10 ? m[8].y : 0.0f);
+                TEST("DCI-P3: GAMUT_DCIP3_* are the primaries MakeTargetXf(4) implies", constantsMatch);
+                TEST("DCI-P3: ColorMathCpu::GamutPrimaries(4) matches the HLSL", cpuMatches);
             }
 
             // Table ACCURACY is deliberately not measured here. An in-kernel

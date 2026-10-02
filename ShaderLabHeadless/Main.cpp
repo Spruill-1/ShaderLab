@@ -119,6 +119,11 @@ namespace
         // HDR deliverable -- so it must win over that default.
         bool         toneMapExplicit{ false };
 
+        // --effects-dir: user effect libraries to register (repeatable).
+        // Headless never reads the GUI's default folder, so a run does not
+        // depend on what happens to be installed.
+        std::vector<std::wstring> effectsDirs;
+
         // Display-profile pin. Without one, every headless mode binds to
         // the LIVE primary monitor (InitializeForPrimaryMonitor), so a
         // graph containing a Working Space node renders differently on
@@ -218,6 +223,9 @@ L"Options:\n"
 L"  --width N                Output width (default: 1024)\n"
 L"  --height N               Output height (default: 1024)\n"
 L"  --adapter X              'warp' or 'default' (default: default)\n"
+L"  --effects-dir DIR        Register user effects from DIR (every *.json saved\n"
+L"                           graph in it; see docs/effects/user-effects.md).\n"
+L"                           Repeatable. Load failures print [ShaderLab] lines.\n"
 L"  --gpu-timing             Sample REAL GPU time via D3D11 timestamp queries\n"
 L"                           and enable the gpu-bench script op. Off by\n"
 L"                           default: it Flushes D2D, which perturbs the\n"
@@ -395,6 +403,7 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
             else if (a == L"--width")   { auto v = needNext(L"--width"); if (!v) return false; out.width = static_cast<uint32_t>(std::wcstoul(v, nullptr, 10)); }
             else if (a == L"--height")  { auto v = needNext(L"--height"); if (!v) return false; out.height = static_cast<uint32_t>(std::wcstoul(v, nullptr, 10)); }
             else if (a == L"--gpu-timing") { out.gpuTiming = true; }
+            else if (a == L"--effects-dir") { auto v = needNext(L"--effects-dir"); if (!v) return false; out.effectsDirs.push_back(v); }
             else if (a == L"--skip-unneeded-readback") { out.skipUnneededReadback = true; }
             else if (a == L"--adapter") { auto v = needNext(L"--adapter"); if (!v) return false; out.useWarp = (std::wstring_view{v} == L"warp"); }
             else if (a == L"--input-peak-nits")  { auto v = needNext(L"--input-peak-nits"); if (!v) return false; out.inputPeakNits = static_cast<float>(std::wcstod(v, nullptr)); out.toneMapExplicit = true; }
@@ -553,98 +562,71 @@ L"                           through CPU readback (the pre-v1.6 path).\n",
     // Deletes the extracted-media temp directory on every exit path.
     // Declare it BEFORE the evaluator / source factory so it destructs AFTER
     // them -- those hold file handles into the directory while rendering.
+    // Replace() moves it to the next loaded graph's directory; one that cannot
+    // be deleted yet (a file still open) is retried at destruction.
     struct ExtractDirGuard
     {
         std::wstring dir;
+        std::vector<std::wstring> retry;
         explicit ExtractDirGuard(std::wstring d) : dir(std::move(d)) {}
-        ~ExtractDirGuard() { RemoveExtractDir(dir); }
+        ~ExtractDirGuard()
+        {
+            RemoveExtractDir(dir);
+            for (const auto& leftover : retry) RemoveExtractDir(leftover);
+        }
+        void Replace(std::wstring next)
+        {
+            if (next == dir) return;
+            RemoveExtractDir(dir);
+            std::error_code ec;
+            if (!dir.empty() && std::filesystem::exists(dir, ec)) retry.push_back(dir);
+            dir = std::move(next);
+        }
         ExtractDirGuard(const ExtractDirGuard&) = delete;
         ExtractDirGuard& operator=(const ExtractDirGuard&) = delete;
     };
 
-    // Load a graph from either container form:
+    // Load a graph from either container form (EffectGraphFile::LoadAny):
     //   * a .effectgraph ZIP (what the GUI's Save produces) -- graph.json plus
     //     optional embedded media under media/, and
     //   * a bare .json graph (what the test fixtures and older files are).
-    //
-    // Detected by the PKZIP local-file-header magic rather than by extension,
-    // because .effectgraph is used for both forms historically.
-    //
-    // Media handling mirrors MainWindow.GraphFileIo.cpp: source nodes carry a
-    // "media://<name>" token which is rewritten to the extracted temp path, in
-    // BOTH shaderPath and the mirrored "shaderPath" property, so the existing
-    // image / video pipeline resolves them with no further special-casing.
+    // Source nodes' "media://<name>" tokens are rewritten to the extracted
+    // temp paths, as the GUI's File > Open does.
     LoadedGraph LoadGraphFromPath(const std::wstring& path)
     {
         LoadedGraph result;
 
-        std::string raw = ReadFileUtf8(path);
-        if (raw.empty())
+        wchar_t tempRoot[MAX_PATH + 1]{};
+        GetTempPathW(MAX_PATH + 1, tempRoot);
+        std::wstring loadError;
+        auto loaded = ShaderLab::Rendering::EffectGraphFile::LoadAny(path, tempRoot, loadError);
+        if (!loaded.has_value())
         {
-            std::wprintf(L"FATAL: could not read graph file '%ls'\n", path.c_str());
+            std::wprintf(L"FATAL: could not read graph file: %ls\n", loadError.c_str());
             result.exitCode = 4;
             return result;
         }
+        result.extractDir = loaded->extractDir;
 
-        std::wstring graphJsonW;
-        std::map<std::wstring, std::wstring> mediaMap;
-
-        const bool isZip = raw.size() >= 4 && raw[0] == 'P' && raw[1] == 'K' &&
-                           raw[2] == '\x03' && raw[3] == '\x04';
-        if (isZip)
-        {
-            wchar_t tempRoot[MAX_PATH]{};
-            GetTempPathW(MAX_PATH, tempRoot);
-            auto loaded = ShaderLab::Rendering::EffectGraphFile::Load(path, tempRoot);
-            if (!loaded.has_value())
-            {
-                std::wprintf(L"FATAL: could not read graph from .effectgraph archive '%ls'\n",
-                    path.c_str());
-                result.exitCode = 4;
-                return result;
-            }
-            graphJsonW         = loaded->graphJson;
-            mediaMap           = std::move(loaded->mediaMap);
-            result.extractDir  = loaded->extractDir;
-        }
-        else
-        {
-            int wcCount = MultiByteToWideChar(CP_UTF8, 0, raw.data(),
-                static_cast<int>(raw.size()), nullptr, 0);
-            graphJsonW.resize(wcCount, L'\0');
-            MultiByteToWideChar(CP_UTF8, 0, raw.data(),
-                static_cast<int>(raw.size()), graphJsonW.data(), wcCount);
-        }
-
+        std::wstring parseError;
         try {
-            result.graph = ShaderLab::Graph::EffectGraph::FromJson(winrt::hstring(graphJsonW));
+            result.graph = ShaderLab::Graph::EffectGraph::FromJson(winrt::hstring(loaded->graphJson));
             ShaderLab::Effects::ShaderLabEffects::RestoreRuntimeFlags(result.graph);
         } catch (winrt::hresult_error const& e) {
-            std::wprintf(L"FATAL: graph JSON parse failed (0x%08X): %ls\n",
-                static_cast<uint32_t>(e.code()), e.message().c_str());
+            parseError = std::format(L"0x{:08X}: {}", static_cast<uint32_t>(e.code()), std::wstring(e.message()));
+        } catch (std::exception const& e) {
+            parseError = winrt::to_hstring(e.what());
+        }
+        if (!parseError.empty())
+        {
+            std::wprintf(L"FATAL: graph JSON parse failed (%ls)\n", parseError.c_str());
             RemoveExtractDir(result.extractDir);
             result.extractDir.clear();
             result.exitCode = 5;
             return result;
         }
 
-        if (!mediaMap.empty())
-        {
-            auto& nodes = const_cast<std::vector<ShaderLab::Graph::EffectNode>&>(
-                result.graph.Nodes());
-            for (auto& n : nodes)
-            {
-                if (n.type != ShaderLab::Graph::NodeType::Source) continue;
-                if (!n.shaderPath.has_value()) continue;
-                auto it = mediaMap.find(*n.shaderPath);
-                if (it == mediaMap.end()) continue;
-                n.shaderPath = it->second;
-                auto pit = n.properties.find(L"shaderPath");
-                if (pit != n.properties.end())
-                    pit->second = it->second;
-            }
-        }
-
+        ShaderLab::Rendering::EffectGraphFile::ResolveMediaTokens(result.graph, loaded->mediaMap);
         result.ok = true;
         return result;
     }
@@ -822,6 +804,129 @@ int RunScript(const Args& args);
 // hangs on D2D device teardown.
 namespace
 {
+    // The time a video node shows, as SourceNodeFactory seeks it: looped into
+    // [0, duration), or clamped at 0 without looping. Nullopt past the end of a
+    // non-looping video, which shows nothing.
+    std::optional<double> VideoTargetTime(const ShaderLab::Graph::EffectNode& node, double duration)
+    {
+        double seconds = 0.0;
+        if (auto it = node.properties.find(L"Time"); it != node.properties.end())
+            if (auto* value = std::get_if<float>(&it->second)) seconds = *value;
+        bool loop = true;
+        if (auto it = node.properties.find(L"Loop"); it != node.properties.end())
+            if (auto* value = std::get_if<bool>(&it->second)) loop = *value;
+        if (duration <= 0.0) return (std::max)(seconds, 0.0);
+        if (loop)
+        {
+            seconds = std::fmod(seconds, duration);
+            if (seconds < 0.0) seconds += duration;
+            return seconds;
+        }
+        if (seconds >= duration) return std::nullopt;
+        return (std::max)(seconds, 0.0);
+    }
+
+    // True when the uploaded frame is the one shown at `target`: the frame
+    // whose [start, start + duration) contains it. The first frame also covers
+    // any time before it, and the last any gap to the end of the stream.
+    bool VideoShowsTime(const ShaderLab::Effects::VideoSourceProvider& provider, double target)
+    {
+        const double frameStart = provider.UploadedFrameTime();
+        if (frameStart < 0.0) return false;
+        target = (std::max)(target, provider.FirstFrameTime());
+        constexpr double cTolerance = 1e-4;
+        double frameEnd = frameStart + (std::max)(provider.UploadedFrameDuration(), cTolerance);
+        const double nominalFrame = 1.0 / (std::max)(provider.FrameRate(), 1.0);
+        if (frameEnd + nominalFrame > provider.Duration()) frameEnd = (std::max)(frameEnd, provider.Duration());
+        return target >= frameStart - cTolerance && target < frameEnd + cTolerance;
+    }
+
+    // Headless has no render loop to tick video sources, so tick them here and
+    // wait (up to 5 s) until each video shows the frame for its Time. Wait on
+    // the uploaded frame (UploadedFrameTime): Position jumps to the target as
+    // soon as a seek is requested, and the first upload after a seek can still
+    // be the previous frame. A Time driven by a binding is resolved first, with
+    // a frozen evaluation pass, so the wait is for the time the render will use.
+    // Returns false, after a [ShaderLab] line, if a video never got there.
+    bool SettleVideoSources(ShaderLab::Effects::SourceNodeFactory& factory,
+                            ShaderLab::Rendering::GraphEvaluator& evaluator,
+                            ShaderLab::Graph::EffectGraph& graph,
+                            ID2D1DeviceContext5* dc)
+    {
+        // Videos that already timed out at a time, keyed by node, file and time,
+        // so a video that cannot deliver does not stall every later evaluation.
+        static std::set<std::tuple<uint32_t, std::wstring, double>> sGaveUp;
+
+        auto& nodes = const_cast<std::vector<ShaderLab::Graph::EffectNode>&>(graph.Nodes());
+        auto isVideo = [](const ShaderLab::Graph::EffectNode& node)
+        {
+            if (node.type != ShaderLab::Graph::NodeType::Source) return false;
+            auto it = node.properties.find(L"IsVideo");
+            return it != node.properties.end() && std::holds_alternative<bool>(it->second) && std::get<bool>(it->second);
+        };
+
+        // Resolve bound Times. Upstream values (a Clock's Time) are only computed
+        // by evaluation, so run one frozen pass and put back the dirty flags so
+        // the caller's evaluation still sees every pending change.
+        const bool anyBoundTime = std::any_of(nodes.begin(), nodes.end(), [&](const auto& node)
+            { return isVideo(node) && node.propertyBindings.count(L"Time"); });
+        if (anyBoundTime)
+        {
+            std::vector<uint32_t> dirtyIds;
+            for (const auto& node : nodes)
+                if (node.dirty) dirtyIds.push_back(node.id);
+            dc->SetTarget(nullptr);
+            evaluator.SetDeferredComputeFrozen(true);
+            evaluator.Evaluate(graph, dc);
+            evaluator.SetDeferredComputeFrozen(false);
+            evaluator.ResolveSourceBindings(graph);
+            for (uint32_t id : dirtyIds)
+                if (auto* node = graph.FindNode(id)) node->dirty = true;
+        }
+
+        struct Pending
+        {
+            uint32_t nodeId;
+            std::wstring name;
+            std::wstring path;
+            double target;
+        };
+        auto collectPending = [&]
+        {
+            std::vector<Pending> pending;
+            for (const auto& node : nodes)
+            {
+                if (!isVideo(node)) continue;
+                auto* provider = factory.GetVideoProvider(node.id);
+                if (!provider || !provider->IsOpen()) continue;
+                const auto target = VideoTargetTime(node, provider->Duration());
+                if (!target || VideoShowsTime(*provider, *target)) continue;
+                const std::wstring path = node.shaderPath.value_or(L"");
+                if (sGaveUp.count({ node.id, path, *target })) continue;
+                pending.push_back({ node.id, node.name, path, *target });
+            }
+            return pending;
+        };
+
+        factory.TickAndUploadVideos(nodes, dc, 0.0);
+        auto pending = collectPending();
+        for (int i = 0; i < 500 && !pending.empty(); ++i)   // 5 s; a seek decodes from the last keyframe
+        {
+            ::Sleep(10);
+            factory.TickAndUploadVideos(nodes, dc, 0.0);
+            pending = collectPending();
+        }
+        for (const auto& video : pending)
+        {
+            sGaveUp.insert({ video.nodeId, video.path, video.target });
+            auto* provider = factory.GetVideoProvider(video.nodeId);
+            std::fwprintf(stderr, L"[ShaderLab] video '%ls' did not deliver the frame for %.3f s within 5 s "
+                                  L"(frame on screen %.3f s); this run shows a different frame\n",
+                          video.name.c_str(), video.target, provider ? provider->UploadedFrameTime() : -1.0);
+        }
+        return pending.empty();
+    }
+
     // Shared by --video and the /render/video route: strings -> enums, with a
     // readable error for anything unrecognised.
     bool ParseVideoEnums(const std::wstring& format, const std::wstring& codec, const std::wstring& mastering,
@@ -961,6 +1066,7 @@ int RunRender(const Args& args)
 
     if (args.time.has_value())
         ShaderLab::Rendering::SetClocksToTime(graph, *args.time);
+    SettleVideoSources(sourceFactory, evaluator, graph, dc.get());
 
     if (!args.videoPath.empty())
     {
@@ -1248,13 +1354,21 @@ int RunRender(const Args& args)
 }
 
 // Headless command sink — synchronous Dispatch (no UI thread to marshal
-// to), all event hooks are no-ops since headless doesn't have a canvas
-// or status bar to keep in sync. The engine routes were designed so
-// that with this sink + a properly populated EngineContext, every
-// route migrated in Phase 7 works identically to the GUI host.
+// to). The UI event hooks are no-ops since headless doesn't have a canvas
+// or status bar to keep in sync; the media-directory hook hands the
+// directory to the guard that owns the loaded graph's extracted media.
+// The engine routes were designed so that with this sink + a properly
+// populated EngineContext, every route migrated in Phase 7 works
+// identically to the GUI host.
 struct HeadlessSink : ShaderLab::Mcp::IEngineCommandSink
 {
     std::function<void(ShaderLab::Mcp::EngineContext&)> populateContext;
+    ExtractDirGuard* mediaDir{ nullptr };
+
+    void OnGraphMediaDirChanged(const std::wstring& extractDir) override
+    {
+        if (mediaDir) mediaDir->Replace(extractDir);
+    }
 
     ShaderLab::Mcp::Response Dispatch(
         std::function<ShaderLab::Mcp::Response(
@@ -1383,6 +1497,7 @@ int RunScript(const Args& args)
         // BFS below so a changed field propagates to binding consumers in
         // the same evaluation.
         ShaderLab::Rendering::UpdateWorkingSpaceNodes(graph, displayMonitor);
+        SettleVideoSources(sourceFactory, evaluator, graph, dc.get());
 
         // Propagate dirty flags downstream so D3D11 compute effects
         // re-dispatch when upstream sources change. Mirrors the BFS
@@ -1446,6 +1561,7 @@ int RunScript(const Args& args)
 
     // ---- Build server + sink + register routes ----------------------------
     HeadlessSink sink;
+    sink.mediaDir = &extractGuard;
     sink.populateContext = [&](ShaderLab::Mcp::EngineContext& ctx) {
         ctx.graph          = &graph;
         ctx.evaluator      = &evaluator;
@@ -2018,6 +2134,23 @@ int wmain(int argc, wchar_t* argv[])
             static_cast<unsigned>(SHADERLAB_ENGINE_ABI_VERSION),
             static_cast<unsigned>(::ShaderLab_GetAbiVersion()));
         return 2;
+    }
+
+    // Register user effects before any graph loads, so a graph holding an
+    // older copy sees it as upgradable and add-node by name finds it.
+    for (const auto& dir : args.effectsDirs)
+    {
+        auto& library = ShaderLab::Effects::ShaderLabEffects::Instance();
+        const size_t loadedBefore = library.UserEffectReport().loaded.size();
+        const size_t errorsBefore = library.UserEffectReport().errors.size();
+        const auto& report = library.LoadUserEffects(dir);
+        for (size_t i = loadedBefore; i < report.loaded.size(); ++i)
+            std::fwprintf(stderr, L"User effect: %ls\n", report.loaded[i].c_str());
+        for (size_t i = errorsBefore; i < report.errors.size(); ++i)
+            std::fwprintf(stderr, L"[ShaderLab] user effect not loaded: %ls\n", report.errors[i].c_str());
+        std::error_code directoryError;
+        if (!std::filesystem::is_directory(dir, directoryError))
+            std::fwprintf(stderr, L"[ShaderLab] --effects-dir %ls is not a directory\n", dir.c_str());
     }
 
     // Cache management modes (Phase 8 cache reaper). Run before any

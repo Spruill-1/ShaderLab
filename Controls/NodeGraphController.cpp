@@ -407,6 +407,7 @@ namespace ShaderLab::Controls
         m_connectionDrag.isDataPin = isDataPin;
 
         // Set start position to the pin center.
+        std::shared_lock<std::shared_mutex> lk(m_visualsMutex);
         auto it = m_visuals.find(nodeId);
         if (it != m_visuals.end())
         {
@@ -562,7 +563,9 @@ namespace ShaderLab::Controls
         CancelConnection();
         if (result)
         {
-            RebuildLayout();
+            // THREADING RULE #3: layout runs on the render thread.
+            if (m_dispatcher) m_dispatcher->DispatchSync([this] { RebuildLayout(); });
+            else              RebuildLayout();
             if (m_connectionCallback)
                 m_connectionCallback(connSrcId, connSrcPin, connDstId, connDstPin, wasDataBinding);
         }
@@ -663,12 +666,15 @@ namespace ShaderLab::Controls
             ++m_autoStaggerCount;
 
             // Try to avoid landing exactly on top of an existing node.
+            // THREADING RULE #1: UI-thread read -> snapshot.
+            auto snap = Snapshot();
             if (m_graph)
             {
+                const auto& existingNodes = snap ? snap->nodes : m_graph->Nodes();
                 for (int attempt = 0; attempt < 8; ++attempt)
                 {
                     bool overlap = false;
-                    for (const auto& n : m_graph->Nodes())
+                    for (const auto& n : existingNodes)
                     {
                         if (std::abs(n.position.x - canvasPos.x) < 8.0f &&
                             std::abs(n.position.y - canvasPos.y) < 8.0f)
@@ -687,24 +693,21 @@ namespace ShaderLab::Controls
         node.position = { canvasPos.x, canvasPos.y };
         uint32_t id = 0;
         Graph::EffectNode movedNode = std::move(node);
-        if (m_dispatcher)
-        {
-            m_dispatcher->DispatchSync([&]{
-                id = m_graph->AddNode(std::move(movedNode));
-            });
-        }
-        else
-        {
+        // The visual is computed with the write, on the render thread, and
+        // stored after the dispatch returns (LOCK ORDER RULE).
+        std::optional<NodeVisual> addedVisual;
+        auto addToGraph = [&]{
             id = m_graph->AddNode(std::move(movedNode));
-        }
+            if (auto* added = m_graph->FindNode(id))
+                addedVisual = ComputeNodeVisual(*added);
+        };
+        if (m_dispatcher) m_dispatcher->DispatchSync(addToGraph);
+        else              addToGraph();
 
-        // The graph write above already went through the dispatcher, so taking
-        // the visuals lock here is after the fact -- never across DispatchSync.
-        auto* added = m_graph->FindNode(id);
-        if (added)
+        if (addedVisual)
         {
             std::unique_lock<std::shared_mutex> lk(m_visualsMutex);
-            m_visuals[id] = ComputeNodeVisual(*added);
+            m_visuals[id] = std::move(*addedVisual);
         }
 
         return id;
@@ -715,7 +718,9 @@ namespace ShaderLab::Controls
         if (!m_graph) return 0;
 
         // Check if an output node already exists.
-        for (const auto& node : m_graph->Nodes())
+        auto snap = Snapshot();
+        const auto& nodes = snap ? snap->nodes : m_graph->Nodes();
+        for (const auto& node : nodes)
         {
             if (node.type == Graph::NodeType::Output)
                 return node.id;
@@ -1913,54 +1918,48 @@ namespace ShaderLab::Controls
 
         // Data binding: clear sources from this binding that reference the
         // hit's source node + field. If nothing remains, unbind the property.
-        auto* destNode = m_graph->FindNode(hit.destNodeId);
-        if (!destNode) return false;
-        auto bIt = destNode->propertyBindings.find(hit.destPropertyName);
-        if (bIt == destNode->propertyBindings.end()) return false;
+        // THREADING RULE #2: the binding is read and written on the render thread.
+        auto removeBinding = [&]() -> bool {
+            auto* destNode = m_graph->FindNode(hit.destNodeId);
+            if (!destNode) return false;
+            auto bIt = destNode->propertyBindings.find(hit.destPropertyName);
+            if (bIt == destNode->propertyBindings.end()) return false;
 
-        auto& binding = bIt->second;
-        bool removeAll = false;
-        if (binding.wholeArray)
-        {
-            removeAll = (binding.wholeArraySourceNodeId == hit.sourceNodeId &&
-                         binding.wholeArraySourceFieldName == hit.sourceFieldName);
-        }
-        else
-        {
-            bool anyLeft = false;
-            for (auto& src : binding.sources)
+            auto& binding = bIt->second;
+            bool removeAll = false;
+            if (binding.wholeArray)
             {
-                if (src.has_value() &&
-                    src->sourceNodeId == hit.sourceNodeId &&
-                    src->sourceFieldName == hit.sourceFieldName)
-                {
-                    src.reset();
-                }
-                else if (src.has_value())
-                {
-                    anyLeft = true;
-                }
+                removeAll = (binding.wholeArraySourceNodeId == hit.sourceNodeId &&
+                             binding.wholeArraySourceFieldName == hit.sourceFieldName);
             }
-            removeAll = !anyLeft;
-        }
+            else
+            {
+                bool anyLeft = false;
+                for (auto& src : binding.sources)
+                {
+                    if (src.has_value() &&
+                        src->sourceNodeId == hit.sourceNodeId &&
+                        src->sourceFieldName == hit.sourceFieldName)
+                    {
+                        src.reset();
+                    }
+                    else if (src.has_value())
+                    {
+                        anyLeft = true;
+                    }
+                }
+                removeAll = !anyLeft;
+            }
 
-        if (removeAll)
-        {
-            if (m_dispatcher)
-                m_dispatcher->DispatchSync([&]{
-                    m_graph->UnbindProperty(hit.destNodeId, hit.destPropertyName);
-                });
-            else
+            if (removeAll)
                 m_graph->UnbindProperty(hit.destNodeId, hit.destPropertyName);
-        }
-        else
-        {
-            // Only the consumer changed; the evaluator pulls it downstream.
-            if (m_dispatcher)
-                m_dispatcher->DispatchSync([&]{ destNode->dirty = true; });
             else
-                destNode->dirty = true;
-        }
+                destNode->dirty = true;   // only the consumer changed; the evaluator pulls it downstream
+            return true;
+        };
+        const bool removed = m_dispatcher ? m_dispatcher->DispatchSync(removeBinding)
+                                          : removeBinding();
+        if (!removed) return false;
         m_needsRedraw = true;
         return true;
     }

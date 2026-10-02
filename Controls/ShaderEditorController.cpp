@@ -164,6 +164,9 @@ namespace ShaderLab::Controls
         return R"(// ShaderLab Pixel Shader
 // Texture inputs are bound as Texture2D in register(t0), t1, etc.
 // Constant buffer variables appear as auto-generated properties.
+// Both includes are optional; delete either and paste the code in instead.
+#include "shaderlab_colormath.hlsli"
+#include "shaderlab_params.hlsli"
 
 Texture2D InputTexture : register(t0);
 SamplerState InputSampler : register(s0);
@@ -196,6 +199,9 @@ float4 main(
         return R"(// ShaderLab Compute Shader
 // Input textures are SRVs; output is a UAV.
 // Thread group size: [numthreads(8, 8, 1)]
+// Both includes are optional; delete either and paste the code in instead.
+#include "shaderlab_colormath.hlsli"
+#include "shaderlab_params.hlsli"
 
 Texture2D<float4> InputTexture : register(t0);
 RWTexture2D<float4> OutputTexture : register(u0);

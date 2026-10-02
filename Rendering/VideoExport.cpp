@@ -2,6 +2,7 @@
 #include "VideoExport.h"
 #include "GraphEvaluator.h"
 #include "../Graph/EffectGraph.h"
+#include "../Effects/ShaderCompiler.h"
 #include "../Effects/ShaderLabEffects.h"
 #include "../Effects/SourceNodeFactory.h"
 
@@ -203,6 +204,7 @@ namespace ShaderLab::Rendering
         // HLSL helpers. Kept separate from the kernel so the shader test bench
         // can call them directly and compare against textbook values.
         const char* kHelpersHLSL = R"HLSL(
+#include "shaderlab_colormath.hlsli"
 // ---- Video export conversion (VideoExport.cpp) ----
 // HDR10: scRGB (linear Rec.709, 1.0 = 80 nits) -> BT.2020 linear nits,
 // clamped to [0, 10000] -> PQ. Colours outside BT.2020 are clipped here; there
@@ -370,9 +372,10 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_G
                 m_groupsX = (w / 2 + 7) / 8;
                 m_groupsY = (h / 2 + 7) / 8;
 
-                std::string src = Effects::GetColorMathHLSL() + kHelpersHLSL + kKernelHLSL;
+                std::string src = std::string(kHelpersHLSL) + kKernelHLSL;
                 winrt::com_ptr<ID3DBlob> blob, errs;
-                HRESULT hr = D3DCompile(src.data(), src.size(), "VideoExportConvert", nullptr, nullptr,
+                HRESULT hr = D3DCompile(src.data(), src.size(), "VideoExportConvert", nullptr,
+                    Effects::ShaderLabIncludeHandler(),
                     "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob.put(), errs.put());
                 if (FAILED(hr))
                 {

@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "EffectDesignerWindow.xaml.h"
+#include "Effects/ShaderVariants.h"
 #if __has_include("EffectDesignerWindow.g.cpp")
 #include "EffectDesignerWindow.g.cpp"
 #endif
@@ -177,6 +178,38 @@ namespace winrt::ShaderLab::implementation
         return row;
     }
 
+    namespace
+    {
+        bool IsSpecialisedOption(const ::ShaderLab::Graph::CustomEffectDefinition& def, const std::wstring& name)
+        {
+            const std::string narrowName(name.begin(), name.end());
+            for (const auto& option : ::ShaderLab::Effects::SpecializedOptionNames(def))
+                if (option == narrowName) return true;
+            return false;
+        }
+
+        // One cbuffer member. A specialised option goes through SHADERLAB_OPTION,
+        // which keeps its slot, and so every later member's offset, in each variant.
+        std::wstring CbufferMember(const ::ShaderLab::Graph::CustomEffectDefinition& def,
+                                   const ::ShaderLab::Graph::ParameterDefinition& p)
+        {
+            if (IsSpecialisedOption(def, p.name))
+                return L"    SHADERLAB_OPTION(" + p.typeName + L", " + p.name + L")  // one variant per option\n";
+            return L"    " + p.typeName + L" " + p.name + L";\n";
+        }
+
+        // Emitted after the cbuffer: each specialised option's value, a constant
+        // in its variants and nothing in the generic build.
+        std::wstring OptionValues(const ::ShaderLab::Graph::CustomEffectDefinition& def)
+        {
+            std::wstring out;
+            for (const auto& p : def.parameters)
+                if (IsSpecialisedOption(def, p.name))
+                    out += L"SHADERLAB_OPTION_VALUE(" + p.typeName + L", " + p.name + L")\n";
+            return out.empty() ? out : out + L"\n";
+        }
+    }
+
     void EffectDesignerWindow::OnAddParam(
         winrt::Windows::Foundation::IInspectable const&,
         winrt::Microsoft::UI::Xaml::RoutedEventArgs const&)
@@ -293,6 +326,18 @@ namespace winrt::ShaderLab::implementation
                 maxBox.Width(70);
                 maxBox.SpinButtonPlacementMode(Controls::NumberBoxSpinButtonPlacementMode::Compact);
                 valRow.Children().Append(maxBox);
+
+                // Option specialisation (ShaderVariants.h): one shader per option,
+                // with the value compiled in as a constant.
+                auto variantsBox = Controls::CheckBox();
+                variantsBox.Content(box_value(L"Variant per option"));
+                variantsBox.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Bottom);
+                Controls::ToolTipService::SetToolTip(variantsBox, box_value(
+                    L"Compile a separate shader for each option, with the value fixed, so the "
+                    L"compiler can drop the code the others need. Every variant is compiled when "
+                    L"the effect is placed, so changing the option later never waits. Parameters "
+                    L"used by only one option (a Custom gamut's primaries) stay adjustable."));
+                valRow.Children().Append(variantsBox);
                 return;
             }
 
@@ -485,6 +530,9 @@ namespace winrt::ShaderLab::implementation
                 }
                 param.defaultValue = 0.0f;
                 param.maxValue = static_cast<float>(param.enumLabels.size() - 1);
+                if (valRow.Children().Size() > 3)
+                    if (auto variants = valRow.Children().GetAt(3).try_as<Controls::CheckBox>())
+                        param.specialize = variants.IsChecked() && variants.IsChecked().Value();
             }
             else
             {
@@ -536,7 +584,12 @@ namespace winrt::ShaderLab::implementation
 
     std::wstring EffectDesignerWindow::GenerateHlsl(const ::ShaderLab::Graph::CustomEffectDefinition& def)
     {
+        // Both engine headers are optional: an author may delete either
+        // include and paste the code in instead. Specialised options need
+        // the params header (SHADERLAB_OPTION).
         std::wstring hlsl;
+        hlsl += L"#include \"shaderlab_colormath.hlsli\"   // shared color math (optional)\n";
+        hlsl += L"#include \"shaderlab_params.hlsli\"      // parameter macros (optional)\n\n";
 
         // Constant buffer.
         if (!def.parameters.empty())
@@ -544,9 +597,10 @@ namespace winrt::ShaderLab::implementation
             hlsl += L"cbuffer Constants : register(b0)\n{\n";
             for (const auto& p : def.parameters)
             {
-                hlsl += L"    " + p.typeName + L" " + p.name + L";\n";
+                hlsl += CbufferMember(def, p);
             }
             hlsl += L"};\n\n";
+            hlsl += OptionValues(def);
         }
 
         if (def.shaderType == ::ShaderLab::Graph::CustomShaderType::PixelShader)
@@ -637,8 +691,9 @@ namespace winrt::ShaderLab::implementation
             hlsl += L"    uint Width;   // Auto-injected: source image width\n";
             hlsl += L"    uint Height;  // Auto-injected: source image height\n";
             for (const auto& p : def.parameters)
-                hlsl += L"    " + p.typeName + L" " + p.name + L";\n";
+                hlsl += CbufferMember(def, p);
             hlsl += L"};\n\n";
+            hlsl += OptionValues(def);
 
             // Analysis field layout comments
             uint32_t pixOff = 0;
@@ -744,8 +799,9 @@ namespace winrt::ShaderLab::implementation
                 hlsl += L"cbuffer Constants : register(b0)\n{\n";
                 hlsl += L"    int2  _TileOffset;  // Auto-injected: tile origin in full image\n";
                 for (const auto& p : def.parameters)
-                    hlsl += L"    " + p.typeName + L" " + p.name + L";\n";
+                    hlsl += CbufferMember(def, p);
                 hlsl += L"};\n\n";
+                hlsl += OptionValues(def);
 
                 // Generate field pixel offset comments.
                 uint32_t pixOff = 0;
@@ -817,8 +873,9 @@ namespace winrt::ShaderLab::implementation
                 hlsl += L"cbuffer Constants : register(b0)\n{\n";
                 hlsl += L"    int2  _TileOffset;  // Auto-injected: tile origin in full image\n";
                 for (const auto& p : def.parameters)
-                    hlsl += L"    " + p.typeName + L" " + p.name + L";\n";
+                    hlsl += CbufferMember(def, p);
                 hlsl += L"};\n\n";
+                hlsl += OptionValues(def);
 
                 hlsl += std::format(L"[numthreads({}, {}, {})]\n",
                     def.threadGroupX, def.threadGroupY, def.threadGroupZ);
@@ -865,8 +922,12 @@ namespace winrt::ShaderLab::implementation
             ? L"ps_5_0" : L"cs_5_0";
         std::wstring entryPoint = L"main";
 
+        // Compile the generic build only; the evaluator builds the variants once the effect is placed.
+        const auto macroDefs = ::ShaderLab::Effects::GenericVariantMacros(def);
+        std::vector<::ShaderLab::Effects::ShaderCompiler::MacroDef> macros;
+        for (const auto& [name, value] : macroDefs) macros.push_back({ name.c_str(), value.c_str() });
         auto result = ::ShaderLab::Effects::ShaderCompiler::CompileFromString(
-            hlslUtf8, "EffectDesigner", winrt::to_string(entryPoint), winrt::to_string(target));
+            hlslUtf8, "EffectDesigner", winrt::to_string(entryPoint), winrt::to_string(target), macros);
         if (!result.succeeded)
         {
             CompileStatusText().Text(L"X " + winrt::hstring(result.ErrorMessage()));
@@ -1096,9 +1157,8 @@ namespace winrt::ShaderLab::implementation
 
         auto def = BuildDefinition();
         def.compiledBytecode = m_lastBytecode;
-        // Preserve the existing shader GUID.
-        if (def.shaderGuid == GUID{})
-            CoCreateGuid(&def.shaderGuid);
+        // D2D ignores LoadPixelShader for a GUID it already holds, so new bytecode needs a new GUID.
+        CoCreateGuid(&def.shaderGuid);
 
         m_updateInGraph(m_editingNodeId, std::move(def));
         CompileStatusText().Text(L"V Updated node " + winrt::to_hstring(m_editingNodeId) + L" in graph");
@@ -1186,6 +1246,9 @@ namespace winrt::ShaderLab::implementation
                         }
                         labelsBox.Text(winrt::hstring(labels));
                     }
+                    if (valRow.Children().Size() > 3)
+                        if (auto variants = valRow.Children().GetAt(3).try_as<Controls::CheckBox>())
+                            variants.IsChecked(p.specialize);
                 }
                 else if (p.typeName == L"bool")
                 {

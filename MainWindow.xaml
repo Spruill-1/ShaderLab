@@ -285,6 +285,14 @@
                            VerticalAlignment="Center"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                            Style="{StaticResource CaptionTextBlockStyle}" />
+                <!-- Option variants compiling in the background (CompileProgressController). -->
+                <TextBlock x:Name="VariantCompileText"
+                           Text=""
+                           Margin="12,0,0,0"
+                           VerticalAlignment="Center"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           ToolTipService.ToolTip="Shader variants are compiled for every option up front, so switching an option later never waits. Nodes render with their generic shader until theirs is ready." />
             </StackPanel>
 
             <StackPanel Orientation="Horizontal" Grid.Column="1" Margin="0,0,20,0">

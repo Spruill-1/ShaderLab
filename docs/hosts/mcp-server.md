@@ -27,7 +27,7 @@ ShaderLab implements the **Model Context Protocol (MCP)** JSON-RPC 2.0 for progr
 
 Full design + rationale: [MCP stdio migration](../development/mcp-stdio-migration.md).
 
-## Tools (44 total)
+## Tools (47 total)
 
 ### Graph structure
 
@@ -42,6 +42,7 @@ Full design + rationale: [MCP stdio migration](../development/mcp-stdio-migratio
 | `graph_overview` | Compact graph summary (nodes, edges, preview). Each node also carries `gpuState` and, where one exists, `gpuMs` — see [GPU cost per node](#gpu-cost-per-node). |
 | `graph_get_node` | Node details incl. properties, pins, `propertyBindings`, analysis results. |
 | `graph_save_json` / `graph_load_json` | Serialize / load the graph as JSON. |
+| `graph_save_file` / `graph_load_file` | Save / open the graph as a file at an absolute path: a `.effectgraph` package (media embedded) or bare `.json`. See [Graph files](#graph-files). |
 
 ### Properties & bindings
 
@@ -103,6 +104,15 @@ Full design + rationale: [MCP stdio migration](../development/mcp-stdio-migratio
 | `perf_render_mode` | Unthrottled (benchmark) render loop on/off: drops the worker's 16 ms pacing wait, evaluates every tick regardless of dirty state, presents with vsync interval 0. Expect tearing and a pegged GPU. |
 
 Resources: `shaderlab://context`, `shaderlab://graph`, `shaderlab://registry/effects`, `shaderlab://custom-effects` via `resources/list` / `resources/read`.
+
+## Graph files
+
+`graph_load_file` (`POST /graph/load-file { path }`) and `graph_save_file` (`POST /graph/save-file { path, embedMedia? }`) are engine routes, so the GUI and both headless modes serve them. Paths must be absolute; the app reads and writes anything its account can reach.
+
+- **Load** accepts a `.effectgraph` package (ZIP: `graph.json` + `media/`) or bare graph JSON, detected by the PKZIP magic rather than the extension, exactly as headless `--graph` does. Package media are extracted to `%TEMP%\ShaderLab-<id>\` and each source's `media://<name>` token is rewritten to the extracted file. The graph then replaces the current one the way File > Open does: evaluator cache released, sources prepared, and the GUI reset through `OnGraphLoaded` (preview selector, output windows, layout). The GUI's current file path and title are not changed. The response lists `nodeCount`, `nodes` (id, name, type), `mediaFiles`, `extractDir` and `errors` (per node: a source that failed to prepare or whose file is missing). A relative path, a missing or unreadable file, a broken package or invalid graph JSON is a 400, and the current graph is left alone.
+- **Save** writes bare JSON when the path ends in `.json` and a package otherwise. `embedMedia` defaults to true for a package (referenced image / video / ICC files are embedded and their paths become `media://` tokens in the saved copy only) and false for JSON; `embedMedia=false` writes a package holding just `graph.json`, and `embedMedia=true` with a `.json` path is a 400. Packages go through the File > Save writer: media unchanged since the last save to the same file are reused (`mediaUnchanged`, `inPlace`), and a new file is written beside the old one and renamed into place. The folder must exist. The response carries `format`, `bytesWritten`, `fileSize`, media counts and `warnings`: a source file that does not exist (saved as its path), or, without embedding, a source that points at extracted package media in the temp folder, which is deleted when the graph is replaced.
+- **Extracted media lifetime.** The extracted folder is handed to the host through `IEngineCommandSink::OnGraphMediaDirChanged` and lives until the graph is next replaced by `graph_load_file`, `graph_load_json` or `graph_clear`, or the host exits. The GUI also heartbeats it like a File > Open folder, so another instance's startup reaper leaves it alone.
+- **Threading and time.** File I/O runs on the MCP listener thread; only the graph swap (load) or serialization (save) runs on the render thread, so a large package does not stall the preview or hit the 20 s render-closure budget. The remaining limit is the shim's 30 s per request (`McpTimeouts.h`). Measured headless on a 1.46 GB video package: save 6.4 s, load 4.1 s. Packages cap at 4 GB (no ZIP64); on slow storage a call past 30 s returns a timeout to the client while the operation still completes.
 
 ## Known Limitations
 

@@ -231,17 +231,25 @@ sequenceDiagram
     UI->>Disp: DispatchSync(closure)
     Note over UI: UI thread blocks here<br/>(short — single eval iteration)
     Disp->>W: queue + Wake()
-    W->>Graph: AddNode + FindNode<br/>+ PrepareSourceNode<br/>(render-side D2D ctx)
+    W->>Graph: AddNode + FindNode<br/>+ PrepareSourceNode<br/>(render-side D2D ctx)<br/>+ AutoLayout
     Note over W,Graph: the new node starts dirty;<br/>nothing else needs invalidating
+    W->>W: after-sync hook: publish GraphUiSnapshot
     W-->>Disp: complete
     Disp-->>UI: return
-    UI->>UI: AutoLayout + PopulatePreviewNodeSelector<br/>(XAML, UI thread)
+    UI->>UI: PopulatePreviewNodeSelector<br/>(XAML, reads the snapshot)
     UI->>UI: m_forceRender = true
 ```
 
-Anything XAML-touching (canvas layout, panel rebuild, selector populate)
-stays on the UI thread after the dispatcher returns. Anything touching
-`m_graph` or D3D11/D2D goes inside the closure.
+Anything XAML-touching (panel rebuild, selector populate) stays on the UI
+thread after the dispatcher returns and reads the `GraphUiSnapshot`. Anything
+touching `m_graph`, layout, or D3D11/D2D goes inside the closure, including
+source preparation, which uses the render D2D context. After every queued
+`DispatchSync` closure the dispatcher runs an after-sync hook
+(`SetAfterSyncClosure`) that republishes the snapshot before the caller is
+released, so a UI read that follows a dispatched write sees it. Property edits
+from the Properties panel go through `EditNodeProperty` in
+`MainWindow.xaml.cpp`, which does the read-modify-write and marks the node dirty
+in one closure.
 
 ## Worker lifecycle
 
@@ -283,7 +291,7 @@ SwapChainPanel-bound swap chain.
 
 | Resource | Owned by | Notes |
 |---|---|---|
-| `m_d3dDevice`, `m_d3dContext` | `RenderEngine` | D3D11 immediate context with `ID3D10Multithread::SetMultithreadProtected(TRUE)`. Both threads call into it. |
+| `m_d3dDevice`, `m_d3dContext` | `RenderEngine` | D3D11 immediate context with `ID3D10Multithread::SetMultithreadProtected(TRUE)`. Both threads call into it. Protection makes each *call* atomic, not a *sequence*: any multi-call GPU operation (bind shader/SRVs/UAVs, then `Dispatch`) must be recorded on its own deferred context and submitted with one `ExecuteCommandList(…, TRUE)`, or another thread's D2D work can land between the calls and the dispatch runs unbound. `D3D11ComputeRunner` and `VideoSourceProvider` both do this; each lost ~2–8% of dispatches, silently, before they did. |
 | Multi-threaded D2D device | `RenderEngine` | Single device, two contexts. |
 | `m_d2dDeviceContext` | UI thread | Editor canvas, blit-to-swap-chain, file-save capture. |
 | `m_renderD2dContext` | Render thread | `BeginDraw` → graph eval → `EndDraw` per tick. |

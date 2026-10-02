@@ -44,6 +44,12 @@ namespace ShaderLab::Effects
         uint32_t                          inputCount{ 0 };      // texture inputs
     };
 
+    // Include handler for the engine's embedded headers,
+    // "shaderlab_params.hlsli", "shaderlab_colormath.hlsli" and
+    // "shaderlab_gamut.hlsli". All are optional for a shader. Every D3DCompile of effect HLSL passes this, so
+    // all compile paths resolve the same names. Never null; do not release.
+    SHADERLAB_API ID3DInclude* ShaderLabIncludeHandler();
+
     // HLSL shader compilation and reflection utilities.
     // Wraps D3DCompile and D3DReflect for use by the custom effect system.
     class SHADERLAB_API ShaderCompiler
@@ -66,11 +72,10 @@ namespace ShaderLab::Effects
 
         // Compile HLSL source with explicit preprocessor macros. Used
         // by the GPU-binding feature to inject _SLPARAM_<name>_GPU=0|1
-        // sentinels per gpuBindable parameter. The compiler's include
-        // handler always resolves "shaderlab_params.hlsli" to the
-        // engine-embedded macro library; other includes are not
-        // supported (D3D_COMPILE_STANDARD_FILE_INCLUDE is intentionally
-        // bypassed since all ShaderLab shaders are in-memory strings).
+        // sentinels per gpuBindable parameter. Includes resolve through
+        // ShaderLabIncludeHandler(); other includes are not supported
+        // (D3D_COMPILE_STANDARD_FILE_INCLUDE is intentionally bypassed
+        // since all ShaderLab shaders are in-memory strings).
         //
         // `macros` is a flat list of {name, definition} pairs, NOT
         // null-terminated -- the ShaderCompiler appends the terminator

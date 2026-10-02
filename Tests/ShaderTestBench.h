@@ -22,7 +22,7 @@
 //     and must match the number of `Result[0..N-1] = ...` writes in the
 //     body.
 //   * The full color-math header (PQ_EOTF, ScRGBToICtCp, ReinhardCompressI,
-//     etc.) is prepended to every test. Author can call any helper that
+//     etc.) is included in every test. Author can call any helper that
 //     `Effects::GetColorMathHLSL()` exposes.
 //   * The kernel runs as a single 1×1×1 thread group. This is *not* an
 //     image-pipeline test; for those, use the regular effect graph tests.
@@ -52,7 +52,7 @@ namespace ShaderLab::Tests
 
         // Compile + dispatch a one-thread compute kernel. The `body` string
         // is wrapped in a `[numthreads(1,1,1)] void main()` shell with the
-        // full color-math HLSL prepended. Returns the contents of the
+        // full color-math HLSL included. Returns the contents of the
         // Result buffer on success.
         //
         // `preamble` (optional) is inserted at file scope between the

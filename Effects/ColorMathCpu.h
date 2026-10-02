@@ -49,6 +49,8 @@ namespace ShaderLab::Effects::ColorMathCpu
     inline constexpr V2 GAMUT_709[3]  = { { 0.64, 0.33 },   { 0.30, 0.60 },   { 0.15, 0.06 } };
     inline constexpr V2 GAMUT_P3[3]   = { { 0.680, 0.320 }, { 0.265, 0.690 }, { 0.150, 0.060 } };
     inline constexpr V2 GAMUT_2020[3] = { { 0.708, 0.292 }, { 0.170, 0.797 }, { 0.131, 0.046 } };
+    // DCI-P3 Bradford-adapted to D65 (GAMUT_DCIP3_* in the HLSL).
+    inline constexpr V2 GAMUT_DCIP3[3] = { { 0.680701, 0.318895 }, { 0.281207, 0.674168 }, { 0.148832, 0.057667 } };
 
     inline double PQ_EOTF(double N)
     {
@@ -84,13 +86,15 @@ namespace ShaderLab::Effects::ColorMathCpu
     }
 
     // Primaries for the TargetGamut / SourceGamut enum shared by the ICtCp
-    // effects: 0 = sRGB, 1 = DCI-P3, 2 = BT.2020, 3 = Custom (the given ones).
+    // effects: 0 = sRGB, 1 = Display P3, 2 = BT.2020, 3 = Custom (the given
+    // ones), 4 = DCI-P3 (adapted to D65).
     inline std::array<V2, 3> GamutPrimaries(int gamut, V2 cR, V2 cG, V2 cB)
     {
         const V2* p = GAMUT_709;
         if (gamut == 1) p = GAMUT_P3;
         else if (gamut == 2) p = GAMUT_2020;
         else if (gamut == 3) return { cR, cG, cB };
+        else if (gamut == 4) p = GAMUT_DCIP3;
         return { p[0], p[1], p[2] };
     }
 

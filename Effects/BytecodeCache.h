@@ -82,6 +82,10 @@ namespace ShaderLab::Effects
         // Direct2D pixel shader can take). Part of the cache key, so two
         // modes of the same effect are distinct entries.
         uint32_t    macroBitset;
+        // Option specialisation: 8 bits per specialised parameter, in
+        // optionParamNames order. 0 = read from the cbuffer at run time,
+        // v + 1 = compiled with the option fixed to index v.
+        uint64_t    optionKey{ 0 };
         std::string entryPoint;          // e.g. "main".
         std::string target;              // e.g. "ps_5_0", "cs_5_0".
 
@@ -128,15 +132,33 @@ namespace ShaderLab::Effects
         BytecodeCompileKey      key;
         BytecodeCacheMetadata   metadata;
         std::string             hlslSource;            // canonical UTF-8 (LF line endings).
-        std::vector<std::string> gpuBindableParamNames; // index i -> bit i in macroBitset.
+        std::vector<std::string> gpuBindableParamNames; // index i -> bits [2i, 2i+1] of macroBitset.
+        std::vector<std::string> optionParamNames;      // index i -> bits [8i, 8i+7] of optionKey.
     };
+
+    // Option specialisation limits: an option key holds eight 8-bit slots.
+    inline constexpr size_t   cMaxSpecializedOptions = 8;
+    inline constexpr uint32_t cMaxOptionValues       = 255;
+
+    // The per-parameter slot of an option key: 0 = generic, v + 1 = option v.
+    inline uint32_t OptionKeySlot(uint64_t optionKey, size_t index) noexcept
+    {
+        return index < cMaxSpecializedOptions ? static_cast<uint32_t>((optionKey >> (8u * index)) & 0xFFu) : 0u;
+    }
 
     // Helpers (also exposed so call sites can hash without going through
     // the cache, e.g. to compute a key for `TryGet`).
     SHADERLAB_API uint64_t FNV1a64(const void* data, size_t size);
     SHADERLAB_API uint64_t HashCanonicalSource(std::string_view canonical);
     SHADERLAB_API uint64_t HashParamSignature(const std::vector<std::string>& orderedNames);
-    SHADERLAB_API uint64_t IncludeLibraryHash();  // covers shaderlab_params.hlsli + cache schema.
+    // Hashes the gpu-bindable and specialised option names together.
+    // With no options this equals HashParamSignature(gpuNames).
+    SHADERLAB_API uint64_t HashParamSignature(const std::vector<std::string>& gpuNames,
+                                              const std::vector<std::string>& optionNames);
+    // Covers the three engine headers and the cache schema.
+    SHADERLAB_API uint64_t IncludeLibraryHash();
+    SHADERLAB_API uint64_t IncludeLibraryHashOf(std::string_view paramsText, std::string_view colorMathText,
+                                                std::string_view gamutText);
 
     // Centralized source canonicalization. Every call site that hashes
     // source MUST go through this so a render-time hash matches the
@@ -173,8 +195,13 @@ namespace ShaderLab::Effects
         // Idempotent enqueue. If status is already Pending or Ready,
         // no-op. If status is Failed, no-op (caller must explicitly
         // Invalidate to retry a deterministic failure). Worker thread
-        // picks it up.
-        void RequestCompile(BytecodeCompileRequest request);
+        // picks it up. `urgent` puts it at the front of the queue, ahead
+        // of eager precompiles, and moves an already queued request there.
+        void RequestCompile(BytecodeCompileRequest request, bool urgent = false);
+
+        // Index of a request in the work queue, or nullopt when it is not
+        // queued (not requested, or already taken by a worker).
+        std::optional<size_t> QueuePosition(const BytecodeCompileKey& key) const;
 
         // Synchronous "fetch or compile". Renders should call this:
         //   1. If Ready -> return immediately, fromCache=true.

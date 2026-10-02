@@ -111,7 +111,7 @@ namespace ShaderLab::Rendering
             // render < DispatchSync < shim < client timeout ladder
             // enforceable (see Engine/Mcp/McpTimeouts.h).
             Item item =
-                [prom, fn = std::forward<F>(fn)](bool cancelled) mutable
+                [this, prom, fn = std::forward<F>(fn)](bool cancelled) mutable
                 {
                     if (cancelled)
                     {
@@ -125,8 +125,18 @@ namespace ShaderLab::Rendering
                     }
                     try
                     {
-                        if constexpr (std::is_void_v<R>) { fn(); prom->set_value(); }
-                        else                              prom->set_value(fn());
+                        if constexpr (std::is_void_v<R>)
+                        {
+                            fn();
+                            RunAfterSyncClosure();
+                            prom->set_value();
+                        }
+                        else
+                        {
+                            R result = fn();
+                            RunAfterSyncClosure();
+                            prom->set_value(std::move(result));
+                        }
                     }
                     catch (...)
                     {
@@ -277,7 +287,20 @@ namespace ShaderLab::Rendering
 
         bool IsSynchronous() const { return m_synchronous; }
 
+        // Runs on the consumer thread after each queued DispatchSync closure,
+        // before its caller is released, so the caller observes whatever the
+        // hook publishes. Set it before the consumer starts.
+        void SetAfterSyncClosure(std::function<void()> hook)
+        {
+            m_afterSyncClosure = std::move(hook);
+        }
+
     private:
+        void RunAfterSyncClosure()
+        {
+            if (m_afterSyncClosure) m_afterSyncClosure();
+        }
+
         bool IsConsumerThread() const
         {
             return m_consumerId.load(std::memory_order_acquire) ==
@@ -293,6 +316,7 @@ namespace ShaderLab::Rendering
         std::condition_variable m_cv;
         std::deque<Item> m_queue;
         std::atomic<std::thread::id> m_consumerId{};
+        std::function<void()> m_afterSyncClosure;
         bool m_shuttingDown{ false };
     };
 }

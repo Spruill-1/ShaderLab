@@ -70,6 +70,12 @@ namespace ShaderLab::Mcp
         // Returning void; cannot fail.
         std::function<void()>         renderFrame;
 
+        // Optional: renderFrame that also evaluates nodeId when nothing else
+        // needs it. The GUI evaluates only what the preview and output windows
+        // need, so a readback of any other node would never be ready. Unset:
+        // routes call renderFrame.
+        std::function<void(uint32_t)> renderFrameFor;
+
         // Host-specific "preview node" id for `GET /graph` responses.
         // GUI returns m_previewNodeId; headless returns 0 (no preview pane).
         // Optional — if unset, routes that surface previewNodeId default
@@ -133,6 +139,14 @@ namespace ShaderLab::Mcp
         virtual void OnGraphCleared() {}
         virtual void OnGraphLoaded() {}
         virtual void OnGraphStructureChanged() {}  // edges added/removed
+
+        // The graph's source paths now point into extractDir, the media a
+        // /graph/load-file package was extracted to; empty when the new graph
+        // uses no extracted media (load-file of bare JSON, /graph/load,
+        // /graph/clear). The host owns the directory from here: keep it while
+        // the graph uses it, delete the previous one, and delete it at
+        // shutdown. The default leaves it in the temp folder.
+        virtual void OnGraphMediaDirChanged(const std::wstring& /*extractDir*/) {}
 
         // Custom effect HLSL recompiled: shader bytecode + parameters
         // changed. GUI rebuilds the canvas layout (parameter pins may

@@ -7,6 +7,7 @@
 #include "../Effects/CustomComputeShaderEffect.h"
 #include "../Effects/CustomComputeBridgeEffect.h"
 #include "../Effects/ShaderCompiler.h"
+#include "../Effects/BytecodeCache.h"
 #include "D3D11ComputeRunner.h"
 #include "GpuTimer.h"
 
@@ -66,6 +67,14 @@ namespace ShaderLab::Rendering
         // Reset to false before pass 1 of each frame.
         void SetDeferredComputeFrozen(bool frozen) { m_deferredComputeFrozen = frozen; }
 
+        // Compile shaders on the cache's worker threads instead of the calling
+        // thread (off by default). A node without its baseline shader has no
+        // output, sets EffectNode::compilePending and stays dirty; a missing
+        // variant falls back to the generic shader. The GUI turns it on so a
+        // long compile does not stall its render thread; headless leaves it
+        // off because a one-shot render must wait for the shader anyway.
+        void SetAsyncCompile(bool on) { m_asyncCompile = on; }
+
         // Async CPU readback (GUI live loop only; see
         // Performance::IsAsyncAnalysisReadbackEnabled). Values copied for a
         // node on one frame are collected here on a later one: returns true
@@ -103,6 +112,11 @@ namespace ShaderLab::Rendering
         // Update an existing cached effect's shader bytecode in-place (for recompile).
         // If the effect isn't cached yet, does nothing (next Evaluate will create it).
         void UpdateNodeShader(uint32_t nodeId, const Graph::EffectNode& node);
+
+        // The GUID a shader is loaded into D2D under: the definition's GUID
+        // mixed with the bytecode's identity. D2D ignores LoadPixelShader for
+        // a GUID it already holds, so different bytecode needs a different GUID.
+        static GUID ShaderGuidFor(const GUID& definitionGuid, const std::vector<uint8_t>& bytecode);
 
         // Phase 8c: host hint set for which nodes need their analysis
         // values on the CPU. UI integration: MainWindow updates this
@@ -253,11 +267,14 @@ namespace ShaderLab::Rendering
         winrt::com_ptr<ID2D1Bitmap1> m_analysisDummyBitmap;
         void EnsureAnalysisDummy(ID2D1DeviceContext5* dc);
 
-        // Last lane-3 mode bitset loaded per node. D2D ignores LoadPixelShader
-        // for a GUID it already holds, so switching a parameter between
-        // cbuffer and texture mode needs both a distinct GUID and a forced
-        // reload; this is how the reload is detected.
-        std::unordered_map<uint32_t, uint32_t> m_pixelGpuModeBits;
+        // Identity (IdOfBytecode) of the pixel-shader bytecode last loaded per
+        // node. A different wanted bytecode forces a reload under its own GUID.
+        std::unordered_map<uint32_t, std::array<uint8_t, 16>> m_pixelLoadedVariant;
+        // GPU-binding bits of the variant each consumer last ran (2 bits per
+        // gpu-bindable parameter). A fallback build clears them, and its
+        // bindings then need the CPU readback.
+        std::unordered_map<uint32_t, uint32_t> m_appliedGpuBits;
+        bool IsBindingGpuApplied(const Graph::EffectNode& consumer, const std::wstring& paramName) const;
         GpuTimer* m_gpuTimer{ nullptr };
 
         // Nodes whose output changed during the current Evaluate pass, so a
@@ -473,19 +490,60 @@ namespace ShaderLab::Rendering
         struct VariantKey
         {
             BytecodeId baseline{};
-            uint32_t   bits{ 0 };
+            uint32_t   bits{ 0 };      // GPU-binding modes
+            uint64_t   options{ 0 };   // option key (ShaderVariants.h)
             bool operator<(const VariantKey& o) const
             {
                 if (baseline != o.baseline) return baseline < o.baseline;
-                return bits < o.bits;
+                if (bits != o.bits) return bits < o.bits;
+                return options < o.options;
             }
         };
         std::map<VariantKey, std::shared_ptr<const std::vector<uint8_t>>> m_variantMemo;
-        // Returns the variant bytecode for (def, bits), compiling through the
-        // BytecodeCache only on the first request. nullptr if unavailable.
+        // Returns the variant bytecode for (def, bits, options), compiling
+        // through the BytecodeCache on the first request. nullptr if not
+        // ready; a pending compile's key goes to pendingKey if it is unset.
         std::shared_ptr<const std::vector<uint8_t>> GetVariantBytecode(
-            const Graph::EffectNode& node, const std::wstring& effectId,
-            uint32_t effectVersion, const std::string& target, uint32_t bits);
+            Graph::EffectNode& node, const std::wstring& effectId,
+            uint32_t effectVersion, const std::string& target, uint32_t bits,
+            uint64_t options, bool urgent,
+            std::optional<Effects::BytecodeCompileKey>& pendingKey);
+
+        // The best ready variant for (bits, options), falling back to drop the
+        // options, then the GPU routing. bits and options come back as the
+        // variant chosen; bytes is nullptr for the generic baseline.
+        struct VariantChoice
+        {
+            std::shared_ptr<const std::vector<uint8_t>> bytes;
+            uint32_t bits{ 0 };
+            uint64_t options{ 0 };
+        };
+        VariantChoice SelectVariant(
+            Graph::EffectNode& node, const std::wstring& effectId,
+            uint32_t effectVersion, const std::string& target,
+            uint32_t bits, uint64_t options);
+
+        // Eager compile of every option combination, per node. Records what
+        // they were queued for and their keys, for the status count.
+        struct OptionPrecompile
+        {
+            BytecodeId baseline{};     // identity of the baseline they were queued for
+            uint32_t gpuBits{ 0 };     // GPU-binding shape they were built for
+            std::vector<std::string> optionNames;   // the specialised options at the time
+            std::vector<Effects::BytecodeCompileKey> keys;
+            bool done{ false };
+        };
+        std::unordered_map<uint32_t, OptionPrecompile> m_optionPrecompile;
+        void QueueOptionVariants(Graph::EffectNode& node, const std::string& target, uint32_t gpuBits);
+        uint32_t IntendedGpuBits(const Graph::EffectNode& node, bool pixel) const;
+        // Nodes rendering a fallback while the variant they want compiles.
+        std::unordered_map<uint32_t, Effects::BytecodeCompileKey> m_wantedVariant;
+        // Once per Evaluate: re-dirty nodes whose wanted variant finished,
+        // publish each node's variantsCompiling count and drop state for
+        // nodes no longer in the graph.
+        void PollVariantCompiles(Graph::EffectGraph& graph);
+        // Drops the per-node shader and variant state above.
+        void ForgetVariantState(uint32_t nodeId);
 
         struct ReflectedCbVar
         {
@@ -532,5 +590,6 @@ namespace ShaderLab::Rendering
         };
         std::vector<DeferredCompute> m_deferredCompute;
         bool m_deferredComputeFrozen{ false };
+        bool m_asyncCompile{ false };
     };
 }

@@ -6,7 +6,7 @@
 ShaderLabHeadless --graph PATH --node ID --output IMAGE_PATH [options]
 ```
 
-`--graph` accepts either form of the container: a **`.effectgraph` ZIP** as the GUI's Save writes it (`graph.json` plus optional `media/`), or a **bare graph JSON**. The form is detected from the PKZIP magic rather than the extension, because `.effectgraph` has historically named both. For an archive, embedded media is extracted to a temp directory, each source node's `media://<name>` token is rewritten to the extracted path, and the directory is deleted when the process exits.
+`--graph` accepts either form of the container: a **`.effectgraph` ZIP** as the GUI's Save writes it (`graph.json` plus optional `media/`), or a **bare graph JSON**. The form is detected from the PKZIP magic rather than the extension, because `.effectgraph` has historically named both. For an archive, embedded media is extracted to a temp directory, each source node's `media://<name>` token is rewritten to the extracted path, and the directory is deleted when the process exits. In `--script` and `--mcp-session` modes the same loader backs `POST /graph/load-file` (and `POST /graph/save-file` writes either form), so a script can switch graphs or round-trip a package mid-run; see [Graph files](mcp-server.md#graph-files). A load-file replaces the startup graph's extracted directory, which is deleted then rather than at exit.
 
 ## Modes
 
@@ -108,6 +108,7 @@ Three flags pin it:
 | Flag | Effect |
 |---|---|
 | `--display-profile NAME` | Replace the live profile with a fully-determined preset: `srgb-sdr`, `srgb-270`, `p3-600`, `p3-1000`, `bt2020-1000`, `bt2020-4000`, `adobergb`. An unknown name is a usage error (exit 1) — never a silent fallback to the live display, which would defeat the flag. |
+| `--effects-dir DIR` | Register user effects from every `*.json` saved graph in `DIR` (repeatable). Headless never reads the GUI's `%LOCALAPPDATA%\ShaderLab\effects` folder by itself. Loaded effects are listed as `User effect:` lines and failures as `[ShaderLab] user effect not loaded:` lines, both on stderr. See [User Effects](../effects/user-effects.md). |
 | `--display-sdr-white N` | Override SDR white level (nits) on top of that preset, or on top of the live profile when no preset is named. |
 | `--display-peak-nits N` | Override peak luminance (nits), same layering. Also lowers `MaxFullFrameNits` if it would otherwise exceed the new peak. |
 
@@ -141,7 +142,7 @@ of the session — see the `[1.9.0]` entry in `CHANGELOG.md`.
 
 ## Engine-side reuse
 
-The MCP route registry (`RegisterEngineRoutes`) is what backs every host — the GUI window's session, the headless `--mcp-session`, and the headless `--script` mode all register the same routes. The same closures execute against the same engine state — only the sink's `Dispatch` impl differs between hosts. The GUI sink marshals to the render worker thread via `RenderThreadDispatcher::DispatchSync` (post-P7); the headless sink runs the closure inline since the script runner thread is the only consumer. The headless host overrides none of the eight `IEngineCommandSink` event hooks; without a UI to keep in sync, every hook is a no-op.
+The MCP route registry (`RegisterEngineRoutes`) is what backs every host — the GUI window's session, the headless `--mcp-session`, and the headless `--script` mode all register the same routes. The same closures execute against the same engine state — only the sink's `Dispatch` impl differs between hosts. The GUI sink marshals to the render worker thread via `RenderThreadDispatcher::DispatchSync` (post-P7); the headless sink runs the closure inline since the script runner thread is the only consumer. The headless host overrides none of the eight UI event hooks; without a UI to keep in sync, each is a no-op. It does override `OnGraphMediaDirChanged`, handing a `/graph/load-file` package's extracted directory to the guard that deletes it when the graph is replaced or the process exits.
 
 ## Smoke coverage
 

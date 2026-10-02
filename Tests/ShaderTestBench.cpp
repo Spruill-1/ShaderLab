@@ -1,6 +1,6 @@
 #include "pch_engine.h"
 #include "ShaderTestBench.h"
-#include "Effects/ShaderLabEffects.h"
+#include "Effects/ShaderCompiler.h"
 
 #include <cstdio>
 #include <cstring>
@@ -10,7 +10,7 @@ namespace ShaderLab::Tests
     namespace
     {
         // The fixed shell wrapped around every test body. The user body is
-        // inserted at $BODY$. The color-math HLSL is prepended ahead of this
+        // inserted at $BODY$. The color-math include goes ahead of this
         // shell so the body has access to every helper.
         constexpr const char* kKernelShell = R"HLSL(
 
@@ -40,11 +40,9 @@ $BODY$
 
         std::string AssembleSource(const std::string& body, const std::string& preamble)
         {
-            const auto& colorMath = ShaderLab::Effects::GetColorMathHLSL();
             std::string src;
-            src.reserve(colorMath.size() + preamble.size()
-                + std::strlen(kKernelShell) + body.size() + 32);
-            src.append(colorMath);
+            src.reserve(preamble.size() + std::strlen(kKernelShell) + body.size() + 64);
+            src.append("#include \"shaderlab_colormath.hlsli\"\n");
             src.append(preamble);
             std::string shell = kKernelShell;
             const std::string marker = "$BODY$";
@@ -128,7 +126,7 @@ $BODY$
             | D3DCOMPILE_WARNINGS_ARE_ERRORS
             | D3DCOMPILE_IEEE_STRICTNESS;  // allow isnan/isinf/isfinite
         HRESULT hr = D3DCompile(src.data(), src.size(),
-            "shader_test_bench", nullptr, nullptr,
+            "shader_test_bench", nullptr, ShaderLab::Effects::ShaderLabIncludeHandler(),
             "main", "cs_5_0", flags, 0,
             bytecode.put(), errors.put());
         if (FAILED(hr) || !bytecode)

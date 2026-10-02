@@ -1,6 +1,7 @@
 #include "pch_engine.h"
 #include "ShaderCompiler.h"
 #include "ShaderLabParamsHlsl.h"
+#include "ShaderLabEffects.h"
 #include "../Graph/PropertyValue.h"
 
 #include <cstring>
@@ -9,13 +10,10 @@ namespace ShaderLab::Effects
 {
     namespace
     {
-        // ID3DInclude impl that resolves "shaderlab_params.hlsli" to
-        // the engine-embedded macro library. Any other include name
-        // returns E_FAIL -- ShaderLab effects don't include other
-        // headers (everything is compiled from in-memory strings),
-        // so a failed include is a useful signal that an effect
-        // author tried something the engine doesn't support.
-        struct ShaderLabIncludeHandler : ID3DInclude
+        // Serves the engine's embedded headers by file name. Any other name
+        // fails: shaders compile from in-memory strings, so there is no
+        // directory to search.
+        struct EmbeddedIncludeHandler : ID3DInclude
         {
             HRESULT __stdcall Open(D3D_INCLUDE_TYPE,
                 LPCSTR pFileName, LPCVOID, LPCVOID* ppData, UINT* pBytes) override
@@ -27,17 +25,36 @@ namespace ShaderLab::Effects
                     *pBytes = static_cast<UINT>(GetShaderLabParamsHLSLLength());
                     return S_OK;
                 }
+                if (std::strcmp(pFileName, cColorMathIncludeName) == 0)
+                {
+                    const std::string& colorMath = GetColorMathHLSL();
+                    *ppData = colorMath.data();
+                    *pBytes = static_cast<UINT>(colorMath.size());
+                    return S_OK;
+                }
+                if (std::strcmp(pFileName, cGamutIncludeName) == 0)
+                {
+                    const std::string& gamut = GetGamutHLSL();
+                    *ppData = gamut.data();
+                    *pBytes = static_cast<UINT>(gamut.size());
+                    return S_OK;
+                }
                 return E_FAIL;
             }
 
             HRESULT __stdcall Close(LPCVOID) override
             {
-                // Static buffer; nothing to free.
+                // Static buffers; nothing to free.
                 return S_OK;
             }
         };
 
-        ShaderLabIncludeHandler s_includeHandler;
+        EmbeddedIncludeHandler sIncludeHandler;
+    }
+
+    ID3DInclude* ShaderLabIncludeHandler()
+    {
+        return &sIncludeHandler;
     }
 
     // -----------------------------------------------------------------------
@@ -118,7 +135,7 @@ namespace ShaderLab::Effects
         // We previously added D3DCOMPILE_DEBUG in debug builds for PIX /
         // RenderDoc HLSL source mapping, but the FXC compiler's PDB
         // stream overflows on large shaders -- e.g. ICtCp Gamut Map +
-        // the prepended colorMath library produces a "pdb append
+        // the colorMath library produces a "pdb append
         // failed: debug info byte count too large" internal error.
         // We don't actually rely on PIX HLSL mapping in this codebase
         // (debugging is via the Effect Designer + Pixel Trace tab),
@@ -140,7 +157,7 @@ namespace ShaderLab::Effects
             hlslSource.size(),
             sourceName.c_str(),
             macros.empty() ? nullptr : nativeMacros.data(),
-            &s_includeHandler,
+            &sIncludeHandler,
             entryPoint.c_str(),
             target.c_str(),
             flags,

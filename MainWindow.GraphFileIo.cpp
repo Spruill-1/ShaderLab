@@ -79,71 +79,10 @@ namespace winrt::ShaderLab::implementation
         // dialog. Also used as the bottom-half of the async save.
         try
         {
-            // Collect every source node that points at a real file
-            // on disk (skip media:// tokens carried over from a
-            // previous load when m_embedMedia is off -- those are
-            // already inside someone else's archive). Generate a
-            // unique zip entry name for each file (keep the basename
-            // when possible; suffix with -2 / -3 on collision).
+            // Copy the graph on the render thread, its single writer.
             std::vector<::ShaderLab::Rendering::EffectGraphFile::MediaEntry> media;
-            std::map<uint32_t, std::wstring> rewriteToToken; // nodeId -> media://name
-            if (m_embedMedia)
-            {
-                std::set<std::wstring> usedNames;
-                for (const auto& n : m_graph.Nodes())
-                {
-                    if (n.type != ::ShaderLab::Graph::NodeType::Source) continue;
-                    if (!n.shaderPath.has_value()) continue;
-                    const std::wstring& p = n.shaderPath.value();
-                    if (p.empty()) continue;
-                    if (p.starts_with(L"media://")) continue; // already a token
-
-                    // Verify the file is actually present on disk; skip
-                    // missing files silently rather than failing the whole save.
-                    if (!std::filesystem::exists(p)) continue;
-
-                    std::wstring base = std::filesystem::path(p).filename().wstring();
-                    std::wstring name = base;
-                    int suffix = 2;
-                    while (usedNames.count(name))
-                    {
-                        auto stem = std::filesystem::path(base).stem().wstring();
-                        auto ext = std::filesystem::path(base).extension().wstring();
-                        name = stem + L"-" + std::to_wstring(suffix++) + ext;
-                    }
-                    usedNames.insert(name);
-
-                    ::ShaderLab::Rendering::EffectGraphFile::MediaEntry me;
-                    me.zipEntryName = L"media/" + name;
-                    me.sourcePath = p;
-                    media.push_back(std::move(me));
-                    rewriteToToken[n.id] = L"media://" + name;
-                }
-            }
-
-            // Serialize a *copy* of the graph with the rewritten paths
-            // so the live in-memory graph keeps its filesystem refs --
-            // re-saving from temp media after a load just round-trips
-            // the same temp filesystem path through the same logic.
-            std::wstring jsonText;
-            if (rewriteToToken.empty())
-            {
-                jsonText = std::wstring(m_graph.ToJson());
-            }
-            else
-            {
-                ::ShaderLab::Graph::EffectGraph clone = m_graph;
-                for (auto& n : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(clone.Nodes()))
-                {
-                    auto it = rewriteToToken.find(n.id);
-                    if (it == rewriteToToken.end()) continue;
-                    n.shaderPath = it->second;
-                    auto pit = n.properties.find(L"shaderPath");
-                    if (pit != n.properties.end())
-                        pit->second = it->second;
-                }
-                jsonText = std::wstring(clone.ToJson());
-            }
+            const std::wstring jsonText = ::ShaderLab::Rendering::EffectGraphFile::SerializeForSave(
+                m_renderDispatcher.DispatchSync([this] { return m_graph; }), m_embedMedia, media);
 
             const bool ok = ::ShaderLab::Rendering::EffectGraphFile::Save(
                 m_currentFilePath, jsonText, media);
@@ -215,63 +154,32 @@ namespace winrt::ShaderLab::implementation
         // UI thread via DispatcherQueue so the bar actually animates
         // while miniz is compressing media.
         winrt::apartment_context ui_thread;
-        auto showOp = dialog.ShowAsync();
+        auto showOp = m_compileProgress.ShowDialogAsync(dialog);
         co_await winrt::resume_after(std::chrono::milliseconds(16));
         co_await ui_thread;
 
-        // Build media entries + rewritten JSON exactly like the sync
-        // path, then drive a single synchronous save with a progress
-        // callback that updates the dialog in-place.
+        // Build media entries + rewritten JSON from a copy of the graph
+        // taken on the render thread, then drive a single synchronous save
+        // with a progress callback that updates the dialog in-place.
         std::vector<::ShaderLab::Rendering::EffectGraphFile::MediaEntry> media;
-        std::map<uint32_t, std::wstring> rewriteToToken;
-        if (m_embedMedia)
-        {
-            std::set<std::wstring> usedNames;
-            for (const auto& n : m_graph.Nodes())
-            {
-                if (n.type != ::ShaderLab::Graph::NodeType::Source) continue;
-                if (!n.shaderPath.has_value()) continue;
-                const std::wstring& p = n.shaderPath.value();
-                if (p.empty() || p.starts_with(L"media://")) continue;
-                if (!std::filesystem::exists(p)) continue;
-
-                std::wstring base = std::filesystem::path(p).filename().wstring();
-                std::wstring name = base;
-                int suffix = 2;
-                while (usedNames.count(name))
-                {
-                    auto stem = std::filesystem::path(base).stem().wstring();
-                    auto ext = std::filesystem::path(base).extension().wstring();
-                    name = stem + L"-" + std::to_wstring(suffix++) + ext;
-                }
-                usedNames.insert(name);
-
-                ::ShaderLab::Rendering::EffectGraphFile::MediaEntry me;
-                me.zipEntryName = L"media/" + name;
-                me.sourcePath = p;
-                media.push_back(std::move(me));
-                rewriteToToken[n.id] = L"media://" + name;
-            }
-        }
-
         std::wstring jsonText;
-        if (rewriteToToken.empty())
+        bool serialized = false;
+        try
         {
-            jsonText = std::wstring(m_graph.ToJson());
+            jsonText = ::ShaderLab::Rendering::EffectGraphFile::SerializeForSave(
+                m_renderDispatcher.DispatchSync([this] { return m_graph; }), m_embedMedia, media);
+            serialized = true;
         }
-        else
+        catch (...)
         {
-            ::ShaderLab::Graph::EffectGraph clone = m_graph;
-            for (auto& n : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(clone.Nodes()))
-            {
-                auto it = rewriteToToken.find(n.id);
-                if (it == rewriteToToken.end()) continue;
-                n.shaderPath = it->second;
-                auto pit = n.properties.find(L"shaderPath");
-                if (pit != n.properties.end())
-                    pit->second = it->second;
-            }
-            jsonText = std::wstring(clone.ToJson());
+            // Reported below through the status bar, like a failed write.
+        }
+        if (!serialized)
+        {
+            m_compileProgress.HideDialog(dialog);
+            co_await showOp;
+            PipelineFormatText().Text(L"Error: Failed to save graph");
+            co_return;
         }
 
         // Synchronous progress callback: marshal each update back to
@@ -299,11 +207,12 @@ namespace winrt::ShaderLab::implementation
         // ProgressBar never repaints.
         std::wstring path = m_currentFilePath;
         bool ok = false;
+        ::ShaderLab::Rendering::EffectGraphFile::SaveStats stats;
         co_await winrt::resume_background();
         try
         {
             ok = ::ShaderLab::Rendering::EffectGraphFile::Save(
-                path, jsonText, media, progressCb);
+                path, jsonText, media, progressCb, &stats);
         }
         catch (...)
         {
@@ -311,16 +220,21 @@ namespace winrt::ShaderLab::implementation
         }
         co_await ui_thread;
 
-        dialog.Hide();
+        m_compileProgress.HideDialog(dialog);
         co_await showOp;
 
         if (ok)
         {
             m_unsavedChanges = false;
             RefreshTitleBar();
+            std::wstring detail;
+            if (stats.mediaUnchanged > 0)
+                detail = L" (" + std::to_wstring(stats.mediaUnchanged) +
+                         (stats.mediaUnchanged == 1 ? L" media file unchanged" : L" media files unchanged") +
+                         (stats.inPlace ? L", updated in place)" : L", copied)");
             PipelineFormatText().Text(
                 L"Graph saved: " +
-                winrt::hstring(std::filesystem::path(m_currentFilePath).filename().wstring()));
+                winrt::hstring(std::filesystem::path(m_currentFilePath).filename().wstring() + detail));
         }
         else
         {
@@ -380,13 +294,23 @@ namespace winrt::ShaderLab::implementation
         // there is at least one, ask the user whether to embed the
         // media. The system FileSavePicker doesn't have a hook for
         // extra options, so we ask via a follow-up ContentDialog.
-        bool hasExternalMedia = false;
-        for (const auto& n : m_graph.Nodes())
+        // Collect the paths on the render thread; check the disk here.
+        const auto sourcePaths = m_renderDispatcher.DispatchSync([this]
         {
-            if (n.type == ::ShaderLab::Graph::NodeType::Source &&
-                n.shaderPath.has_value() && !n.shaderPath->empty() &&
-                !n.shaderPath->starts_with(L"media://") &&
-                std::filesystem::exists(*n.shaderPath))
+            std::vector<std::wstring> paths;
+            for (const auto& node : m_graph.Nodes())
+            {
+                if (node.type == ::ShaderLab::Graph::NodeType::Source &&
+                    node.shaderPath.has_value() && !node.shaderPath->empty() &&
+                    !node.shaderPath->starts_with(L"media://"))
+                    paths.push_back(*node.shaderPath);
+            }
+            return paths;
+        });
+        bool hasExternalMedia = false;
+        for (const auto& path : sourcePaths)
+        {
+            if (std::filesystem::exists(path))
             {
                 hasExternalMedia = true;
                 break;
@@ -420,7 +344,7 @@ namespace winrt::ShaderLab::implementation
             dialog.PrimaryButtonText(L"Save");
             dialog.CloseButtonText(L"Cancel");
             dialog.DefaultButton(XC::ContentDialogButton::Primary);
-            auto result = co_await dialog.ShowAsync();
+            auto result = co_await m_compileProgress.ShowDialogAsync(dialog);
             if (result != XC::ContentDialogResult::Primary)
             {
                 m_currentFilePath.clear();
@@ -479,7 +403,7 @@ namespace winrt::ShaderLab::implementation
         // the load on a background thread so miniz inflate doesn't
         // freeze the UI on big media archives.
         winrt::apartment_context ui_thread;
-        auto showOp = dialog.ShowAsync();
+        auto showOp = m_compileProgress.ShowDialogAsync(dialog);
         co_await winrt::resume_after(std::chrono::milliseconds(16));
         co_await ui_thread;
 
@@ -509,7 +433,7 @@ namespace winrt::ShaderLab::implementation
         catch (...)                       { loadError = L"Unknown load failure"; }
         co_await ui_thread;
 
-        dialog.Hide();
+        m_compileProgress.HideDialog(dialog);
         co_await showOp;
 
         if (!loadResult.has_value())
@@ -528,19 +452,7 @@ namespace winrt::ShaderLab::implementation
                 // Rewrite media:// tokens on source nodes to the
                 // extracted temp paths so the live graph can render
                 // them through the existing image / video pipeline.
-                for (auto& n : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(loaded.Nodes()))
-                {
-                    if (n.type != ::ShaderLab::Graph::NodeType::Source) continue;
-                    if (!n.shaderPath.has_value()) continue;
-                    auto it = loadResult->mediaMap.find(*n.shaderPath);
-                    if (it != loadResult->mediaMap.end())
-                    {
-                        n.shaderPath = it->second;
-                        auto pit = n.properties.find(L"shaderPath");
-                        if (pit != n.properties.end())
-                            pit->second = it->second;
-                    }
-                }
+                ::ShaderLab::Rendering::EffectGraphFile::ResolveMediaTokens(loaded, loadResult->mediaMap);
 
                 // On the render thread: we're on the UI thread here, and the
                 // worker is the graph's single writer -- releasing its caches
@@ -587,7 +499,7 @@ namespace winrt::ShaderLab::implementation
             edialog.Title(winrt::box_value(L"Cannot Open Graph"));
             edialog.Content(winrt::box_value(winrt::hstring(versionError)));
             edialog.CloseButtonText(L"OK");
-            co_await edialog.ShowAsync();
+            co_await m_compileProgress.ShowDialogAsync(edialog);
         }
     }
 
@@ -605,7 +517,7 @@ namespace winrt::ShaderLab::implementation
         dialog.SecondaryButtonText(L"Discard");
         dialog.CloseButtonText(L"Cancel");
         dialog.DefaultButton(winrt::Microsoft::UI::Xaml::Controls::ContentDialogButton::Primary);
-        auto result = co_await dialog.ShowAsync();
+        auto result = co_await m_compileProgress.ShowDialogAsync(dialog);
         switch (result)
         {
             case winrt::Microsoft::UI::Xaml::Controls::ContentDialogResult::Primary:   co_return 0; // Save
@@ -727,7 +639,7 @@ namespace winrt::ShaderLab::implementation
         dialog.CloseButtonText(L"Keep");
         dialog.DefaultButton(XC::ContentDialogButton::Primary);
 
-        auto result = co_await dialog.ShowAsync();
+        auto result = co_await m_compileProgress.ShowDialogAsync(dialog);
         if (result != XC::ContentDialogResult::Primary) co_return;
 
         co_await winrt::resume_background();
@@ -903,11 +815,23 @@ namespace winrt::ShaderLab::implementation
         // play/pause button + progress bar; if it runs first the visual
         // ends up sized as a regular parameter node and the controls
         // never appear until something else triggers another layout.
-        ::ShaderLab::Effects::ShaderLabEffects::RestoreRuntimeFlags(m_graph);
-
-        m_nodeGraphController.SetGraph(&m_graph);
-
-        m_graph.MarkAllDirty();
+        auto resetGraph = [this]
+        {
+            ::ShaderLab::Effects::ShaderLabEffects::RestoreRuntimeFlags(m_graph);
+            m_nodeGraphController.SetGraph(&m_graph);
+            m_graph.MarkAllDirty();
+        };
+        // The graph is written on the render thread. The adapter switch calls
+        // this with the worker stopped, when there is no render thread to use.
+        if (m_renderWorker.joinable())
+        {
+            m_renderDispatcher.DispatchSync(resetGraph);
+        }
+        else
+        {
+            resetGraph();
+            PublishGraphSnapshot();
+        }
         PopulatePreviewNodeSelector();
 
         // Reset trace UI.
@@ -922,10 +846,13 @@ namespace winrt::ShaderLab::implementation
         // Reopen output windows for all Output nodes in the loaded graph.
         if (reopenOutputWindows)
         {
-            auto outputIds = m_graph.GetOutputNodeIds();
-            for (uint32_t id : outputIds)
+            if (const auto snapshot = CurrentGraphSnapshot())
             {
-                try { OpenOutputWindow(id); } catch (...) {}
+                for (const auto& node : snapshot->nodes)
+                {
+                    if (node.type != ::ShaderLab::Graph::NodeType::Output) continue;
+                    try { OpenOutputWindow(node.id); } catch (...) {}
+                }
             }
         }
     }

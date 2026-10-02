@@ -96,8 +96,8 @@ ShaderLab/
 │   ├── MathExpression.h / .cpp     # ExprTk-backed expression evaluator (PCH disabled on .cpp)
 │
 ├── Effects/                        # Engine: built-in effect wrappers + custom effect base
-│   ├── ShaderLabEffects.h / .cpp   # 36 ShaderLab effects (versioned) — embedded HLSL
-│   ├── ColorMath.cpp               # Shared HLSL color math library (extracted from ShaderLabEffects)
+│   ├── ShaderLabEffects.h / .cpp   # 37 ShaderLab effects (versioned) — embedded HLSL
+│   ├── ColorMath.cpp               # Shared HLSL color math library, served as shaderlab_colormath.hlsli
 │   ├── ColorMathCpu.h              # CPU port of the ICtCp path, for derived-constant tables (tested against the HLSL)
 │   ├── PropertyMetadata.h          # Effect property metadata for UI generation
 │   ├── ImageLoader.h / .cpp        # WIC HDR/SDR image loading

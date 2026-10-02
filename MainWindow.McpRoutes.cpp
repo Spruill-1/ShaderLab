@@ -313,6 +313,20 @@ namespace winrt::ShaderLab::implementation
                     ctx.d3dDevice = window->m_renderEngine.D3DDevice();
                     ctx.d3dContext = window->m_renderEngine.D3DContext();
                     ctx.renderFrame = [this]() { window->RenderFrameToOffscreen(0.0); };
+                    ctx.renderFrameFor = [this](uint32_t nodeId)
+                    {
+                        window->m_readbackNodeId = nodeId;
+                        try
+                        {
+                            window->RenderFrameToOffscreen(0.0);
+                        }
+                        catch (...)
+                        {
+                            window->m_readbackNodeId = 0;
+                            throw;
+                        }
+                        window->m_readbackNodeId = 0;
+                    };
                     ctx.getPreviewNodeId = [this]() -> uint32_t { return window->m_previewNodeId; };
                     ctx.getPipelineFormatName = [this]() -> std::wstring {
                         return std::wstring(window->m_renderEngine.ActiveFormat().name);
@@ -479,6 +493,32 @@ namespace winrt::ShaderLab::implementation
         w->DispatcherQueue().TryEnqueue([w]{
             RunLayoutOnRenderThread(w->m_renderDispatcher,
                 [w]{ w->m_nodeGraphController.AutoLayout(); });
+        });
+    }
+
+    void MainWindow::GuiEngineCommandSink::OnGraphMediaDirChanged(const std::wstring& extractDir)
+    {
+        // m_extractedMediaDirs and the heartbeat timer belong to the UI thread.
+        // If the queue is shutting down the directory is left for the startup reaper.
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w, extractDir]
+        {
+            const std::wstring previous = w->m_mcpMediaDir;
+            w->m_mcpMediaDir = extractDir;
+            if (!previous.empty() && previous != extractDir)
+            {
+                // A file still open keeps the directory; it is retried at shutdown.
+                std::error_code ec;
+                std::filesystem::remove_all(previous, ec);
+                if (!std::filesystem::exists(previous, ec))
+                    std::erase(w->m_extractedMediaDirs, previous);
+            }
+            if (!extractDir.empty())
+            {
+                w->m_extractedMediaDirs.push_back(extractDir);
+                w->TouchHeartbeats();
+                w->StartHeartbeatTimer();
+            }
         });
     }
 
@@ -1020,7 +1060,7 @@ namespace winrt::ShaderLab::implementation
             // reproducibly access-violated inside d2d1.dll (0xc0000005).
             // Isolated by stages -- unthrottled + sub-rect ON ran clean, and
             // the crash landed exactly on this route's cache teardown.
-            m_graph.MarkAllDirty();
+            m_renderDispatcher.DispatchSync([this] { m_graph.MarkAllDirty(); });
             m_forceRender = true;
             return { 200, std::format(
                 "{{\"subRectInputDemand\":{}}}",
@@ -1381,7 +1421,7 @@ namespace winrt::ShaderLab::implementation
             -> ::ShaderLab::Mcp::Response
         {
             return DispatchSync([&]() -> ::ShaderLab::Mcp::Response {
-                m_nodeGraphController.RebuildLayout();
+                m_renderDispatcher.DispatchSync([this] { m_nodeGraphController.RebuildLayout(); });
                 auto pan = m_nodeGraphController.PanOffset();
                 float zoom = m_nodeGraphController.Zoom();
                 auto b = m_nodeGraphController.ContentBounds();

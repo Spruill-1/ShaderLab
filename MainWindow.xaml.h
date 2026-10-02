@@ -14,6 +14,7 @@
 #include "Controls/NodeGraphController.h"
 #include "Controls/PixelInspectorController.h"
 #include "Controls/PixelTraceController.h"
+#include "Controls/CompileProgressController.h"
 #include "Controls/OutputWindow.h"
 #include "Controls/LogWindow.h"
 #include "Controls/NodeLog.h"
@@ -192,6 +193,8 @@ namespace winrt::ShaderLab::implementation
         // loaded .effectgraph archives. Cleaned up at shutdown so the
         // user's %TEMP% doesn't accumulate stale graph media.
         std::vector<std::wstring> m_extractedMediaDirs;
+        // The one of those an MCP /graph/load-file extracted; deleted when the graph is next replaced.
+        std::wstring m_mcpMediaDir;
 
         // Heartbeat: every HeartbeatIntervalSec we touch a sentinel
         // file inside each extracted dir so a future instance can
@@ -215,6 +218,8 @@ namespace winrt::ShaderLab::implementation
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
         winrt::fire_and_forget AddWindowsGraphicsCaptureSourceAsync();
+        // Loads a source node's content on the render thread with its D2D context.
+        void PrepareSourceOnRenderThread(uint32_t nodeId);
         void OnNodeAdded(uint32_t nodeId);
         void OnPreviewPointerDragged(
             winrt::Windows::Foundation::IInspectable const& sender,
@@ -370,6 +375,7 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Controls::NodeGraphController       m_nodeGraphController;
         ::ShaderLab::Controls::PixelInspectorController  m_pixelInspector;
         ::ShaderLab::Controls::PixelTraceController      m_pixelTrace;
+        ::ShaderLab::Controls::CompileProgressController m_compileProgress;
 
         // Output windows (one per additional Output node).
         std::vector<std::unique_ptr<::ShaderLab::Controls::OutputWindow>> m_outputWindows;
@@ -476,6 +482,7 @@ namespace winrt::ShaderLab::implementation
 
         // Per-node preview.
         uint32_t m_previewNodeId{ 0 };       // Tracks selected node for inline viewport
+        uint32_t m_readbackNodeId{ 0 };      // Render thread: extra root for an MCP readback frame
         std::vector<uint32_t> m_topoOrder;   // cached for [ ] navigation
 
         // Node clipboard for copy/paste.
@@ -547,6 +554,11 @@ namespace winrt::ShaderLab::implementation
         {
             return std::atomic_load(&m_uiGraphSnapshot);
         }
+        // Rebuild and publish the UI snapshot from the live graph. Render
+        // thread only, or the UI thread while the worker is not running.
+        // Also runs after every queued DispatchSync closure, so a UI read
+        // that follows a dispatched write sees that write.
+        void PublishGraphSnapshot();
         // True when any descendant of PropertiesPanel currently has keyboard
         // focus (TextBox cursor, NumberBox edit, dropdown open). Used by the
         // 4 Hz binding-value refresh path to avoid clobbering an in-progress
@@ -667,6 +679,7 @@ namespace winrt::ShaderLab::implementation
             void OnGraphCleared() override;
             void OnGraphLoaded() override;
             void OnGraphStructureChanged() override;
+            void OnGraphMediaDirChanged(const std::wstring& extractDir) override;
             void OnCustomEffectRecompiled(uint32_t nodeId) override;
             void OnDisplayProfileChanged() override;
         };

@@ -25,9 +25,11 @@ Reference for "how does ShaderLab work under the hood".
 
 Reference for the effect catalog and per-effect mechanics.
 
-- [Built-in Effect Catalog](effects/builtin-catalog.md) — the 36 ShaderLab effects (Analysis, Color, Source, Tone Mapping, Parameter).
+- [Built-in Effect Catalog](effects/builtin-catalog.md) — the 37 ShaderLab effects (Analysis, Color, Source, Tone Mapping, Parameter).
+- [User Effects](effects/user-effects.md) — effects registered at runtime from saved-graph files, outside the build.
 - [Effect Versioning System](effects/effect-versioning.md) — how `effectVersion` bumps are detected on graph load.
 - [Effect Designer](effects/effect-designer.md) — the modal window for authoring custom pixel/compute shaders.
+- [Option Variants](effects/option-variants.md) — compile one shader per option of an option parameter, all up front.
 - [Numeric Expression Node (ExprTk)](effects/numeric-expression.md) — single-input math expression parameter node.
 - [Parameter Nodes](effects/parameter-nodes.md) — Float / Integer / Toggle / Gamut Parameter and Clock.
 - [Property Bindings (Data Pins)](effects/property-bindings.md) — wiring analysis fields to downstream parameters.

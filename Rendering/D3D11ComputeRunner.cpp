@@ -2,6 +2,7 @@
 #include "D3D11ComputeRunner.h"
 #include "../Effects/Performance.h"
 #include "../Effects/ShaderLabParamsHlsl.h"
+#include "../Effects/ShaderCompiler.h"
 
 namespace ShaderLab::Rendering
 {
@@ -86,7 +87,7 @@ namespace ShaderLab::Rendering
         winrt::com_ptr<ID3DBlob> blob, errors;
         HRESULT hr = D3DCompile(
             hlslSource.c_str(), hlslSource.size(),
-            "D3D11ComputeEffect", nullptr, nullptr,
+            "D3D11ComputeEffect", nullptr, Effects::ShaderLabIncludeHandler(),
             "main", "cs_5_0",
             D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
             0, blob.put(), errors.put());

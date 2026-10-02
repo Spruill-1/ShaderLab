@@ -3,6 +3,11 @@
 #include "pch_engine.h"
 #include "../EngineExport.h"
 
+namespace ShaderLab::Graph
+{
+	class EffectGraph;
+}
+
 namespace ShaderLab::Rendering
 {
 	// EffectGraphFile -- read/write of the .effectgraph container.
@@ -18,12 +23,18 @@ namespace ShaderLab::Rendering
 	//                   loader can rewrite them to extracted temp
 	//                   paths without ambiguity.
 	//
+	// Entry order: media first, then the media/ folder marker, then
+	// graph.json, so a re-save with unchanged media rewrites only the
+	// tail. Load accepts any order.
+	//
 	// Compression: every entry is run through miniz DEFLATE (ZIP
 	// method 8). Entries where deflate actually saves space keep the
 	// compressed payload; entries where it doesn't (already-compressed
 	// MP4 / PNG / JPEG / JXR, etc.) silently fall back to method 0
 	// (stored) per-entry, so the archive is never bigger than just
-	// concatenating the inputs. Any standard unzip tool can list and
+	// concatenating the inputs. An entry of 8 MB or more is stored
+	// without a full deflate pass when a 1 MB sample from its middle
+	// does not deflate by 2%. Any standard unzip tool can list and
 	// extract the archive.
 
 	class SHADERLAB_API EffectGraphFile
@@ -46,13 +57,29 @@ namespace ShaderLab::Rendering
 		// Return false from the callback to abort.
 		using ProgressCallback = std::function<bool(uint32_t current, uint32_t total, const std::wstring& message)>;
 
+		// What a Save did, for status text and tests.
+		struct SaveStats
+		{
+			uint32_t mediaUnchanged{ 0 }; // copied from the file being overwritten
+			uint32_t mediaWritten{ 0 };   // new or changed, read and written
+			bool     inPlace{ false };    // only the tail of the existing file was rewritten
+			uint64_t bytesWritten{ 0 };
+		};
+
 		// Serialize the given JSON string into a .effectgraph zip at
-		// the given file path. Overwrites if the file exists. Returns
+		// the given file path, replacing any existing file. Returns
 		// true on success; false if the file could not be written.
+		//
+		// Media entries in the existing file with the same name, size and
+		// CRC-32 as the source are reused rather than recompressed. If all
+		// media are reused and already lead the file, only the tail is
+		// rewritten; otherwise a new file is written beside the old one and
+		// swapped in once complete.
 		static bool Save(const std::wstring& path,
 						 const std::wstring& graphJson,
 						 const std::vector<MediaEntry>& media = {},
-						 const ProgressCallback& progress = {});
+						 const ProgressCallback& progress = {},
+						 SaveStats* stats = nullptr);
 
 		// Load result: graph JSON plus a map from "media://<name>"
 		// tokens to the extracted absolute path on disk. Caller is
@@ -64,6 +91,7 @@ namespace ShaderLab::Rendering
 			std::wstring graphJson;
 			std::wstring extractDir;                  // where files were extracted
 			std::map<std::wstring, std::wstring> mediaMap; // "media://<name>" -> abs path
+			bool package{ false };                    // false: the file was bare graph JSON
 		};
 
 		// Load a .effectgraph at path. extractDirRoot is a directory
@@ -73,6 +101,28 @@ namespace ShaderLab::Rendering
 		static std::optional<LoadResult> Load(const std::wstring& path,
 											  const std::wstring& extractDirRoot,
 											  const ProgressCallback& progress = {});
+
+		// Load either form: a package (detected by the PKZIP magic, not the
+		// extension) goes through Load; anything else is read as bare graph
+		// JSON with no media. On failure returns std::nullopt and sets error.
+		static std::optional<LoadResult> LoadAny(const std::wstring& path,
+												 const std::wstring& extractDirRoot,
+												 std::wstring& error,
+												 const ProgressCallback& progress = {});
+
+		// Point every source node whose path is a media:// token at its extracted file.
+		static void ResolveMediaTokens(Graph::EffectGraph& graph,
+									   const std::map<std::wstring, std::wstring>& mediaMap);
+
+		// Serialize a copy of the graph for saving. With embedMedia, source nodes
+		// that point at an existing file are listed in media and their paths are
+		// rewritten to media:// tokens; missing files are skipped.
+		static std::wstring SerializeForSave(Graph::EffectGraph graph, bool embedMedia,
+											 std::vector<MediaEntry>& media);
+
+		// Write bare graph JSON (UTF-8, no BOM) through a temp file renamed into place.
+		static bool SaveJson(const std::wstring& path, const std::wstring& graphJson,
+							 uint64_t* bytesWritten = nullptr);
 	};
 }
 

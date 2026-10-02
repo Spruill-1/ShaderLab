@@ -65,6 +65,17 @@ namespace ShaderLab::Effects
         uint64_t UploadSuccesses() const { return m_uploadSuccesses; }
         uint64_t DecodeCount() const { return m_decodeCount; }
 
+        // Presentation time (seconds) of the frame most recently uploaded, or
+        // -1 before the first upload. Unlike CurrentPosition(), which Seek()
+        // sets immediately, this says which frame the output actually holds.
+        double UploadedFrameTime() const { return m_uploadedFrameTime.load(); }
+        // How long that frame is shown (the sample duration, or 1/fps if the
+        // file gives none); 0 before the first upload.
+        double UploadedFrameDuration() const { return m_uploadedFrameDuration.load(); }
+        // Presentation time of the first frame, which need not be 0 (B-frame
+        // reordering delay). Earlier times show this frame.
+        double FirstFrameTime() const { return m_firstFrameTime; }
+
         // The last target handed to Seek(), or NaN once playback has moved
         // the position since. A caller holding a paused/static Time uses it
         // to tell "already asked for this" from "somewhere else": the frame
@@ -94,7 +105,11 @@ namespace ShaderLab::Effects
         bool DecodeOneFrame(double discardBefore = -1.0);
         bool CreateGPUResources(ID2D1DeviceContext5* dc, ID3D11Device* d3dDevice);
         bool CompileConversionShader(ID3D11Device* d3dDevice);
-        void RunConversionShader(ID3D11DeviceContext* ctx, bool planar = false);
+        // Copy the decoder surface (when given) and convert into the output
+        // texture, submitted as one immediate-context call; see m_convertCtx.
+        // False (with m_lastError set) if nothing was submitted.
+        bool RunConversionShader(bool planar = false, ID3D11Texture2D* decoderTex = nullptr,
+                                 UINT decoderSubresource = 0);
         bool EnsurePlanarTexture(ID3D11Texture2D* decoderTexture);
         static uint16_t FloatToHalf(float f);
 
@@ -109,6 +124,12 @@ namespace ShaderLab::Effects
         // D3D11 GPU conversion resources.
         ID3D11Device* m_d3dDevice{ nullptr };           // Non-owning, from render engine.
         ID3D11DeviceContext* m_d3dContext{ nullptr };    // Non-owning, from render engine.
+        // Deferred context the conversion is recorded on, then submitted with
+        // one ExecuteCommandList. The immediate context is shared with D2D on
+        // other threads, and multithread protection serializes single calls,
+        // not sequences of them. Null if unavailable; then the immediate
+        // context is used directly.
+        winrt::com_ptr<ID3D11DeviceContext> m_convertCtx;
         winrt::com_ptr<ID3D11ComputeShader> m_csP010;
         winrt::com_ptr<ID3D11ComputeShader> m_csNV12;
         winrt::com_ptr<ID3D11ComputeShader> m_csRGB32;
@@ -161,6 +182,13 @@ namespace ShaderLab::Effects
         std::vector<BYTE> m_backBuffer;
         std::vector<BYTE> m_frontBuffer;
         LONG m_lastPitch{ 0 };           // Pitch from last decoded frame.
+        double m_backFrameTime{ -1.0 };  // Timestamp of the frame in the back buffer.
+        double m_frontFrameTime{ -1.0 }; // Timestamp of the frame in the front buffer (m_bufferMutex).
+        std::atomic<double> m_uploadedFrameTime{ -1.0 };
+        double m_backFrameDuration{ 0.0 };
+        double m_frontFrameDuration{ 0.0 };  // m_bufferMutex
+        std::atomic<double> m_uploadedFrameDuration{ 0.0 };
+        double m_firstFrameTime{ 0.0 };
         std::mutex m_bufferMutex;
         std::atomic<bool> m_frameReady{ false };
 
