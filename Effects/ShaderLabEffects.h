@@ -76,6 +76,16 @@ namespace ShaderLab::Effects
             const DerivedConstantWriter& write)>;
         DerivedConstantsFn deriveConstants;
 
+        // Image-output size of a D3D11 compute effect that depends on its
+        // inputs' sizes. `inputSizes` is indexed by pin, {0, 0} for an
+        // unwired pin. Returning {0, 0} falls back to the evaluator's usual
+        // sizing (OutputWidth/OutputHeight, then input 0). A size past the
+        // D3D11 texture limit is refused with a node error.
+        using ImageOutputSizeFn = std::function<D2D1_SIZE_U(
+            const std::map<std::wstring, Graph::PropertyValue>& props,
+            const std::vector<D2D1_SIZE_U>& inputSizes)>;
+        ImageOutputSizeFn deriveImageOutputSize;
+
         // Data-only effects have no visible image output pin. They produce
         // analysis output fields but their image output is internal only.
         bool dataOnly{ false };

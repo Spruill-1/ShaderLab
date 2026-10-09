@@ -105,6 +105,7 @@
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Tests\TestRunner.cpp" />
+    <ClCompile Include="Tests\VideoPlaybackTests.cpp" />
     <ClCompile Include="Tests\ShaderTestBench.cpp" />
     <ClCompile Include="Tests\Math\TransferFunctionTests.cpp" />
     <ClCompile Include="Tests\Math\ColorMatrixTests.cpp" />

@@ -119,6 +119,7 @@ namespace ShaderLab::Rendering
         // Stash bytecode so callers can run D3DReflect for cbuffer layout.
         const auto* src = static_cast<const uint8_t*>(blob->GetBufferPointer());
         m_bytecode.assign(src, src + blob->GetBufferSize());
+        ReflectContracts();
 
         return true;
     }
@@ -359,18 +360,96 @@ void main(uint3 tid : SV_DispatchThreadID)
         m_bytecode = bytecode;
         m_shader = std::move(shader);
         m_compileError.clear();
+        ReflectContracts();
+    }
 
-        // Does this shader opt into the multi-group reduction contract?
+    void D3D11ComputeRunner::ReflectContracts()
+    {
         m_usesScratch = false;
+        m_usesImagePass = false;
+        m_accumulatorStride = 0;
+        m_accumulatorNeedsClear = true;
+        m_groupSize[0] = m_groupSize[1] = m_groupSize[2] = 1;
         winrt::com_ptr<ID3D11ShaderReflection> reflect;
-        if (!m_bytecode.empty() &&
-            SUCCEEDED(D3DReflect(m_bytecode.data(), m_bytecode.size(),
-                IID_ID3D11ShaderReflection, reinterpret_cast<void**>(reflect.put()))) && reflect)
+        if (m_bytecode.empty() ||
+            FAILED(D3DReflect(m_bytecode.data(), m_bytecode.size(),
+                IID_ID3D11ShaderReflection, reinterpret_cast<void**>(reflect.put()))) || !reflect)
+            return;
+
+        reflect->GetThreadGroupSize(&m_groupSize[0], &m_groupSize[1], &m_groupSize[2]);
+
+        // Multi-group reduction contract.
+        D3D11_SHADER_INPUT_BIND_DESC bd{};
+        if (SUCCEEDED(reflect->GetResourceBindingDescByName("_SLScratch", &bd)))
+            m_usesScratch = (bd.BindPoint == 2);
+
+        // Two-pass image contract. For a structured buffer, NumSamples is the stride.
+        D3D11_SHADER_INPUT_BIND_DESC passBind{};
+        D3D11_SHADER_INPUT_BIND_DESC accumulatorBind{};
+        if (SUCCEEDED(reflect->GetResourceBindingDescByName("_SLPassConstants", &passBind)) &&
+            passBind.Type == D3D_SIT_CBUFFER && passBind.BindPoint == Effects::cImagePassConstantsSlot &&
+            SUCCEEDED(reflect->GetResourceBindingDescByName("_SLPixelAccum", &accumulatorBind)) &&
+            accumulatorBind.Type == D3D_SIT_UAV_RWSTRUCTURED &&
+            accumulatorBind.BindPoint == Effects::cImagePassAccumulatorSlot &&
+            accumulatorBind.NumSamples > 0)
         {
-            D3D11_SHADER_INPUT_BIND_DESC bd{};
-            if (SUCCEEDED(reflect->GetResourceBindingDescByName("_SLScratch", &bd)))
-                m_usesScratch = (bd.BindPoint == 2);
+            m_usesImagePass = true;
+            m_accumulatorStride = accumulatorBind.NumSamples;
         }
+    }
+
+    HRESULT D3D11ComputeRunner::EnsureImagePassResources(uint64_t pixelCount)
+    {
+        if (!m_device) return E_NOT_VALID_STATE;
+        if (!m_passConstants[0])
+        {
+            for (UINT pass = 0; pass < 2; ++pass)
+            {
+                const UINT data[4] = { pass, 0, 0, 0 };
+                D3D11_BUFFER_DESC desc{};
+                desc.ByteWidth = sizeof(data);
+                desc.Usage = D3D11_USAGE_IMMUTABLE;
+                desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                D3D11_SUBRESOURCE_DATA init{ data, 0, 0 };
+                const HRESULT hr = m_device->CreateBuffer(&desc, &init, m_passConstants[pass].put());
+                if (FAILED(hr))
+                {
+                    m_passConstants[0] = nullptr;
+                    m_passConstants[1] = nullptr;
+                    return hr;
+                }
+            }
+        }
+
+        const uint64_t bytes = pixelCount * m_accumulatorStride;
+        if (m_accumulatorUAV && m_accumulatorBytes == bytes) return S_OK;
+        m_accumulator = nullptr;
+        m_accumulatorUAV = nullptr;
+        m_accumulatorBytes = 0;
+        if (pixelCount == 0 || bytes > UINT32_MAX) return E_OUTOFMEMORY;
+
+        D3D11_BUFFER_DESC desc{};
+        desc.ByteWidth = static_cast<UINT>(bytes);
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        desc.StructureByteStride = m_accumulatorStride;
+        HRESULT hr = m_device->CreateBuffer(&desc, nullptr, m_accumulator.put());
+        if (FAILED(hr)) return hr;
+
+        D3D11_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_UNKNOWN;
+        view.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        view.Buffer.NumElements = static_cast<UINT>(pixelCount);
+        hr = m_device->CreateUnorderedAccessView(m_accumulator.get(), &view, m_accumulatorUAV.put());
+        if (FAILED(hr))
+        {
+            m_accumulator = nullptr;
+            return hr;
+        }
+        m_accumulatorBytes = bytes;
+        m_accumulatorNeedsClear = true;
+        return S_OK;
     }
 
     bool D3D11ComputeRunner::EnsureScratch()
@@ -453,13 +532,17 @@ void main(uint3 tid : SV_DispatchThreadID)
         Readback readbackMode)
     {
         std::vector<float> result;
+        m_lastDispatchResult = E_FAIL;
         // Record on the private deferred context unless the A/B switch says
         // otherwise (see Performance::IsComputeCommandListEnabled).
         m_context = (m_deferredCtx && Performance::IsComputeCommandListEnabled())
             ? m_deferredCtx : m_immediate;
         m_deferred = (m_context == m_deferredCtx) && m_deferredCtx;
         if (!m_shader || !m_context || inputTextures.empty() || !inputTextures[0])
+        {
+            m_lastDispatchResult = E_NOT_VALID_STATE;
             return result;
+        }
 
         // Auto-inject Width / Height come from input #0 (t0). Multi-input
         // shaders are expected to operate on inputs of the same size --
@@ -473,7 +556,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         // SRV bound.
         uint32_t bufferSlots = (resultCount > 0) ? resultCount : 1;
         EnsureBuffers(bufferSlots);
-        if (!m_resultBuffer || !m_resultUAV || !m_cbuffer) return result;
+        if (!m_resultBuffer || !m_resultUAV || !m_cbuffer) { m_lastDispatchResult = E_OUTOFMEMORY; return result; }
 
         // Create one SRV per input texture, bound at t0..t(N-1) in order.
         std::vector<winrt::com_ptr<ID3D11ShaderResourceView>> inputSrvs;
@@ -482,7 +565,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         inputSrvPtrs.reserve(inputTextures.size());
         for (auto* tex : inputTextures)
         {
-            if (!tex) return result;
+            if (!tex) { m_lastDispatchResult = E_INVALIDARG; return result; }
             D3D11_TEXTURE2D_DESC d{};
             tex->GetDesc(&d);
             winrt::com_ptr<ID3D11ShaderResourceView> srv;
@@ -491,26 +574,38 @@ void main(uint3 tid : SV_DispatchThreadID)
             srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             srvDesc.Texture2D.MipLevels = 1;
             HRESULT hr = m_device->CreateShaderResourceView(tex, &srvDesc, srv.put());
-            if (FAILED(hr)) return result;
+            if (FAILED(hr)) { m_lastDispatchResult = hr; return result; }
             inputSrvPtrs.push_back(srv.get());
             inputSrvs.push_back(std::move(srv));
         }
 
         // Image-output UAV (optional).
         winrt::com_ptr<ID3D11UnorderedAccessView> imageUAV;
+        D3D11_TEXTURE2D_DESC outDesc{};
         if (imageOutputTexture)
         {
-            D3D11_TEXTURE2D_DESC outDesc{};
             imageOutputTexture->GetDesc(&outDesc);
             D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
             uavDesc.Format = outDesc.Format;
             uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
             HRESULT hr = m_device->CreateUnorderedAccessView(imageOutputTexture, &uavDesc, imageUAV.put());
-            if (FAILED(hr)) return result;
+            if (FAILED(hr)) { m_lastDispatchResult = hr; return result; }
             // Clear the image-output UAV so previous-frame contents
             // don't leak through when the shader writes selectively.
             float clearF[4] = { 0, 0, 0, 0 };
             m_context->ClearUnorderedAccessViewFloat(imageUAV.get(), clearF);
+        }
+
+        // The two-pass image contract needs an image to write and its accumulator.
+        if (m_usesImagePass)
+        {
+            if (!imageUAV) { m_lastDispatchResult = E_INVALIDARG; return result; }
+            const HRESULT hr = EnsureImagePassResources(uint64_t{ outDesc.Width } * outDesc.Height);
+            if (FAILED(hr) || !EnsureScratch())
+            {
+                m_lastDispatchResult = FAILED(hr) ? hr : E_OUTOFMEMORY;
+                return result;
+            }
         }
 
         // Pack cbuffer: Width, Height (8 bytes) + user data.
@@ -559,21 +654,50 @@ void main(uint3 tid : SV_DispatchThreadID)
         {
             const UINT zero[4] = { 0, 0, 0, 0 };
             m_context->ClearUnorderedAccessViewUint(m_scratchHeadUAV.get(), zero);
-            if (dispatchX <= 1 && dispatchY <= 1 && dispatchZ <= 1)
+            if (!m_usesImagePass && dispatchX <= 1 && dispatchY <= 1 && dispatchZ <= 1)
                 dispatchX = Effects::kReduceGroups;
         }
 
-        ID3D11UnorderedAccessView* uavs[3] = { m_resultUAV.get(), imageUAV.get(),
-                                               scratch ? m_scratchUAV.get() : nullptr };
-        UINT uavCount = scratch ? 3u : (imageUAV ? 2u : 1u);
+        ID3D11UnorderedAccessView* uavs[4] = { m_resultUAV.get(), imageUAV.get(),
+                                               scratch ? m_scratchUAV.get() : nullptr,
+                                               m_usesImagePass ? m_accumulatorUAV.get() : nullptr };
+        UINT uavCount = m_usesImagePass ? 4u : (scratch ? 3u : (imageUAV ? 2u : 1u));
         m_context->CSSetUnorderedAccessViews(0, uavCount, uavs, nullptr);
         ID3D11Buffer* cbs[] = { m_cbuffer.get() };
         m_context->CSSetConstantBuffers(0, 1, cbs);
 
-        m_context->Dispatch(
-            (std::max)(dispatchX, 1u),
-            (std::max)(dispatchY, 1u),
-            (std::max)(dispatchZ, 1u));
+        if (m_usesImagePass)
+        {
+            // Pass 0 over input 0, pass 1 over the output. D3D11 orders the
+            // two dispatches, so pass 1 sees every pass-0 atomic. Pass 1
+            // leaves the accumulator zeroed, so it is cleared here only when
+            // nothing has run on it yet.
+            if (m_accumulatorNeedsClear)
+            {
+                const UINT zero[4] = { 0, 0, 0, 0 };
+                m_context->ClearUnorderedAccessViewUint(m_accumulatorUAV.get(), zero);
+                m_accumulatorNeedsClear = false;
+            }
+            ID3D11Buffer* passZero[] = { m_passConstants[0].get() };
+            m_context->CSSetConstantBuffers(Effects::cImagePassConstantsSlot, 1, passZero);
+            m_context->Dispatch(
+                (texDesc.Width + m_groupSize[0] - 1) / m_groupSize[0],
+                (texDesc.Height + m_groupSize[1] - 1) / m_groupSize[1], 1);
+            ID3D11Buffer* passOne[] = { m_passConstants[1].get() };
+            m_context->CSSetConstantBuffers(Effects::cImagePassConstantsSlot, 1, passOne);
+            m_context->Dispatch(
+                (outDesc.Width + m_groupSize[0] - 1) / m_groupSize[0],
+                (outDesc.Height + m_groupSize[1] - 1) / m_groupSize[1], 1);
+            ID3D11Buffer* noPass[] = { nullptr };
+            m_context->CSSetConstantBuffers(Effects::cImagePassConstantsSlot, 1, noPass);
+        }
+        else
+        {
+            m_context->Dispatch(
+                (std::max)(dispatchX, 1u),
+                (std::max)(dispatchY, 1u),
+                (std::max)(dispatchZ, 1u));
+        }
 
         // Clear shader state.
         std::vector<ID3D11ShaderResourceView*> nullSrvs(inputSrvPtrs.size(), nullptr);
@@ -583,7 +707,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             ID3D11ShaderResourceView* none[1] = { nullptr };
             m_context->CSSetShaderResources(extraSrvSlots[i], 1, none);
         }
-        ID3D11UnorderedAccessView* nullUAVs[3] = { nullptr, nullptr, nullptr };
+        ID3D11UnorderedAccessView* nullUAVs[4] = { nullptr, nullptr, nullptr, nullptr };
         m_context->CSSetUnorderedAccessViews(0, uavCount, nullUAVs, nullptr);
         m_context->CSSetShader(nullptr, nullptr, 0);
 
@@ -648,6 +772,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         // Phase 8: bump the dispatch counter so downstream
         // IEngineComputeOutput consumers can detect freshness.
         ++m_lastEvaluatedFrame;
+        m_lastDispatchResult = S_OK;
 
         return result;
     }

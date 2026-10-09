@@ -6,6 +6,7 @@
 #include "Rendering/PixelReadback.h"
 #include "Rendering/VideoExport.h"
 #include "Rendering/EffectGraphFile.h"
+#include "Rendering/GpuTimer.h"
 #include "Effects/SourceNodeFactory.h"
 #include "Effects/ColorMathCpu.h"
 #include "Effects/ShaderLabEffects.h"
@@ -18,6 +19,7 @@
 #include "Effects/ShaderLabParamsHlsl.h"
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
+#include "Rendering/FramePacer.h"
 #include "Rendering/RenderThreadDispatcher.h"
 #include "Graph/GraphUiSnapshot.h"
 #include "Engine/Mcp/McpRouter.h"
@@ -54,6 +56,16 @@ namespace ShaderLab::Tests
     void TestMobiusReinhard(ShaderTestBench& bench);
     void TestDeltaE(ShaderTestBench& bench);
     void TestGamut(ShaderTestBench& bench);
+    void TestVideoPlaybackRate(ID2D1DeviceContext5* dc, ID3D11Device* device, ID3D11DeviceContext* context);
+    void TestVideoDecoderSurfacePool(ID3D11Device* device);
+    void TestVideoPlaybackControl(ID2D1DeviceContext5* dc, ID3D11Device* device, ID3D11DeviceContext* context);
+    void TestVideoSeekWhilePlaying(ID2D1DeviceContext5* dc, ID3D11Device* device, ID3D11DeviceContext* context);
+    void TestVideoPastEndShowsBlack(ID2D1DeviceContext5* dc, ID3D11Device* device, ID3D11DeviceContext* context);
+    void TestVideoDownstreamRedraws(ID2D1DeviceContext5* dc, ID3D11Device* device, ID3D11DeviceContext* context);
+    void TestPreviewRenderStats(ID2D1DeviceContext5* dc, ID3D11Device* device);
+    void TestRenderLoopPacing();
+    void TestVideoTickWork(ID2D1DeviceContext5* dc, ID3D11Device* device, ID3D11DeviceContext* context);
+    void TestVideoFrameCost(ID2D1DeviceContext5* dc, ID3D11Device* device, ID3D11DeviceContext* context);
 }
 
 namespace
@@ -293,7 +305,7 @@ namespace
         printf("\n=== Effect Catalog Count (doc drift guard) ===\n");
 
         // Bump this together with the catalog table + the counts listed above.
-        constexpr size_t kExpectedShaderLabEffects = 37;
+        constexpr size_t kExpectedShaderLabEffects = 38;
 
         const auto& all = ShaderLab::Effects::ShaderLabEffects::Instance().All();
         const size_t builtIns = static_cast<size_t>(std::count_if(all.begin(), all.end(),
@@ -507,6 +519,210 @@ namespace
         TEST("ComputeChain2Hop_ReadbackSucceeded", readOk2);
         TEST("ComputeChain2Hop_TracksUpstream", readOk2 && std::fabs(c1 - c2) > 1e-3f);
         TEST("ComputeChain2Hop_NoStaleLag", readOk2 && std::fabs(c1 - c3) < 1e-4f);
+    }
+
+    // A compute node whose inputs come through other compute nodes and through
+    // Direct2D chains must see this frame's inputs on the first rendered frame,
+    // in the exact shape headless renders: Evaluate twice outside the draw
+    // session, ProcessDeferredCompute inside it, then the frozen sweep.
+    std::wstring FindFixture(const wchar_t* name);
+
+    namespace
+    {
+        void RenderOneShot(ShaderLab::Graph::EffectGraph& graph)
+        {
+            g_dc->SetTarget(nullptr);
+            g_evaluator.Evaluate(graph, g_dc.get());
+            if (graph.HasDirtyNodes())
+                g_evaluator.Evaluate(graph, g_dc.get());
+            g_dc->BeginDraw();
+            g_evaluator.ProcessDeferredCompute(graph, g_dc.get());
+            if (graph.HasDirtyNodes())
+            {
+                g_evaluator.SetDeferredComputeFrozen(true);
+                g_evaluator.Evaluate(graph, g_dc.get());
+                g_evaluator.SetDeferredComputeFrozen(false);
+            }
+            g_dc->EndDraw();
+        }
+
+        // A 64x64 FP32 region of a node's output, or empty when unreadable.
+        std::vector<float> ReadRegion(ShaderLab::Graph::EffectGraph& graph, uint32_t nodeId, int32_t x, int32_t y)
+        {
+            auto region = ShaderLab::Rendering::ReadPixelRegion(graph, nodeId, x, y, 64, 64, g_dc.get());
+            if (region.status != ShaderLab::Rendering::ReadPixelRegionStatus::Success ||
+                region.pixels.size() != 64 * 64 * 4)
+                return {};
+            return region.pixels;
+        }
+
+        // Largest difference relative to the value. ReadPixelRegion reads a
+        // Direct2D node through an FP16 intermediate, while a compute node's
+        // pre-render of it is FP32, so a match is within two FP16 roundings.
+        float MaxRelativeDifference(const std::vector<float>& expected, const std::vector<float>& shown)
+        {
+            if (expected.empty() || expected.size() != shown.size()) return INFINITY;
+            float largest = 0.0f;
+            for (size_t i = 0; i < expected.size(); ++i)
+                largest = (std::max)(largest,
+                    std::fabs(expected[i] - shown[i]) / (std::max)(std::fabs(expected[i]), 1.0f / 64.0f));
+            return largest;
+        }
+        constexpr float cHalfPrecision = 1.0f / 512.0f;
+
+        float ColorSum(const std::vector<float>& pixels)
+        {
+            float sum = 0.0f;
+            for (size_t i = 0; i + 3 < pixels.size(); i += 4)
+                sum += pixels[i] + pixels[i + 1] + pixels[i + 2];
+            return sum;
+        }
+    }
+
+    void TestComputeFedByChains()
+    {
+        printf("\n=== Compute node fed by compute and Direct2D chains ===\n");
+        auto& registry = ShaderLab::Effects::ShaderLabEffects::Instance();
+        const auto* sourceDesc    = registry.FindByName(L"Gamut Source");
+        const auto* histogramDesc = registry.FindByName(L"CIE Histogram");
+        const auto* plotDesc      = registry.FindByName(L"CIE Chromaticity Plot");
+        const auto* nitMapDesc    = registry.FindByName(L"Nit Map");
+        const auto* toneMapDesc   = registry.FindByName(L"ICtCp Tone Map (HDR -> SDR)");
+        const auto* sideDesc      = registry.FindByName(L"Side by Side");
+        if (!sourceDesc || !histogramDesc || !plotDesc || !nitMapDesc || !toneMapDesc || !sideDesc)
+        {
+            TEST("ComputeFedByChains_FindDescriptors", false);
+            return;
+        }
+        using ShaderLab::Effects::ShaderLabEffects;
+        constexpr float cSize = 256.0f;
+        constexpr int32_t cProbe = 96;
+
+        // Pins: source -> histogram -> plot; source -> Nit Map;
+        // source -> tone map (compute) -> Nit Map; source. Every tile is
+        // cSize square, so the row is native and each tile is its input at 1:1.
+        {
+            g_evaluator.ReleaseCache();
+            ShaderLab::Graph::EffectGraph g;
+            ShaderLab::Effects::SourceNodeFactory sf;
+            const auto sourceId    = g.AddNode(ShaderLabEffects::CreateNode(*sourceDesc));
+            const auto histogramId = g.AddNode(ShaderLabEffects::CreateNode(*histogramDesc));
+            const auto plotId      = g.AddNode(ShaderLabEffects::CreateNode(*plotDesc));
+            const auto nitMapId    = g.AddNode(ShaderLabEffects::CreateNode(*nitMapDesc));
+            const auto toneMapId   = g.AddNode(ShaderLabEffects::CreateNode(*toneMapDesc));
+            const auto nitMap2Id   = g.AddNode(ShaderLabEffects::CreateNode(*nitMapDesc));
+            const auto sideId      = g.AddNode(ShaderLabEffects::CreateNode(*sideDesc));
+            g.FindNode(sourceId)->properties[L"OutputSize"] = cSize;
+            g.FindNode(sourceId)->properties[L"Luminance"] = 400.0f;
+            g.FindNode(histogramId)->properties[L"OutputSize"] = cSize;
+            g.FindNode(plotId)->properties[L"DiagramSize"] = cSize;
+            g.FindNode(sideId)->properties[L"Layout"] = 0.0f;
+            g.Connect(sourceId, 0, histogramId, 0);
+            g.Connect(histogramId, 0, plotId, 0);
+            g.Connect(sourceId, 0, nitMapId, 0);
+            g.Connect(sourceId, 0, toneMapId, 0);
+            g.Connect(toneMapId, 0, nitMap2Id, 0);
+            g.Connect(plotId, 0, sideId, 0);
+            g.Connect(nitMapId, 0, sideId, 1);
+            g.Connect(nitMap2Id, 0, sideId, 2);
+            g.Connect(sourceId, 0, sideId, 3);
+
+            for (auto& node : const_cast<std::vector<ShaderLab::Graph::EffectNode>&>(g.Nodes()))
+                if (node.type == ShaderLab::Graph::NodeType::Source)
+                    sf.PrepareSourceNode(node, g_dc.get(), 0.0, g_d3dDevice.get(), g_d3dContext.get());
+            RenderOneShot(g);
+
+            const auto* side = g.FindNode(sideId);
+            TEST("ComputeFedByChains_FirstFrameHasOutput", side->cachedOutput != nullptr);
+            TEST("ComputeFedByChains_NoDispatchError", side->runtimeError.empty());
+            if (!side->runtimeError.empty())
+                printf("      runtimeError: %ls\n", side->runtimeError.c_str());
+            TEST("ComputeFedByChains_ConvergesInOneFrame", !g.HasDirtyNodes());
+
+            // The histogram must actually hold counts under the probe, or a
+            // plot without them would match a tile without them.
+            const auto histogram = ReadRegion(g, histogramId, cProbe, cProbe);
+            TEST("ComputeFedByChains_HistogramHasCounts", ColorSum(histogram) > 0.0f);
+
+            const uint32_t sources[] = { plotId, nitMapId, nitMap2Id, sourceId };
+            bool allMatch = true;
+            for (int tile = 0; tile < 4; ++tile)
+            {
+                const auto expected = ReadRegion(g, sources[tile], cProbe, cProbe);
+                const auto shown = ReadRegion(g, sideId, tile * static_cast<int32_t>(cSize) + cProbe, cProbe);
+                const float difference = MaxRelativeDifference(expected, shown);
+                printf("  [info] tile %d: max relative difference %g\n", tile, difference);
+                if (!(difference < cHalfPrecision) || !(ColorSum(expected) > 0.0f))
+                    allMatch = false;
+            }
+            TEST("ComputeFedByChains_EveryTileIsItsInput", allMatch);
+        }
+
+        // The same shape fed by a video, on the frame the video is first shown.
+        const std::wstring videoPath = FindFixture(L"video_index_h264_180p30.mp4");
+        if (videoPath.empty())
+        {
+            printf("  [SKIP] video_index_h264_180p30.mp4 not found -- run Tests\\fixtures\\MakeVideoFixtures.ps1\n");
+            return;
+        }
+        {
+            g_evaluator.ReleaseCache();
+            ShaderLab::Graph::EffectGraph g;
+            ShaderLab::Effects::SourceNodeFactory sf;
+            const auto videoId     = g.AddNode(ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(videoPath));
+            const auto nitMapId    = g.AddNode(ShaderLabEffects::CreateNode(*nitMapDesc));
+            const auto histogramId = g.AddNode(ShaderLabEffects::CreateNode(*histogramDesc));
+            const auto plotId      = g.AddNode(ShaderLabEffects::CreateNode(*plotDesc));
+            const auto sideId      = g.AddNode(ShaderLabEffects::CreateNode(*sideDesc));
+            constexpr float cPlotSize = 128.0f;
+            g.FindNode(histogramId)->properties[L"OutputSize"] = cPlotSize;
+            g.FindNode(plotId)->properties[L"DiagramSize"] = cPlotSize;
+            g.FindNode(sideId)->properties[L"Layout"] = 2.0f;
+            g.Connect(videoId, 0, nitMapId, 0);
+            g.Connect(videoId, 0, histogramId, 0);
+            g.Connect(histogramId, 0, plotId, 0);
+            g.Connect(videoId, 0, sideId, 0);
+            g.Connect(nitMapId, 0, sideId, 1);
+            g.Connect(plotId, 0, sideId, 2);
+
+            // Wait for the first decoded frame, as headless does before rendering.
+            auto& nodes = const_cast<std::vector<ShaderLab::Graph::EffectNode>&>(g.Nodes());
+            auto* videoNode = g.FindNode(videoId);
+            sf.PrepareSourceNode(*videoNode, g_dc.get(), 0.0, g_d3dDevice.get(), g_d3dContext.get());
+            auto* provider = sf.GetVideoProvider(videoId);
+            for (int attempt = 0; provider && attempt < 300 && provider->UploadedFrameTime() < 0.0; ++attempt)
+            {
+                ::Sleep(10);
+                sf.TickAndUploadVideos(nodes, g_dc.get(), 0.0);
+            }
+            if (!provider || provider->UploadedFrameTime() < 0.0)
+            {
+                TEST("ComputeFedByVideo_FrameDecoded", false);
+                return;
+            }
+            sf.PrepareSourceNode(*videoNode, g_dc.get(), 0.0, g_d3dDevice.get(), g_d3dContext.get());
+            RenderOneShot(g);
+
+            const auto* side = g.FindNode(sideId);
+            TEST("ComputeFedByVideo_FirstFrameHasOutput", side->cachedOutput != nullptr && side->runtimeError.empty());
+
+            // Grid of three 320x180 tiles; the 128 px plot sits centred in the third.
+            constexpr int32_t cTileWidth = 320, cTileHeight = 180;
+            constexpr int32_t cPlotLeft = (cTileWidth - 128) / 2, cPlotTop = (cTileHeight - 128) / 2;
+            const float videoDifference = MaxRelativeDifference(ReadRegion(g, videoId, 100, 50),
+                                                                ReadRegion(g, sideId, 100, 50));
+            const float nitMapDifference = MaxRelativeDifference(ReadRegion(g, nitMapId, 100, 50),
+                                                                 ReadRegion(g, sideId, cTileWidth + 100, 50));
+            const float plotDifference = MaxRelativeDifference(ReadRegion(g, plotId, 32, 32),
+                ReadRegion(g, sideId, cPlotLeft + 32, cTileHeight + cPlotTop + 32));
+            printf("  [info] max relative difference: video %g, Nit Map %g, plot %g\n",
+                   videoDifference, nitMapDifference, plotDifference);
+            TEST("ComputeFedByVideo_VideoTileIsVideo", videoDifference < cHalfPrecision &&
+                                                      ColorSum(ReadRegion(g, videoId, 100, 50)) > 0.0f);
+            TEST("ComputeFedByVideo_ChainTileIsChain", nitMapDifference < cHalfPrecision);
+            TEST("ComputeFedByVideo_PlotTileIsPlot", plotDifference < cHalfPrecision &&
+                                                    ColorSum(ReadRegion(g, histogramId, 32, 32)) > 0.0f);
+        }
     }
 
     void TestAnalysisEffects()
@@ -2597,6 +2813,84 @@ void main(uint3 id : SV_DispatchThreadID)
         g_evaluator.ReleaseCache();
     }
 
+    // HighlightP99 is the 99th percentile of the above-white pixels alone:
+    // it must find a small HDR window's highlights that the whole-frame P99
+    // never reaches, match a CPU mirror of the histogram on a full ramp, and
+    // fall back to the clip threshold when nothing is above white.
+    void TestLuminanceHighlightP99()
+    {
+        printf("\n=== Luminance Statistics: HighlightP99 ===\n");
+        g_evaluator.ReleaseCache();
+        auto& registry = ShaderLab::Effects::ShaderLabEffects::Instance();
+        constexpr int cWidth = 256;
+        constexpr int cHeight = 16;
+        constexpr float cClipNits = 280.0f;
+
+        auto measure = [&](const wchar_t* name, const char* body, float& highlightP99, float& p99)
+        {
+            ShaderLab::Effects::SourceNodeFactory sourceFactory;
+            ShaderLab::Graph::EffectGraph graph;
+            const auto pattern = PatternEffect(name, body);
+            const auto patternId = AddPatternSource(graph, sourceFactory, pattern, static_cast<float>(cWidth), static_cast<float>(cHeight));
+            const auto statsId = graph.AddNode(ShaderLab::Effects::ShaderLabEffects::CreateNode(
+                *registry.FindByName(L"Luminance Statistics")));
+            graph.FindNode(statsId)->properties[L"ClipNits"] = cClipNits;
+            graph.Connect(patternId, 0, statsId, 0);
+            graph.MarkAllDirty();
+            RunFrame(graph);
+            graph.MarkAllDirty();
+            RunFrame(graph);
+            highlightP99 = AnalysisField(graph.FindNode(statsId), L"HighlightP99");
+            p99 = AnalysisField(graph.FindNode(statsId), L"P99");
+            g_evaluator.ReleaseCache();
+        };
+        // The shader's bin centre for a value, by the same rule. Adjacent bins
+        // are 7.5% apart, so 0.1% pins the bin and allows for the GPU's pow.
+        auto binCentre = [](float nits)
+        {
+            const float t = (std::log10((std::max)(nits, 1e-4f)) + 2.0f) / 8.0f;
+            const int bin = static_cast<int>((std::min)((std::max)(t, 0.0f), 1.0f) * 255.0f);
+            return std::pow(10.0f, -2.0f + (bin + 0.5f) / 256.0f * 8.0f);
+        };
+        const float clipThreshold = cClipNits * 1.01f;
+
+        // A small HDR window: two columns, 500 and 1500 nits, in an 80-nit frame (0.8%).
+        float windowHighlight = 0.0f, windowP99 = 0.0f;
+        measure(L"Highlight Window Pattern",
+            "    float v = pixel.x < 254.0 ? 1.0 : pixel.x < 255.0 ? 6.25 : 18.75;\n"
+            "    return float4(v, v, v, input.a);\n", windowHighlight, windowP99);
+        printf("  [info] small window: P99 %.1f, HighlightP99 %.1f (expect bin of 1500 = %.1f)\n",
+            windowP99, windowHighlight, binCentre(1500.0f));
+        TEST("LumHighlightP99_WholeFrameP99StaysSdr", windowP99 < cClipNits);
+        TEST("LumHighlightP99_FindsSmallWindow", std::abs(windowHighlight / binCentre(1500.0f) - 1.0f) < 1e-3f);
+
+        // A full ramp: columns 128..255 at 300 + 10 nits per column. 2048
+        // highlight pixels, so 20 may lie above the percentile: the top
+        // column (16) and four of the next, which therefore holds it.
+        float rampHighlight = 0.0f, rampP99 = 0.0f;
+        measure(L"Highlight Ramp Pattern",
+            "    float v = pixel.x < 128.0 ? 1.0 : 3.75 + (pixel.x - 128.0) * 0.125;\n"
+            "    return float4(v, v, v, input.a);\n", rampHighlight, rampP99);
+        std::vector<float> highlights;
+        for (int x = 128; x < cWidth; ++x)
+            for (int y = 0; y < cHeight; ++y)
+                highlights.push_back((300.0f + (x - 128) * 10.0f));
+        std::sort(highlights.begin(), highlights.end());
+        const size_t tail = highlights.size() / 100;
+        const float expected = binCentre(highlights[highlights.size() - 1 - tail]);
+        printf("  [info] ramp: P99 %.1f, HighlightP99 %.1f, CPU mirror %.1f (value %.0f)\n",
+            rampP99, rampHighlight, expected, highlights[highlights.size() - 1 - tail]);
+        TEST("LumHighlightP99_MatchesCpuMirror", std::abs(rampHighlight / expected - 1.0f) < 1e-3f);
+
+        // Nothing above white: the clip threshold itself.
+        float noneHighlight = 0.0f, noneP99 = 0.0f;
+        measure(L"Highlight None Pattern",
+            "    float v = pixel.x < 128.0 ? 1.0 : 3.5;\n"
+            "    return float4(v, v, v, input.a);\n", noneHighlight, noneP99);
+        printf("  [info] no highlights: HighlightP99 %.2f (clip threshold %.2f)\n", noneHighlight, clipThreshold);
+        TEST("LumHighlightP99_NoneIsClipThreshold", std::abs(noneHighlight - clipThreshold) < 1e-2f);
+    }
+
     // Frames wider than 4096 px (a multi-monitor desktop) reach the far
     // columns through custom pixel shaders and compute nodes. An unbounded
     // input still gets a finite default rect, and a compute input past the
@@ -3280,6 +3574,40 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION,
                p3Green[0], p3Green[1], p3Green[2], dciGreen[0], dciGreen[1], dciGreen[2]);
         TEST("GamutClip_P3Green_InsideDisplayP3", approxEq(p3Green, -0.45f, 2.084f, -0.157f));
         TEST("GamutClip_P3Green_ClippedByDciP3", approxEq(dciGreen, -0.30811f, 2.07890f, -0.15624f));
+
+        // A near-black wide-gamut colour (luminance under the near-black
+        // cutoff, a negative red) must still leave inside the target.
+        auto nearBlack = clipOf(-0.004f, 0.00001f, 0.00002f, 0.0f, 480.0f);
+        printf("  [info] near-black wide-gamut through Clip (sRGB): (%.6f, %.6f, %.6f)\n",
+               nearBlack[0], nearBlack[1], nearBlack[2]);
+        TEST("GamutClip_NearBlackClampedIntoTarget",
+             nearBlack[0] >= -1e-6f && nearBlack[1] >= -1e-6f && nearBlack[2] >= -1e-6f);
+
+        // ICtCp Gamut Map has the same near-black early-out.
+        const auto* ictcpDesc = lib.FindByName(L"ICtCp Gamut Map");
+        TEST("GamutClip_IctcpMapExists", ictcpDesc != nullptr);
+        if (ictcpDesc)
+        {
+            g_evaluator.ReleaseCache();
+            ShaderLab::Graph::EffectGraph graph;
+            auto src = graph.AddNode(ShaderLabEffects::CreateNode(*gradDesc));
+            auto map = graph.AddNode(ShaderLabEffects::CreateNode(*ictcpDesc));
+            graph.Connect(src, 0, map, 0);
+            auto* srcNode = graph.FindNode(src);
+            srcNode->properties[L"GradSize"] = 32.0f;
+            srcNode->properties[L"StartR"] = -0.004f; srcNode->properties[L"StartG"] = 0.00001f; srcNode->properties[L"StartB"] = 0.00002f;
+            srcNode->properties[L"EndR"] = -0.004f;   srcNode->properties[L"EndG"] = 0.00001f;   srcNode->properties[L"EndB"] = 0.00002f;
+            graph.FindNode(map)->properties[L"TargetGamut"] = 0.0f;
+            graph.MarkAllDirty();
+            g_dc->SetTarget(nullptr);
+            g_evaluator.Evaluate(graph, g_dc.get());
+            g_evaluator.Evaluate(graph, g_dc.get());
+            auto readback = ShaderLab::Rendering::ReadPixelRegion(graph, map, 8, 8, 1, 1, g_dc.get());
+            g_evaluator.ReleaseCache();
+            const bool read = readback.status == ShaderLab::Rendering::ReadPixelRegionStatus::Success && readback.pixels.size() >= 3;
+            TEST("IctcpMap_NearBlackClampedIntoTarget", read &&
+                 readback.pixels[0] >= -1e-6f && readback.pixels[1] >= -1e-6f && readback.pixels[2] >= -1e-6f);
+        }
     }
 
     // DCI-P3 through the LUT generator, and the Gamut LUT Viewer drawing real
@@ -3890,6 +4218,516 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION,
         // Rotation 180 swaps the two halves.
         graph.FindNode(split)->properties[L"Rotation"] = 180.0f;
         TEST("Split_RotationTurnsTheWedges", sourceAt(180, 80) == 2 && sourceAt(0, 80) == 0);
+        g_evaluator.ReleaseCache();
+    }
+
+    // Side by Side: each whole input in its own tile, read exactly at Native.
+    void TestSideBySide()
+    {
+        printf("\n=== Side by Side: whole inputs in tiles ===\n");
+        using ShaderLab::Effects::ShaderLabEffects;
+        using Float4 = winrt::Windows::Foundation::Numerics::float4;
+        const auto* descriptor = ShaderLabEffects::Instance().FindByName(L"Side by Side");
+        TEST("SideBySide_Registered", descriptor != nullptr && descriptor->deriveImageOutputSize);
+        if (!descriptor || !descriptor->deriveImageOutputSize) return;
+
+        // Output size rule, CPU side.
+        {
+            const auto node = ShaderLabEffects::CreateNode(*descriptor);
+            auto props = node.properties;
+            const D2D1_SIZE_U hd{ 1920, 1080 };
+            const std::vector<D2D1_SIZE_U> fiveInputs{ hd, hd, { 0, 0 }, hd, hd, hd, { 0, 0 }, { 0, 0 } };
+            props[L"Layout"] = 2.0f;
+            props[L"Gap"] = 10.0f;
+            const auto grid = descriptor->deriveImageOutputSize(props, fiveInputs);
+            props[L"Layout"] = 1.0f;
+            const auto column = descriptor->deriveImageOutputSize(props, fiveInputs);
+            props[L"SizeMode"] = 1.0f;
+            const auto fit = descriptor->deriveImageOutputSize(props, fiveInputs);
+            printf("  [info] five 1920x1080, gap 10: grid %ux%u, column %ux%u, fit %ux%u\n",
+                   grid.width, grid.height, column.width, column.height, fit.width, fit.height);
+            TEST("SideBySide_GridSizeFiveIsThreeByTwo", grid.width == 3 * 1920 + 20 && grid.height == 2 * 1080 + 10);
+            TEST("SideBySide_ColumnSizeRule", column.width == 1920 && column.height == 5 * 1080 + 40);
+            TEST("SideBySide_FitSizeIsOutputSize", fit.width == 1920 && fit.height == 1080);
+        }
+
+        // Exact in FP16. Source C is signed, as wide-gamut scRGB is.
+        const auto patternA = PatternEffect(L"Side by Side Pattern A",
+            "    return float4(0.25 + pixel.x / 256.0, pixel.y / 256.0, 0.5, 1.0);\n");
+        const auto patternB = PatternEffect(L"Side by Side Pattern B",
+            "    return float4(1.5, 0.125 + pixel.x / 512.0, pixel.y / 128.0, 1.0);\n");
+        const auto patternC = PatternEffect(L"Side by Side Pattern C",
+            "    return float4(-0.5 - pixel.x / 256.0, 1.25, -0.0625 + pixel.y / 512.0, 1.0);\n");
+        constexpr int cTileWidth = 64;
+        constexpr int cTileHeight = 32;
+
+        g_evaluator.ReleaseCache();
+        ShaderLab::Effects::SourceNodeFactory sourceFactory;
+        ShaderLab::Graph::EffectGraph graph;
+        const uint32_t sources[3] = {
+            AddPatternSource(graph, sourceFactory, patternA, cTileWidth, cTileHeight),
+            AddPatternSource(graph, sourceFactory, patternB, cTileWidth, cTileHeight),
+            AddPatternSource(graph, sourceFactory, patternC, cTileWidth, cTileHeight),
+        };
+        const uint32_t sideBySide = graph.AddNode(ShaderLabEffects::CreateNode(*descriptor));
+        for (uint32_t pin = 0; pin < 3; ++pin)
+            graph.Connect(sources[pin], 0, sideBySide, pin);
+        auto& properties = graph.FindNode(sideBySide)->properties;
+
+        auto render = [&]
+        {
+            graph.MarkAllDirty();
+            RunFrame(graph);
+            graph.MarkAllDirty();
+            RunFrame(graph);
+        };
+        auto pixelAt = [&](uint32_t nodeId, int x, int y) -> std::array<float, 4>
+        {
+            const float nan = std::numeric_limits<float>::quiet_NaN();
+            auto readback = ShaderLab::Rendering::ReadPixelRegion(graph, nodeId, x, y, 1, 1, g_dc.get());
+            if (readback.status != ShaderLab::Rendering::ReadPixelRegionStatus::Success || readback.pixels.size() < 4)
+                return { nan, nan, nan, nan };
+            return { readback.pixels[0], readback.pixels[1], readback.pixels[2], readback.pixels[3] };
+        };
+        auto outputSize = [&]() -> std::pair<int, int>
+        {
+            const auto* node = graph.FindNode(sideBySide);
+            if (!node || !node->cachedOutput) return { 0, 0 };
+            D2D1_RECT_F bounds{};
+            g_dc->GetImageLocalBounds(node->cachedOutput, &bounds);
+            return { static_cast<int>(bounds.right - bounds.left), static_cast<int>(bounds.bottom - bounds.top) };
+        };
+        auto same = [](const std::array<float, 4>& a, const std::array<float, 4>& b, float tolerance)
+        {
+            for (int channel = 0; channel < 4; ++channel)
+                if (!(std::abs(a[channel] - b[channel]) <= tolerance)) return false;
+            return true;
+        };
+        // Corners and centre of `source` against its tile at (left, top).
+        auto tileExact = [&](uint32_t source, int left, int top) -> bool
+        {
+            const int points[5][2] = { { 0, 0 }, { cTileWidth - 1, 0 }, { 0, cTileHeight - 1 },
+                                       { cTileWidth - 1, cTileHeight - 1 }, { cTileWidth / 2, cTileHeight / 2 } };
+            for (const auto& point : points)
+            {
+                const auto want = pixelAt(source, point[0], point[1]);
+                const auto got = pixelAt(sideBySide, left + point[0], top + point[1]);
+                if (std::memcmp(want.data(), got.data(), sizeof(want)) != 0 || std::isnan(want[0]))
+                {
+                    printf("    (debug) tile at %d,%d point %d,%d: got %.6f %.6f %.6f %.6f, source %.6f %.6f %.6f %.6f\n",
+                           left, top, point[0], point[1], got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+                    return false;
+                }
+            }
+            return true;
+        };
+        const std::array<float, 4> black{ 0.0f, 0.0f, 0.0f, 1.0f };
+
+        // Row, no gap.
+        render();
+        auto size = outputSize();
+        printf("  [info] row of three %dx%d: %dx%d, error '%ls'\n", cTileWidth, cTileHeight, size.first, size.second,
+               graph.FindNode(sideBySide)->runtimeError.c_str());
+        TEST("SideBySide_RowSize", size.first == 3 * cTileWidth && size.second == cTileHeight);
+        TEST("SideBySide_RowTilesExact", tileExact(sources[0], 0, 0) && tileExact(sources[1], cTileWidth, 0) &&
+                                         tileExact(sources[2], 2 * cTileWidth, 0));
+        const auto signedPixel = pixelAt(sideBySide, 2 * cTileWidth + 5, 3);
+        TEST("SideBySide_SignedScRgbPreserved", signedPixel[0] < -0.5f && signedPixel[2] < 0.0f);
+
+        // Row with a gap and a background.
+        properties[L"Gap"] = 4.0f;
+        properties[L"Background"] = Float4{ 0.25f, 0.5f, 0.75f, 1.0f };
+        render();
+        size = outputSize();
+        const std::array<float, 4> background{ 0.25f, 0.5f, 0.75f, 1.0f };
+        TEST("SideBySide_GapSize", size.first == 3 * cTileWidth + 8 && size.second == cTileHeight);
+        TEST("SideBySide_GapTilesExact", tileExact(sources[0], 0, 0) && tileExact(sources[1], cTileWidth + 4, 0) &&
+                                         tileExact(sources[2], 2 * cTileWidth + 8, 0));
+        TEST("SideBySide_GapIsBackground", same(pixelAt(sideBySide, cTileWidth, 0), background, 0.0f) &&
+                                           same(pixelAt(sideBySide, cTileWidth + 3, cTileHeight - 1), background, 0.0f) &&
+                                           same(pixelAt(sideBySide, 2 * cTileWidth + 7, 10), background, 0.0f));
+        properties[L"Gap"] = 0.0f;
+        properties[L"Background"] = Float4{ 0.0f, 0.0f, 0.0f, 1.0f };
+
+        // Column.
+        properties[L"Layout"] = 1.0f;
+        render();
+        size = outputSize();
+        TEST("SideBySide_ColumnSize", size.first == cTileWidth && size.second == 3 * cTileHeight);
+        TEST("SideBySide_ColumnTilesExact", tileExact(sources[0], 0, 0) && tileExact(sources[1], 0, cTileHeight) &&
+                                            tileExact(sources[2], 0, 2 * cTileHeight));
+
+        // Grid: three inputs in two columns, the fourth cell empty.
+        properties[L"Layout"] = 2.0f;
+        render();
+        size = outputSize();
+        TEST("SideBySide_GridSize", size.first == 2 * cTileWidth && size.second == 2 * cTileHeight);
+        TEST("SideBySide_GridTilesExact", tileExact(sources[0], 0, 0) && tileExact(sources[1], cTileWidth, 0) &&
+                                          tileExact(sources[2], 0, cTileHeight));
+        TEST("SideBySide_GridEmptyCellIsBackground", same(pixelAt(sideBySide, cTileWidth + 10, cTileHeight + 10), black, 0.0f));
+        properties[L"Layout"] = 0.0f;
+
+        // Unconnected middle pin: two tiles, the third input next to the first.
+        graph.Disconnect(sources[1], 0, sideBySide, 1);
+        render();
+        size = outputSize();
+        const float inputMask = std::get<float>(graph.FindNode(sideBySide)->properties[L"InputMask"]);
+        TEST("SideBySide_GapPinSkipped", size.first == 2 * cTileWidth && size.second == cTileHeight &&
+                                         inputMask == 5.0f && tileExact(sources[2], cTileWidth, 0));
+        graph.Connect(sources[1], 0, sideBySide, 1);
+
+        // Fit, enlarging: 192x32 into 384x128 is a scale of 2, letterboxed by
+        // 32 rows top and bottom. A linear gradient is exact under bilinear.
+        properties[L"SizeMode"] = 1.0f;
+        properties[L"OutputWidth"] = 384.0f;
+        properties[L"OutputHeight"] = 128.0f;
+        render();
+        size = outputSize();
+        TEST("SideBySide_FitOutputSize", size.first == 384 && size.second == 128);
+        {
+            // Output (41, 53) is arrangement (20.75, 10.75): texel position 20.25, 10.25 in A.
+            const std::array<float, 4> wantA{ 0.25f + 20.25f / 256.0f, 10.25f / 256.0f, 0.5f, 1.0f };
+            // Output (161, 53) is arrangement (80.75, 10.75): B at 16.25, 10.25.
+            const std::array<float, 4> wantB{ 1.5f, 0.125f + 16.25f / 512.0f, 10.25f / 128.0f, 1.0f };
+            const auto gotA = pixelAt(sideBySide, 41, 53);
+            const auto gotB = pixelAt(sideBySide, 161, 53);
+            printf("  [info] fit x2: A %.6f %.6f (want %.6f %.6f), B %.6f %.6f (want %.6f %.6f)\n",
+                   gotA[0], gotA[1], wantA[0], wantA[1], gotB[1], gotB[2], wantB[1], wantB[2]);
+            TEST("SideBySide_FitEnlargeBilinear", same(gotA, wantA, 1e-4f) && same(gotB, wantB, 1e-4f));
+            TEST("SideBySide_FitLetterbox", same(pixelAt(sideBySide, 100, 10), black, 0.0f) &&
+                                            same(pixelAt(sideBySide, 100, 120), black, 0.0f) &&
+                                            !same(pixelAt(sideBySide, 100, 33), black, 0.0f));
+        }
+
+        // Fit, reducing: 192x32 into 96x16, half size. Each output pixel is
+        // the mean of a 2x2 block.
+        properties[L"OutputWidth"] = 96.0f;
+        properties[L"OutputHeight"] = 16.0f;
+        render();
+        {
+            // Output (10, 5) covers A's texels 20-21, 10-11.
+            const std::array<float, 4> want{ 0.25f + 20.5f / 256.0f, 10.5f / 256.0f, 0.5f, 1.0f };
+            const auto got = pixelAt(sideBySide, 10, 5);
+            printf("  [info] fit x0.5: %.6f %.6f (want %.6f %.6f)\n", got[0], got[1], want[0], want[1]);
+            TEST("SideBySide_FitReduceAveragesFootprint", same(got, want, 1e-4f));
+        }
+        properties[L"SizeMode"] = 0.0f;
+
+        // Mixed sizes: a smaller input centred unscaled, a larger one scaled
+        // down to fit, both inside tiles the size of input 0.
+        const auto patternWide = PatternEffect(L"Side by Side Pattern Wide",
+            "    return float4(pixel.x / 256.0, 0.75, pixel.y / 64.0, 1.0);\n");
+        const uint32_t smallSource = AddPatternSource(graph, sourceFactory, patternC, 32, 16);
+        const uint32_t wideSource = AddPatternSource(graph, sourceFactory, patternWide, 128, 32);
+        graph.Connect(smallSource, 0, sideBySide, 1);
+        graph.Connect(wideSource, 0, sideBySide, 2);
+        render();
+        size = outputSize();
+        TEST("SideBySide_MixedSizesKeepTileOfInput0", size.first == 3 * cTileWidth && size.second == cTileHeight);
+        {
+            // The 32x16 input sits at (16, 8) in tile 1.
+            const bool smallPlaced =
+                std::memcmp(pixelAt(smallSource, 0, 0).data(), pixelAt(sideBySide, cTileWidth + 16, 8).data(), 16) == 0 &&
+                std::memcmp(pixelAt(smallSource, 31, 15).data(), pixelAt(sideBySide, cTileWidth + 47, 23).data(), 16) == 0;
+            const bool smallSurround =
+                same(pixelAt(sideBySide, cTileWidth + 15, 8), black, 0.0f) &&
+                same(pixelAt(sideBySide, cTileWidth + 48, 23), black, 0.0f) &&
+                same(pixelAt(sideBySide, cTileWidth + 20, 7), black, 0.0f);
+            TEST("SideBySide_SmallerInputCentredUnscaled", smallPlaced && smallSurround);
+
+            // The 128x32 input is halved to 64x16 at (0, 8) in tile 2; output
+            // (2*64 + 10, 8 + 3) is the mean of its texels 20-21, 6-7.
+            const std::array<float, 4> want{ 20.5f / 256.0f, 0.75f, 6.5f / 64.0f, 1.0f };
+            const auto got = pixelAt(sideBySide, 2 * cTileWidth + 10, 11);
+            printf("  [info] larger input halved: %.6f %.6f %.6f (want %.6f %.6f %.6f)\n",
+                   got[0], got[1], got[2], want[0], want[1], want[2]);
+            TEST("SideBySide_LargerInputScaledToFit", same(got, want, 1e-4f) &&
+                                                      same(pixelAt(sideBySide, 2 * cTileWidth + 10, 7), black, 0.0f) &&
+                                                      same(pixelAt(sideBySide, 2 * cTileWidth + 10, 24), black, 0.0f));
+        }
+
+        // An output past the D3D11 texture limit is refused, not truncated.
+        {
+            g_evaluator.ReleaseCache();
+            ShaderLab::Graph::EffectGraph bigGraph;
+            ShaderLab::Effects::SourceNodeFactory bigFactory;
+            const uint32_t left = AddPatternSource(bigGraph, bigFactory, patternA, 9000, 8);
+            const uint32_t right = AddPatternSource(bigGraph, bigFactory, patternB, 9000, 8);
+            const uint32_t big = bigGraph.AddNode(ShaderLabEffects::CreateNode(*descriptor));
+            bigGraph.Connect(left, 0, big, 0);
+            bigGraph.Connect(right, 0, big, 1);
+            bigGraph.MarkAllDirty();
+            RunFrame(bigGraph);
+            bigGraph.MarkAllDirty();
+            RunFrame(bigGraph);
+            const auto& error = bigGraph.FindNode(big)->runtimeError;
+            printf("  [info] 2 x 9000 wide: '%ls'\n", error.c_str());
+            TEST("SideBySide_OversizeOutputRefused", error.find(L"18000x8") != std::wstring::npos &&
+                                                     error.find(L"16384") != std::wstring::npos);
+        }
+
+        // Reducing a 3840x2160 input into a 1024x1024 tile (16 bilinear taps
+        // per output pixel) costs about what copying it 1:1 does, measured as
+        // the node's own GPU time.
+        if (!g_useWarp)
+        {
+            constexpr int cRuns = 7;
+            constexpr double cMaxReduceToCopyRatio = 4.0;
+            ShaderLab::Rendering::GpuTimer timer;
+            timer.Initialize(g_d3dDevice.get());
+            timer.SetEnabled(true);
+            auto medianNodeMs = [&](bool reduce)
+            {
+                g_evaluator.ReleaseCache();
+                ShaderLab::Graph::EffectGraph costGraph;
+                ShaderLab::Effects::SourceNodeFactory costFactory;
+                const uint32_t large = AddPatternSource(costGraph, costFactory, patternA, 3840, 2160);
+                const uint32_t node = costGraph.AddNode(ShaderLabEffects::CreateNode(*descriptor));
+                if (reduce)
+                {
+                    const uint32_t tile = AddPatternSource(costGraph, costFactory, patternB, 1024, 1024);
+                    costGraph.Connect(tile, 0, node, 0);
+                    costGraph.Connect(large, 0, node, 1);
+                }
+                else
+                {
+                    costGraph.Connect(large, 0, node, 0);
+                }
+                g_evaluator.SetGpuTimer(&timer);
+                std::vector<double> samples;
+                for (int run = 0; run < cRuns + 2; ++run)
+                {
+                    costGraph.MarkAllDirty();
+                    timer.BeginFrame();
+                    RunFrame(costGraph);
+                    timer.EndFrame();
+                    if (timer.CollectBlocking() && run >= 2 && timer.NodeMs(node) > 0.0)
+                        samples.push_back(timer.NodeMs(node));
+                }
+                g_evaluator.SetGpuTimer(nullptr);
+                std::sort(samples.begin(), samples.end());
+                return samples.empty() ? -1.0 : samples[samples.size() / 2];
+            };
+            const double reduceMs = medianNodeMs(true);
+            const double copyMs = medianNodeMs(false);
+            printf("  [info] node GPU time: 4K reduced into a 1024 tile %.2f ms, 4K copied 1:1 %.2f ms\n", reduceMs, copyMs);
+            TEST("SideBySide_CostMeasured", reduceMs > 0.0 && copyMs > 0.0);
+            ShaderLab::Tests::TIMING_TEST("SideBySide_ReduceCostNearCopy", reduceMs > 0.0 && copyMs > 0.0 &&
+                                                                           reduceMs < cMaxReduceToCopyRatio * copyMs);
+        }
+        g_evaluator.ReleaseCache();
+    }
+
+    // CIE Histogram: one bin per output pixel, counted exactly against a CPU
+    // histogram of the same source pixels.
+    void TestCieHistogram()
+    {
+        printf("\n=== CIE Histogram: bins at the output resolution ===\n");
+        using ShaderLab::Effects::ShaderLabEffects;
+        const auto* descriptor = ShaderLabEffects::Instance().FindByName(L"CIE Histogram");
+        TEST("CieHist_Registered", descriptor != nullptr);
+        if (!descriptor) return;
+
+        // The shader opts into the two-pass image contract.
+        {
+            ShaderLab::Rendering::D3D11ComputeRunner runner;
+            runner.Initialize(g_d3dDevice.get());
+            const bool compiled = runner.CompileShader(descriptor->hlslSource);
+            if (!compiled) printf("    (debug) compile: %ls\n", runner.GetCompileError().c_str());
+            TEST("CieHist_UsesImagePass", compiled && runner.UsesImagePass());
+        }
+
+        // Solid patches (one Rec.709 red, one green, one signed wide-gamut),
+        // a gradient, a black row (no chromaticity) and transparent rows.
+        const auto pattern = PatternEffect(L"CIE Histogram Test Pattern",
+            "    if (pixel.y >= 56.0) return float4(0.3, 0.3, 0.3, 0.0);\n"
+            "    if (pixel.y < 1.0) return float4(0.0, 0.0, 0.0, 1.0);\n"
+            "    if (pixel.x < 24.0) return float4(1.0, 0.0, 0.0, 1.0);\n"
+            "    if (pixel.x < 48.0) return float4(0.0, 0.5, 0.0, 1.0);\n"
+            "    if (pixel.x < 72.0) return float4(-0.5, 1.25, -0.0625, 1.0);\n"
+            "    return float4(0.1 + (pixel.x - 72.0) / 64.0, 0.2 + pixel.y / 256.0, 0.6, 1.0);\n");
+        const auto emptyPattern = PatternEffect(L"CIE Histogram Empty Pattern",
+            "    return float4(1.0, 0.0, 0.0, 0.0);\n");
+        constexpr int cWidth = 96;
+        constexpr int cHeight = 64;
+
+        g_evaluator.ReleaseCache();
+        ShaderLab::Effects::SourceNodeFactory sourceFactory;
+        ShaderLab::Graph::EffectGraph graph;
+        const uint32_t source = AddPatternSource(graph, sourceFactory, pattern, cWidth, cHeight);
+        const uint32_t histogram = graph.AddNode(ShaderLabEffects::CreateNode(*descriptor));
+        graph.Connect(source, 0, histogram, 0);
+
+        auto render = [&]
+        {
+            graph.MarkAllDirty();
+            RunFrame(graph);
+            graph.MarkAllDirty();
+            RunFrame(graph);
+        };
+        auto readAll = [&](uint32_t nodeId, int width, int height) -> std::vector<float>
+        {
+            auto readback = ShaderLab::Rendering::ReadPixelRegion(graph, nodeId, 0, 0, width, height, g_dc.get());
+            if (readback.status != ShaderLab::Rendering::ReadPixelRegionStatus::Success ||
+                readback.actualWidth != static_cast<uint32_t>(width) || readback.actualHeight != static_cast<uint32_t>(height))
+                return {};
+            return std::move(readback.pixels);
+        };
+
+        render();
+        const std::vector<float> sourcePixels = readAll(source, cWidth, cHeight);
+        TEST("CieHist_SourceReadback", sourcePixels.size() == size_t{ cWidth } * cHeight * 4);
+        if (sourcePixels.empty()) return;
+
+        // The shader's mapping, in double. A pixel within float32 error of a
+        // bin edge may land on either side, so its bin is excluded from the
+        // exact comparison (none are expected for this pattern).
+        struct Reference
+        {
+            std::vector<uint32_t> counts;
+            std::vector<double> nitSums;
+            std::vector<bool> ambiguous;
+            uint64_t total = 0;
+            int ambiguousPixels = 0;
+        };
+        auto reference = [&](int binsPerSide) -> Reference
+        {
+            Reference result;
+            const size_t binCount = size_t(binsPerSide) * binsPerSide;
+            result.counts.assign(binCount, 0);
+            result.nitSums.assign(binCount, 0.0);
+            result.ambiguous.assign(binCount, false);
+            for (size_t i = 0; i < size_t{ cWidth } * cHeight; ++i)
+            {
+                const float* rgba = &sourcePixels[i * 4];
+                if (rgba[3] < 0.01f) continue;
+                const double x = 0.4123908 * rgba[0] + 0.3575843 * rgba[1] + 0.1804808 * rgba[2];
+                const double y = 0.2126390 * rgba[0] + 0.7151687 * rgba[1] + 0.0721923 * rgba[2];
+                const double z = 0.0193308 * rgba[0] + 0.1191950 * rgba[1] + 0.9505322 * rgba[2];
+                const double sum = x + y + z;
+                if (sum < 1e-7) continue;
+                const double u = (x / sum - 0.3127) + 0.5;
+                const double v = 0.5 - (y / sum - 0.3290);
+                if (u < 0.0 || u >= 1.0 || v < 0.0 || v >= 1.0) continue;
+                const double binU = u * binsPerSide;
+                const double binV = v * binsPerSide;
+                const int binX = (std::min)(static_cast<int>(binU), binsPerSide - 1);
+                const int binY = (std::min)(static_cast<int>(binV), binsPerSide - 1);
+                const size_t bin = size_t(binY) * binsPerSide + binX;
+                ++result.counts[bin];
+                result.nitSums[bin] += y * 80.0;
+                ++result.total;
+                const double edgeTolerance = binsPerSide * 2e-6;
+                if (std::abs(binU - std::round(binU)) < edgeTolerance || std::abs(binV - std::round(binV)) < edgeTolerance)
+                {
+                    result.ambiguous[bin] = true;
+                    ++result.ambiguousPixels;
+                }
+            }
+            return result;
+        };
+
+        // Compares the histogram at `outputSize` with blocks of `blockSide`
+        // output pixels per bin against the reference at the coarse grid.
+        auto check = [&](int outputSize, int blockSide, const char* label)
+        {
+            auto* settings = graph.FindNode(histogram);
+            settings->properties[L"OutputSize"] = static_cast<uint32_t>(outputSize);
+            settings->properties[L"BinSize"] = static_cast<float>(blockSide - 1);
+            render();
+            // A second frame must not add to the first one's bins.
+            render();
+            const auto* node = graph.FindNode(histogram);
+            const std::vector<float> output = readAll(histogram, outputSize, outputSize);
+            const int binsPerSide = (outputSize + blockSide - 1) / blockSide;
+            const Reference expected = reference(binsPerSide);
+            const auto maxBin = std::max_element(expected.counts.begin(), expected.counts.end());
+            const uint32_t maxCount = *maxBin;
+            const double logMax = std::log2(double(maxCount) + 1.0);
+            auto texelAt = [&](int x, int y) { return &output[(size_t(y) * outputSize + x) * 4]; };
+
+            int countMismatches = 0;
+            int occupancyMismatches = 0;
+            int unevenBlocks = 0;
+            uint64_t gpuTotal = 0;
+            float maxR = 0.0f;
+            double maxLumError = 0.0;
+            bool finite = !output.empty();
+            for (size_t bin = 0; bin < expected.counts.size() && !output.empty(); ++bin)
+            {
+                // Every pixel of the bin's block, clipped at the image edge,
+                // must hold the block's first pixel.
+                const int left = int(bin % binsPerSide) * blockSide;
+                const int top = int(bin / binsPerSide) * blockSide;
+                const float* texel = texelAt(left, top);
+                bool flat = true;
+                for (int y = top; y < (std::min)(top + blockSide, outputSize); ++y)
+                    for (int x = left; x < (std::min)(left + blockSide, outputSize); ++x)
+                        flat = flat && std::memcmp(texelAt(x, y), texel, 4 * sizeof(float)) == 0;
+                if (!flat) ++unevenBlocks;
+
+                for (int channel = 0; channel < 4; ++channel)
+                    finite = finite && std::isfinite(texel[channel]);
+                maxR = (std::max)(maxR, texel[0]);
+                const bool hit = texel[3] > 0.5f;
+                const uint32_t count = hit
+                    ? static_cast<uint32_t>(std::llround(std::exp2(double(texel[0]) * logMax) - 1.0)) : 0;
+                gpuTotal += count;
+                if (hit != (expected.counts[bin] > 0)) ++occupancyMismatches;
+                if (expected.ambiguous[bin]) continue;
+                if (count != expected.counts[bin]) ++countMismatches;
+                if (expected.counts[bin] > 0)
+                {
+                    const double expectedLum = expected.nitSums[bin] / expected.counts[bin] / 10000.0;
+                    maxLumError = (std::max)(maxLumError, std::abs(double(texel[1]) - expectedLum));
+                }
+            }
+            const size_t maxIndex = size_t(maxBin - expected.counts.begin());
+            const float rAtMax = output.empty() ? 0.0f
+                : texelAt(int(maxIndex % binsPerSide) * blockSide, int(maxIndex / binsPerSide) * blockSide)[0];
+            printf("  [info] %d px, %dx%d blocks, %d bins/side: %llu px counted (CPU %llu), max count %u, ambiguous px %d, "
+                   "count mismatches %d, occupancy mismatches %d, uneven blocks %d, max R %.7f (at CPU max %.7f), "
+                   "max |dG| %.2e, error '%ls'\n",
+                   outputSize, blockSide, blockSide, binsPerSide,
+                   static_cast<unsigned long long>(gpuTotal), static_cast<unsigned long long>(expected.total),
+                   maxCount, expected.ambiguousPixels, countMismatches, occupancyMismatches, unevenBlocks, maxR, rAtMax,
+                   maxLumError, node ? node->runtimeError.c_str() : L"(no node)");
+            const std::string prefix = std::string("CieHist_") + label;
+            TEST((prefix + "_ReadbackFinite").c_str(), finite);
+            TEST((prefix + "_ExactCounts").c_str(), finite && countMismatches == 0 && occupancyMismatches == 0 &&
+                                                    gpuTotal == expected.total && expected.total > 0);
+            TEST((prefix + "_BlocksFlat").c_str(), finite && unevenBlocks == 0);
+            TEST((prefix + "_MaxBinIsOne").c_str(), std::abs(maxR - 1.0f) < 1e-6f && std::abs(rAtMax - 1.0f) < 1e-6f);
+            TEST((prefix + "_AverageLuminance").c_str(), finite && maxLumError < 1e-6);
+        };
+        check(64, 1, "64");
+        check(256, 1, "256");
+        // 64 / 3 and 256 / 10 leave a partial last row and column of blocks.
+        check(64, 3, "64Bin3");
+        check(64, 10, "64Bin10");
+        check(256, 10, "256Bin10");
+        check(64, 1, "64Again");
+
+        // A fully transparent source: every bin empty, nothing undefined.
+        {
+            g_evaluator.ReleaseCache();
+            ShaderLab::Effects::SourceNodeFactory emptyFactory;
+            ShaderLab::Graph::EffectGraph emptyGraph;
+            const uint32_t emptySource = AddPatternSource(emptyGraph, emptyFactory, emptyPattern, cWidth, cHeight);
+            const uint32_t emptyHistogram = emptyGraph.AddNode(ShaderLabEffects::CreateNode(*descriptor));
+            emptyGraph.Connect(emptySource, 0, emptyHistogram, 0);
+            emptyGraph.FindNode(emptyHistogram)->properties[L"OutputSize"] = 64u;
+            emptyGraph.MarkAllDirty();
+            RunFrame(emptyGraph);
+            emptyGraph.MarkAllDirty();
+            RunFrame(emptyGraph);
+            auto readback = ShaderLab::Rendering::ReadPixelRegion(emptyGraph, emptyHistogram, 0, 0, 64, 64, g_dc.get());
+            bool allZero = readback.status == ShaderLab::Rendering::ReadPixelRegionStatus::Success &&
+                           readback.pixels.size() == size_t{ 64 } * 64 * 4;
+            for (float value : readback.pixels)
+                allZero = allZero && value == 0.0f;
+            TEST("CieHist_EmptyInputAllZero", allZero);
+        }
         g_evaluator.ReleaseCache();
     }
 
@@ -4918,6 +5756,128 @@ float4 main(float4 pos : SV_POSITION, float4 scene : SCENE_POSITION, float4 uv0 
         std::atomic<std::shared_ptr<const ShaderLab::Graph::GraphUiSnapshot>> latest{ snap };
         auto loaded = latest.load();
         TEST("atomic<shared_ptr> publication round-trips", loaded == snap);
+    }
+
+    void TestFramePacer()
+    {
+        printf("\n=== FramePacer + RenderThreadDispatcher::WaitUntil ===\n");
+        using ShaderLab::Rendering::FramePacer;
+        using Clock = std::chrono::steady_clock;
+        using std::chrono::milliseconds;
+
+        // ---- Deadline schedule (synthetic time, no waiting). -------------
+        {
+            FramePacer pacer(60);
+            const auto period = pacer.Period();
+            TEST("FramePacer first deadline is due immediately", pacer.Deadline() == Clock::time_point{});
+            const auto start = Clock::now();
+            TEST("FramePacer first frame is paced", pacer.BeginFrame(start));
+            TEST("FramePacer next deadline is one period later", pacer.Deadline() == start + period);
+            TEST("FramePacer early wake leaves the deadline",
+                 !pacer.BeginFrame(start + period / 2) && pacer.Deadline() == start + period);
+            TEST("FramePacer late wake stays on the grid",
+                 pacer.BeginFrame(start + period + milliseconds(3)) && pacer.Deadline() == start + 2 * period);
+            const auto overrun = start + 5 * period;
+            TEST("FramePacer overrun schedules from now",
+                 pacer.BeginFrame(overrun) && pacer.Deadline() == overrun + period);
+            TEST("FramePacer overrun does not burst", !pacer.BeginFrame(overrun + milliseconds(1)));
+            TEST("FramePacer waits for a deadline still ahead",
+                 pacer.WaitDeadline(overrun + milliseconds(1)) == pacer.Deadline());
+            const auto lateEnd = pacer.Deadline() + milliseconds(4);
+            TEST("FramePacer idles after an overrun",
+                 pacer.WaitDeadline(lateEnd) == lateEnd + FramePacer::scOverrunIdle);
+            TEST("FramePacer first wait is immediate", FramePacer(60).WaitDeadline(start) == Clock::time_point{});
+
+            const auto period60 = std::chrono::duration<double, std::milli>(period).count();
+            TEST("FramePacer 60 Hz period is 16.67 ms", std::abs(period60 - 1000.0 / 60.0) < 1e-3);
+            pacer.SetRate(144);
+            const auto period144 = std::chrono::duration<double, std::milli>(pacer.Period()).count();
+            TEST("FramePacer rate change keeps fractional periods", std::abs(period144 - 1000.0 / 144.0) < 1e-3);
+            TEST("FramePacer rate change re-anchors on the last frame", pacer.Deadline() == overrun + pacer.Period());
+            TEST("FramePacer clamps below 60 Hz", FramePacer(30).RateHz() == 60);
+            TEST("FramePacer clamps above 240 Hz", FramePacer(1000).RateHz() == 240);
+        }
+
+        // ---- Wake() ends a predicate wait. --------------------------------
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher dispatcher;
+            std::atomic<bool> woke{ false };
+            std::atomic<long long> waitedMs{ 0 };
+            std::thread consumer([&] {
+                dispatcher.RegisterConsumer();
+                const auto begin = Clock::now();
+                woke = dispatcher.WaitFor(std::chrono::seconds(5));
+                waitedMs = std::chrono::duration_cast<milliseconds>(Clock::now() - begin).count();
+            });
+            std::this_thread::sleep_for(milliseconds(20));
+            dispatcher.Wake();
+            consumer.join();
+            TEST("Wake() returns WaitFor early", woke.load() && waitedMs.load() < 1000);
+        }
+
+        // ---- WaitUntil: queued work wakes it before the deadline. ---------
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher dispatcher;
+            std::atomic<bool> woke{ false };
+            std::atomic<long long> waitedMs{ 0 };
+            std::thread consumer([&] {
+                dispatcher.RegisterConsumer();
+                const auto begin = Clock::now();
+                woke = dispatcher.WaitUntil(begin + std::chrono::seconds(5));
+                waitedMs = std::chrono::duration_cast<milliseconds>(Clock::now() - begin).count();
+                dispatcher.Drain();
+            });
+            std::this_thread::sleep_for(milliseconds(20));
+            dispatcher.DispatchAsync([] {});
+            consumer.join();
+            TEST("WaitUntil returns early for queued work", woke.load() && waitedMs.load() < 1000);
+        }
+
+        // ---- WaitUntil: timer precision. ----------------------------------
+        // A 15.6 ms system-tick wait would overshoot a 5 ms deadline by
+        // several milliseconds; the high-resolution timer should not.
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher dispatcher;
+            dispatcher.RegisterConsumer();
+            std::vector<double> overshootMs;
+            bool anyWoke = false;
+            for (int i = 0; i < 20; ++i)
+            {
+                const auto deadline = Clock::now() + milliseconds(5);
+                anyWoke |= dispatcher.WaitUntil(deadline);
+                overshootMs.push_back(std::chrono::duration<double, std::milli>(Clock::now() - deadline).count());
+            }
+            std::sort(overshootMs.begin(), overshootMs.end());
+            const double medianMs = overshootMs[overshootMs.size() / 2];
+            printf("  [info] WaitUntil 5 ms deadline overshoot: min %.3f median %.3f max %.3f ms\n",
+                   overshootMs.front(), medianMs, overshootMs.back());
+            TEST("WaitUntil reports the deadline, not a wake", !anyWoke);
+            TEST("WaitUntil never returns before the deadline", overshootMs.front() >= 0.0);
+            ShaderLab::Tests::TIMING_TEST("WaitUntil median overshoot < 2 ms", medianMs < 2.0);
+        }
+
+        // ---- The render worker's throttled loop holds 60 Hz. --------------
+        // Pacer plus WaitUntil with 10 ms of spun work per frame.
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher dispatcher;
+            dispatcher.RegisterConsumer();
+            FramePacer pacer(60);
+            const auto begin = Clock::now();
+            auto frameStart = begin;
+            int frames = 0;
+            while (Clock::now() - begin < std::chrono::seconds(1))
+            {
+                dispatcher.WaitUntil(pacer.WaitDeadline(Clock::now()));
+                frameStart = Clock::now();
+                if (!pacer.BeginFrame(frameStart)) continue;
+                ++frames;
+                const auto workEnd = frameStart + milliseconds(10);
+                while (Clock::now() < workEnd) YieldProcessor();
+            }
+            const double hz = (frames - 1) / std::chrono::duration<double>(frameStart - begin).count();
+            printf("  [info] paced loop, 10 ms work: %.1f Hz over %d frames\n", hz, frames);
+            ShaderLab::Tests::TIMING_TEST("Paced worker loop runs at 60 +- 2 Hz", hz >= 58.0 && hz <= 62.0);
+        }
     }
 
     void TestRenderThreadDispatcher()
@@ -6103,6 +7063,17 @@ int main(int argc, char* argv[])
 
     g_useWarp = useWarp;
     printf("Device: %s\n", useWarp ? "WARP" : "Hardware");
+    {
+        char timing[8]{};
+        char ci[8]{};
+        const DWORD timingLength = ::GetEnvironmentVariableA("SHADERLAB_TIMING_TESTS", timing, sizeof(timing));
+        if (timingLength > 0 && timingLength < sizeof(timing))
+            ShaderLab::Tests::g_timingAssertions = std::string(timing) != "0";
+        else
+            ShaderLab::Tests::g_timingAssertions = !useWarp && ::GetEnvironmentVariableA("CI", ci, sizeof(ci)) == 0;
+        printf("Timing assertions: %s\n", ShaderLab::Tests::g_timingAssertions
+            ? "on" : "off (WARP or CI; SHADERLAB_TIMING_TESTS=1 forces them)");
+    }
 
     // Create D2D.
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
@@ -6120,6 +7091,32 @@ int main(int argc, char* argv[])
     g_d2dFactory->QueryInterface(factory1.put());
     ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
 
+    if (char only[16]{}; ::GetEnvironmentVariableA("SHADERLAB_TESTS", only, sizeof(only)) && std::string(only) == "videoperf")
+    {
+        ShaderLab::Tests::TestVideoFrameCost(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+        MFShutdown();
+        return g_failed == 0 ? 0 : 1;
+    }
+
+    // SHADERLAB_TESTS=video runs only the video source tests, a quick loop for playback work.
+    if (char only[16]{}; ::GetEnvironmentVariableA("SHADERLAB_TESTS", only, sizeof(only)) && std::string(only) == "video")
+    {
+        TestVideoSourceSeekAndZeroCopy();
+        TestVideoUploadUnderD2DContention();
+        TestVideoFrameTimeReporting();
+        ShaderLab::Tests::TestVideoDecoderSurfacePool(g_d3dDevice.get());
+        ShaderLab::Tests::TestVideoPlaybackControl(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+        ShaderLab::Tests::TestVideoSeekWhilePlaying(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+        ShaderLab::Tests::TestVideoPastEndShowsBlack(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+        ShaderLab::Tests::TestVideoPlaybackRate(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+        ShaderLab::Tests::TestVideoDownstreamRedraws(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+        ShaderLab::Tests::TestVideoTickWork(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+        ShaderLab::Tests::TestPreviewRenderStats(g_dc.get(), g_d3dDevice.get());
+        printf("\nVIDEO TESTS: %d passed, %d failed\n", g_passed, g_failed);
+        MFShutdown();
+        return g_failed == 0 ? 0 : 1;
+    }
+
     // Run tests.
     TestGraphOperations();
     TestSerialization();
@@ -6127,6 +7124,7 @@ int main(int argc, char* argv[])
     TestEffectCatalogCount();
     TestSourceEffects();
     TestComputeChainFreshness();
+    TestComputeFedByChains();
     TestAnalysisEffects();
     TestBuiltInD2DEffects();
     TestPropertyBindings();
@@ -6147,6 +7145,7 @@ int main(int argc, char* argv[])
     TestVariantSwitchWhileDirty();
     TestPerfPassRegressions();
     TestLuminanceClipMargin();
+    TestLuminanceHighlightP99();
     TestWideFrames();
     TestVideoSourceSeekAndZeroCopy();
     TestVideoUploadUnderD2DContention();
@@ -6157,6 +7156,7 @@ int main(int argc, char* argv[])
     TestHeadlessReadback();
     TestSnapshot();
     TestRenderThreadDispatcher();
+    TestFramePacer();
     TestMcpRouter();
     TestImageLoaderExtensions();
     TestMcpJsonRpc();
@@ -6169,7 +7169,18 @@ int main(int argc, char* argv[])
     TestEffectGraphPackageSave();
     TestEffectGraphPackageSaveProgressAndFailure();
     TestVideoFrameTimeReporting();
+    ShaderLab::Tests::TestVideoDecoderSurfacePool(g_d3dDevice.get());
+    ShaderLab::Tests::TestVideoPlaybackControl(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+    ShaderLab::Tests::TestVideoSeekWhilePlaying(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+    ShaderLab::Tests::TestVideoPastEndShowsBlack(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+    ShaderLab::Tests::TestVideoPlaybackRate(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+    ShaderLab::Tests::TestVideoDownstreamRedraws(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+    ShaderLab::Tests::TestVideoTickWork(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+    ShaderLab::Tests::TestPreviewRenderStats(g_dc.get(), g_d3dDevice.get());
+    ShaderLab::Tests::TestRenderLoopPacing();
     TestSplitComparisonWedges();
+    TestSideBySide();
+    TestCieHistogram();
     TestAsyncCompile();
     TestOptionSpecialization();
     TestVariantReloadState();

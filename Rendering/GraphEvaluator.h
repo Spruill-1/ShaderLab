@@ -141,6 +141,14 @@ namespace ShaderLab::Rendering
             return n;
         }
         uint64_t CacheInvalidations() const { return m_cacheInvalidations; }
+        // Evaluate passes in which this node's output changed (it re-rendered,
+        // or its analysis fields moved). A host compares it across a frame to
+        // learn whether the node rendered in that frame.
+        uint64_t OutputChangeCount(uint32_t nodeId) const
+        {
+            auto it = m_outputChangeCounts.find(nodeId);
+            return it == m_outputChangeCounts.end() ? 0 : it->second;
+        }
 
         void SetCpuAnalysisInterest(std::unordered_set<uint32_t> ids)
         {
@@ -282,6 +290,18 @@ namespace ShaderLab::Rendering
         // Rebuilt every pass; see the propagation comment in Evaluate for why
         // this is pulled at visit time rather than pushed up front.
         std::unordered_set<uint32_t> m_outputChangedThisEval;
+        std::unordered_map<uint32_t, uint64_t> m_outputChangeCounts;
+        // Adds a node to m_outputChangedThisEval, counting it once per pass.
+        void MarkOutputChanged(uint32_t nodeId)
+        {
+            if (m_outputChangedThisEval.insert(nodeId).second)
+                ++m_outputChangeCounts[nodeId];
+        }
+        // Nodes whose analysis fields moved this pass while their image did
+        // not (a video whose bound Time moved). Wakes binding consumers only.
+        std::unordered_set<uint32_t> m_fieldsChangedThisEval;
+        // True when a node a binding of `node` reads changed earlier this pass.
+        bool BoundSourceChanged(const Graph::EffectNode& node) const;
 
         // Counted per ProcessDeferredCompute, read by the host's perf UI.
         uint32_t m_dispatchesLastFrame{ 0 };
@@ -324,7 +344,8 @@ namespace ShaderLab::Rendering
         // DispatchUserD3D11Compute (analysis-only) and DispatchImageCompute
         // (image-producing) paths -- both now route through
         // CustomComputeBridgeEffect::Dispatch.
-        void DispatchViaBridge(
+        // False when no dispatch ran (compile pending, error).
+        bool DispatchViaBridge(
             ID2D1DeviceContext5* dc,
             const Graph::EffectGraph& graph,
             Graph::EffectNode& node,

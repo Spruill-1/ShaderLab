@@ -67,7 +67,8 @@ namespace ShaderLab::Effects
         // Check if any video source is currently playing.
         bool HasPlayingVideo() const;
 
-        // Tick all video sources and upload new frames.
+        // Show each video's frame for its Time property (Clock-bound or static)
+        // and upload it; deltaSeconds is not used, since Time sets the frame.
         // Marks nodes dirty only when a new frame is actually uploaded.
         // Call BEFORE checking HasDirtyNodes. Returns true if any new frame was uploaded.
         bool TickAndUploadVideos(
@@ -116,13 +117,14 @@ namespace ShaderLab::Effects
         // Cached video providers: nodeId → video provider.
         std::unordered_map<uint32_t, std::unique_ptr<VideoSourceProvider>> m_videoCache;
 
+        // Opaque black at the video's size, shown instead of the provider's
+        // bitmap while a non-looping video's Time is past its end: nodeId →
+        // crop of a black flood.
+        std::unordered_map<uint32_t, winrt::com_ptr<ID2D1Effect>> m_videoPastEnd;
+
         std::unordered_map<uint32_t, std::unique_ptr<DxgiDuplicationSourceProvider>> m_dxgiCaptureCache;
         std::unordered_map<uint32_t, std::unique_ptr<WindowsGraphicsCaptureSourceProvider>> m_wgcCaptureCache;
         std::unordered_map<uint32_t, std::optional<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>> m_pendingWgcItems;
 
-        // Last clock-driven seek time per node — used to detect a paused
-        // Clock so the video doesn't free-run when the bound Time stops
-        // advancing. NaN means "no prior sample".
-        std::unordered_map<uint32_t, double> m_lastClockTime;
     };
 }

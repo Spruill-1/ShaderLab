@@ -50,4 +50,14 @@ namespace ShaderLab::Effects
     inline constexpr uint32_t kReduceGroups              = 64;
     inline constexpr uint32_t kReduceScratchUints        = 1u << 19;   // 2 MB
     inline constexpr uint32_t kReduceScratchClearedUints = 16384;      // 64 KB
+
+    // Two-pass image contract (SHADERLAB_IMAGE_PASS). Reflection detects the
+    // `_SLPassConstants` cbuffer at b1; the runner then binds the scratch
+    // buffer at u2 (head zeroed per frame) and a per-output-pixel accumulator
+    // at u3, sized from the image output and the reflected structure stride
+    // and zeroed only when created or when the shader changes (pass 1 re-zeroes
+    // what pass 0 used), and dispatches pass 0 over input 0 and pass 1 over the
+    // output.
+    inline constexpr uint32_t cImagePassConstantsSlot = 1;
+    inline constexpr uint32_t cImagePassAccumulatorSlot = 3;
 }

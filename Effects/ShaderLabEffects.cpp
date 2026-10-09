@@ -693,6 +693,58 @@ bool GamutLutStampMatches(float4 stamp, TargetXf t, float peak)
                 write(L"BndPts", pts.data(), pts.size());
             };
         }
+
+        // Side by Side: columns and rows for `count` tiles. Must match Shape()
+        // in its HLSL.
+        void SideBySideShape(uint32_t layout, uint32_t count, uint32_t& columns, uint32_t& rows)
+        {
+            columns = count;
+            rows = 1;
+            if (layout == 1)
+            {
+                columns = 1;
+                rows = count;
+            }
+            else if (layout == 2)
+            {
+                columns = 1;
+                while (columns * columns < count) ++columns;
+                rows = (count + columns - 1) / columns;
+            }
+        }
+
+        // Side by Side output size. Native: the arrangement at 1:1, tiles the
+        // size of the first connected input. Fit: OutputWidth x OutputHeight.
+        D2D1_SIZE_U SideBySideOutputSize(const PropMap& props, const std::vector<D2D1_SIZE_U>& inputSizes)
+        {
+            if (PropNumber(props, L"SizeMode", 0.0) >= 0.5)
+            {
+                const double width  = std::round(PropNumber(props, L"OutputWidth", 1920.0));
+                const double height = std::round(PropNumber(props, L"OutputHeight", 1080.0));
+                return D2D1::SizeU(static_cast<UINT32>(std::clamp(width, 1.0, 1.0e6)),
+                                   static_cast<UINT32>(std::clamp(height, 1.0, 1.0e6)));
+            }
+
+            uint32_t count = 0;
+            D2D1_SIZE_U tile{ 0, 0 };
+            for (const auto& size : inputSizes)
+            {
+                if (size.width == 0 || size.height == 0) continue;
+                if (count == 0) tile = size;
+                ++count;
+            }
+            if (count == 0)
+                return D2D1::SizeU(64, 64);
+
+            uint32_t columns = 0, rows = 0;
+            SideBySideShape(static_cast<uint32_t>(PropNumber(props, L"Layout", 0.0) + 0.5), count, columns, rows);
+            const uint64_t gap = static_cast<uint64_t>(std::floor((std::max)(PropNumber(props, L"Gap", 0.0), 0.0) + 0.5));
+            const uint64_t width  = uint64_t{ columns } * (tile.width + gap) - gap;
+            const uint64_t height = uint64_t{ rows } * (tile.height + gap) - gap;
+            constexpr uint64_t cMaxReported = 1u << 30;
+            return D2D1::SizeU(static_cast<UINT32>((std::min)(width, cMaxReported)),
+                               static_cast<UINT32>((std::min)(height, cMaxReported)));
+        }
     }
 
     void ShaderLabEffects::RegisterAll()
@@ -787,30 +839,39 @@ bool GamutLutStampMatches(float4 stamp, TargetXf t, float peak)
         // Future effects will be added here as they're implemented.
 
         // ---- CIE Histogram (D3D11 Compute) ----
-        // Builds a 2D scatter histogram of source image chromaticity in CIE xy space.
-        // Output: a 2D texture where R = log2(count+1) normalized, usable as input
-        // to the CIE Chromaticity Plot pixel shader.
+        // A 2D histogram of source chromaticity in CIE xy, each bin a BinSize
+        // block of output pixels. R = log2(count+1) normalized, the input the
+        // CIE Chromaticity Plot reads.
         {
             static const std::string cieHistHLSL = R"HLSL(
-// CIE xy Histogram: scatter source pixels into a 2D CIE xy histogram.
-// Uses groupshared tiled accumulation to avoid data races.
-// Output R: log-scaled density, G: avg luminance / 10000, A: 1 if hit.
-//
-// Multi-group (SHADERLAB_REDUCE_SCRATCH): SHADERLAB_REDUCE_GROUPS groups each
-// scatter a share of the pixels into their own groupshared tile and write it
-// to scratch as a partial; the last group to finish sums the partials and
-// renders the diagram. It used to be one group scattering the whole frame.
+// CIE xy Histogram: bins over the CIE xy plane, each covering a BinSize x
+// BinSize block of output pixels (clipped at the image edge).
+// Output R: log2(count + 1) / log2(maxCount + 1), G: average luminance / 10000,
+// A: 1 where any pixel landed; empty bins stay 0.
+// Pass 0 scatters the source into the bins and lists each bin it touches;
+// pass 1 runs one thread per list entry and fills that bin's block.
 
 #include "shaderlab_params.hlsli"
 
 Texture2D<float4> Source : register(t0);
 RWTexture2D<float4> Output : register(u1);
-SHADERLAB_REDUCE_SCRATCH
+
+// Pixel count, luminance sum as a signed 64-bit fixed-point value split into
+// two words, and one entry of the touched-bin list (entry i lives in element i).
+struct Bin
+{
+    uint count;
+    uint lumLow;
+    uint lumHigh;
+    uint listedBin;
+};
+SHADERLAB_IMAGE_PASS(Bin)
 
 cbuffer Constants : register(b0) {
     uint Width;
     uint Height;
     uint OutputSize;
+    uint BinSize;       // option index: block side - 1
 };
 
 float3 ScRGBToXYZ(float3 rgb) {
@@ -824,116 +885,176 @@ float3 ScRGBToXYZ(float3 rgb) {
 static const float2 CENTER = float2(0.3127, 0.3290);
 static const float HALF_EXTENT = 0.50;
 
-// Tile-based groupshared histogram.
-// 48x48 = 2304 bins, well within 32KB groupshared limit.
-#define TILE_SIZE 48
-#define TILE_BINS (TILE_SIZE * TILE_SIZE)
-// Scratch words: per-group [counts | lumSum] blocks.
-#define PART_BASE   SHADERLAB_REDUCE_CLEARED
-#define PART_STRIDE (2 * TILE_BINS)
-groupshared uint gs_counts[TILE_BINS];
-groupshared float gs_lumSum[TILE_BINS];
-groupshared uint gs_maxCount;
+#define GROUP_SIDE 16
+#define GROUP_THREADS (GROUP_SIDE * GROUP_SIDE)
+// Per-group table of the bins its pixels hit, so each distinct bin costs one
+// set of global atomics per group. A power of two, twice the group's pixels.
+#define SLOT_COUNT 512
+#define SLOT_BITS 9
+#define NO_BIN 0xFFFFFFFF
+#define MAX_COUNT_WORD 1      // scratch word: the largest bin count
+#define LIST_LENGTH_WORD 2    // scratch word: entries in the touched-bin list
+#define LUM_STEPS 256.0       // fixed-point steps per nit
 
-[numthreads(32, 32, 1)]
-void main(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID) {
-    uint tid = GTid.x + GTid.y * 32;
-    uint g = Gid.x;
-    uint totalThreads = 1024;
-    uint totalPixels = Width * Height;
-    uint outSize = max(OutputSize, 64u);
+groupshared uint gs_bin[SLOT_COUNT];
+groupshared uint gs_count[SLOT_COUNT];
+groupshared uint gs_lumLow[SLOT_COUNT];
+groupshared uint gs_lumHigh[SLOT_COUNT];
+groupshared uint gs_newBins[SLOT_COUNT];
+groupshared uint gs_newCount;
+groupshared uint gs_listStart;
+groupshared uint gs_groupMax;
 
-    // Clear groupshared tile.
-    for (uint ti = tid; ti < TILE_BINS; ti += totalThreads) {
-        gs_counts[ti] = 0;
-        gs_lumSum[ti] = 0.0;
+// Atomically adds the 64-bit (addLow, addHigh) to (low, high): a carry out of
+// the low word goes into the high word.
+#define ADD_WIDE(low, high, addLow, addHigh) \
+    { \
+        uint lowBefore; \
+        InterlockedAdd(low, (addLow), lowBefore); \
+        uint highAdd = (addHigh) + ((lowBefore + (addLow) < lowBefore) ? 1u : 0u); \
+        if (highAdd != 0) InterlockedAdd(high, highAdd); \
+    }
+
+// The bin a source pixel falls in, or NO_BIN.
+uint BinOf(float4 src, uint binsPerSide, out int lumFixed)
+{
+    lumFixed = 0;
+    if (src.a < 0.01) return NO_BIN;
+
+    float3 xyz = ScRGBToXYZ(src.rgb);  // negatives kept for wide-gamut chromaticity
+    float sum = xyz.x + xyz.y + xyz.z;
+    if (sum < 1e-7) return NO_BIN;
+
+    float cieX = xyz.x / sum;
+    float cieY = xyz.y / sum;
+    float u = (cieX - CENTER.x) / (2.0 * HALF_EXTENT) + 0.5;
+    float v = 0.5 - (cieY - CENTER.y) / (2.0 * HALF_EXTENT);
+    if (u < 0 || u >= 1 || v < 0 || v >= 1) return NO_BIN;
+
+    uint binX = min((uint)(u * binsPerSide), binsPerSide - 1);
+    uint binY = min((uint)(v * binsPerSide), binsPerSide - 1);
+    lumFixed = (int)round(clamp(xyz.y * 80.0 * LUM_STEPS, -2147483520.0, 2147483520.0));
+    return binY * binsPerSide + binX;
+}
+
+// Pass 0: merge the group's pixels by bin, add each bin once, and list the
+// bins this group touched first.
+void Accumulate(uint2 pixel, uint threadIndex, uint width, uint height, uint binsPerSide)
+{
+    for (uint clearSlot = threadIndex; clearSlot < SLOT_COUNT; clearSlot += GROUP_THREADS)
+    {
+        gs_bin[clearSlot] = NO_BIN;
+        gs_count[clearSlot] = 0;
+        gs_lumLow[clearSlot] = 0;
+        gs_lumHigh[clearSlot] = 0;
+    }
+    if (threadIndex == 0)
+    {
+        gs_newCount = 0;
+        gs_groupMax = 0;
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // This group's share of the source pixels, scattered into its tile.
-    for (uint pi = g * totalThreads + tid; pi < totalPixels;
-         pi += totalThreads * SHADERLAB_REDUCE_GROUPS) {
-        uint px = pi % Width;
-        uint py = pi / Width;
-        float4 src = Source[int2(px, py)];
-        if (src.a < 0.01) continue;
-
-        float3 xyz = ScRGBToXYZ(src.rgb);  // preserve negatives for wide-gamut chromaticity
-        float sum = xyz.x + xyz.y + xyz.z;
-        if (sum < 1e-7) continue;
-
-        float cieX = xyz.x / sum;
-        float cieY = xyz.y / sum;
-
-        float u = (cieX - CENTER.x) / (2.0 * HALF_EXTENT) + 0.5;
-        float v = 0.5 - (cieY - CENTER.y) / (2.0 * HALF_EXTENT);
-        if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
-
-        uint tx = min((uint)(u * TILE_SIZE), TILE_SIZE - 1);
-        uint ty = min((uint)(v * TILE_SIZE), TILE_SIZE - 1);
-        uint idx = ty * TILE_SIZE + tx;
-
-        InterlockedAdd(gs_counts[idx], 1u);
-        // Luminance accumulation has minor races but acceptable for avg.
-        gs_lumSum[idx] += xyz.y * 80.0 / 10000.0;
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    uint pb = PART_BASE + g * PART_STRIDE;
-    for (uint wi = tid; wi < TILE_BINS; wi += totalThreads) {
-        ShaderLabScratchStore(pb + wi, gs_counts[wi]);
-        ShaderLabScratchStore(pb + TILE_BINS + wi, asuint(gs_lumSum[wi]));
-    }
-
-    if (!ShaderLabReduceIsLastGroup(tid))
-        return;
-
-    // Last group: sum every group's tile.
-    for (uint si = tid; si < TILE_BINS; si += totalThreads) {
-        uint c = 0;
-        float l = 0.0;
-        for (uint gg = 0; gg < SHADERLAB_REDUCE_GROUPS; ++gg) {
-            uint b2 = PART_BASE + gg * PART_STRIDE;
-            c += ShaderLabScratchLoad(b2 + si);
-            l += asfloat(ShaderLabScratchLoad(b2 + TILE_BINS + si));
+    int lumFixed = 0;
+    uint bin = NO_BIN;
+    if (pixel.x < width && pixel.y < height)
+        bin = BinOf(Source[pixel], binsPerSide, lumFixed);
+    if (bin != NO_BIN)
+    {
+        // Open addressing from a multiplicative hash; the table never fills.
+        uint slot = (bin * 2654435761u) >> (32 - SLOT_BITS);
+        [loop] for (uint probe = 0; probe < SLOT_COUNT; ++probe)
+        {
+            uint held;
+            InterlockedCompareExchange(gs_bin[slot], NO_BIN, bin, held);
+            if (held == NO_BIN || held == bin) break;
+            slot = (slot + 1) & (SLOT_COUNT - 1);
         }
-        gs_counts[si] = c;
-        gs_lumSum[si] = l;
-    }
-
-    // Find max count for log normalization.
-    if (tid == 0) gs_maxCount = 1;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint mi = tid; mi < TILE_BINS; mi += totalThreads) {
-        InterlockedMax(gs_maxCount, gs_counts[mi]);
+        InterlockedAdd(gs_count[slot], 1u);
+        ADD_WIDE(gs_lumLow[slot], gs_lumHigh[slot], (uint)lumFixed, (lumFixed < 0) ? 0xFFFFFFFFu : 0u);
     }
     GroupMemoryBarrierWithGroupSync();
 
-    float logMax = log2(float(gs_maxCount) + 1.0);
-
-    // Write every output pixel (empty bins as 0), upscaling the tile.
-    float scale = float(outSize) / float(TILE_SIZE);
-    for (uint oi = tid; oi < outSize * outSize; oi += totalThreads) {
-        uint ox = oi % outSize;
-        uint oy = oi / outSize;
-        uint tx = min((uint)(float(ox) / scale), TILE_SIZE - 1);
-        uint ty = min((uint)(float(oy) / scale), TILE_SIZE - 1);
-        uint idx = ty * TILE_SIZE + tx;
-        uint cnt = gs_counts[idx];
-        float4 o = float4(0, 0, 0, 0);
-        if (cnt > 0) {
-            float logDensity = log2(float(cnt) + 1.0) / logMax;
-            float avgLum = gs_lumSum[idx] / float(cnt);
-            o = float4(logDensity, avgLum, 0, 1.0);
+    for (uint flushSlot = threadIndex; flushSlot < SLOT_COUNT; flushSlot += GROUP_THREADS)
+    {
+        uint slotBin = gs_bin[flushSlot];
+        if (slotBin == NO_BIN) continue;
+        uint slotCount = gs_count[flushSlot];
+        uint countBefore;
+        InterlockedAdd(_SLPixelAccum[slotBin].count, slotCount, countBefore);
+        InterlockedMax(gs_groupMax, countBefore + slotCount);
+        ADD_WIDE(_SLPixelAccum[slotBin].lumLow, _SLPixelAccum[slotBin].lumHigh,
+                 gs_lumLow[flushSlot], gs_lumHigh[flushSlot]);
+        if (countBefore == 0)
+        {
+            uint newIndex;
+            InterlockedAdd(gs_newCount, 1u, newIndex);
+            gs_newBins[newIndex] = slotBin;
         }
-        Output[int2(ox, oy)] = o;
     }
+    GroupMemoryBarrierWithGroupSync();
+
+    // One list reservation per group.
+    if (threadIndex == 0)
+    {
+        if (gs_groupMax > 0)
+            _SLScratch.InterlockedMax(MAX_COUNT_WORD * 4, gs_groupMax);
+        uint listStart = 0;
+        if (gs_newCount > 0)
+            _SLScratch.InterlockedAdd(LIST_LENGTH_WORD * 4, gs_newCount, listStart);
+        gs_listStart = listStart;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint newSlot = threadIndex; newSlot < gs_newCount; newSlot += GROUP_THREADS)
+        _SLPixelAccum[gs_listStart + newSlot].listedBin = gs_newBins[newSlot];
+}
+
+// Pass 1: list entry -> its bin's output block. The bin is zeroed for the
+// next frame; listedBin words are rewritten by every pass 0.
+void WriteImage(uint2 thread, uint binsPerSide, uint blockSide, uint outputSize)
+{
+    uint entry = thread.y * binsPerSide + thread.x;
+    if (thread.x >= binsPerSide || entry >= _SLScratch.Load(LIST_LENGTH_WORD * 4)) return;
+
+    uint bin = _SLPixelAccum[entry].listedBin;
+    uint count = _SLPixelAccum[bin].count;
+    uint lumLow = _SLPixelAccum[bin].lumLow;
+    uint lumHigh = _SLPixelAccum[bin].lumHigh;
+    _SLPixelAccum[bin].count = 0;
+    _SLPixelAccum[bin].lumLow = 0;
+    _SLPixelAccum[bin].lumHigh = 0;
+
+    float logMax = log2(float(_SLScratch.Load(MAX_COUNT_WORD * 4)) + 1.0);
+    float lumSum = float(asint(lumHigh)) * 4294967296.0 + float(lumLow);
+    float avgLum = lumSum / (LUM_STEPS * 10000.0) / float(count);
+    float4 color = float4(log2(float(count) + 1.0) / logMax, avgLum, 0, 1.0);
+    uint2 blockStart = uint2(bin % binsPerSide, bin / binsPerSide) * blockSide;
+    uint2 blockEnd = min(blockStart + blockSide, outputSize);
+    for (uint y = blockStart.y; y < blockEnd.y; ++y)
+        for (uint x = blockStart.x; x < blockEnd.x; ++x)
+            Output[uint2(x, y)] = color;
+}
+
+[numthreads(GROUP_SIDE, GROUP_SIDE, 1)]
+void main(uint3 dispatchId : SV_DispatchThreadID, uint threadIndex : SV_GroupIndex)
+{
+    uint width = Width;
+    uint height = Height;
+    uint outputSize = max(OutputSize, 64u);
+    uint blockSide = clamp(BinSize + 1, 1u, 10u);
+    uint binsPerSide = (outputSize + blockSide - 1) / blockSide;
+
+    if (ShaderLabPass == 0)
+        Accumulate(dispatchId.xy, threadIndex, width, height, binsPerSide);
+    else
+        WriteImage(dispatchId.xy, binsPerSide, blockSide, outputSize);
 }
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"CIE Histogram";
-            desc.effectId = L"CIE Histogram"; desc.effectVersion = 3;
+            desc.effectId = L"CIE Histogram"; desc.effectVersion = 6;
             desc.category = L"Analysis";
             desc.subcategory = L"Scopes";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -941,7 +1062,10 @@ void main(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID) {
             desc.inputNames = { L"Source" };
             desc.hasImageOutput = true;
             desc.parameters = {
-                { L"OutputSize", L"uint", 512.0f, 64.0f, 2048.0f, 64.0f },
+                { L"OutputSize", L"uint", 512.0f, 64.0f, 4096.0f, 64.0f },
+                // Output pixels per bin, per side.
+                { L"BinSize", L"float", 0.0f, 0.0f, 9.0f, 1.0f,
+                    { L"1x1", L"2x2", L"3x3", L"4x4", L"5x5", L"6x6", L"7x7", L"8x8", L"9x9", L"10x10" } },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2085,10 +2209,6 @@ float4 main(
     float4 color = InputTexture.Sample(InputSampler, uv0.xy);
     if (Strength < 0.001) return color;
 
-    // Near-black pixels have unreliable chromaticity — pass through unchanged.
-    float lum = dot(max(color.rgb, 0.0), float3(0.2126, 0.7152, 0.0722));
-    if (lum < 1e-5) return color;
-
     // Read all cbuffer vars at top so DXC keeps them resident.
     float targetF = TargetGamut;
     float sourceF = SourceGamut;
@@ -2099,6 +2219,18 @@ float4 main(
     float2 csG = SourceGreenPrimary;
     float2 csB = SourceBluePrimary;
     float clipNits = ClipNits;
+
+    // Near-black chromaticity is unreliable, so no mode maps these pixels, but
+    // they are still clamped into the target: a near-black wide-gamut colour
+    // must not leave the effect outside it.
+    float lum = dot(max(color.rgb, 0.0), float3(0.2126, 0.7152, 0.0722));
+    if (lum < 1e-5)
+    {
+        TargetXf nearBlackXf = MakeTargetXf((uint)targetF, ctR, ctG, ctB, D65_WHITE);
+        float3 inTarget = TargetToScRGB(nearBlackXf, max(ScRGBToTarget(nearBlackXf, color.rgb), 0.0));
+        color.rgb = lerp(color.rgb, inTarget, Strength);
+        return color;
+    }
     // Upper bound per target channel. scRGB white (1,1,1) is (1,1,1) in any
     // D65 target's RGB, so clipNits / 80 is each primary at full drive.
     float chMax = (clipNits > 0.0) ? clipNits / 80.0 : 3.0e38;
@@ -2136,11 +2268,8 @@ float4 main(
             color.rgb = lerp(rgb, result, Strength);
         }
         else if (gamut == 3) {
-            // Custom: the target's own primaries (D65 white, as the other
-            // modes assume). Until effectVersion 6 this fell through to the
-            // BT.2020 branch below, so a Custom target -- e.g. a panel's
-            // primaries bound from Working Space -- silently clipped to
-            // BT.2020 in Clip mode while every other mode honoured it.
+            // Custom: the target's own primaries, with a D65 white as the
+            // other modes assume.
             TargetXf t = MakeTargetXf(3, ctR, ctG, ctB, D65_WHITE);
             float3 clamped = clamp(ScRGBToTarget(t, rgb), 0.0, chMax);
             float3 result = TargetToScRGB(t, clamped);
@@ -2226,7 +2355,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Gamut Map";
-            desc.effectId = L"Gamut Map"; desc.effectVersion = 8;
+            desc.effectId = L"Gamut Map"; desc.effectVersion = 9;
             desc.category = L"Analysis";
             desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2458,10 +2587,6 @@ float4 main(
     float4 color = InputTexture.Sample(InputSampler, uv0.xy);
     if (Strength < 0.001) return color;
 
-    // Near-black pixels have unreliable chromaticity — pass through unchanged.
-    float lum = dot(max(color.rgb, 0.0), float3(0.2126, 0.7152, 0.0722));
-    if (lum < 1e-5) return color;
-
     // Read all cbuffer vars at top so DXC keeps them resident.
     float targetF = TargetGamut;
     float sourceF = SourceGamut;
@@ -2474,6 +2599,17 @@ float4 main(
     float softT = SoftThreshold;
     float softL = SoftLimit;
     float softP = KneeHardness;
+
+    // Near-black chromaticity is unreliable, so these pixels are not mapped,
+    // but they are still clamped into the target.
+    float lum = dot(max(color.rgb, 0.0), float3(0.2126, 0.7152, 0.0722));
+    if (lum < 1e-5)
+    {
+        TargetXf nearBlackXf = MakeTargetXf((uint)targetF, ctR, ctG, ctB, D65_WHITE);
+        float3 inTarget = TargetToScRGB(nearBlackXf, max(ScRGBToTarget(nearBlackXf, color.rgb), 0.0));
+        color.rgb = lerp(color.rgb, inTarget, Strength);
+        return color;
+    }
 
     float2 gR, gG, gB;
     uint g = (uint)targetF;
@@ -2603,7 +2739,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Gamut Map";
-            desc.effectId = L"ICtCp Gamut Map"; desc.effectVersion = 14;
+            desc.effectId = L"ICtCp Gamut Map"; desc.effectVersion = 15;
             desc.category = L"Analysis";
             desc.subcategory = L"Gamut Mapping";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -3691,6 +3827,271 @@ float4 main(
             m_effects.push_back(std::move(desc));
         }
 
+        // ---- Side by Side ----
+        // Compute rather than a pixel shader: each output pixel reads an input
+        // at an offset, and D2D hands a pixel shader only the input region
+        // under the output pixel.
+        {
+            static const std::string sideBySideHLSL = R"HLSL(
+// Side by Side - D3D11 Compute Shader
+//
+// Every connected input, whole, in one image: in a row, a column or a
+// near-square grid, in pin order. Each tile is the size of the first
+// connected input. An input of another size is centred in its tile, scaled
+// down to fit if it is larger. Gaps and letterboxing are Background.
+//
+// The host sizes the output: Native is the arrangement at 1:1, Fit is
+// OutputWidth x OutputHeight. The arrangement is scaled uniformly into the
+// output and centred, so at Native each input is read with Load, unfiltered.
+//
+// The effect always has eight inputs; unconnected ones hold a 1x1 zero
+// placeholder. InputMask says which pins are connected, so a gap in the
+// pins leaves no empty tile.
+
+Texture2D<float4>   Image1      : register(t0);
+Texture2D<float4>   Image2      : register(t1);
+Texture2D<float4>   Image3      : register(t2);
+Texture2D<float4>   Image4      : register(t3);
+Texture2D<float4>   Image5      : register(t4);
+Texture2D<float4>   Image6      : register(t5);
+Texture2D<float4>   Image7      : register(t6);
+Texture2D<float4>   Image8      : register(t7);
+RWTexture2D<float4> ImageOutput : register(u1);
+
+cbuffer constants : register(b0)
+{
+    uint   Width;        // auto-injected from input 0
+    uint   Height;
+    uint   Layout;       // 0 = row, 1 = column, 2 = grid
+    float  Gap;          // pixels between tiles, before scaling
+    float4 Background;   // gaps and letterboxing
+    uint   InputMask;    // host-injected: bit i set = pin i connected
+};
+
+uint2 InputSize(uint pin)
+{
+    uint2 size = uint2(0, 0);
+    [branch] switch (pin)
+    {
+        case 0:  Image1.GetDimensions(size.x, size.y); break;
+        case 1:  Image2.GetDimensions(size.x, size.y); break;
+        case 2:  Image3.GetDimensions(size.x, size.y); break;
+        case 3:  Image4.GetDimensions(size.x, size.y); break;
+        case 4:  Image5.GetDimensions(size.x, size.y); break;
+        case 5:  Image6.GetDimensions(size.x, size.y); break;
+        case 6:  Image7.GetDimensions(size.x, size.y); break;
+        default: Image8.GetDimensions(size.x, size.y); break;
+    }
+    return size;
+}
+
+// The readers take the texture itself, so the pin is resolved once per
+// pixel (ReadPin) rather than once per tap.
+
+// Bilinear read at `position` in input pixels (texel centres at +0.5),
+// clamped to the edge.
+float4 Bilinear(Texture2D<float4> image, float2 position, uint2 size)
+{
+    float2 texel  = position - 0.5;
+    float2 base   = floor(texel);
+    float2 weight = texel - base;
+    int2   last   = int2(size) - 1;
+    int2   low    = clamp(int2(base), 0, last);
+    int2   high   = clamp(int2(base) + 1, 0, last);
+    float4 top    = lerp(image.Load(int3(low, 0)), image.Load(int3(high.x, low.y, 0)), weight.x);
+    float4 bottom = lerp(image.Load(int3(low.x, high.y, 0)), image.Load(int3(high, 0)), weight.x);
+    return lerp(top, bottom, weight.y);
+}
+
+// An output pixel covers 1/scale input pixels: one bilinear tap when
+// enlarging, up to 4x4 taps spread over that footprint when reducing.
+float4 Filtered(Texture2D<float4> image, float2 position, uint2 size, float scale)
+{
+    if (scale >= 1.0)
+        return Bilinear(image, position, size);
+    float footprint = 1.0 / scale;
+    uint  taps = min((uint)ceil(footprint), 4u);
+    float4 sum = float4(0, 0, 0, 0);
+    [loop] for (uint y = 0; y < taps; ++y)
+    {
+        [loop] for (uint x = 0; x < taps; ++x)
+        {
+            float2 offset = (float2(x, y) + 0.5) / taps - 0.5;
+            sum += Bilinear(image, position + offset * footprint, size);
+        }
+    }
+    return sum / (taps * taps);
+}
+
+// One input in its tile. `local` is the point in tile pixels and `scale`
+// is output pixels per tile pixel.
+float4 ReadTile(Texture2D<float4> image, float2 local, uint2 tile, float scale, float4 background)
+{
+    uint2 size;
+    image.GetDimensions(size.x, size.y);
+    if (all(size <= tile))
+    {
+        // Centred at 1:1, on whole pixels.
+        float2 position = local - float2((tile - size) / 2);
+        if (any(position < 0.0) || any(position >= float2(size)))
+            return background;
+        if (scale == 1.0)
+            return image.Load(int3(int2(position), 0));
+        return Filtered(image, position, size, scale);
+    }
+
+    // Larger than the tile: scaled down to fit, centred.
+    float  fit      = min(float(tile.x) / size.x, float(tile.y) / size.y);
+    float2 origin   = (float2(tile) - float2(size) * fit) * 0.5;
+    float2 position = (local - origin) / fit;
+    if (any(position < 0.0) || any(position >= float2(size)))
+        return background;
+    return Filtered(image, position, size, scale * fit);
+}
+
+float4 ReadPin(uint pin, float2 local, uint2 tile, float scale, float4 background)
+{
+    [branch] switch (pin)
+    {
+        case 0:  return ReadTile(Image1, local, tile, scale, background);
+        case 1:  return ReadTile(Image2, local, tile, scale, background);
+        case 2:  return ReadTile(Image3, local, tile, scale, background);
+        case 3:  return ReadTile(Image4, local, tile, scale, background);
+        case 4:  return ReadTile(Image5, local, tile, scale, background);
+        case 5:  return ReadTile(Image6, local, tile, scale, background);
+        case 6:  return ReadTile(Image7, local, tile, scale, background);
+        default: return ReadTile(Image8, local, tile, scale, background);
+    }
+}
+
+// Columns and rows for `count` tiles; the host sizes the output with the same rule.
+void Shape(uint layout, uint count, out uint columns, out uint rows)
+{
+    columns = count;
+    rows = 1;
+    if (layout == 1)
+    {
+        columns = 1;
+        rows = count;
+    }
+    else if (layout == 2)
+    {
+        columns = 1;
+        [loop] while (columns * columns < count) ++columns;
+        rows = (count + columns - 1) / columns;
+    }
+}
+
+// The index-th connected pin.
+uint NthPin(uint mask, uint index)
+{
+    uint pin = 0, seen = 0;
+    [unroll] for (uint i = 0; i < 8; ++i)
+    {
+        if ((mask >> i) & 1)
+        {
+            if (seen == index) pin = i;
+            ++seen;
+        }
+    }
+    return pin;
+}
+
+float4 Arrange(uint2 pixel, uint2 outputSize, uint layout, uint gap, uint mask, uint count, float4 background)
+{
+    uint2 tile = InputSize(firstbitlow(mask));
+    uint columns, rows;
+    Shape(layout, count, columns, rows);
+    uint2 pitch = tile + gap;
+    uint2 arrangement = uint2(columns, rows) * pitch - gap;
+
+    uint2  cell;
+    float2 local;
+    float  scale;
+    if (all(outputSize == arrangement))
+    {
+        // Native: whole pixels throughout.
+        cell = pixel / pitch;
+        uint2 within = pixel - cell * pitch;
+        if (any(within >= tile))
+            return background;
+        local = float2(within) + 0.5;
+        scale = 1.0;
+    }
+    else
+    {
+        // Fit: the arrangement scaled uniformly into the output, centred.
+        scale = min(float(outputSize.x) / arrangement.x, float(outputSize.y) / arrangement.y);
+        float2 offset   = (float2(outputSize) - float2(arrangement) * scale) * 0.5;
+        float2 arranged = (float2(pixel) + 0.5 - offset) / scale;
+        if (any(arranged < 0.0) || any(arranged >= float2(arrangement)))
+            return background;
+        cell  = min(uint2(arranged / float2(pitch)), uint2(columns, rows) - 1);
+        local = arranged - float2(cell * pitch);
+        if (any(local >= float2(tile)))
+            return background;
+    }
+
+    uint index = cell.y * columns + cell.x;
+    if (index >= count)
+        return background;
+    return ReadPin(NthPin(mask, index), local, tile, scale, background);
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    // Read every cbuffer member before branching; the compiler strips
+    // members unused on some paths.
+    uint   layout     = Layout;
+    uint   gap        = (uint)floor(max(Gap, 0.0) + 0.5);
+    float4 background = Background;
+    uint   mask       = InputMask & 0xFF;
+    uint   sizeTouch  = Width + Height;
+
+    uint2 outputSize;
+    ImageOutput.GetDimensions(outputSize.x, outputSize.y);
+    if (any(id.xy >= outputSize) || sizeTouch == 0xFFFFFFFFu)
+        return;
+
+    uint count = countbits(mask);
+    float4 color = background;
+    if (count > 0)
+        color = Arrange(id.xy, outputSize, layout, gap, mask, count, background);
+    ImageOutput[id.xy] = color;
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Side by Side";
+            desc.effectId = L"Side by Side"; desc.effectVersion = 2;
+            desc.category = L"Analysis";
+            desc.subcategory = L"Comparison";
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
+            desc.hlslSource = sideBySideHLSL;
+            desc.inputNames = { L"Image 1", L"Image 2", L"Image 3", L"Image 4",
+                                L"Image 5", L"Image 6", L"Image 7", L"Image 8" };
+            desc.variadicInputs = true;
+            desc.parameters = {
+                { L"Layout",       L"float", 0.0f, 0.0f, 2.0f, 1.0f, { L"Row", L"Column", L"Grid" } },
+                { L"SizeMode",     L"float", 0.0f, 0.0f, 1.0f, 1.0f, { L"Native", L"Fit" } },
+                { L"OutputWidth",  L"float", 1920.0f, 64.0f, 16384.0f, 1.0f, {}, L"SizeMode == 1" },
+                { L"OutputHeight", L"float", 1080.0f, 64.0f, 16384.0f, 1.0f, {}, L"SizeMode == 1" },
+                { L"Gap",          L"float", 0.0f, 0.0f, 256.0f, 1.0f },
+                { L"Background",   L"float4", winrt::Windows::Foundation::Numerics::float4{ 0.0f, 0.0f, 0.0f, 1.0f },
+                                   -1.0f, 125.0f, 0.01f },
+            };
+            // GraphEvaluator writes InputMask before every dispatch.
+            desc.hiddenDefaults = {
+                { L"InputMask", 3.0f },
+            };
+            desc.deriveImageOutputSize = SideBySideOutputSize;
+            m_effects.push_back(std::move(desc));
+        }
+
         // ---- Image Statistics ----
         // D3D11 compute shader with stride-based reduction + 256-bin histogram.
         // Built-in path uses GpuReduction (RWBuffer<uint>); user-modified path
@@ -3932,7 +4333,10 @@ void main(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
 // Luminance Statistics - D3D11 Compute Shader
 // Outputs (in nits when Units = 1, normalized otherwise):
 //   Min, Max, Mean, Median, P95, P99, AvgLog, ClippedFraction, Samples,
-//   WhiteErrorBudget
+//   WhiteErrorBudget, HighlightP99
+//
+// HighlightP99 is the 99th percentile of the above-white pixels only, so it
+// describes the highlights whether they fill the frame or one small window.
 //
 // WhiteErrorBudget = min(ClippedFraction * BudgetScale, BudgetMax), computed
 // HERE rather than in a downstream Numeric Expression node. That is a
@@ -4154,12 +4558,33 @@ void main(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
         Result[9] = float4(
             clamp(min(clippedFrac * BudgetScale, BudgetMax), 0.0, BudgetMax),
             0, 0, 0);
+
+        // HighlightP99: the 99th percentile of the pixels ClippedFraction
+        // counts, walked down from the top bin. With nothing above white it
+        // is the clip threshold itself.
+        float fHighlightP99 = clipThreshold;
+        const uint highlightTail = gs_clipped[0] / 100;
+        uint above = 0;
+        if (gs_clipped[0] > 0)
+        {
+            for (int hb2 = HIST_BINS - 1; hb2 >= 0; --hb2)
+            {
+                above += gs_hist[hb2];
+                if (above > highlightTail)
+                {
+                    float binLog = LOG_MIN + (float(hb2) + 0.5) / float(HIST_BINS) * LOG_RANGE;
+                    fHighlightP99 = max(pow(10.0, binLog), clipThreshold);
+                    break;
+                }
+            }
+        }
+        Result[10] = float4(fHighlightP99 * scale, 0, 0, 0);
     }
 }
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"Luminance Statistics";
-            desc.effectId = L"Luminance Statistics"; desc.effectVersion = 5;
+            desc.effectId = L"Luminance Statistics"; desc.effectVersion = 6;
             desc.category = L"Analysis";
             desc.subcategory = L"Statistics";
             desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
@@ -4169,7 +4594,7 @@ void main(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
             desc.parameters = {
                 { L"Units",      L"float", 1.0f,    0.0f, 1.0f,    1.0f, { L"Normalized", L"Nits" } },
                 { L"ClipNits",   L"float", 203.0f, 10.0f, 10000.0f, 1.0f },
-                { L"BudgetScale", L"float", 15.0f,  0.0f, 100.0f,   0.5f },
+                { L"BudgetScale", L"float", 2.0f,   0.0f, 100.0f,   0.5f },
                 { L"BudgetMax",   L"float", 20.0f,  0.0f, 100.0f,   0.5f },
             };
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
@@ -4184,6 +4609,7 @@ void main(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
                 { L"ClippedFraction", Graph::AnalysisFieldType::Float },
                 { L"Samples",         Graph::AnalysisFieldType::Float },
                 { L"WhiteErrorBudget", Graph::AnalysisFieldType::Float },
+                { L"HighlightP99",     Graph::AnalysisFieldType::Float },
             };
             m_effects.push_back(std::move(desc));
         }

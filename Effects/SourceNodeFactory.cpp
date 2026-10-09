@@ -285,15 +285,25 @@ namespace ShaderLab::Effects
                     if (lv) provider->SetLoop(*lv);
                 }
 
-                // Always keep provider in "playing" state so Tick() processes
-                // frames. The Clock node drives seeking; m_playing just means
-                // the MF reader is in active decode mode.
+                // The node's Time picks the frame (TickAndUploadVideos). On a
+                // provider that has not played to its end, Play() only marks
+                // the source live (HasPlayingVideo).
                 if (!provider->IsPlaying())
                     provider->Play();
 
-                // Tick/Upload now handled by TickAndUploadVideos() — called before graph eval.
-                // Just ensure cachedOutput is set.
-                node.cachedOutput = provider->CurrentBitmap();
+                // Frames are uploaded by TickAndUploadVideos before evaluation;
+                // here the node just points at the current image.
+                auto pastEnd = m_videoPastEnd.find(node.id);
+                if (pastEnd != m_videoPastEnd.end())
+                {
+                    winrt::com_ptr<ID2D1Image> black;
+                    pastEnd->second->GetOutput(black.put());
+                    node.cachedOutput = black.get();
+                }
+                else
+                {
+                    node.cachedOutput = provider->CurrentBitmap();
+                }
               }
               catch (...)
               {
@@ -396,10 +406,10 @@ namespace ShaderLab::Effects
         m_bitmapPathCache.clear();
         m_floodCache.clear();
         m_videoCache.clear();
+        m_videoPastEnd.clear();
         m_dxgiCaptureCache.clear();
         m_wgcCaptureCache.clear();
         m_pendingWgcItems.clear();
-        m_lastClockTime.clear();
     }
 
     void SourceNodeFactory::PruneOrphans(const std::vector<Graph::EffectNode>& nodes)
@@ -425,7 +435,7 @@ namespace ShaderLab::Effects
         std::erase_if(m_bitmapCache, gone);
         std::erase_if(m_bitmapPathCache, gone);
         std::erase_if(m_floodCache, gone);
-        std::erase_if(m_lastClockTime, gone);
+        std::erase_if(m_videoPastEnd, [&](const auto& kv) { return !isKind(kv.first, L"IsVideo"); });
     }
 
     bool SourceNodeFactory::HasPlayingVideo() const
@@ -441,7 +451,7 @@ namespace ShaderLab::Effects
     bool SourceNodeFactory::TickAndUploadVideos(
         std::vector<Graph::EffectNode>& nodes,
         ID2D1DeviceContext5* dc,
-        double deltaSeconds)
+        double /*deltaSeconds*/)
     {
         PruneOrphans(nodes);
         bool anyNewFrame = false;
@@ -454,7 +464,6 @@ namespace ShaderLab::Effects
             for (auto& node : nodes)
                 if (node.id == id) { nodePtr = &node; break; }
 
-            bool clockDriven = false;
             double seekTime = 0.0;
             if (nodePtr)
             {
@@ -477,9 +486,30 @@ namespace ShaderLab::Effects
                 // Past end of video with looping off → show black.
                 if (!loop && provider->Duration() > 0 && seekTime >= provider->Duration())
                 {
-                    nodePtr->cachedOutput = nullptr;
-                    clockDriven = true;  // skip tick/seek below
-                    // Still update analysis output.
+                    auto [pastEnd, entered] = m_videoPastEnd.try_emplace(id);
+                    if (entered)
+                    {
+                        // A null cachedOutput would stop the whole graph from
+                        // evaluating, so black is an image: a flood cropped to
+                        // the frame.
+                        winrt::com_ptr<ID2D1Effect> flood, crop;
+                        if (FAILED(dc->CreateEffect(CLSID_D2D1Flood, flood.put())) ||
+                            FAILED(dc->CreateEffect(CLSID_D2D1Crop, crop.put())))
+                        {
+                            m_videoPastEnd.erase(pastEnd);
+                            nodePtr->runtimeError = L"Could not create the black past-the-end image";
+                            continue;
+                        }
+                        flood->SetValue(D2D1_FLOOD_PROP_COLOR, D2D1_VECTOR_4F{ 0.0f, 0.0f, 0.0f, 1.0f });
+                        crop->SetInputEffect(0, flood.get());
+                        crop->SetValue(D2D1_CROP_PROP_RECT, D2D1_VECTOR_4F{ 0.0f, 0.0f,
+                            static_cast<float>(provider->FrameWidth()), static_cast<float>(provider->FrameHeight()) });
+                        pastEnd->second = crop;
+                        nodePtr->dirty = true;
+                    }
+                    winrt::com_ptr<ID2D1Image> black;
+                    pastEnd->second->GetOutput(black.put());
+                    nodePtr->cachedOutput = black.get();
                     nodePtr->analysisOutput.type = Graph::AnalysisOutputType::Typed;
                     nodePtr->analysisOutput.fields.clear();
                     Graph::AnalysisFieldValue durFv;
@@ -492,53 +522,20 @@ namespace ShaderLab::Effects
                     nodePtr->analysisOutput.fields.push_back(std::move(posFv));
                     continue;
                 }
-
-                clockDriven = nodePtr->propertyBindings.count(L"Time") > 0;
             }
 
-            double currentPos = provider->CurrentPosition();
-            double diff = seekTime - currentPos;
-            double frameDur = 1.0 / (std::max)(provider->FrameRate(), 1.0);
-
-            if (clockDriven)
+            // Back from past the end: show the provider's frame again.
+            if (m_videoPastEnd.erase(id) > 0 && nodePtr)
             {
-                // Detect a paused Clock: bound Time hasn't advanced since
-                // the last tick. Without this, Tick() free-runs the decoder
-                // and the next iteration's Seek() snaps it back, producing
-                // a ~1s loop while the user thinks the video is static.
-                auto lcIt = m_lastClockTime.find(id);
-                bool clockAdvanced = (lcIt == m_lastClockTime.end()) ||
-                    std::abs(seekTime - lcIt->second) > 1e-6;
-                m_lastClockTime[id] = seekTime;
+                nodePtr->cachedOutput = provider->CurrentBitmap();
+                nodePtr->dirty = true;
+            }
 
-                if (!clockAdvanced)
-                {
-                    // Hold the frame for seekTime. The frame shown for a
-                    // target starts at or before it, so the position alone
-                    // cannot say "done": also skip a seek already made.
-                    if (std::abs(diff) > frameDur * 0.5 && provider->LastSeekTarget() != seekTime)
-                        provider->Seek(seekTime);
-                }
-                // Only seek for actual jumps: backward or very large skip (>5s).
-                // Never seek for small forward gaps — sequential decode catches up
-                // naturally and avoids expensive keyframe re-decode on scene changes.
-                else if (diff < -frameDur || diff > 5.0)
-                {
-                    provider->Seek(seekTime);
-                }
-                else
-                {
-                    provider->Tick(deltaSeconds);
-                }
-            }
-            else
-            {
-                // No clock: static frame at Time property value.
-                // Only seek if position differs from target and this target
-                // has not already been asked for (see the paused-clock case).
-                if (std::abs(diff) > frameDur * 0.5 && provider->LastSeekTarget() != seekTime)
-                    provider->Seek(seekTime);
-            }
+            // Show the frame for Time, whether a Clock drives it or it is a
+            // static value. The provider decodes forward (dropping frames a
+            // slow tick has passed) or seeks, whichever is cheaper, and holds
+            // the frame while Time stands still.
+            provider->PlayTo(seekTime);
 
             if (provider->UploadIfReady(dc))
             {

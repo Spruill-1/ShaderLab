@@ -25,7 +25,7 @@ Reference for "how does ShaderLab work under the hood".
 
 Reference for the effect catalog and per-effect mechanics.
 
-- [Built-in Effect Catalog](effects/builtin-catalog.md) — the 37 ShaderLab effects (Analysis, Color, Source, Tone Mapping, Parameter).
+- [Built-in Effect Catalog](effects/builtin-catalog.md) — the 38 ShaderLab effects (Analysis, Color, Source, Tone Mapping, Parameter).
 - [User Effects](effects/user-effects.md) — effects registered at runtime from saved-graph files, outside the build.
 - [Effect Versioning System](effects/effect-versioning.md) — how `effectVersion` bumps are detected on graph load.
 - [Effect Designer](effects/effect-designer.md) — the modal window for authoring custom pixel/compute shaders.

@@ -267,9 +267,10 @@ Content is part of the instrument. Also:
   visible region; only below fit does it shade the full intermediate.
 - **`perf_timings.fps` is `1/totalUs`** — per-frame *work*, not achieved rate
   (~35,000 on an idle throttled loop). For throughput diff `framesSampled` over a
-  window with **no MCP traffic inside it**: the worker's `WaitFor` is a cv
-  predicate wait, so every MCP call wakes it early and inflates the rate being
-  measured — observed 264 Hz against a 62.5 Hz timeout floor.
+  window with **no MCP traffic inside it**: the worker's deadline wait
+  (`WaitUntil`, paced by `FramePacer` at the monitor refresh, 60–240 Hz) ends
+  early for every queued MCP call, so MCP traffic inflates the rate being
+  measured — observed 264 Hz when the pacing ceiling was ~32 Hz.
 - **Check that an ablation ablates.** Non-monotonic deltas — removing more work
   saving less — mean the variant didn't take (e.g. `skipGamut = true` on a line a
   later block reassigns). Kill the branch at the `[branch]`, not at its inputs.

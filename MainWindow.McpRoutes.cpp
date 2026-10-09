@@ -835,9 +835,14 @@ namespace winrt::ShaderLab::implementation
             if (t.framesSampled == 0)
                 t = m_frameTiming;  // fallback to live if no snapshot yet
             double fps = (t.totalUs > 0) ? 1000000.0 / t.totalUs : 0;
+            const double previewFps = m_previewRenderStats.Fps();
+            const double previewMs = m_previewRenderStats.Ms();
+            const double previewCpuMs = m_previewRenderStats.CpuMs();
+            const double previewGpuMs = m_previewRenderStats.GpuMs();
+            auto msOrNull = [](double ms) { return ms < 0.0 ? std::string("null") : std::format("{:.3f}", ms); };
             return { 200, std::format(
                 "{{\"fps\":{:.1f},\"totalMs\":{:.2f},"
-                "\"sourcesPrepMs\":{:.2f},\"evaluateMs\":{:.2f},"
+                "\"frameStartMs\":{:.2f},\"sourcesPrepMs\":{:.2f},\"evaluateMs\":{:.2f},"
                 "\"deferredComputeMs\":{:.2f},\"drawMs\":{:.2f},"
                 "\"endDrawFlushMs\":{:.2f},"
                 "\"uiTickMs\":{:.2f},\"outputWindowsMs\":{:.2f},\"traceMs\":{:.2f},"
@@ -854,9 +859,11 @@ namespace winrt::ShaderLab::implementation
                 "\"gpuFramesOpened\":{},\"gpuFramesResolved\":{},\"gpuDisjointDrops\":{},"
                 "\"gpuFrameMs\":{:.3f},\"gpuSourcesPrepMs\":{:.3f},"
                 "\"gpuEvaluateMs\":{:.3f},\"gpuDeferredComputeMs\":{:.3f},"
-                "\"gpuDrawMs\":{:.3f}}}",
+                "\"gpuDrawMs\":{:.3f},"
+                "\"previewRenderFps\":{},\"previewRenderMs\":{},"
+                "\"previewRenderCpuMs\":{},\"previewRenderGpuMs\":{}}}",
                 fps, t.totalUs / 1000.0,
-                t.sourcesPrepUs / 1000.0, t.evaluateUs / 1000.0,
+                t.frameStartUs / 1000.0, t.sourcesPrepUs / 1000.0, t.evaluateUs / 1000.0,
                 t.deferredComputeUs / 1000.0, t.drawUs / 1000.0,
                 t.endDrawFlushUs / 1000.0,
                 // UI-thread fields come from the LIVE struct: the UI thread
@@ -880,7 +887,10 @@ namespace winrt::ShaderLab::implementation
                 m_renderEngine.Timer().DisjointDrops(),
                 t.gpuFrameMs, t.gpuSourcesPrepMs,
                 t.gpuEvaluateMs, t.gpuDeferredComputeMs,
-                t.gpuDrawMs) };
+                t.gpuDrawMs,
+                // null when the previewed node has not re-rendered recently.
+                previewFps < 0.0 ? std::string("null") : std::format("{:.2f}", previewFps),
+                msOrNull(previewMs), msOrNull(previewCpuMs), msOrNull(previewGpuMs)) };
         });
 
         // =====================================================================
@@ -949,7 +959,7 @@ namespace winrt::ShaderLab::implementation
                     DispatcherQueue().TryEnqueue([combo, preset]() { combo.SelectedIndex(preset); });
             }
             // Wake the worker so a new mode applies on this tick, not after
-            // one more 16 ms wait.
+            // its current frame wait.
             m_renderDispatcher.Wake();
             // Read back rather than echo: echoing made a toggle that never
             // took effect look like it had.

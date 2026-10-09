@@ -90,4 +90,4 @@ The rule (`ResolveUserEffectConflict`):
 - `LibraryVersion()` (the "effects lib vN" in the title bar) counts built-ins only,
   so it keeps identifying the build.
 - The catalog-count and pixel-shader-signature tests pin built-ins only.
-- A user effect gets no built-in-only hooks (`deriveConstants`, clock behaviour).
+- A user effect gets no built-in-only hooks (`deriveConstants`, `deriveImageOutputSize`, clock behaviour).

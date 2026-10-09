@@ -466,6 +466,8 @@ float4 main(
         m_gpuBindingSrvs.clear();
         m_gpuBindingSlots.clear();
         m_dispatchX = m_dispatchY = m_dispatchZ = 1;
+        if (FAILED(m_runner.LastDispatchResult()))
+            return m_runner.LastDispatchResult();
 
         m_lastEvaluatedFrame++;
         return S_OK;

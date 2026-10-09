@@ -120,6 +120,12 @@ namespace ShaderLab::Rendering
         bool IsInitialized() const { return m_device != nullptr; }
         bool HasShader() const { return m_shader != nullptr; }
 
+        // Why the last Dispatch did nothing, or S_OK.
+        HRESULT LastDispatchResult() const { return m_lastDispatchResult; }
+
+        // True when the installed shader declares SHADERLAB_IMAGE_PASS.
+        bool UsesImagePass() const { return m_usesImagePass; }
+
         // SRV onto the result structured buffer. Used by upstream
         // effects implementing IEngineComputeOutput to expose their
         // analysis output for direct GPU consumption by downstream
@@ -219,6 +225,20 @@ namespace ShaderLab::Rendering
         winrt::com_ptr<ID3D11UnorderedAccessView> m_scratchUAV;       // whole buffer
         winrt::com_ptr<ID3D11UnorderedAccessView> m_scratchHeadUAV;   // cleared head
         bool EnsureScratch();
+
+        // Two-pass image contract (see ShaderLabParamsHlsl.h).
+        bool m_usesImagePass{ false };
+        UINT m_groupSize[3]{ 1, 1, 1 };
+        uint32_t m_accumulatorStride{ 0 };
+        uint64_t m_accumulatorBytes{ 0 };
+        bool m_accumulatorNeedsClear{ true };
+        winrt::com_ptr<ID3D11Buffer>              m_accumulator;
+        winrt::com_ptr<ID3D11UnorderedAccessView> m_accumulatorUAV;
+        winrt::com_ptr<ID3D11Buffer>              m_passConstants[2];
+        HRESULT EnsureImagePassResources(uint64_t pixelCount);
+        // Reads the scratch / image-pass opt-ins and the group size.
+        void ReflectContracts();
+        HRESULT m_lastDispatchResult{ S_OK };
 
         void EnsureBuffers(uint32_t resultCount);
         // Creates the lane-3 texture + copy shader on demand. Safe to call

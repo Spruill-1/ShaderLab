@@ -167,6 +167,23 @@ float ShaderLabAnalysisField(Texture2D<float4> tex, uint index)
 #define ShaderLabScratchStore(word, value)  _SLScratch.Store((word) * 4, (value))
 #define ShaderLabScratchLoad(word)          _SLScratch.Load((word) * 4)
 
+// ---- Accumulate, then write the image ----------------------------------------
+// For an image whose pixels are bins the input is scattered into. Declare
+// SHADERLAB_IMAGE_PASS(type) at file scope (instead of SHADERLAB_REDUCE_SCRATCH)
+// and the host runs the shader twice per frame, ignoring the caller's dispatch size:
+//   ShaderLabPass == 0  one thread per input-0 pixel (SV_DispatchThreadID.xy)
+//   ShaderLabPass == 1  one thread per image-output pixel
+// _SLPixelAccum (u3) holds one `type` per output pixel; its layout is the
+// shader's. The host zeroes it only when it is created or the shader changes,
+// so whatever pass 0 accumulates into, pass 1 must zero again. The first
+// SHADERLAB_REDUCE_CLEARED words of _SLScratch (u2) and the output image are
+// zeroed before every pass 0.
+// ShaderLabPass is a cbuffer value, so barriers may sit under a branch on it.
+#define SHADERLAB_IMAGE_PASS(type) \
+    cbuffer _SLPassConstants : register(b1) { uint ShaderLabPass; }; \
+    RWByteAddressBuffer _SLScratch : register(u2); \
+    RWStructuredBuffer<type> _SLPixelAccum : register(u3);
+
 #endif // SHADERLAB_PARAMS_HLSLI_INCLUDED
 )HLSL";
 

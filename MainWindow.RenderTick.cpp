@@ -8,6 +8,7 @@
 #include "pch.h"
 #include "MainWindow.xaml.h"
 
+#include "Rendering/FramePacer.h"
 #include "Rendering/PipelineFormat.h"
 #include "Effects/Performance.h"
 
@@ -171,7 +172,7 @@ namespace winrt::ShaderLab::implementation
             m_lastVideoFps = videoFps;
             m_lastFps = fps;
 
-            FpsText().Text(std::format(L"{:.0f} fps | {:.1f} ms", fps, m_frameTiming.totalUs / 1000.0));
+            FpsText().Text(winrt::hstring(BuildFpsStatusText()));
             UpdateFpsTooltip();
             m_fpsTimePoint = fpsNow;
         }
@@ -206,18 +207,12 @@ namespace winrt::ShaderLab::implementation
         m_renderDispatcher.RegisterConsumer();
 
         auto last = std::chrono::steady_clock::now();
+        ::ShaderLab::Rendering::FramePacer pacer(m_targetRefreshHz.load(std::memory_order_relaxed));
         while (!stop.stop_requested() && !m_renderShouldStop.load(std::memory_order_acquire))
         {
-            // Pacing. The 16 ms timeout is what makes this an editor rather
-            // than a benchmark: it caps the worker near 62.5 Hz so a static
-            // graph does not spin a core. In unthrottled mode we drain
-            // without blocking and loop immediately, so the only limit left
-            // is how fast the machine can actually evaluate the graph.
-            //
-            // Note the wait is a cv predicate wait either way, so a queued
-            // MCP closure already wakes it early -- MCP traffic itself raises
-            // the tick rate, which is worth remembering when benchmarking
-            // over MCP.
+            // Pacing. In both modes a queued MCP closure wakes the worker
+            // early, so MCP traffic raises the tick rate, which matters when
+            // benchmarking over MCP.
             const bool unthrottled = ::ShaderLab::Performance::IsUnthrottledRenderEnabled();
             if (unthrottled)
             {
@@ -239,14 +234,14 @@ namespace winrt::ShaderLab::implementation
             }
             else
             {
-                // The 16 ms timeout is what makes this an editor rather than
-                // a benchmark: it caps the worker near 62.5 Hz so a static
-                // graph does not spin a core.
-                //
-                // Either way this is a cv PREDICATE wait, so a queued MCP
-                // closure wakes it early -- MCP traffic itself raises the
-                // tick rate, which matters when benchmarking over MCP.
-                m_renderDispatcher.WaitFor(std::chrono::milliseconds(16));
+                // Wait for the next frame deadline at the display refresh
+                // rate (60 Hz minimum), so a static graph does not spin a
+                // core and the frame's own work is absorbed in the period.
+                // A frame that overran still idles briefly, for the same
+                // lock-fairness reason as the yield above.
+                pacer.SetRate(m_targetRefreshHz.load(std::memory_order_relaxed));
+                m_renderDispatcher.WaitUntil(pacer.WaitDeadline(std::chrono::steady_clock::now()));
+                pacer.BeginFrame(std::chrono::steady_clock::now());
             }
             {
                 // Every MCP mutation arrives as a closure drained here. Hold the
@@ -498,6 +493,9 @@ namespace winrt::ShaderLab::implementation
                     }
                 }
 
+                // Every iteration, rendered or not, so the rate ages to N/A.
+                m_previewRenderStats.Publish(std::chrono::steady_clock::now());
+
                 // Publish snapshot.
                 m_frameGeneration.fetch_add(1, std::memory_order_release);
                 PublishGraphSnapshot();
@@ -630,7 +628,19 @@ namespace winrt::ShaderLab::implementation
         // "the GPU did no work" rather than "the timer is jammed".
         gpu.BeginFrame();
         gpu.Begin(::ShaderLab::Rendering::GpuSpan::Frame);
+
+        // Whether the previewed node renders in this frame: its output-change
+        // count moves in any of the frame's evaluation passes.
+        m_previewRenderStats.Initialize(m_renderEngine.D3DDevice());
+        m_previewRenderStats.SetNode(m_previewNodeId);
+        const uint64_t previewChangesBefore = m_graphEvaluator.OutputChangeCount(m_previewNodeId);
+        m_previewRenderStats.BeginFrame(std::chrono::steady_clock::now());
         gpu.Begin(::ShaderLab::Rendering::GpuSpan::SourcesPrep);
+
+        // The timer flushes above wait here when the GPU is still busy with
+        // earlier frames; that wait is reported as frameStartUs, not as
+        // source preparation.
+        auto tSourcesStart = std::chrono::high_resolution_clock::now();
 
         // ---- Source preparation + graph evaluation (same as RenderFrame) ----
         for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
@@ -818,6 +828,9 @@ namespace winrt::ShaderLab::implementation
         gpu.End(::ShaderLab::Rendering::GpuSpan::Draw);
         gpu.End(::ShaderLab::Rendering::GpuSpan::Frame);
         gpu.EndFrame();
+        m_previewRenderStats.EndFrame(
+            m_previewNodeId != 0 && m_graphEvaluator.OutputChangeCount(m_previewNodeId) != previewChangesBefore,
+            std::chrono::steady_clock::now());
 
         // Publish per-node GPU results onto the nodes, where the canvas picks
         // them up through the ordinary GraphUiSnapshot copy.
@@ -930,7 +943,8 @@ namespace winrt::ShaderLab::implementation
             };
             const double a = 0.1;
             auto& t = m_frameTiming;
-            t.sourcesPrepUs     = t.sourcesPrepUs     * (1-a) + usec(tFrameStart,  tSourcesEnd) * a;
+            t.frameStartUs      = t.frameStartUs      * (1-a) + usec(tFrameStart,  tSourcesStart) * a;
+            t.sourcesPrepUs     = t.sourcesPrepUs     * (1-a) + usec(tSourcesStart, tSourcesEnd) * a;
             t.evaluateUs        = t.evaluateUs        * (1-a) + usec(tSourcesEnd,  tEvalEnd)    * a;
             t.deferredComputeUs = t.deferredComputeUs * (1-a) + usec(tEvalEnd,     tComputeEnd) * a;
             t.drawUs            = t.drawUs            * (1-a) + usec(tComputeEnd,  tDrawEnd)    * a;

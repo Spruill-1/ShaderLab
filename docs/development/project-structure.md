@@ -45,7 +45,13 @@ ShaderLab/
 │
 ├── Tests/                          # ShaderLabTests + smoke scripts
 │   ├── TestRunner.cpp              # 289 tests (the runner prints the authoritative total) (graph, evaluator, dispatcher [+fail-fast], snapshot, bytecode cache, router, JSON-RPC, frame/crypto/peer/channel, math bench)
-│   ├── TestCommon.h                # Shared TEST() macro across TUs
+│   ├── TestCommon.h                # Shared TEST() macro across TUs; TIMING_TEST() for real-time checks
+│   │                               # (asserted on hardware outside CI; SHADERLAB_TIMING_TESTS=1/0 overrides)
+│   ├── VideoPlaybackTests.cpp      # Real-time harnesses: Clock-driven video playback rate, render-loop pacing,
+│   │                               # video playback controls, seeks while playing, past-the-end black,
+│   │                               # decoder surface pool probe
+│   │                               # (reports [info] tables; SHADERLAB_VIDEO_MATRIX=full runs every clip x tick rate;
+│   │                               # SHADERLAB_TESTS=video runs only the video tests)
 │   ├── ShaderTestBench.h / .cpp    # D3D11 compute test harness for HLSL math
 │   ├── Math/                       # 51 HLSL math tests
 │   │   ├── TransferFunctionTests.cpp  # PQ, HLG, sRGB encode/decode round-trips
@@ -61,6 +67,9 @@ ShaderLab/
 │   └── fixtures/                      # test_cli_basic.json (golden graph for headless smoke),
 │                                      # MakeVideoFixtures.ps1 -> video_*_30f.mp4 (generated with ffmpeg, git-ignored;
 │                                      # the video seek + zero-copy test reports [SKIP] without them)
+│                                      # and video_index_h264_{180p24,180p30,180p60,720p60,720p60_g600}.mp4 (checked
+│                                      # in, < 100 KB each; 10 bars encode each frame's index for the playback
+│                                      # harness; _g600 has one keyframe in 10 s, for the seek tests)
 │
 ├── ShaderLabHeadless/
 │   └── Main.cpp                    # Console host: PNG render / --pixels / --script / --serve / --mcp-session
@@ -85,6 +94,7 @@ ShaderLab/
 │   ├── IccProfileParser.h / .cpp   # mscms.dll-based ICC reader
 │   ├── PipelineFormat.h            # PipelineFormat struct (scRGB FP16 always)
 │   ├── RenderEngine.h / .cpp       # App-only D3D11 + D2D1 + swap chain lifecycle
+│   ├── FramePacer.h                # Frame deadlines for the throttled render worker
 │   ├── RenderThreadDispatcher.h    # Closure queue for UI → render-worker marshalling (P7)
 │   ├── GraphEvaluator.h / .cpp     # Topological walk, effect cache, dirty gating, D3D11 dispatch
 │   ├── D3D11ComputeRunner.h / .cpp # Generic D3D11 compute dispatch for user shaders
@@ -96,7 +106,7 @@ ShaderLab/
 │   ├── MathExpression.h / .cpp     # ExprTk-backed expression evaluator (PCH disabled on .cpp)
 │
 ├── Effects/                        # Engine: built-in effect wrappers + custom effect base
-│   ├── ShaderLabEffects.h / .cpp   # 37 ShaderLab effects (versioned) — embedded HLSL
+│   ├── ShaderLabEffects.h / .cpp   # 38 ShaderLab effects (versioned) — embedded HLSL
 │   ├── ColorMath.cpp               # Shared HLSL color math library, served as shaderlab_colormath.hlsli
 │   ├── ColorMathCpu.h              # CPU port of the ICtCp path, for derived-constant tables (tested against the HLSL)
 │   ├── PropertyMetadata.h          # Effect property metadata for UI generation

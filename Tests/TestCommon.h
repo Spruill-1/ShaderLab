@@ -26,4 +26,22 @@ namespace ShaderLab::Tests
         }
         std::fflush(stdout);
     }
+
+    // Real-time assertions (rates, deadlines, playback tracking) need an
+    // otherwise idle machine. Off on WARP and under CI (shared runners);
+    // SHADERLAB_TIMING_TESTS=1 or 0 overrides. Set by main().
+    inline bool g_timingAssertions = true;
+
+    // TEST() when timing assertions are on; otherwise the result is printed
+    // as [info] and not counted.
+    inline void TIMING_TEST(const char* name, bool result)
+    {
+        if (g_timingAssertions)
+        {
+            TEST(name, result);
+            return;
+        }
+        std::printf("  [info] %s: %s (timing, not asserted)\n", name, result ? "met" : "missed");
+        std::fflush(stdout);
+    }
 }

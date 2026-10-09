@@ -23,6 +23,7 @@
 #include "Engine/Mcp/EngineMcpRoutes.h"
 #include "Engine/Mcp/McpSessionClient.h"
 #include "Rendering/RenderThreadDispatcher.h"
+#include "Rendering/PreviewRenderStats.h"
 
 namespace winrt::ShaderLab::implementation
 {
@@ -414,12 +415,10 @@ namespace winrt::ShaderLab::implementation
         std::chrono::steady_clock::time_point m_fpsTimePoint;
         std::chrono::steady_clock::time_point m_lastRenderTick;
 
-        // Render cadence: target 1 / monitor refresh, clamped to [60, 240] Hz.
-        // Refreshed on init and on every display change so a 120/144/240 Hz
-        // panel actually drives the render loop at its native rate. Going
-        // higher than display refresh wastes work; going lower than 60 Hz
-        // makes interactions feel laggy on unusual modes (e.g. 30 Hz TV out).
-        uint32_t m_targetRefreshHz{ 60 };
+        // Render cadence: monitor refresh, clamped to [60, 240] Hz by
+        // FramePacer::ClampRate. Written by the UI thread on init and display
+        // change; drives both the UI blit timer and the render worker's pacer.
+        std::atomic<uint32_t> m_targetRefreshHz{ 60 };
         uint32_t QueryDisplayRefreshHz() const noexcept;
         void UpdateRenderTimerInterval();
 
@@ -430,6 +429,7 @@ namespace winrt::ShaderLab::implementation
             // These add up to totalUs and represent the actual cost of one
             // graph eval -- which is the meaningful number for HDR shader /
             // tonemap perf evaluation, the primary focus of this app.
+            double frameStartUs{};       // GPU frame timers opening the frame; waits while the GPU is behind
             double sourcesPrepUs{};      // PrepareSourceNode loop (image/video upload)
             double evaluateUs{};         // GraphEvaluator::Evaluate (passes 1 + 2)
             double deferredComputeUs{};  // ProcessDeferredCompute (D3D11 compute dispatches) + post-PDC eval
@@ -468,6 +468,9 @@ namespace winrt::ShaderLab::implementation
         };
         FrameTimings m_frameTiming;
         FrameTimings m_lastFrameTiming;  // snapshot for MCP read
+        // The previewed node's re-render rate and per-render time (status bar,
+        // perf_timings). Written on the render thread, read through atomics.
+        ::ShaderLab::Rendering::PreviewRenderStats m_previewRenderStats;
 
         HWND m_hwnd{ nullptr };
         bool m_customEffectsRegistered{ false };

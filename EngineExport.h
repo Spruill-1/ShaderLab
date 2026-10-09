@@ -44,7 +44,12 @@
 //      GraphEvaluator (variant state); a new IEngineCommandSink virtual
 //      (OnGraphMediaDirChanged), EffectGraphFile::LoadResult (package) and
 //      Mcp::EngineContext (renderFrameFor).
-#define SHADERLAB_ENGINE_ABI_VERSION 6
+//   7: ShaderLabEffectDescriptor gains deriveImageOutputSize; D3D11ComputeRunner
+//      gains the two-pass image contract (accumulator, pass constants);
+//      VideoSourceProvider's decode-ahead queue, PlayTo and learned
+//      keyframe spans, and SourceNodeFactory without its paused-clock map
+//      and with its past-the-end black images.
+#define SHADERLAB_ENGINE_ABI_VERSION 7
 
 // C-linkage entry so it can be GetProcAddress'd if a host wants to do a
 // version check before dynamically loading the DLL.

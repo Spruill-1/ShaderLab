@@ -120,3 +120,6 @@ Tests/output/
 
 # Generated test media (Tests/fixtures/MakeVideoFixtures.ps1)
 Tests/fixtures/*.mp4
+# The frame-index clips are small (< 100 KB) and checked in so the playback
+# harness runs without ffmpeg.
+!Tests/fixtures/video_index_*.mp4

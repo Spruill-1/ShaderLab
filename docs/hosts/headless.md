@@ -41,7 +41,7 @@ ShaderLabHeadless --graph PATH --node ID --output IMAGE_PATH [options]
   | `get-node` | `GET /graph/node/<nodeId>` |
   | `analysis` | `GET /analysis/<nodeId>` |
   | `render` | (internal) force a fresh evaluator pass — barrier between mutations and readbacks |
-  | `gpu-bench` | (internal, needs `--gpu-timing`) re-dirty the sources and draw `nodeId` for `iterations` frames; reports GPU draw / frame / evaluate time (min, median), CPU evaluate and whole-frame time (`cpuFrameMedianMs` includes any synchronous GPU waits such as blocking readbacks), and `computeNodeMedianMs` -- each compute node's own dispatch time. Re-dirtying *every* source means a large graph measures all of it; bench one effect in a minimal graph when you want its cost alone. |
+  | `gpu-bench` | (internal, needs `--gpu-timing`) re-dirty the sources and draw `nodeId` for `iterations` frames; reports GPU draw / frame / evaluate time (min, median), CPU evaluate and whole-frame time (`cpuFrameMedianMs` includes any synchronous GPU waits such as blocking readbacks), and `computeNodeMedianMs` -- each compute node's own dispatch time. Re-dirtying *every* source means a large graph measures all of it; bench one effect in a minimal graph when you want its cost alone. The GPU is shared: with the GUI or the test suite rendering at the same time, CPU evaluate and compute-node times inflate several-fold while the draw time barely moves, so bench on an otherwise idle GPU. |
 
   Example script (insert a Luminance Statistics node, sweep upstream, read back):
 

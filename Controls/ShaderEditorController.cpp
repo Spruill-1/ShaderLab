@@ -110,6 +110,9 @@ namespace ShaderLab::Controls
             // are internal).
             if (cb.name.starts_with(L"$") && cb.name != L"$Globals")
                 continue;
+            // Host-owned (the image-pass index from shaderlab_params.hlsli).
+            if (cb.name.starts_with(L"_SL"))
+                continue;
 
             for (const auto& var : cb.variables)
             {

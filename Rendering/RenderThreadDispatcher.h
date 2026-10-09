@@ -22,6 +22,9 @@
 // host needs this because there is no separate render thread there; the MCP
 // listener thread is the sole consumer and must run closures synchronously.
 
+#include <windows.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -46,9 +49,22 @@ namespace ShaderLab::Rendering
         // calling thread. Used by ShaderLabHeadless and the existing 154-test
         // suite, where there is no separate render thread.
         explicit RenderThreadDispatcher(bool synchronous = false)
-            : m_synchronous(synchronous) {}
+            : m_synchronous(synchronous)
+        {
+            if (m_synchronous) return;
+            // WaitUntil needs a wake event plus a high-resolution timer; a
+            // condition variable timeout rounds up to the 15.6 ms system tick.
+            m_wakeEvent = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            m_deadlineTimer = ::CreateWaitableTimerExW(nullptr, nullptr,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        }
 
-        ~RenderThreadDispatcher() { Shutdown(); }
+        ~RenderThreadDispatcher()
+        {
+            Shutdown();
+            if (m_deadlineTimer) ::CloseHandle(m_deadlineTimer);
+            if (m_wakeEvent) ::CloseHandle(m_wakeEvent);
+        }
 
         RenderThreadDispatcher(const RenderThreadDispatcher&) = delete;
         RenderThreadDispatcher& operator=(const RenderThreadDispatcher&) = delete;
@@ -77,7 +93,7 @@ namespace ShaderLab::Rendering
                 if (m_shuttingDown) return;
                 m_queue.push_back(std::move(item));
             }
-            m_cv.notify_one();
+            NotifyConsumer();
         }
 
         // Enqueue a closure and block the calling thread until it has run.
@@ -155,7 +171,7 @@ namespace ShaderLab::Rendering
                 }
             }
             if (queued)
-                m_cv.notify_one();
+                NotifyConsumer();
             else
                 item(true);   // shutting down: fail the promise immediately
 
@@ -204,33 +220,79 @@ namespace ShaderLab::Rendering
             return local.size();
         }
 
-        // Block the consumer until at least one closure is enqueued or
+        // Block the consumer until a closure is enqueued, Wake() is called or
         // Shutdown() is called. Spurious wakeups are fine -- callers should
         // follow with Drain() and then loop.
         void Wait()
         {
             if (m_synchronous) return;
             std::unique_lock lock(m_mutex);
-            m_cv.wait(lock, [this] { return m_shuttingDown || !m_queue.empty(); });
+            m_cv.wait(lock, [this] { return IsReadyLocked(); });
+            m_wakeRequested = false;
         }
 
-        // Like Wait() but with a timeout so the consumer can periodically
-        // run other work (e.g. pump animation) even when fully idle.
+        // Like Wait() but with a timeout. The timeout has system-tick
+        // granularity (15.6 ms by default); use WaitUntil for frame pacing.
         bool WaitFor(std::chrono::milliseconds timeout)
         {
             if (m_synchronous) return true;
             std::unique_lock lock(m_mutex);
-            return m_cv.wait_for(lock, timeout,
-                [this] { return m_shuttingDown || !m_queue.empty(); });
+            const bool ready = m_cv.wait_for(lock, timeout, [this] { return IsReadyLocked(); });
+            m_wakeRequested = false;
+            return ready;
         }
 
-        // Wake the consumer (Wait/WaitFor return) without enqueueing work.
-        // Useful when the consumer needs to re-check external state (dirty
-        // bits, animation, resize) on demand.
+        // Like Wait() but returns at an absolute deadline, timed with a
+        // high-resolution waitable timer (sub-millisecond on Windows 10 1803
+        // and later). Returns true when woken by work, Wake() or Shutdown(),
+        // false when the deadline passed. Consumer thread only.
+        bool WaitUntil(std::chrono::steady_clock::time_point deadline)
+        {
+            if (m_synchronous) return true;
+            if (!m_wakeEvent || !m_deadlineTimer)
+                return WaitUntilCoarse(deadline);
+            for (;;)
+            {
+                {
+                    std::scoped_lock lock(m_mutex);
+                    if (IsReadyLocked())
+                    {
+                        m_wakeRequested = false;
+                        return true;
+                    }
+                }
+                const auto remaining = deadline - std::chrono::steady_clock::now();
+                if (remaining <= std::chrono::steady_clock::duration::zero())
+                    return false;
+
+                // Relative due time in 100 ns units.
+                LARGE_INTEGER dueTime{};
+                dueTime.QuadPart = -(std::max<LONGLONG>)(1,
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count() / 100);
+                if (!::SetWaitableTimer(m_deadlineTimer, &dueTime, 0, nullptr, nullptr, FALSE))
+                    return WaitUntilCoarse(deadline);
+
+                // A producer that queued after the check above has already
+                // set the auto-reset event, so this returns at once. A stale
+                // event from earlier work just loops back to the check.
+                const HANDLE handles[] = { m_wakeEvent, m_deadlineTimer };
+                const DWORD waitResult = ::WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+                if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_OBJECT_0 + 1)
+                    return WaitUntilCoarse(deadline);
+            }
+        }
+
+        // Wake the consumer (Wait/WaitFor/WaitUntil return) without
+        // enqueueing work, so it re-checks external state such as a stop
+        // flag or a render-mode change.
         void Wake()
         {
             if (m_synchronous) return;
-            m_cv.notify_all();
+            {
+                std::scoped_lock lock(m_mutex);
+                m_wakeRequested = true;
+            }
+            NotifyConsumer();
         }
 
         // ------------------------------------------------------------------
@@ -250,6 +312,7 @@ namespace ShaderLab::Rendering
                 std::scoped_lock lock(m_mutex);
                 local.swap(m_queue);
                 m_shuttingDown = false;
+                m_wakeRequested = false;
             }
             for (auto& fn : local) { try { fn(true); } catch (...) {} }
             m_consumerId.store(std::thread::id{}, std::memory_order_release);
@@ -269,7 +332,7 @@ namespace ShaderLab::Rendering
                 local.swap(m_queue);
             }
             for (auto& fn : local) { try { fn(true); } catch (...) {} }
-            m_cv.notify_all();
+            NotifyConsumer();
         }
 
         bool IsShuttingDown() const
@@ -301,6 +364,25 @@ namespace ShaderLab::Rendering
             if (m_afterSyncClosure) m_afterSyncClosure();
         }
 
+        bool IsReadyLocked() const
+        {
+            return m_shuttingDown || m_wakeRequested || !m_queue.empty();
+        }
+
+        void NotifyConsumer()
+        {
+            m_cv.notify_all();
+            if (m_wakeEvent) ::SetEvent(m_wakeEvent);
+        }
+
+        bool WaitUntilCoarse(std::chrono::steady_clock::time_point deadline)
+        {
+            std::unique_lock lock(m_mutex);
+            const bool ready = m_cv.wait_until(lock, deadline, [this] { return IsReadyLocked(); });
+            m_wakeRequested = false;
+            return ready;
+        }
+
         bool IsConsumerThread() const
         {
             return m_consumerId.load(std::memory_order_acquire) ==
@@ -318,5 +400,8 @@ namespace ShaderLab::Rendering
         std::atomic<std::thread::id> m_consumerId{};
         std::function<void()> m_afterSyncClosure;
         bool m_shuttingDown{ false };
+        bool m_wakeRequested{ false };
+        HANDLE m_wakeEvent{ nullptr };       // auto-reset, set on every notify
+        HANDLE m_deadlineTimer{ nullptr };   // high-resolution, consumer only
     };
 }

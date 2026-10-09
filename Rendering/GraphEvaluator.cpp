@@ -150,7 +150,39 @@ namespace ShaderLab::Rendering
             }
             return names;
         }
+
+        // A video Source: its image comes from SourceNodeFactory's uploads,
+        // and its bound properties (Time) only steer the provider.
+        bool IsVideoSource(const EffectNode& node)
+        {
+            if (node.type != NodeType::Source) return false;
+            auto it = node.properties.find(L"IsVideo");
+            if (it == node.properties.end()) return false;
+            const auto* isVideo = std::get_if<bool>(&it->second);
+            return isVideo && *isVideo;
+        }
     }
+
+    bool GraphEvaluator::BoundSourceChanged(const EffectNode& node) const
+    {
+        auto changed = [this](uint32_t sourceNodeId)
+        {
+            return m_outputChangedThisEval.count(sourceNodeId) > 0 ||
+                   m_fieldsChangedThisEval.count(sourceNodeId) > 0;
+        };
+        for (const auto& [propName, binding] : node.propertyBindings)
+        {
+            if (binding.wholeArray)
+            {
+                if (changed(binding.wholeArraySourceNodeId)) return true;
+                continue;
+            }
+            for (const auto& source : binding.sources)
+                if (source.has_value() && changed(source->sourceNodeId)) return true;
+        }
+        return false;
+    }
+
     // -----------------------------------------------------------------------
     // Main evaluation entry point
     // -----------------------------------------------------------------------
@@ -236,6 +268,7 @@ namespace ShaderLab::Rendering
         // every predecessor -- edge or binding -- has finished its visit, so
         // m_outputChangedThisEval is final for all of them.
         m_outputChangedThisEval.clear();
+        m_fieldsChangedThisEval.clear();
 
         for (uint32_t nodeId : order)
         {
@@ -252,30 +285,21 @@ namespace ShaderLab::Rendering
                     { node->dirty = true; break; }
                 }
             }
-            if (!node->dirty)
+            if (!node->dirty && BoundSourceChanged(*node))
             {
-                for (const auto& [propName, binding] : node->propertyBindings)
-                {
-                    if (binding.wholeArray)
-                    {
-                        if (m_outputChangedThisEval.count(binding.wholeArraySourceNodeId))
-                        { node->dirty = true; break; }
-                        continue;
-                    }
-                    for (const auto& src : binding.sources)
-                    {
-                        if (src.has_value() &&
-                            m_outputChangedThisEval.count(src->sourceNodeId))
-                        { node->dirty = true; break; }
-                    }
-                    if (node->dirty) break;
-                }
+                // A video's bound properties drive its provider, which marks
+                // the node dirty itself when a new frame is uploaded. Until
+                // then only its analysis fields move.
+                if (IsVideoSource(*node))
+                    m_fieldsChangedThisEval.insert(nodeId);
+                else
+                    node->dirty = true;
             }
 
             // Record BEFORE the visit for the start-of-frame case; the binding
             // sites below add themselves when they discover a change mid-visit.
             if (node->dirty)
-                m_outputChangedThisEval.insert(nodeId);
+                MarkOutputChanged(nodeId);
 
             // Skip nodes not needed by any visible output -- but KEEP their
             // pending change. Clearing `dirty` here threw away an edit made
@@ -316,8 +340,15 @@ namespace ShaderLab::Rendering
                             }
                             node->properties[propName] = eit->second;
                         }
-                        node->dirty = true;
-                        m_outputChangedThisEval.insert(nodeId);
+                        if (IsVideoSource(*node))
+                        {
+                            m_fieldsChangedThisEval.insert(nodeId);
+                        }
+                        else
+                        {
+                            node->dirty = true;
+                            MarkOutputChanged(nodeId);
+                        }
                     }
                 }
                 node->dirty = false;
@@ -361,7 +392,7 @@ namespace ShaderLab::Rendering
                     const bool wasDirty = node->dirty || bindingsChanged;
                     // A binding that moved changes this node's output, so
                     // downstream consumers have to learn about it too.
-                    if (bindingsChanged) m_outputChangedThisEval.insert(nodeId);
+                    if (bindingsChanged) MarkOutputChanged(nodeId);
                     if (wasDirty)
                     {
                         ApplyProperties(effect, *node, effectiveProps);
@@ -429,7 +460,7 @@ namespace ShaderLab::Rendering
                                 }
                             }
                             node->dirty = true;
-                            m_outputChangedThisEval.insert(nodeId);
+                            MarkOutputChanged(nodeId);
                         }
                     }
 
@@ -486,6 +517,20 @@ namespace ShaderLab::Rendering
                         const uint32_t declared = static_cast<uint32_t>(node->customEffect->inputNames.size());
                         const uint32_t firstLookup = declared - (std::min)(lookupCount, declared);
                         for (uint32_t pin = firstLookup; pin < declared && pin < inputImages.size(); ++pin)
+                        {
+                            const bool wired = std::any_of(inputs.begin(), inputs.end(),
+                                [pin](const auto* edge) { return edge->destPin == pin; });
+                            if (wired) continue;
+                            EnsureAnalysisDummy(dc);
+                            if (m_analysisDummyBitmap)
+                                inputImages[pin].copy_from(static_cast<ID2D1Image*>(m_analysisDummyBitmap.get()));
+                        }
+                    }
+                    // So does every unwired pin of a variadic node; its
+                    // InputMask says which pins are real.
+                    if (node->customEffect->variadicInputs)
+                    {
+                        for (uint32_t pin = 0; pin < inputImages.size(); ++pin)
                         {
                             const bool wired = std::any_of(inputs.begin(), inputs.end(),
                                 [pin](const auto* edge) { return edge->destPin == pin; });
@@ -557,7 +602,12 @@ namespace ShaderLab::Rendering
                     // does instead, inside the draw session, is the fresh one by
                     // construction. It is now the only one, into a persistent
                     // per-producer target.
-                    if (primaryInput && needsCompute && !m_deferredComputeFrozen &&
+                    // A pin fed by a compute node queued in this cycle has no
+                    // image yet; ProcessDeferredCompute resolves it after that
+                    // producer has dispatched.
+                    const bool inputFromQueuedProducer = std::any_of(inputs.begin(), inputs.end(),
+                        [this](const auto* edge) { return m_queuedComputeThisEval.count(edge->sourceNodeId) > 0; });
+                    if ((primaryInput || inputFromQueuedProducer) && needsCompute && !m_deferredComputeFrozen &&
                         !m_queuedComputeThisEval.count(nodeId))
                     {
                         // Phase 8: ensure the bridge effect exists for this
@@ -568,7 +618,10 @@ namespace ShaderLab::Rendering
                         m_deferredCompute.push_back({ nodeId, std::move(inputImages) });
                         m_queuedComputeThisEval.insert(nodeId);
                     }
-                    node->dirty = false;
+                    // A frozen pass cannot queue, so a change it finds stays
+                    // pending for the next cycle rather than being dropped.
+                    if (!m_deferredComputeFrozen)
+                        node->dirty = false;
                     if (!hasImageOutput)
                         node->cachedOutput = nullptr;
                     break;
@@ -870,7 +923,7 @@ namespace ShaderLab::Rendering
                     bool wasDirty = node->dirty || bindingsChanged;
                     // A binding that moved changes this node's output, so
                     // downstream consumers have to learn about it too.
-                    if (bindingsChanged) m_outputChangedThisEval.insert(nodeId);
+                    if (bindingsChanged) MarkOutputChanged(nodeId);
 
                     // Inject host-driven output dimensions for shaders that
                     // declare OutputW / OutputH cbuffer fields. D2D pads input
@@ -1130,7 +1183,12 @@ namespace ShaderLab::Rendering
                         node->cachedOutput &&
                         m_justCreated.find(node->id) == m_justCreated.end())
                     {
-                        ReadCustomAnalysisOutput(dc, *node);
+                        // A frozen pass runs inside the host's draw session,
+                        // where the readback's own BeginDraw would nest.
+                        if (m_deferredComputeFrozen)
+                            node->dirty = true;
+                        else
+                            ReadCustomAnalysisOutput(dc, *node);
                     }
                 }
                 else
@@ -1434,48 +1492,108 @@ namespace ShaderLab::Rendering
             return ptr;
         };
 
-        // Nodes whose image output is (re)produced by THIS pass. An input fed
-        // by one of them must NOT use the Evaluate-time pre-render: that
-        // bitmap was captured before the producer was dispatched, so it holds
-        // the PREVIOUS evaluation's pixels. Symptom is a clean one-mutation
-        // lag -- a CS-Img consuming a CS-Img reports the value its upstream
-        // had before the last set-property, silently and at HTTP 200.
-        // m_deferredCompute is built in topological order (see
-        // docs/architecture/topological-evaluation.md), so by the time a
-        // consumer is reached its producer has already been dispatched and a
-        // re-render here picks up fresh pixels.
-        std::unordered_set<uint32_t> producedThisPass;
-        for (const auto& d : m_deferredCompute)
-            producedThisPass.insert(d.nodeId);
+        // Dispatch in topological order. The queue is filled across the host's
+        // Evaluate passes, so a producer first queued in a later pass can sit
+        // behind its consumer.
+        {
+            std::unordered_map<uint32_t, size_t> rank;
+            try
+            {
+                const auto order = graph.TopologicalSort();
+                for (size_t i = 0; i < order.size(); ++i)
+                    rank[order[i]] = i;
+            }
+            catch (const std::logic_error&)
+            {
+                // A cycle: Evaluate queued nothing from it, keep the queue order.
+            }
+            std::stable_sort(m_deferredCompute.begin(), m_deferredCompute.end(),
+                [&rank](const DeferredCompute& a, const DeferredCompute& b)
+                { return rank[a.nodeId] < rank[b.nodeId]; });
+        }
 
-        // ...and everything DOWNSTREAM of them. Checking only the immediate
-        // producer fixes compute -> compute but leaves the lag alive one hop
-        // further out: a pixel shader between two compute nodes is not in the
-        // deferred set, yet its D2D output still resolves through a producer
-        // that has not been dispatched at Evaluate time, so the consumer's
-        // snapshot of it is a frame stale. Measured on
-        // ICtCp Tone Map -> Nit Map -> ICtCp Highlight Desaturation: the
-        // consumer reported 1.400438 / 1.400438 / 0.772682 while its input read
-        // 1.401232 / 0.772924 / 2.435596 -- each value one mutation behind.
-        // Data-only consumers never had this because they do not pre-render at
-        // all, which is why the direct-edge test passed and this did not.
-        std::unordered_set<uint32_t> staleThisPass = producedThisPass;
-        std::vector<uint32_t> reach(producedThisPass.begin(), producedThisPass.end());
-        for (size_t qi = 0; qi < reach.size(); ++qi)
-            for (const auto* e : graph.GetOutputEdges(reach[qi]))
-                if (e && staleThisPass.insert(e->destNodeId).second)
-                    reach.push_back(e->destNodeId);
+        // A dispatch changes its node's pixels and analysis values, but the
+        // Direct2D nodes that read them were wired, sized and bound by
+        // Evaluate, before it ran. When a later consumer reads through one of
+        // them, re-run that evaluation first, frozen so nothing is queued and
+        // no readback opens a draw session.
+        auto isComputeNode = [](const EffectNode& node)
+        {
+            return node.customEffect.has_value() &&
+                   node.customEffect->shaderType == CustomShaderType::D3D11ComputeShader;
+        };
+        bool dispatchedSinceRefresh = false;
+        auto refreshUpstreamOf = [&](uint32_t consumerId)
+        {
+            if (!dispatchedSinceRefresh) return;
+
+            // Walk the Direct2D nodes upstream of the consumer, stopping at
+            // compute nodes: those are dispatched in order and need nothing.
+            bool upstreamDirty = false;
+            std::vector<uint32_t> queue = { consumerId };
+            std::unordered_set<uint32_t> visited;
+            for (size_t i = 0; i < queue.size() && !upstreamDirty; ++i)
+            {
+                for (const auto* edge : graph.GetInputEdges(queue[i]))
+                {
+                    const auto* source = graph.FindNode(edge->sourceNodeId);
+                    if (!source || isComputeNode(*source) || !visited.insert(source->id).second)
+                        continue;
+                    if (source->dirty) { upstreamDirty = true; break; }
+                    queue.push_back(source->id);
+                }
+            }
+            if (!upstreamDirty) return;
+
+            const bool wasFrozen = m_deferredComputeFrozen;
+            m_deferredComputeFrozen = true;
+            Evaluate(graph, dc);
+            m_deferredComputeFrozen = wasFrozen;
+            dispatchedSinceRefresh = false;
+        };
+
+        auto markDownstreamDirty = [&graph](uint32_t producerId)
+        {
+            std::vector<uint32_t> queue = { producerId };
+            for (size_t i = 0; i < queue.size(); ++i)
+            {
+                for (const auto* edge : graph.GetOutputEdges(queue[i]))
+                {
+                    auto* downstream = graph.FindNode(edge->destNodeId);
+                    if (downstream && !downstream->dirty)
+                    {
+                        downstream->dirty = true;
+                        queue.push_back(edge->destNodeId);
+                    }
+                }
+            }
+        };
+
+        // A failed dispatch leaves no output rather than the previous one,
+        // which would read as current.
+        auto failDispatch = [&](EffectNode& failed, std::wstring message)
+        {
+            failed.runtimeError = std::move(message);
+            if (!failed.outputPins.empty() && failed.cachedOutput)
+            {
+                failed.cachedOutput = nullptr;
+                markDownstreamDirty(failed.id);
+                imageComputeProduced = true;
+            }
+        };
 
         for (auto& deferred : m_deferredCompute)
         {
             auto* node = graph.FindNode(deferred.nodeId);
-            if (!node || deferred.inputImages.empty() || !deferred.inputImages[0]) continue;
+            if (!node || deferred.inputImages.empty()) continue;
             if (!node->customEffect.has_value()) continue;
 
             auto bit = m_bridgeImplCache.find(node->id);
             if (bit == m_bridgeImplCache.end() || !bit->second)
                 continue;
             auto* bridge = bit->second;
+
+            refreshUpstreamOf(node->id);
 
             // Resolve each input from the graph NOW rather than trusting the
             // image recorded at Evaluate time: a later Evaluate pass in the
@@ -1491,6 +1609,7 @@ namespace ShaderLab::Rendering
 
             HRESULT preRenderHr = S_OK;
             size_t failedPin = 0;
+            std::vector<bool> preRenderFailed(deferred.inputImages.size(), false);
             for (size_t i = 0; i < deferred.inputImages.size(); ++i)
             {
                 uint64_t key = kNoProducerKey;
@@ -1508,6 +1627,7 @@ namespace ShaderLab::Rendering
                 inputRaw[i] = img;
                 HRESULT hr = S_OK;
                 preRendered[i] = preRenderShared(img, key, &hr);
+                preRenderFailed[i] = FAILED(hr);
                 if (FAILED(hr) && SUCCEEDED(preRenderHr)) { preRenderHr = hr; failedPin = i; }
             }
             if (preRenderHr == E_BOUNDS)
@@ -1515,17 +1635,38 @@ namespace ShaderLab::Rendering
                 // An unbounded image (Flood, Tile, Border, Turbulence) cannot
                 // be copied into a texture; it used to become a 1 GiB 8192^2
                 // FP32 allocation. Say so instead of dispatching on garbage.
-                node->runtimeError = std::format(
+                failDispatch(*node, std::format(
                     L"Input {} has unbounded extent (Flood, Tile, Border or Turbulence?). "
-                    L"Crop it before feeding a compute effect.", failedPin);
+                    L"Crop it before feeding a compute effect.", failedPin));
                 continue;
             }
             if (preRenderHr == D2DERR_MAX_TEXTURE_SIZE_EXCEEDED)
             {
-                node->runtimeError = std::format(
+                failDispatch(*node, std::format(
                     L"Input {} is larger than {} px, the largest texture a compute effect can read. "
-                    L"Scale or crop it first.", failedPin, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
+                    L"Scale or crop it first.", failedPin, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION));
                 continue;
+            }
+
+            // A wired input without an image, or with an empty one, has an
+            // upstream that is not ready (a shader still compiling, a failed
+            // producer). Dispatching would mismatch the tiles a variadic node
+            // counts with the sizes it derives.
+            {
+                std::optional<uint32_t> missingPin;
+                for (const auto& entry : edgeByPin)
+                {
+                    const uint32_t pin = entry.first;
+                    if (pin >= inputRaw.size()) continue;
+                    if ((!inputRaw[pin] || preRenderFailed[pin]) && (!missingPin || pin < *missingPin))
+                        missingPin = pin;
+                }
+                if (missingPin)
+                {
+                    failDispatch(*node, std::format(
+                        L"Input {} has no image yet; its upstream is not ready", *missingPin));
+                    continue;
+                }
             }
 
             const bool readback = isReadbackNeeded(node->id);
@@ -1544,7 +1685,7 @@ namespace ShaderLab::Rendering
                 Performance::IsAsyncAnalysisReadbackEnabled();
             bridge->SetAsyncReadback(asyncReadback);
             if (m_gpuTimer) m_gpuTimer->BeginNode(node->id);
-            DispatchViaBridge(dc, graph, *node, inputRaw,
+            const bool dispatched = DispatchViaBridge(dc, graph, *node, inputRaw,
                 preRendered, bridge, readback);
             if (m_gpuTimer) m_gpuTimer->EndNode(node->id);
             if (asyncReadback && bridge->HasPendingReadback())
@@ -1578,23 +1719,21 @@ namespace ShaderLab::Rendering
             // nodes this frame, so the value is used the frame it is made.
             MarkBindingConsumersDirty(graph, node->id);
 
-            bool hasImageOutput = !node->outputPins.empty();
-            if (hasImageOutput && node->cachedOutput)
+            // This dispatch consumed the node's pending change.
+            if (dispatched)
+            {
+                node->dirty = false;
+                dispatchedSinceRefresh = true;
+            }
+            else if (!node->compilePending)
+            {
+                failDispatch(*node, node->runtimeError);
+            }
+
+            if (dispatched && !node->outputPins.empty() && node->cachedOutput)
             {
                 imageComputeProduced = true;
-                std::vector<uint32_t> queue = { node->id };
-                for (size_t i = 0; i < queue.size(); ++i)
-                {
-                    for (const auto* edge : graph.GetOutputEdges(queue[i]))
-                    {
-                        auto* dn = graph.FindNode(edge->destNodeId);
-                        if (dn && !dn->dirty)
-                        {
-                            dn->dirty = true;
-                            queue.push_back(edge->destNodeId);
-                        }
-                    }
-                }
+                markDownstreamDirty(node->id);
             }
         }
 
@@ -1863,7 +2002,23 @@ namespace ShaderLab::Rendering
         if (SUCCEEDED(D3DReflect(bytes.data(), bytes.size(),
                 IID_ID3D11ShaderReflection, reinterpret_cast<void**>(reflect.put()))) && reflect)
         {
-            auto* cbReflect = reflect->GetConstantBufferByIndex(0);
+            // The parameters live in the cbuffer at b0; an image-pass shader
+            // also has one at b1, which may come first in reflection order.
+            ID3D11ShaderReflectionConstantBuffer* cbReflect = reflect->GetConstantBufferByIndex(0);
+            D3D11_SHADER_DESC shaderDesc{};
+            if (SUCCEEDED(reflect->GetDesc(&shaderDesc)))
+            {
+                for (UINT resourceIndex = 0; resourceIndex < shaderDesc.BoundResources; ++resourceIndex)
+                {
+                    D3D11_SHADER_INPUT_BIND_DESC bind{};
+                    if (SUCCEEDED(reflect->GetResourceBindingDesc(resourceIndex, &bind)) &&
+                        bind.Type == D3D_SIT_CBUFFER && bind.BindPoint == 0)
+                    {
+                        cbReflect = reflect->GetConstantBufferByName(bind.Name);
+                        break;
+                    }
+                }
+            }
             D3D11_SHADER_BUFFER_DESC cbDesc{};
             if (cbReflect && SUCCEEDED(cbReflect->GetDesc(&cbDesc)))
             {
@@ -2059,7 +2214,7 @@ namespace ShaderLab::Rendering
         return bmp.get();
     }
 
-    void GraphEvaluator::DispatchViaBridge(
+    bool GraphEvaluator::DispatchViaBridge(
         ID2D1DeviceContext5* dc,
         const EffectGraph& graph,
         EffectNode& node,
@@ -2068,7 +2223,7 @@ namespace ShaderLab::Rendering
         Effects::CustomComputeBridgeEffect* bridge,
         bool readbackToCpu)
     {
-        if (!bridge) return;
+        if (!bridge) return false;
         auto& def = node.customEffect.value();
 
         // Lazy compile: ProcessDeferredCompute runs inside BeginDraw so
@@ -2090,7 +2245,7 @@ namespace ShaderLab::Rendering
                 // Skip this dispatch and look again next frame.
                 node.compilePending = true;
                 node.dirty = true;
-                return;
+                return false;
             }
             node.compilePending = false;
             if (cached.status != Effects::BytecodeStatus::Ready)
@@ -2098,7 +2253,7 @@ namespace ShaderLab::Rendering
                 node.runtimeError = cached.errorMessage.empty()
                     ? L"D3D11 compute shader compile failed"
                     : std::move(cached.errorMessage);
-                return;
+                return false;
             }
             def.compiledBytecode = std::move(cached.bytecode);
             bridge->SetCompiledBytecode(def.compiledBytecode.data(),
@@ -2256,7 +2411,48 @@ namespace ShaderLab::Rendering
         // u1 binding).
         UINT32 imageOutW = 0, imageOutH = 0;
         bool hasImageOutput = !node.outputPins.empty();
-        if (hasImageOutput)
+
+        // A variadic node's connected pins: bit i set = pin i has an image.
+        if (def.variadicInputs && node.properties.count(L"InputMask"))
+        {
+            uint32_t inputMask = 0;
+            for (const auto* edge : graph.GetInputEdges(node.id))
+                if (edge->destPin < 32 && edge->destPin < inputImages.size() && inputImages[edge->destPin])
+                    inputMask |= 1u << edge->destPin;
+            node.properties[L"InputMask"] = static_cast<float>(inputMask);
+        }
+
+        // An output size the effect derives from its inputs' sizes.
+        const Effects::ShaderLabEffectDescriptor* builtIn = def.shaderLabEffectId.empty()
+            ? nullptr : Effects::ShaderLabEffects::Instance().FindById(def.shaderLabEffectId);
+        if (hasImageOutput && builtIn && builtIn->deriveImageOutputSize)
+        {
+            std::vector<D2D1_SIZE_U> inputSizes(inputImages.size(), D2D1_SIZE_U{ 0, 0 });
+            for (const auto* edge : graph.GetInputEdges(node.id))
+            {
+                const uint32_t pin = edge->destPin;
+                if (pin >= inputImages.size() || !inputImages[pin]) continue;
+                if (pin < preRenderedInputs.size() && preRenderedInputs[pin])
+                {
+                    inputSizes[pin] = preRenderedInputs[pin]->GetPixelSize();
+                    continue;
+                }
+                float oldDpiX = 0, oldDpiY = 0;
+                dc->GetDpi(&oldDpiX, &oldDpiY);
+                dc->SetDpi(96.0f, 96.0f);
+                D2D1_RECT_F bounds{};
+                D2D1_RECT_L px{};
+                if (SUCCEEDED(dc->GetImageLocalBounds(inputImages[pin], &bounds)) &&
+                    SUCCEEDED(Effects::SnapComputeInputRect(bounds, px)))
+                    inputSizes[pin] = D2D1::SizeU(px.right - px.left, px.bottom - px.top);
+                dc->SetDpi(oldDpiX, oldDpiY);
+            }
+            const D2D1_SIZE_U size = builtIn->deriveImageOutputSize(node.properties, inputSizes);
+            imageOutW = size.width;
+            imageOutH = size.height;
+        }
+
+        if (hasImageOutput && imageOutW == 0)
         {
             // Pass 1: explicit OutputWidth + OutputHeight (non-square).
             UINT32 explicitW = 0, explicitH = 0;
@@ -2336,6 +2532,14 @@ namespace ShaderLab::Rendering
                 if (imageOutH < 64) imageOutH = 64;
             }
         }
+        if (imageOutW > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || imageOutH > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+        {
+            node.runtimeError = std::format(
+                L"Output would be {}x{} px, larger than {} px, the largest texture a compute effect can write. "
+                L"Make it smaller or scale the inputs first.",
+                imageOutW, imageOutH, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
+            return false;
+        }
 
         // Pack cbuffer (user portion only -- the runner prepends
         // Width/Height). Use the typed PackPropertyToCBuffer helper
@@ -2412,9 +2616,10 @@ namespace ShaderLab::Rendering
 
         // Image-producing per-pixel computes need dispatch dims that
         // cover the full output. analysis-only and "fixed-size loop"
-        // image producers (e.g. CIE Histogram, Vectorscope) keep (1,1,1)
+        // image producers (e.g. Vectorscope) keep (1,1,1)
         // because their shader does its own internal iteration over the
-        // source pixels into groupshared accumulators.
+        // source pixels into groupshared accumulators. An image-pass shader
+        // (SHADERLAB_IMAGE_PASS, e.g. CIE Histogram) is sized by the runner.
         //
         // Heuristic for "single group" vs "per-pixel tile":
         //   * Effects whose descriptor declares a `DiagramSize` /
@@ -2486,7 +2691,7 @@ namespace ShaderLab::Rendering
         {
             node.runtimeError = std::format(L"Bridge dispatch failed 0x{:08X}",
                 static_cast<uint32_t>(hr));
-            return;
+            return false;
         }
         node.runtimeError.clear();
 
@@ -2509,6 +2714,7 @@ namespace ShaderLab::Rendering
             node.cachedOutput = bridge->GetImageOutput();
         else
             node.cachedOutput = nullptr;
+        return true;
     }
 
     // Phase 8c: predicate matching the GPU-routability checks used inside
@@ -2687,7 +2893,9 @@ namespace ShaderLab::Rendering
                                 L"' resolved to a non-finite value; previous kept";
                     }
                 }
-                node.dirty = true;
+                // A video's image changes only when TickAndUploadVideos uploads a frame.
+                if (!IsVideoSource(node))
+                    node.dirty = true;
             }
         }
     }

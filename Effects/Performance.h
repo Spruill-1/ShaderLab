@@ -132,9 +132,9 @@ namespace ShaderLab::Performance
 
     // Unthrottled render loop -- the benchmark mode.
     //
-    // Normally the render worker paces itself with a 16 ms condition-variable
-    // timeout, so it tops out near 62.5 Hz, and the UI presents with a vsync
-    // interval of 1. Neither limit exists to protect correctness: they exist
+    // Normally the render worker paces itself to frame deadlines at the
+    // monitor refresh rate (FramePacer, 60-240 Hz), and the UI presents with
+    // a vsync interval of 1. Neither limit exists to protect correctness: they exist
     // so an editor does not spin a core and peg a GPU while someone is
     // reading the screen.
     //

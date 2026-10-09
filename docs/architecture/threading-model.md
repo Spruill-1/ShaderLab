@@ -94,8 +94,8 @@ sequenceDiagram
         UI->>UI: PresentOutputWindows()<br/>(same blit pattern per Output)
     end
 
-    loop @ monitor refresh
-        W->>Disp: Drain() any queued closures
+    loop @ FramePacer deadline (monitor refresh, 60-240 Hz)
+        W->>Disp: WaitUntil(deadline), then Drain() any queued closures
         W->>W: RenderFrameToOffscreen(dt):<br/>dirty BFS, pick idx = published ^ 1<br/>BeginDraw → Evaluate → ProcessDeferredCompute<br/>→ DrawImage → EndDraw
         W->>Off: publishedIdx.store(idx)
         W->>Off: publishedVersion.fetch_add(1)
@@ -106,6 +106,41 @@ sequenceDiagram
 The two loops are independent — the UI tick never blocks on the worker, and
 the worker never blocks on the UI. The handoff is two atomic stores per
 frame.
+
+### Render worker pacing
+
+In the default (throttled) mode the worker runs on a deadline, not a fixed
+sleep. `Rendering::FramePacer` keeps a grid of deadlines one period apart and
+the worker blocks in `RenderThreadDispatcher::WaitUntil(pacer.WaitDeadline(now))`
+for only the time left until the next one, so the frame's own work is
+absorbed inside the period instead of added to it.
+
+- **Rate.** `m_targetRefreshHz`: the monitor refresh rate clamped to
+  60–240 Hz (`FramePacer::ClampRate`), the same value that drives the UI blit
+  timer. Rendering faster than the UI can present is wasted work, and the
+  60 Hz floor keeps 60 fps video and interaction smooth on 30 Hz modes. It
+  is re-read every iteration, so a display change takes effect at once.
+- **Timer.** `WaitUntil` waits on a high-resolution waitable timer
+  (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) plus an auto-reset event the
+  producers set. A condition-variable timeout rounds up to the 15.6 ms
+  system tick: the old `WaitFor(16 ms)` actually waited ~31 ms and held the
+  worker at ~32 Hz whatever the load. No process-wide `timeBeginPeriod`.
+- **Early wake.** Queued closures, `Wake()` and `Shutdown()` end the wait
+  at once. An early wake runs an iteration but does not move the deadline.
+- **Overrun.** A frame that runs past its slot is followed by one frame after
+  a 1 ms idle gap (`FramePacer::scOverrunIdle`); if a whole period was missed
+  the grid restarts from now, so a long frame never causes a burst of
+  catch-up frames. The gap is required for the same reason as the
+  unthrottled mode's yield: each iteration takes `m_graphMutex` exclusively
+  twice, and SRWLOCK is not fair, so with no wait between iterations the UI
+  thread's shared read can lose the race indefinitely. With frames of 24 ms
+  of work at 60 Hz, a shared reader waited at most 17.5-23 ms with the gap
+  and 0.6-1.1 s without it (`RenderPacing_OverrunLetsReadersIn`).
+- **Idle.** A static graph still wakes once per period (drain, clock tick,
+  snapshot publish) but does not evaluate or spin.
+
+Unthrottled mode (`perf_render_mode`) is unchanged: drain without blocking,
+yield, loop.
 
 ## MCP mutation (e.g. `/graph/add-node`, `/graph/set-property`)
 
@@ -292,6 +327,7 @@ SwapChainPanel-bound swap chain.
 | Resource | Owned by | Notes |
 |---|---|---|
 | `m_d3dDevice`, `m_d3dContext` | `RenderEngine` | D3D11 immediate context with `ID3D10Multithread::SetMultithreadProtected(TRUE)`. Both threads call into it. Protection makes each *call* atomic, not a *sequence*: any multi-call GPU operation (bind shader/SRVs/UAVs, then `Dispatch`) must be recorded on its own deferred context and submitted with one `ExecuteCommandList(…, TRUE)`, or another thread's D2D work can land between the calls and the dispatch runs unbound. `D3D11ComputeRunner` and `VideoSourceProvider` both do this; each lost ~2–8% of dispatches, silently, before they did. |
+| `VideoSourceProvider` frame queue | Decode thread fills, render thread takes | One mutex per provider guards the queue, the seek request and a seek generation number; a frame decoded for an older seek is discarded. `Close()` releases the queued decoder samples before joining the decode thread, since a `ReadSample` waiting for a free decoder surface returns only when one is released. See [video playback](../ui-ux/animation-system.md#video-playback). |
 | Multi-threaded D2D device | `RenderEngine` | Single device, two contexts. |
 | `m_d2dDeviceContext` | UI thread | Editor canvas, blit-to-swap-chain, file-save capture. |
 | `m_renderD2dContext` | Render thread | `BeginDraw` → graph eval → `EndDraw` per tick. |
@@ -307,7 +343,9 @@ SwapChainPanel-bound swap chain.
 worker) and many producers (UI thread, MCP server thread). `DispatchSync`
 blocks until the closure has run and returns its result. Re-entrant calls
 from inside the consumer thread run inline (the dispatcher detects this with
-a thread-local flag).
+a thread-local flag). The consumer waits with `Wait`, `WaitFor` or
+`WaitUntil`; all three return early for queued work, `Wake()` or
+`Shutdown()`. Only `WaitUntil` is precise below the 15.6 ms system tick.
 
 ## MCP routes
 
@@ -342,7 +380,9 @@ for the duration of the readback.
 ## What stays on UI thread
 
 - XAML mutations (Properties panel rebuilds, node-graph canvas, FPS counter,
-  flyouts).
+  flyouts). The FPS counter's two numbers come from
+  `Rendering::PreviewRenderStats`, which the worker writes and publishes as
+  atomics every loop iteration; the UI thread reads only those atomics.
 - Editor `m_graphSwapChain` Present (the editor canvas renders cheaply,
   sub-ms — kept on UI for simplicity).
 - File pickers, dialogs.

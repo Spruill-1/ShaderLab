@@ -396,28 +396,6 @@ void main(uint3 id : SV_DispatchThreadID)
             }
         }
 
-        // Allocate raw byte double buffers.
-        {
-            size_t ySize, uvSize = 0;
-            if (m_outputFormat == OutputFormat::P010)
-            {
-                ySize = static_cast<size_t>(m_stride) * m_height;
-                uvSize = static_cast<size_t>(m_stride) * (m_height / 2);
-            }
-            else if (m_outputFormat == OutputFormat::NV12)
-            {
-                ySize = static_cast<size_t>(m_stride) * m_height;
-                uvSize = static_cast<size_t>(m_stride) * (m_height / 2);
-            }
-            else
-            {
-                ySize = static_cast<size_t>(m_stride) * m_height;
-            }
-            size_t totalSize = ySize + uvSize;
-            m_backBuffer.resize(totalSize);
-            m_frontBuffer.resize(totalSize);
-        }
-
         // Create GPU conversion resources.
         if (!CreateGPUResources(dc, d3dDevice))
         {
@@ -434,25 +412,23 @@ void main(uint3 id : SV_DispatchThreadID)
             return false;
         }
 
-        // Decode first frame synchronously.
-        m_currentPositionSeconds = 0.0;
-        m_endOfStream = false;
-        if (DecodeOneFrame())
+        // Decode the first frame synchronously so the node has an image at once.
         {
-            std::lock_guard lock(m_bufferMutex);
-            std::swap(m_frontBuffer, m_backBuffer);
-            // A hardware-decoded first frame arrives as a GPU sample, not bytes.
-            std::swap(m_frontGpu, m_backGpu);
-            m_backGpu = {};
-            m_frontFrameTime = m_backFrameTime;
-            m_frontFrameDuration = m_backFrameDuration;
-            m_firstFrameTime = m_backFrameTime;
-            if (!m_frontGpu.tex) m_lastPitch = m_stride;
-            m_frameReady = true;
+            DecodedFrame first;
+            ReadStats stats;
+            if (DecodeOneFrame(first, 0, {}, stats) == DecodeResult::Frame)
+            {
+                first.seekFrame = true;
+                m_firstFrameTime = first.time;
+                std::lock_guard lock(m_stateMutex);
+                m_decodeHead = first.time;
+                RecordKeyframeLocked(first.time, first.time);
+                m_queue.push_back(std::move(first));
+            }
         }
 
         // Start background decode thread.
-        m_decodeThread = std::jthread([this](std::stop_token) { DecodeThreadFunc(); });
+        m_decodeThread = std::jthread([this](std::stop_token token) { DecodeThreadFunc(token); });
 
         const wchar_t* fmtName = (m_outputFormat == OutputFormat::P010) ? L"P010"
             : (m_outputFormat == OutputFormat::NV12) ? L"NV12" : L"RGB32";
@@ -466,14 +442,40 @@ void main(uint3 id : SV_DispatchThreadID)
     {
         if (m_decodeThread.joinable())
         {
-            m_decodeThread.request_stop();
+            // Release the queued frames first: their decoder surfaces are what
+            // a ReadSample blocked on a full surface pool is waiting for.
+            std::vector<DecodedFrame> released;
+            {
+                std::lock_guard lock(m_stateMutex);
+                m_decodeThread.request_stop();
+                for (auto& frame : m_queue) released.push_back(std::move(frame));
+                m_queue.clear();
+            }
+            released.clear();
             m_decodeCV.notify_all();
             m_decodeThread.join();
         }
 
         // Held samples pin decoder surfaces: release them before the reader.
-        m_frontGpu = {};
-        m_backGpu = {};
+        m_queue.clear();
+        m_spareBuffers.clear();
+        m_seekPending = false;
+        m_seekTarget = 0.0;
+        m_endOfStream = false;
+        m_stepRequested = false;
+        m_seekFrameDecoded = true;
+        m_resumePending = false;
+        m_readRetried = false;
+        m_keyframeSpans.clear();
+        m_minKeyframeInterval = 0.0;
+        m_generation = 0;
+        m_targetTime = 0.0;
+        m_decodeHead = 0.0;
+        m_uploadedGeneration = 0;
+        m_playTime = 0.0;
+        m_decodeSecondsPerFrame = 0.0;
+        m_seekOverheadSeconds = 0.0;
+        m_meanPrerollSeconds = 0.0;
         m_texPlanar = nullptr; m_srvPlanarY = nullptr; m_srvPlanarUV = nullptr;
         m_zeroCopyFailed = false;
         m_lastSeekTarget = std::numeric_limits<double>::quiet_NaN();
@@ -489,15 +491,9 @@ void main(uint3 id : SV_DispatchThreadID)
         m_width = 0; m_height = 0; m_stride = 0;
         m_frameRate = 0.0; m_durationSeconds = 0.0;
         m_currentPositionSeconds = 0.0; m_frameDuration = 0.0;
-        m_playing = false; m_endOfStream = false;
-        m_accumulatedTime = 0.0;
-        m_frameReady = false; m_frameNeeded = false;
+        m_playing = false;
         m_firstFrameLogged = false;
-        m_backFrameTime = -1.0;
-        m_frontFrameTime = -1.0;
         m_uploadedFrameTime = -1.0;
-        m_backFrameDuration = 0.0;
-        m_frontFrameDuration = 0.0;
         m_uploadedFrameDuration = 0.0;
         m_firstFrameTime = 0.0;
 
@@ -783,16 +779,43 @@ void main(uint3 id : SV_DispatchThreadID)
     }
 
     // -----------------------------------------------------------------------
-    // Playback controls
+    // Playback controls (render thread)
     // -----------------------------------------------------------------------
+
+    // A frame starting within this of a target counts as starting at it.
+    static constexpr double scTimeTolerance = 1e-4;
+    // Weight of each new measurement in the decode and seek cost averages.
+    static constexpr double scCostSmoothing = 0.2;
+    // A read loop this long times decode throughput. Single reads after an
+    // idle wait come from the decoder's pipeline and are far cheaper.
+    static constexpr int scMinTimedReads = 8;
+    // Seek overhead, in seconds of video, until the costs have been measured.
+    static constexpr double scDefaultSeekThresholdSeconds = 0.25;
+    // Keyframe-to-target distance a seek is assumed to decode through until
+    // one has been measured: half a typical 2 s keyframe interval.
+    static constexpr double scDefaultPrerollSeconds = 1.0;
+    static constexpr size_t scMaxKnownKeyframes = 4096;
+    // Longest a catch-up decodes without delivering a frame.
+    static constexpr double scCatchUpFrameSeconds = 0.1;
+
+    static void Smooth(std::atomic<double>& average, double sample)
+    {
+        const double previous = average.load();
+        average = previous > 0.0 ? previous + scCostSmoothing * (sample - previous) : sample;
+    }
+
+    static double SecondsSince(std::chrono::steady_clock::time_point start)
+    {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    }
 
     void VideoSourceProvider::Play()
     {
         if (!m_reader) return;
-        if (m_endOfStream && m_loop) Seek(0.0);
+        // A video that played to its end without looping starts over.
+        if (!m_loop && m_durationSeconds > 0.0 && m_playTime >= m_durationSeconds - m_frameDuration)
+            Seek(0.0);
         m_playing = true;
-        m_frameNeeded = true;
-        m_decodeCV.notify_one();
     }
 
     void VideoSourceProvider::Pause() { m_playing = false; }
@@ -800,164 +823,299 @@ void main(uint3 id : SV_DispatchThreadID)
     void VideoSourceProvider::Seek(double seconds)
     {
         if (!m_reader) return;
-        seconds = (std::clamp)(seconds, 0.0, m_durationSeconds);
+        seconds = m_durationSeconds > 0.0 ? (std::clamp)(seconds, 0.0, m_durationSeconds) : (std::max)(seconds, 0.0);
+        std::vector<DecodedFrame> released;
         {
-            std::lock_guard lock(m_decodeMutex);
+            std::lock_guard lock(m_stateMutex);
+            ++m_generation;
             m_seekTarget = seconds;
             m_seekPending = true;
+            m_seekFrameDecoded = false;
+            m_resumePending = false;
+            m_readRetried = false;
+            m_stepRequested = false;
+            m_targetTime = seconds;
+            m_decodeHead = seconds;
+            for (auto& frame : m_queue)
+            {
+                RecycleLocked(frame);
+                released.push_back(std::move(frame));
+            }
+            m_queue.clear();
         }
-        m_endOfStream = false;
-        m_accumulatedTime = 0.0;
+        m_decodeCV.notify_one();
+        ++m_seekCount;
+        m_playTime = seconds;
         m_currentPositionSeconds = seconds;
         m_lastSeekTarget = seconds;
-        m_frameNeeded = true;  // Force decode at the new position.
+    }
+
+    double VideoSourceProvider::SeekThresholdFrames() const
+    {
+        const double frameSeconds = m_decodeSecondsPerFrame.load();
+        const double overheadSeconds = m_seekOverheadSeconds.load();
+        const double frames = (frameSeconds > 0.0 && overheadSeconds > 0.0)
+            ? overheadSeconds / frameSeconds
+            : scDefaultSeekThresholdSeconds * m_frameRate;
+        return (std::max)(static_cast<double>(scDecodeAheadFrames), frames);
+    }
+
+    size_t VideoSourceProvider::KnownKeyframeCount()
+    {
+        std::lock_guard lock(m_stateMutex);
+        return m_keyframeSpans.size();
+    }
+
+    void VideoSourceProvider::RecordKeyframeLocked(double keyframe, double target)
+    {
+        if (keyframe < 0.0 || target < keyframe - scTimeTolerance) return;
+        m_minKeyframeInterval = (std::max)(m_minKeyframeInterval, target - keyframe);
+        auto it = m_keyframeSpans.find(keyframe);
+        if (it != m_keyframeSpans.end())
+            it->second = (std::max)(it->second, target);
+        else if (m_keyframeSpans.size() < scMaxKnownKeyframes)
+            m_keyframeSpans.emplace(keyframe, target);
+    }
+
+    bool VideoSourceProvider::ForwardSeekPaysLocked(double target) const
+    {
+        if (m_frameDuration <= 0.0) return false;
+        const double threshold = SeekThresholdFrames() * m_frameDuration;
+        if (target - m_decodeHead <= threshold) return false;
+
+        // The latest known keyframe at or before the target. A seek lands on
+        // it exactly when the target is inside its known span, and at or
+        // after it otherwise.
+        double knownKeyframe = -1.0;
+        double knownSpanEnd = -1.0;
+        bool landingKnown = false;
+        auto it = m_keyframeSpans.upper_bound(target + scTimeTolerance);
+        if (it != m_keyframeSpans.begin())
+        {
+            --it;
+            knownKeyframe = it->first;
+            knownSpanEnd = it->second;
+            landingKnown = target <= knownSpanEnd + scTimeTolerance;
+        }
+
+        // While a seek is still decoding up to its frame, only a keyframe known
+        // to be further ahead justifies another; an estimate would restart it
+        // on every tick.
+        if (!m_seekFrameDecoded || landingKnown)
+            return knownKeyframe - m_decodeHead > threshold;
+
+        // Otherwise the seek lands on the known keyframe if the next one
+        // cannot be that close yet, or the usual preroll before the target if
+        // that falls past the known span, which holds no other keyframe.
+        if (target < knownKeyframe + m_minKeyframeInterval)
+            return knownKeyframe - m_decodeHead > threshold;
+        const double meanPreroll = m_meanPrerollSeconds.load();
+        const double expected = target - (meanPreroll > 0.0 ? meanPreroll : scDefaultPrerollSeconds);
+        const double landing = expected > knownSpanEnd ? expected : knownKeyframe;
+        return landing - m_decodeHead > threshold;
+    }
+
+    void VideoSourceProvider::PlayTo(double seconds)
+    {
+        if (!m_reader) return;
+        seconds = (std::max)(seconds, 0.0);
+        // Past the end holds the last frame, which ends at or after the duration.
+        if (m_durationSeconds > 0.0)
+            seconds = (std::min)(seconds, m_durationSeconds - 2.0 * scTimeTolerance);
+        m_playTime = seconds;
+        // A seek to this time is already delivering its frame.
+        if (seconds == m_lastSeekTarget.load()) return;
+
+        bool seek;
+        {
+            std::lock_guard lock(m_stateMutex);
+            // The earliest time reachable without a seek is the start of the
+            // frame on screen, or the pending seek's target. The first frame
+            // also covers any earlier time.
+            const bool shownThisGeneration = m_uploadedGeneration == m_generation.load() && m_uploadedFrameTime.load() >= 0.0;
+            const double earliest = shownThisGeneration ? m_uploadedFrameTime.load() : m_seekTarget;
+            const bool behind = earliest > m_firstFrameTime + scTimeTolerance && seconds < earliest - scTimeTolerance;
+            seek = behind || ForwardSeekPaysLocked(seconds);
+        }
+        if (seek)
+        {
+            Seek(seconds);
+            return;
+        }
+        SetTarget(seconds);
+    }
+
+    void VideoSourceProvider::SetTarget(double seconds)
+    {
+        m_lastSeekTarget = std::numeric_limits<double>::quiet_NaN();
+        std::vector<DecodedFrame> released;
+        {
+            std::lock_guard lock(m_stateMutex);
+            m_targetTime = seconds;
+            PruneQueueLocked(released);
+        }
         m_decodeCV.notify_one();
     }
 
     void VideoSourceProvider::Tick(double deltaSeconds)
     {
         if (!m_reader || !m_playing) return;
-
-        // Handle end-of-stream looping.
-        if (m_endOfStream)
+        double seconds = m_playTime + deltaSeconds * m_speed;
+        if (m_durationSeconds > 0.0 && seconds >= m_durationSeconds)
         {
             if (m_loop)
             {
-                Seek(0.0);
-                m_playing = true;
+                seconds = std::fmod(seconds, m_durationSeconds);
             }
             else
             {
+                // Hold the last frame, which ends at or after the duration.
+                seconds = m_durationSeconds - 2.0 * scTimeTolerance;
                 m_playing = false;
             }
-            return;
         }
-
-        m_accumulatedTime += deltaSeconds * m_speed;
-        if (m_accumulatedTime >= m_frameDuration)
-        {
-            m_accumulatedTime -= m_frameDuration;
-            if (m_accumulatedTime > m_frameDuration * 2)
-                m_accumulatedTime = 0.0;
-            // Playback moves the position away from any requested target.
-            m_lastSeekTarget = std::numeric_limits<double>::quiet_NaN();
-            m_frameNeeded = true;
-            m_decodeCV.notify_one();
-        }
+        PlayTo(seconds);
     }
 
     void VideoSourceProvider::RequestNextFrame()
     {
         if (!m_reader) return;
-        if (m_endOfStream)
-        {
-            if (m_loop) { Seek(0.0); m_playing = true; }
-            return;
-        }
+        // Until a seek's frame is up there is nothing to step from.
+        const double shown = m_uploadedFrameTime.load();
+        if (shown < 0.0 || m_uploadedGeneration != m_generation.load()) return;
+        const double next = shown + (std::max)(m_uploadedFrameDuration.load(), 2.0 * scTimeTolerance);
         m_lastSeekTarget = std::numeric_limits<double>::quiet_NaN();
-        if (!m_frameNeeded.exchange(true))
-            m_decodeCV.notify_one();
+        m_playTime = next;
+        std::vector<DecodedFrame> released;
+        {
+            std::lock_guard lock(m_stateMutex);
+            m_targetTime = next;
+            m_stepRequested = true;
+            PruneQueueLocked(released);
+        }
+        m_decodeCV.notify_one();
+    }
+
+    void VideoSourceProvider::PruneQueueLocked(std::vector<DecodedFrame>& released)
+    {
+        const double target = m_targetTime.load();
+        while (m_queue.size() >= 2 && m_queue[1].time <= target + scTimeTolerance)
+        {
+            RecycleLocked(m_queue.front());
+            released.push_back(std::move(m_queue.front()));
+            m_queue.pop_front();
+            ++m_droppedFrames;
+        }
+    }
+
+    void VideoSourceProvider::RecycleLocked(DecodedFrame& frame)
+    {
+        if (!frame.bytes.empty() && m_spareBuffers.size() < scDecodeAheadFrames + 2)
+            m_spareBuffers.push_back(std::move(frame.bytes));
+        frame.bytes = {};
     }
 
     // -----------------------------------------------------------------------
-    // Upload (UI thread) — GPU copy or CPU upload, then run conversion shader
+    // Upload (render thread) — GPU copy or CPU upload, then run conversion shader
     // -----------------------------------------------------------------------
 
     bool VideoSourceProvider::UploadIfReady(ID2D1DeviceContext5* dc)
     {
         m_uploadAttempts++;
-        if (!m_frameReady || !m_d3dContext || !dc) return false;
+        if (!m_reader || !m_d3dContext || !dc) return false;
 
-        // Upload raw bytes from the front buffer to GPU textures.
-        std::vector<BYTE> uploadBuf;
-        LONG pitch;
-        GpuFrame gpu;
-        double frameTime, frameDuration;
+        // Take the newest queued frame due at the target; older ones are dropped.
+        DecodedFrame frame;
+        bool haveFrame = false;
+        bool restart = false;
+        std::vector<DecodedFrame> released;
         {
-            std::lock_guard lock(m_bufferMutex);
-            uploadBuf.swap(m_frontBuffer);
-            pitch = m_lastPitch;
-            gpu = std::move(m_frontGpu);
-            m_frontGpu = {};
-            m_frameReady = false;
-            frameTime = m_frontFrameTime;
-            frameDuration = m_frontFrameDuration;
+            std::lock_guard lock(m_stateMutex);
+            const double target = m_targetTime.load();
+            size_t due = 0;
+            while (due < m_queue.size() &&
+                   (m_queue[due].seekFrame || m_queue[due].time <= target + scTimeTolerance))
+                ++due;
+            if (due > 0)
+            {
+                for (size_t i = 0; i + 1 < due; ++i)
+                {
+                    RecycleLocked(m_queue[i]);
+                    released.push_back(std::move(m_queue[i]));
+                    ++m_droppedFrames;
+                }
+                frame = std::move(m_queue[due - 1]);
+                m_queue.erase(m_queue.begin(), m_queue.begin() + static_cast<ptrdiff_t>(due));
+                m_stepRequested = false;
+                haveFrame = true;
+            }
+            else
+            {
+                restart = m_queue.empty() && m_endOfStream && m_loop && m_stepRequested;
+            }
         }
+        released.clear();
+        if (restart)
+        {
+            Seek(0.0);
+            return false;
+        }
+        if (!haveFrame) return false;
+        m_decodeCV.notify_one();   // the queue has room again
 
-        if (gpu.tex)
+        bool converted = false;
+        if (frame.gpu.tex)
         {
             // Zero-copy: the decoder surface is already on this device. One
             // GPU copy into the planar texture (D3D11 copies both planes of
             // an NV12/P010 subresource together), then convert from it.
-            if (EnsurePlanarTexture(gpu.tex.get()))
+            if (!EnsurePlanarTexture(frame.gpu.tex.get()))
             {
-                const bool converted = RunConversionShader(/*planar*/ true, gpu.tex.get(), gpu.subresource);
-                m_lastUploadZeroCopy = true;
-                {
-                    std::lock_guard lock(m_bufferMutex);
-                    m_frontBuffer.swap(uploadBuf);
-                }
-                if (!converted) return false;
-                m_uploadSuccesses++;
-                m_uploadedFrameDuration = frameDuration;
-                m_uploadedFrameTime = frameTime;
-                return true;   // `gpu` releases the sample -> surface back to the decoder
+                // Unsupported here: use the CPU path from now on, and decode
+                // this position again so the frame is not simply lost.
+                m_zeroCopyFailed = true;
+                frame = {};
+                Seek(m_targetTime.load());
+                return false;
             }
-            // Unsupported here: fall back to the CPU path for good, and
-            // re-decode this position so the frame is not simply lost.
-            m_zeroCopyFailed = true;
+            converted = RunConversionShader(/*planar*/ true, frame.gpu.tex.get(), frame.gpu.subresource);
+            m_lastUploadZeroCopy = true;
+        }
+        else
+        {
+            m_lastUploadZeroCopy = false;
+            const UINT pitch = static_cast<UINT>(frame.pitch);
+            if (m_outputFormat == OutputFormat::P010 || m_outputFormat == OutputFormat::NV12)
             {
-                std::lock_guard lock(m_bufferMutex);
-                m_frontBuffer.swap(uploadBuf);
+                D3D11_BOX yBox = { 0, 0, 0, m_width, m_height, 1 };
+                m_d3dContext->UpdateSubresource(m_texY.get(), 0, &yBox, frame.bytes.data(), pitch, 0);
+                const BYTE* uvData = frame.bytes.data() + static_cast<ptrdiff_t>(pitch) * m_height;
+                D3D11_BOX uvBox = { 0, 0, 0, m_width / 2, m_height / 2, 1 };
+                m_d3dContext->UpdateSubresource(m_texUV.get(), 0, &uvBox, uvData, pitch, 0);
             }
-            Seek(m_currentPositionSeconds);
-            return false;
+            else // RGB32
+            {
+                D3D11_BOX box = { 0, 0, 0, m_width, m_height, 1 };
+                m_d3dContext->UpdateSubresource(m_texRGB.get(), 0, &box, frame.bytes.data(), pitch, 0);
+            }
+            // The uploads above can stay on the immediate context: each is a
+            // single call, and they are ordered before the conversion.
+            converted = RunConversionShader();
         }
-        m_lastUploadZeroCopy = false;
 
-        if (m_outputFormat == OutputFormat::P010)
         {
-            D3D11_BOX yBox = { 0, 0, 0, m_width, m_height, 1 };
-            m_d3dContext->UpdateSubresource(m_texY.get(), 0, &yBox, uploadBuf.data(),
-                static_cast<UINT>(pitch), 0);
-
-            const BYTE* uvData = uploadBuf.data() + static_cast<ptrdiff_t>(pitch) * m_height;
-            D3D11_BOX uvBox = { 0, 0, 0, m_width / 2, m_height / 2, 1 };
-            m_d3dContext->UpdateSubresource(m_texUV.get(), 0, &uvBox, uvData,
-                static_cast<UINT>(pitch), 0);
+            std::lock_guard lock(m_stateMutex);
+            RecycleLocked(frame);
         }
-        else if (m_outputFormat == OutputFormat::NV12)
-        {
-            D3D11_BOX yBox = { 0, 0, 0, m_width, m_height, 1 };
-            m_d3dContext->UpdateSubresource(m_texY.get(), 0, &yBox, uploadBuf.data(),
-                static_cast<UINT>(pitch), 0);
-
-            const BYTE* uvData = uploadBuf.data() + static_cast<ptrdiff_t>(pitch) * m_height;
-            D3D11_BOX uvBox = { 0, 0, 0, m_width / 2, m_height / 2, 1 };
-            m_d3dContext->UpdateSubresource(m_texUV.get(), 0, &uvBox, uvData,
-                static_cast<UINT>(pitch), 0);
-        }
-        else // RGB32
-        {
-            D3D11_BOX box = { 0, 0, 0, m_width, m_height, 1 };
-            m_d3dContext->UpdateSubresource(m_texRGB.get(), 0, &box, uploadBuf.data(),
-                static_cast<UINT>(pitch), 0);
-        }
-
-        // The uploads above can stay on the immediate context: each is a single
-        // call, and they are ordered before the conversion.
-        const bool converted = RunConversionShader();
-
-        // Return buffer for reuse.
-        {
-            std::lock_guard lock(m_bufferMutex);
-            m_frontBuffer.swap(uploadBuf);
-        }
+        // Releasing the sample hands its surface back to the decoder.
+        frame.gpu = {};
 
         if (!converted) return false;
         m_uploadSuccesses++;
-        m_uploadedFrameDuration = frameDuration;
-        m_uploadedFrameTime = frameTime;
+        m_uploadedGeneration = frame.generation;
+        m_uploadedFrameDuration = frame.duration;
+        m_uploadedFrameTime = frame.time;
+        m_currentPositionSeconds = frame.time;
         return true;
     }
 
@@ -965,92 +1123,163 @@ void main(uint3 id : SV_DispatchThreadID)
     // Background decode thread — raw byte copy only, no color conversion
     // -----------------------------------------------------------------------
 
-    void VideoSourceProvider::DecodeThreadFunc()
+    void VideoSourceProvider::DecodeThreadFunc(std::stop_token token)
     {
-        auto token = m_decodeThread.get_stop_token();
-        while (!token.stop_requested())
+        for (;;)
         {
+            bool seek = false;
+            bool resume = false;
+            double seekTarget = 0.0;
+            double skipThrough = -1.0;
+            uint64_t generation = 0;
+            DecodedFrame frame;
             {
-                std::unique_lock lock(m_decodeMutex);
+                std::unique_lock lock(m_stateMutex);
                 m_decodeCV.wait(lock, [&] {
-                    return m_frameNeeded.load() || m_seekPending.load() || token.stop_requested();
+                    return token.stop_requested() || m_seekPending || m_resumePending ||
+                           (!m_endOfStream && m_queue.size() < scDecodeAheadFrames);
                 });
-            }
-            if (token.stop_requested()) break;
-
-            double discardBefore = -1.0;
-            if (m_seekPending)
-            {
-                double target;
+                if (token.stop_requested()) return;
+                if (m_seekPending)
                 {
-                    std::lock_guard lock(m_decodeMutex);
-                    target = m_seekTarget;
+                    seek = true;
+                    seekTarget = m_seekTarget;
                     m_seekPending = false;
+                    m_endOfStream = false;
                 }
-                discardBefore = target;
-                PROPVARIANT var;
-                PropVariantInit(&var);
-                var.vt = VT_I8;
-                var.hVal.QuadPart = static_cast<LONGLONG>(target * 10'000'000.0);
-                m_reader->SetCurrentPosition(GUID_NULL, var);
-                PropVariantClear(&var);
-                m_endOfStream = false;
+                else if (m_resumePending)
+                {
+                    resume = true;
+                    skipThrough = m_decodeHead;
+                    m_resumePending = false;
+                }
+                generation = m_generation.load();
+                if (!m_spareBuffers.empty())
+                {
+                    frame.bytes = std::move(m_spareBuffers.back());
+                    m_spareBuffers.pop_back();
+                }
             }
 
-            if (m_frameNeeded)
+            bool positioned = true;
+            if (seek || resume)
             {
-                m_frameNeeded = false;
-                if (DecodeOneFrame(discardBefore))
-                {
-                    m_decodeCount++;
-                    std::lock_guard lock(m_bufferMutex);
-                    std::swap(m_frontBuffer, m_backBuffer);
-                    std::swap(m_frontGpu, m_backGpu);
-                    m_backGpu = {};
-                    m_frontFrameTime = m_backFrameTime;
-                    m_frontFrameDuration = m_backFrameDuration;
-                    m_frameReady = true;
-                }
+                PROPVARIANT position;
+                PropVariantInit(&position);
+                position.vt = VT_I8;
+                position.hVal.QuadPart = static_cast<LONGLONG>((seek ? seekTarget : skipThrough) * 10'000'000.0);
+                positioned = SUCCEEDED(m_reader->SetCurrentPosition(GUID_NULL, position));
+                PropVariantClear(&position);
             }
+            ReadStats stats;
+            const DecodeResult result = positioned
+                ? DecodeOneFrame(frame, generation, token, stats, skipThrough,
+                                 seek ? seekTarget : -std::numeric_limits<double>::infinity())
+                : DecodeResult::Failed;
+            if (seek && result == DecodeResult::Frame)
+                Smooth(m_seekOverheadSeconds, stats.secondsToFirstSample);
+
+            std::vector<DecodedFrame> released;
+            std::lock_guard lock(m_stateMutex);
+            if (seek && stats.firstSampleTime >= 0.0)
+            {
+                RecordKeyframeLocked(stats.firstSampleTime, seekTarget);
+                if (stats.firstSampleTime <= seekTarget + scTimeTolerance)
+                    Smooth(m_meanPrerollSeconds, (std::max)(seekTarget - stats.firstSampleTime, scTimeTolerance));
+            }
+            const bool current = generation == m_generation.load();
+            if (seek && current && result != DecodeResult::Superseded)
+                m_seekFrameDecoded = true;
+            if (token.stop_requested() || !current || result != DecodeResult::Frame)
+            {
+                RecycleLocked(frame);
+                released.push_back(std::move(frame));
+                if (current && result == DecodeResult::Failed && !m_readRetried)
+                {
+                    // Retry a failed read once: redo the seek, or re-position
+                    // at the decode head and skip what was already read.
+                    m_readRetried = true;
+                    if (seek)
+                    {
+                        m_seekPending = true;
+                        m_seekFrameDecoded = false;
+                    }
+                    else
+                    {
+                        m_resumePending = true;
+                    }
+                }
+                else if (current && (result == DecodeResult::EndOfStream || result == DecodeResult::Failed))
+                {
+                    // Decoding stops until the next seek.
+                    m_endOfStream = true;
+                }
+                continue;
+            }
+            m_readRetried = false;
+            frame.generation = generation;
+            frame.seekFrame = seek;
+            m_queue.push_back(std::move(frame));
+            ++m_decodeCount;
+            PruneQueueLocked(released);
         }
     }
 
-    bool VideoSourceProvider::DecodeOneFrame(double discardBefore)
+    VideoSourceProvider::DecodeResult VideoSourceProvider::DecodeOneFrame(
+        DecodedFrame& frame, uint64_t generation, std::stop_token token, ReadStats& stats, double skipThrough,
+        double progressFrom)
     {
-        if (!m_reader) return false;
+        if (!m_reader) return DecodeResult::Failed;
 
         DWORD streamIndex = 0, flags = 0;
         LONGLONG timestamp = 0;
         winrt::com_ptr<IMFSample> sample;
         HRESULT hr = S_OK;
+        double sampleSeconds = 0.0;
+        double sampleDuration = 0.0;
+        int reads = 0;
+        const auto readStart = std::chrono::steady_clock::now();
+        auto firstSampleAt = readStart;
 
-        // Frame-accurate seek: SetCurrentPosition lands on the keyframe at or
-        // before the target, so decode forward and keep the first sample that
-        // is still showing at the target. Without this the position stayed at
-        // the keyframe, the caller saw "not at target yet" and sought again --
-        // every tick, forever, for any time that was not a keyframe.
+        // Read until a sample is still showing at the target. Earlier ones are
+        // already in the past: after a seek they lead up from the keyframe MF
+        // lands on, and in playback they are frames the target has moved past.
         for (;;)
         {
+            if (token.stop_requested() || m_generation.load() != generation)
+                return DecodeResult::Superseded;
             sample = nullptr;
             hr = m_reader->ReadSample(
                 static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM),
                 0, &streamIndex, &flags, &timestamp, sample.put());
-            if (FAILED(hr)) return false;
-            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { m_endOfStream = true; return false; }
-            if (!sample) return false;
-            if (discardBefore < 0.0) break;
-            LONGLONG dur = 0;
-            const double durSec = (SUCCEEDED(sample->GetSampleDuration(&dur)) && dur > 0)
-                ? static_cast<double>(dur) / 10'000'000.0 : m_frameDuration;
-            const double ts = static_cast<double>(timestamp) / 10'000'000.0;
-            if (ts + durSec > discardBefore + 1e-6) break;
+            if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR)) return DecodeResult::Failed;
+            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) return DecodeResult::EndOfStream;
+            if (!sample) continue;   // a stream tick or format notice
+            sampleSeconds = static_cast<double>(timestamp) / 10'000'000.0;
+            if (reads++ == 0)
+            {
+                firstSampleAt = std::chrono::steady_clock::now();
+                stats.firstSampleTime = sampleSeconds;
+                stats.secondsToFirstSample = std::chrono::duration<double>(firstSampleAt - readStart).count();
+            }
+            if (sampleSeconds <= skipThrough + scTimeTolerance) continue;
+
+            LONGLONG durationTicks = 0;
+            sampleDuration = (SUCCEEDED(sample->GetSampleDuration(&durationTicks)) && durationTicks > 0)
+                ? static_cast<double>(durationTicks) / 10'000'000.0 : m_frameDuration;
+            {
+                std::lock_guard lock(m_stateMutex);
+                if (m_generation.load() == generation) m_decodeHead = (std::max)(m_decodeHead, sampleSeconds);
+            }
+            if (sampleSeconds + sampleDuration > m_targetTime.load() + 1e-6) break;
+            if (sampleSeconds >= progressFrom && SecondsSince(readStart) > scCatchUpFrameSeconds) break;
         }
 
-        m_currentPositionSeconds = static_cast<double>(timestamp) / 10'000'000.0;
-        m_backFrameTime = m_currentPositionSeconds;
-        LONGLONG sampleDuration = 0;
-        m_backFrameDuration = (SUCCEEDED(sample->GetSampleDuration(&sampleDuration)) && sampleDuration > 0)
-            ? static_cast<double>(sampleDuration) / 10'000'000.0 : m_frameDuration;
+        // Timed from the first sample, so a seek's own latency is not counted.
+        if (reads > scMinTimedReads)
+            Smooth(m_decodeSecondsPerFrame, SecondsSince(firstSampleAt) / (reads - 1));
+        frame.time = sampleSeconds;
+        frame.duration = sampleDuration;
 
         // Lock buffer and copy raw bytes — GPU shader handles all color conversion.
         // With DXVA2 (DXGI device manager), the buffer may be a GPU texture;
@@ -1062,26 +1291,26 @@ void main(uint3 id : SV_DispatchThreadID)
             hr = sample->GetBufferByIndex(0, buffer.put());
         else
             hr = sample->ConvertToContiguousBuffer(buffer.put());
-        if (FAILED(hr) || !buffer) return false;
+        if (FAILED(hr) || !buffer) return DecodeResult::Failed;
 
-        // Hardware decode: hand the decoder texture over instead of reading it
-        // back (see GpuFrame).
+        // Hardware decode: queue the decoder texture instead of reading it
+        // back (see m_texPlanar).
         if (m_zeroCopyAllowed && !m_zeroCopyFailed && m_outputFormat != OutputFormat::RGB32)
         {
             winrt::com_ptr<IMFDXGIBuffer> dxgiBuffer;
             if (buffer.try_as(dxgiBuffer))
             {
-                GpuFrame f;
-                if (SUCCEEDED(dxgiBuffer->GetResource(IID_PPV_ARGS(f.tex.put()))) &&
-                    SUCCEEDED(dxgiBuffer->GetSubresourceIndex(&f.subresource)) && f.tex)
+                GpuFrame gpu;
+                if (SUCCEEDED(dxgiBuffer->GetResource(IID_PPV_ARGS(gpu.tex.put()))) &&
+                    SUCCEEDED(dxgiBuffer->GetSubresourceIndex(&gpu.subresource)) && gpu.tex)
                 {
-                    f.sample = sample;
-                    m_backGpu = std::move(f);
-                    return true;
+                    gpu.sample = sample;
+                    frame.gpu = std::move(gpu);
+                    return DecodeResult::Frame;
                 }
             }
         }
-        m_backGpu = {};
+        frame.gpu = {};
 
         winrt::com_ptr<IMF2DBuffer> buffer2D;
         buffer.try_as(buffer2D);
@@ -1104,7 +1333,7 @@ void main(uint3 id : SV_DispatchThreadID)
         {
             DWORD maxLen = 0;
             hr = buffer->Lock(&data, &maxLen, &lockedLength);
-            if (FAILED(hr)) return false;
+            if (FAILED(hr)) return DecodeResult::Failed;
             pitch = static_cast<LONG>(m_stride);
         }
 
@@ -1122,34 +1351,17 @@ void main(uint3 id : SV_DispatchThreadID)
 
         // Raw byte copy — no color conversion. GPU shader handles everything.
         LONG absPitch = (pitch < 0) ? -pitch : pitch;
-        size_t yPlaneSize, totalSize;
-        if (m_outputFormat == OutputFormat::P010)
-        {
-            yPlaneSize = static_cast<size_t>(absPitch) * m_height;
-            totalSize = yPlaneSize + static_cast<size_t>(absPitch) * (m_height / 2);
-        }
-        else if (m_outputFormat == OutputFormat::NV12)
-        {
-            yPlaneSize = static_cast<size_t>(absPitch) * m_height;
-            totalSize = yPlaneSize + static_cast<size_t>(absPitch) * (m_height / 2);
-        }
-        else
-        {
-            yPlaneSize = static_cast<size_t>(absPitch) * m_height;
-            totalSize = yPlaneSize;
-        }
+        const size_t yPlaneSize = static_cast<size_t>(absPitch) * m_height;
+        const size_t totalSize = m_outputFormat == OutputFormat::RGB32
+            ? yPlaneSize : yPlaneSize + static_cast<size_t>(absPitch) * (m_height / 2);
 
-        if (m_backBuffer.size() < totalSize)
-            m_backBuffer.resize(totalSize);
+        if (frame.bytes.size() < totalSize)
+            frame.bytes.resize(totalSize);
 
-        // The chroma plane follows the ALLOCATED luma rows, not the frame's.
-        // Decoders round the surface height up to their block size -- 1080 is
-        // stored as 1088, 180 as 192 -- so reading chroma at pitch * height
-        // took it from luma padding and misregistered colour by 16 px at
-        // 1080p. Every hardware-decoded video used this path until the
-        // zero-copy upload existed, and software decode still does. The
-        // allocated height is recoverable from the buffer size: luma rows
-        // plus half as many chroma rows, one pitch each.
+        // The chroma plane follows the ALLOCATED luma rows, not the frame's:
+        // decoders round the surface height up to their block size (1080 is
+        // stored as 1088). The allocated height is recoverable from the
+        // buffer size: luma rows plus half as many chroma rows, one pitch each.
         uint32_t surfaceRows = m_height;
         if (m_outputFormat != OutputFormat::RGB32 && absPitch > 0 && lockedLength > 0)
         {
@@ -1160,20 +1372,20 @@ void main(uint3 id : SV_DispatchThreadID)
 
         if (pitch > 0 && surfaceRows == m_height)
         {
-            std::memcpy(m_backBuffer.data(), data, totalSize);
+            std::memcpy(frame.bytes.data(), data, totalSize);
         }
         else
         {
             for (uint32_t y = 0; y < m_height; ++y)
             {
                 const BYTE* srcRow = data + static_cast<ptrdiff_t>(y) * pitch;
-                BYTE* dstRow = m_backBuffer.data() + static_cast<size_t>(y) * absPitch;
+                BYTE* dstRow = frame.bytes.data() + static_cast<size_t>(y) * absPitch;
                 std::memcpy(dstRow, srcRow, absPitch);
             }
             if (m_outputFormat != OutputFormat::RGB32)
             {
                 const BYTE* uvSrc = data + static_cast<ptrdiff_t>(surfaceRows) * pitch;
-                BYTE* uvDst = m_backBuffer.data() + yPlaneSize;
+                BYTE* uvDst = frame.bytes.data() + yPlaneSize;
                 for (uint32_t y = 0; y < m_height / 2; ++y)
                 {
                     std::memcpy(uvDst + static_cast<size_t>(y) * absPitch,
@@ -1181,12 +1393,11 @@ void main(uint3 id : SV_DispatchThreadID)
                 }
             }
         }
-        m_lastPitch = absPitch;
+        frame.pitch = absPitch;
 
         if (locked2D) buffer2D->Unlock2D();
         else buffer->Unlock();
 
-        return true;
+        return DecodeResult::Frame;
     }
 }
-

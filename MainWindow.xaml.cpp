@@ -4,6 +4,7 @@
 #include "MainWindow.g.cpp"
 #endif
 
+#include "Rendering/FramePacer.h"
 #include "Rendering/PipelineFormat.h"
 #include "Rendering/IccProfileParser.h"
 #include "Rendering/EffectGraphFile.h"
@@ -952,14 +953,13 @@ namespace winrt::ShaderLab::implementation
         // - 60 Hz floor: avoid laggy interactions on 30 Hz TV-out modes.
         // - 240 Hz ceiling: dispatcher tick scheduling becomes noisy below
         //   ~4 ms, and rendering faster than panel refresh is wasted work.
-        uint32_t hz = QueryDisplayRefreshHz();
-        if (hz < 60) hz = 60;
-        if (hz > 240) hz = 240;
+        // The render worker reads the same value for its FramePacer.
+        const uint32_t hz = ::ShaderLab::Rendering::FramePacer::ClampRate(QueryDisplayRefreshHz());
 
-        if (hz == m_targetRefreshHz && m_renderTimer)
+        if (hz == m_targetRefreshHz.load(std::memory_order_relaxed) && m_renderTimer)
             return;
 
-        m_targetRefreshHz = hz;
+        m_targetRefreshHz.store(hz, std::memory_order_relaxed);
 
         // Use microseconds so non-integer-ms periods (e.g. 144 Hz ~6.944 ms)
         // don't get rounded to a slower or faster cadence than the panel.
@@ -5968,15 +5968,26 @@ namespace winrt::ShaderLab::implementation
         double fps = m_lastFps;
         double total = ft.totalUs / 1000.0;
         double sumGraph =
+            ft.frameStartUs / 1000.0 +
             ft.sourcesPrepUs / 1000.0 + ft.evaluateUs / 1000.0 +
             ft.deferredComputeUs / 1000.0 +
             ft.drawUs / 1000.0 + ft.endDrawFlushUs / 1000.0;
         double idle = (std::max)(0.0, total - sumGraph);
 
-        std::wstring text = std::format(
-            L"{:.0f} FPS  ({:.1f} ms / graph eval)\n"
+        std::wstring text = L"Previewed node: " + BuildFpsStatusText() +
+            (m_previewRenderStats.GpuTimed()
+                ? L"\n  renders per second; ms from frame start to GPU done\n"
+                : L"\n  renders per second; ms of CPU time (no GPU timestamps)\n");
+        const double previewCpuMs = m_previewRenderStats.CpuMs();
+        const double previewGpuMs = m_previewRenderStats.GpuMs();
+        if (previewCpuMs >= 0.0 && previewGpuMs >= 0.0)
+            text += std::format(L"  CPU to submit {:.2f} ms, GPU timestamp span {:.2f} ms\n", previewCpuMs, previewGpuMs);
+        text += L"\n";
+        text += std::format(
+            L"Render loop: {:.0f} evaluations/s  ({:.1f} ms CPU / graph eval)\n"
             L"\n"
             L"  Graph eval (render thread):\n"
+            L"    frame start     {:>6.2f} ms  (waiting on the GPU)\n"
             L"    sources prep    {:>6.2f} ms\n"
             L"    eval            {:>6.2f} ms\n"
             L"    compute         {:>6.2f} ms  ({} dispatch{})\n"
@@ -5991,6 +6002,7 @@ namespace winrt::ShaderLab::implementation
             L"    output windows  {:>6.2f} ms\n"
             L"    pixel trace     {:>6.2f} ms",
             fps, total,
+            ft.frameStartUs / 1000.0,
             ft.sourcesPrepUs / 1000.0,
             ft.evaluateUs / 1000.0,
             ft.deferredComputeUs / 1000.0, ft.computeDispatches,
@@ -6084,8 +6096,7 @@ namespace winrt::ShaderLab::implementation
         const bool on = box.IsChecked() && box.IsChecked().Value();
         ::ShaderLab::Performance::SetUnthrottledRenderEnabled(on);
         // Wake the worker so the change takes effect on this tick rather than
-        // after one more 16 ms wait -- turning it ON while the worker is
-        // parked in that wait would otherwise look like a lag.
+        // after its current frame wait.
         m_renderDispatcher.Wake();
         UpdateFpsTooltip();
     }
@@ -6167,10 +6178,15 @@ namespace winrt::ShaderLab::implementation
 
     std::wstring MainWindow::BuildFpsStatusText() const
     {
-        // Single-line "60 fps | 16.5 ms" canonical status string. Shared by
-        // the main FPS counter and every output window's status bar.
-        return std::format(L"{:.0f} fps | {:.1f} ms",
-            m_lastFps, m_frameTiming.totalUs / 1000.0);
+        // "24 fps | 3.1 ms": how often the previewed node re-rendered, and its
+        // last render's time through the GPU. N/A when it has not rendered
+        // recently. Shared by the main status bar and every output window.
+        const double fps = m_previewRenderStats.Fps();
+        if (fps < 0.0)
+            return L"N/A fps | N/A ms";
+        const double ms = m_previewRenderStats.Ms();
+        return ms < 0.0 ? std::format(L"{:.0f} fps | N/A ms", fps)
+                        : std::format(L"{:.0f} fps | {:.1f} ms", fps, ms);
     }
 
     void MainWindow::UpdateFpsTooltip()
