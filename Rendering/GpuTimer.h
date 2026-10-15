@@ -7,15 +7,9 @@ namespace ShaderLab::Rendering
 {
     // GPU-side span timing via D3D11 timestamp queries.
     //
-    // WHY THIS EXISTS. Every other timing in this project is CPU wall-clock
-    // wrapped around D2D calls -- and D2D submission is ASYNCHRONOUS, so those
-    // numbers measure how long it took to RECORD commands, not how long the GPU
-    // spent executing them. That is not a small discrepancy: a perf sweep built
-    // on `perf_timings` produced run-to-run variance of +-50%, several negative
-    // "costs", and a still image reporting 114 fps while a single re-render of
-    // the same graph took hundreds of milliseconds. Shader optimisation is not
-    // possible on that instrument, because the quantity being optimised is the
-    // one it does not measure.
+    // CPU wall-clock around D2D calls measures how long it took to RECORD
+    // commands, not how long the GPU spent executing them, because D2D
+    // submission is asynchronous. These spans measure the GPU side.
     //
     // THE D2D BATCHING TRAP. A timestamp is a command in the D3D11 stream, so
     // it orders correctly against other D3D11 commands -- but D2D buffers its
@@ -144,6 +138,9 @@ namespace ShaderLab::Rendering
             winrt::com_ptr<ID3D11Query> begin[kSpanCount];
             winrt::com_ptr<ID3D11Query> end[kSpanCount];
             bool used[kSpanCount]{};
+            // Begin issued this frame. End without it is ignored: the begin
+            // query would hold a timestamp from kLatency frames ago, or none.
+            bool begun[kSpanCount]{};
             bool inFlight{ false };
             // Grown on demand up to kMaxNodeSpans and then reused; the queries
             // are the expensive part, not the vector.
@@ -155,6 +152,9 @@ namespace ShaderLab::Rendering
         int AcquireNodeSpan(FrameQueries& f, uint32_t nodeId);
 
         void Collect(FrameQueries& f);
+        // Decodes a retired frame's spans into the results. False, keeping
+        // the previous results, when its clock was disjoint.
+        bool ResolveFrame(FrameQueries& f, const D3D11_QUERY_DATA_TIMESTAMP_DISJOINT& dj);
 
         winrt::com_ptr<ID3D11Device>        m_device;
         winrt::com_ptr<ID3D11DeviceContext> m_context;
@@ -166,7 +166,7 @@ namespace ShaderLab::Rendering
         // worker -- the route reported enabled=true while the render thread
         // kept sampling nothing, and framesResolved sat at 0.
         std::atomic<bool> m_enabled{ false };
-        bool     m_frameOpen{ false };
+        bool     m_frameOpen{ false };   // render thread only
         // ALL of these are written by the render worker and read from the
         // UI/MCP thread. As plain members on ARM64 the reader saw a value
         // frozen at its first observation -- framesOpened stuck at 1 while the
@@ -178,8 +178,8 @@ namespace ShaderLab::Rendering
         std::atomic<uint64_t> m_framesResolved{ 0 };
         std::atomic<uint32_t> m_disjointDrops{ 0 };
 
-        // Per-node results from the last retired frame. Read from the UI
-        // thread via a snapshot copy, written on the render thread.
+        // Per-node results from the last retired frame. Render thread only;
+        // other threads see them through the published graph snapshot.
         std::unordered_map<uint32_t, double> m_nodeResultMs;
     };
 }

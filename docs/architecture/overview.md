@@ -10,15 +10,15 @@ graph TB
 
     subgraph Engine["ShaderLabEngine.dll"]
         EG[Graph/*]
-        EV[GraphEvaluator / FalseColorOverlay]
+        EV[GraphEvaluator]
         FX[EffectRegistry / ShaderLabEffects / SourceNodeFactory]
-        IO[ImageLoader / VideoSourceProvider / ShaderCompiler]
+        IO[ImageLoader / VideoSourceProvider / capture providers / ShaderCompiler]
         MON[DisplayMonitor / ICC]
-        MCP[Engine/Mcp: McpRouter + EngineMcpRoutes]
+        MCP[Engine/Mcp: McpRouter + Routes/]
     end
 
     subgraph Tests["ShaderLabTests.exe"]
-        TR[TestRunner main + 51 HLSL math tests]
+        TR[TestRunner main + self-registering cases<br/>Graph / Effects / Rendering / Sources / Video / Mcp / Math]
     end
 
     subgraph Headless["ShaderLabHeadless.exe"]

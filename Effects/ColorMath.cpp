@@ -314,6 +314,107 @@ float DeltaEITPFromScRGB(float3 rgb1, float3 rgb2) {
     return DeltaEITP(ScRGBToICtCp(rgb1), ScRGBToICtCp(rgb2));
 }
 
+// ---- CIE Lab colour differences ----
+// For SDR, sRGB-gamut comparisons; prefer DeltaEITP for HDR or wide gamut.
+// Named Cie* because graphs saved before these moved here define DeltaE76,
+// DeltaE94 and DeltaE2000 themselves.
+
+// CIE76: simple Euclidean distance in L*a*b*
+float CieDeltaE76(float3 lab1, float3 lab2) {
+    float3 d = lab1 - lab2;
+    return sqrt(dot(d, d));
+}
+
+// CIE94 (graphic arts)
+float CieDeltaE94(float3 lab1, float3 lab2) {
+    float dL = lab1.x - lab2.x;
+    float C1 = sqrt(lab1.y * lab1.y + lab1.z * lab1.z);
+    float C2 = sqrt(lab2.y * lab2.y + lab2.z * lab2.z);
+    float dC = C1 - C2;
+    float da = lab1.y - lab2.y;
+    float db = lab1.z - lab2.z;
+    float dH2 = da * da + db * db - dC * dC;
+    float dH = sqrt(max(dH2, 0.0));
+    float SL = 1.0;
+    float SC = 1.0 + 0.045 * C1;
+    float SH = 1.0 + 0.015 * C1;
+    float t1 = dL / SL;
+    float t2 = dC / SC;
+    float t3 = dH / SH;
+    return sqrt(t1*t1 + t2*t2 + t3*t3);
+}
+
+// CIEDE2000
+float CieDeltaE2000(float3 lab1, float3 lab2) {
+    float L1 = lab1.x, a1 = lab1.y, b1 = lab1.z;
+    float L2 = lab2.x, a2 = lab2.y, b2 = lab2.z;
+
+    float Cab1 = sqrt(a1*a1 + b1*b1);
+    float Cab2 = sqrt(a2*a2 + b2*b2);
+    float Cab_avg = (Cab1 + Cab2) * 0.5;
+    float Cab_avg7 = pow(Cab_avg, 7.0);
+    float G = 0.5 * (1.0 - sqrt(Cab_avg7 / (Cab_avg7 + 6103515625.0))); // 25^7
+
+    float a1p = a1 * (1.0 + G);
+    float a2p = a2 * (1.0 + G);
+    float C1p = sqrt(a1p*a1p + b1*b1);
+    float C2p = sqrt(a2p*a2p + b2*b2);
+
+    // Hue angles. atan2(0, 0) is implementation-defined and on some
+    // drivers returns NaN -- guard against (a,b)==(0,0) by treating C==0
+    // as h==0 (the hue angle of an achromatic point is meaningless and
+    // any consistent value works because the C-weighted hp_avg branch
+    // below short-circuits to h1p+h2p).
+    float h1p = (C1p < 1e-10) ? 0.0 : atan2(b1, a1p);
+    if (h1p < 0.0) h1p += 6.28318530718;
+    float h2p = (C2p < 1e-10) ? 0.0 : atan2(b2, a2p);
+    if (h2p < 0.0) h2p += 6.28318530718;
+
+    float dLp = L2 - L1;
+    float dCp = C2p - C1p;
+
+    float dhp;
+    if (C1p * C2p < 1e-10) dhp = 0.0;
+    else {
+        dhp = h2p - h1p;
+        if (dhp > 3.14159265359) dhp -= 6.28318530718;
+        else if (dhp < -3.14159265359) dhp += 6.28318530718;
+    }
+    float dHp = 2.0 * sqrt(C1p * C2p) * sin(dhp * 0.5);
+
+    float Lp_avg = (L1 + L2) * 0.5;
+    float Cp_avg = (C1p + C2p) * 0.5;
+
+    float hp_avg;
+    if (C1p * C2p < 1e-10) hp_avg = h1p + h2p;
+    else {
+        hp_avg = (h1p + h2p) * 0.5;
+        if (abs(h1p - h2p) > 3.14159265359) hp_avg += 3.14159265359;
+    }
+
+    float T = 1.0
+        - 0.17 * cos(hp_avg - 0.52359877559)       // 30 deg
+        + 0.24 * cos(2.0 * hp_avg)
+        + 0.32 * cos(3.0 * hp_avg + 0.10471975512)  // 6 deg
+        - 0.20 * cos(4.0 * hp_avg - 1.09955742876);  // 63 deg
+
+    float Lp50sq = (Lp_avg - 50.0) * (Lp_avg - 50.0);
+    float SL = 1.0 + 0.015 * Lp50sq / sqrt(20.0 + Lp50sq);
+    float SC = 1.0 + 0.045 * Cp_avg;
+    float SH = 1.0 + 0.015 * Cp_avg * T;
+
+    float Cp_avg7 = pow(Cp_avg, 7.0);
+    float RC = 2.0 * sqrt(Cp_avg7 / (Cp_avg7 + 6103515625.0));
+    float hp_deg = hp_avg * 57.29577951; // rad to deg
+    float dtheta = 30.0 * exp(-((hp_deg - 275.0) / 25.0) * ((hp_deg - 275.0) / 25.0));
+    float RT = -sin(2.0 * dtheta * 0.01745329252) * RC;
+
+    float t1 = dLp / SL;
+    float t2 = dCp / SC;
+    float t3 = dHp / SH;
+    return sqrt(t1*t1 + t2*t2 + t3*t3 + RT * t2 * t3);
+}
+
 // OKLab: linear sRGB -> OKLab
 float3 LinearToOKLab(float3 c) {
     float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
@@ -346,7 +447,7 @@ float IToNits(float I) {
 }
 
 // Reinhard compression on I, expressed in I-space directly. Anchored
-// Möbius: maps 0 -> 0 and peakIn_I -> peakOut_I exactly, with f'(0)=1
+// Mobius: maps 0 -> 0 and peakIn_I -> peakOut_I exactly, with f'(0)=1
 // (linear at the low end) and smooth rolloff near peakIn. Both peaks
 // are I coordinates (PQ values). For HDR -> SDR pass peakIn = HDR_I,
 // peakOut = SDR_I. Inputs above peakIn_I are clamped so the curve
@@ -484,6 +585,18 @@ static const float3x3 BRADFORD_INV = float3x3(
      0.9869929, -0.1470543,  0.1599627,
      0.4323053,  0.5183603,  0.0492912,
     -0.0085287,  0.0400428,  0.9684867);
+
+// The xy primaries of gamut id 0 sRGB, 1 Display P3, 2 BT.2020, 3 custom
+// (cR, cG, cB), 4 DCI-P3 adapted to D65; any other id is sRGB. Ternaries, not
+// if/else: every operand is evaluated, so custom primaries read from a cbuffer
+// stay referenced on all paths and are never stripped.
+void GamutPrimariesFor(uint gamut, float2 cR, float2 cG, float2 cB,
+                       out float2 r, out float2 g, out float2 b)
+{
+    r = (gamut == 1) ? GAMUT_P3_R : (gamut == 2) ? GAMUT_2020_R : (gamut == 3) ? cR : (gamut == 4) ? GAMUT_DCIP3_R : GAMUT_709_R;
+    g = (gamut == 1) ? GAMUT_P3_G : (gamut == 2) ? GAMUT_2020_G : (gamut == 3) ? cG : (gamut == 4) ? GAMUT_DCIP3_G : GAMUT_709_G;
+    b = (gamut == 1) ? GAMUT_P3_B : (gamut == 2) ? GAMUT_2020_B : (gamut == 3) ? cB : (gamut == 4) ? GAMUT_DCIP3_B : GAMUT_709_B;
+}
 
 TargetXf MakeTargetXf(uint gamut, float2 cR, float2 cG, float2 cB, float2 cW)
 {

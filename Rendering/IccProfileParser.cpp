@@ -105,6 +105,16 @@ namespace
 		std::vector<uint8_t> buf(cb);
 		if (!::GetColorProfileElement(prof, kTagDesc, 0, &cb, buf.data(), &ref))
 			return {};
+		return ShaderLab::Rendering::ParseIccDescriptionTag(buf.data(), buf.size());
+	}
+}
+
+namespace ShaderLab::Rendering
+{
+	std::wstring ParseIccDescriptionTag(const uint8_t* data, size_t size)
+	{
+		if (!data || size < 12) return {};
+		const std::span<const uint8_t> buf(data, size);
 
 		uint32_t typeSigBe = 0;
 		std::memcpy(&typeSigBe, buf.data(), 4);
@@ -115,7 +125,8 @@ namespace
 			uint32_t lenBe = 0;
 			std::memcpy(&lenBe, buf.data() + 8, 4);
 			const uint32_t len = SwapBE32(lenBe);
-			if (len == 0 || 12 + len > buf.size()) return {};
+			// Subtraction form: the lengths come from the file and may be huge.
+			if (len == 0 || len > buf.size() - 12) return {};
 			std::string ascii(reinterpret_cast<const char*>(buf.data() + 12), len);
 			if (!ascii.empty() && ascii.back() == '\0') ascii.pop_back();
 			return std::wstring(ascii.begin(), ascii.end());
@@ -131,7 +142,7 @@ namespace
 			std::memcpy(&strOffBe, buf.data() + 24, 4);
 			const uint32_t strLen = SwapBE32(strLenBe);
 			const uint32_t strOff = SwapBE32(strOffBe);
-			if (strLen < 2 || strOff + strLen > buf.size()) return {};
+			if (strLen < 2 || strOff > buf.size() || strLen > buf.size() - strOff) return {};
 
 			const uint32_t chars = strLen / 2;
 			std::wstring out;
@@ -149,9 +160,6 @@ namespace
 
 		return {};
 	}
-
-	// DetectGamut now lives in DisplayProfile.h so the live-display path in
-	// DisplayMonitor can classify with the identical thresholds.
 }
 
 namespace ShaderLab::Rendering

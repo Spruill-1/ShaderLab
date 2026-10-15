@@ -40,6 +40,9 @@ graph LR
 - **Cycle detection** covers both image edges and binding edges
 - Bound values resolved **every frame** (bypass dirty logic — upstream analysis may change)
 - **Authored properties never mutated** — bindings build an effective properties map at evaluation time
+- **Write-back for display**: `GraphEvaluator::ResolveAndWriteBackBindings` copies each moved value into `properties` (what the UI shows and a save writes), except a non-finite one, which keeps the previous value and sets `runtimeError`; every node kind goes through it
+- **One traversal**: `PropertyBinding::ForEachSourceNode` / `AnySourceNode` / `ReadsFrom` and `ForEachBindingSource` / `AnyBindingSource` (`Graph/EffectNode.h`) visit the nodes a binding reads, whole-array or per-component, for the sort, dirty propagation, removal and the canvas
+- **Removing one source**: `GraphModel::UnbindPropertySource` drops the components that read a given source field and the whole binding when none is left (Alt+click on a data edge)
 
 
 ---

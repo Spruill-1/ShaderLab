@@ -27,10 +27,10 @@ namespace ShaderLab::Effects
     //   SHADERLAB_PARAM(float, TargetPeakNits)          // inside cbuffer
     //   SHADERLAB_LOAD_PARAM(float, TargetPeakNits)     // inside main()
     // and use TargetPeakNits as a normal local downstream. The host
-    // does the rest: emits _SLPARAM_TargetPeakNits_GPU=0|1 and, when 1,
-    // binds an SRV to the right t-slot.
+    // does the rest: emits _SLPARAM_TargetPeakNits_GPU=0|1|2 and binds the
+    // matching resource (1 = structured-buffer SRV, 2 = analysis texture).
     static constexpr const char* kSource = R"HLSL(
-// shaderlab_params.hlsli — engine-embedded macro library.
+// shaderlab_params.hlsli -- engine-embedded macro library.
 // See Effects/ShaderLabParamsHlsl.h for documentation.
 #ifndef SHADERLAB_PARAMS_HLSLI_INCLUDED
 #define SHADERLAB_PARAMS_HLSLI_INCLUDED
@@ -166,6 +166,62 @@ float ShaderLabAnalysisField(Texture2D<float4> tex, uint index)
     }
 #define ShaderLabScratchStore(word, value)  _SLScratch.Store((word) * 4, (value))
 #define ShaderLabScratchLoad(word)          _SLScratch.Load((word) * 4)
+
+// ---- Statistics over the reduce scratch --------------------------------------
+// Words above the cleared head: one partial block of SHADERLAB_PARTIAL_STRIDE
+// words per group, then one histogram of `bins` words per group.
+#define SHADERLAB_PARTIAL_STRIDE 8
+#define SHADERLAB_PARTIAL_WORD(group, i) \
+    (SHADERLAB_REDUCE_CLEARED + (group) * SHADERLAB_PARTIAL_STRIDE + (i))
+#define SHADERLAB_HISTOGRAM_WORD(group, bin, bins) \
+    (SHADERLAB_REDUCE_CLEARED + SHADERLAB_REDUCE_GROUPS * SHADERLAB_PARTIAL_STRIDE + (group) * (bins) + (bin))
+
+// Each of these is a braced block, so a loop variable it declares cannot
+// collide with one in the caller (fxc scopes a for-init to the enclosing block).
+
+// Tree-reduces a group's groupshared accumulators into element 0, calling
+// combine(dst, src) to fold element src into dst. Every thread calls it.
+#define ShaderLabTreeReduce(tid, threads, combine) \
+    { \
+        GroupMemoryBarrierWithGroupSync(); \
+        for (uint _slStride = (threads) / 2; _slStride > 0; _slStride >>= 1) \
+        { \
+            if ((tid) < _slStride) combine((tid), (tid) + _slStride); \
+            GroupMemoryBarrierWithGroupSync(); \
+        } \
+    }
+
+// Writes this group's groupshared histogram to its scratch slot. Every thread calls it.
+#define ShaderLabStoreHistogram(hist, bins, group, tid, threads) \
+    { \
+        for (uint _slStoreBin = (tid); _slStoreBin < (bins); _slStoreBin += (threads)) \
+            ShaderLabScratchStore(SHADERLAB_HISTOGRAM_WORD(group, _slStoreBin, bins), hist[_slStoreBin]); \
+    }
+
+// In the last group: sums every group's histogram into hist. Every thread calls it.
+#define ShaderLabMergeHistograms(hist, bins, tid, threads) \
+    { \
+        for (uint _slMergeBin = (tid); _slMergeBin < (bins); _slMergeBin += (threads)) \
+        { \
+            uint _slMerged = 0; \
+            for (uint _slGroup = 0; _slGroup < SHADERLAB_REDUCE_GROUPS; ++_slGroup) \
+                _slMerged += ShaderLabScratchLoad(SHADERLAB_HISTOGRAM_WORD(_slGroup, _slMergeBin, bins)); \
+            hist[_slMergeBin] = _slMerged; \
+        } \
+    }
+
+// binOut = the first bin at which hist's running count reaches target, or
+// `bins` when it never does.
+#define ShaderLabPercentileBin(hist, bins, target, binOut) \
+    { \
+        uint _slRunning = 0; \
+        binOut = (bins); \
+        for (uint _slBin = 0; _slBin < (bins); ++_slBin) \
+        { \
+            _slRunning += hist[_slBin]; \
+            if (_slRunning >= (target)) { binOut = _slBin; break; } \
+        } \
+    }
 
 // ---- Accumulate, then write the image ----------------------------------------
 // For an image whose pixels are bins the input is scattered into. Declare

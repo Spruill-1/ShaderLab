@@ -18,11 +18,12 @@ namespace ShaderLab::Rendering
     // cbuffer contract: first 8 bytes = uint Width, uint Height (auto-injected).
     // User parameters start at offset 8.
     //
-    // Phase 8: implements IEngineComputeOutput so downstream effects can
-    // bind the result SRV directly into a SHADERLAB_GPU_BUFFER slot,
-    // avoiding the Map() round-trip. The COM impl is no-op-refcounted
-    // -- the runner's lifetime is owned by the GraphEvaluator's
-    // unique_ptr cache, callers are not allowed to AddRef beyond that.
+    // Implements IEngineComputeOutput (lane 1) and IEngineComputeTexture
+    // (lane 3) so downstream effects read the results on the GPU without a
+    // Map(); the lanes are defined in docs/architecture/d2d-d3d11-hybrid-compute.md.
+    // The COM implementation is no-op-refcounted: the runner is an interior
+    // object of the bridge effect that holds it by value, valid while that
+    // effect lives.
     class SHADERLAB_API D3D11ComputeRunner
         : public Effects::IEngineComputeOutput
         , public Effects::IEngineComputeTexture
@@ -38,16 +39,13 @@ namespace ShaderLab::Rendering
         // Returns true on success. Call GetCompileError() on failure.
         // On success, GetCompiledBytecode() returns the bytecode blob —
         // the caller should store it on the CustomEffectDefinition so
-        // downstream cbuffer reflection (in DispatchUserD3D11Compute)
-        // can pack user properties at the correct offsets.
+        // cbuffer reflection can pack user properties at the right offsets.
         bool CompileShader(const std::string& hlslSource);
 
-        // Install pre-compiled shader bytecode (Phase 8 bridge effect
-        // path). Bypasses D3DCompile -- used when the host already
-        // has the bytecode (e.g. after an MCP /effect/compile call).
-        // The runner stashes the bytecode blob and the live
-        // ID3D11ComputeShader; subsequent Dispatch calls use it like
-        // they would the CompileShader output.
+        // Install bytecode compiled elsewhere (the bridge effect's path:
+        // the evaluator compiles through the BytecodeCache). The runner
+        // keeps the blob and the live ID3D11ComputeShader; later Dispatch
+        // calls use them as they would CompileShader's output.
         void InstallPrecompiledShader(
             const std::vector<uint8_t>& bytecode,
             winrt::com_ptr<ID3D11ComputeShader> shader);
@@ -82,8 +80,7 @@ namespace ShaderLab::Rendering
         // producing per-pixel effects pass (W/tx, H/ty, 1) where tx,ty
         // are the [numthreads] dimensions.
         //
-        // extraSrvs / extraSrvSlots: Phase 8 GPU-binding extension.
-        // For each entry, the SRV is bound at the named t-slot before
+        // extraSrvs / extraSrvSlots: GPU bindings (lane 1). For each entry, the SRV is bound at the named t-slot before
         // dispatch. Used by the bridge to wire upstream
         // IEngineComputeOutput SRVs into a consumer's
         // SHADERLAB_GPU_BUFFER slots without a CPU readback round-trip.
@@ -92,8 +89,7 @@ namespace ShaderLab::Rendering
         // readback: None leaves the values GPU-only (the SRV still sees them).
         // Blocking copies and Maps immediately -- the Map waits for the GPU to
         // finish EVERYTHING queued on the immediate context, including the
-        // upstream D2D pre-render, so it drains the pipeline (2-10 ms per call
-        // measured on this project's graphs). Async queues the copy into a
+        // upstream D2D pre-render, so it drains the pipeline. Async queues the copy into a
         // small staging ring and returns nothing; PollReadback collects the
         // values on a later frame without waiting.
         enum class Readback { None, Blocking, Async };
@@ -117,11 +113,20 @@ namespace ShaderLab::Rendering
             return false;
         }
 
+        // Benchmark-only A/B mode: issue dispatches call by call on the shared
+        // immediate context instead of recording them on the private deferred
+        // context. Racy against Direct2D on other threads (see Initialize);
+        // EvaluatorOptions::computeCommandList = false turns it on.
+        void UseImmediateContextForBenchmark(bool on) { m_immediateForBenchmark = on; }
+
         bool IsInitialized() const { return m_device != nullptr; }
         bool HasShader() const { return m_shader != nullptr; }
 
         // Why the last Dispatch did nothing, or S_OK.
         HRESULT LastDispatchResult() const { return m_lastDispatchResult; }
+        // The blocking readback's Map: a failure leaves the dispatch done and
+        // the returned values empty. S_OK when no blocking read was asked for.
+        HRESULT LastReadbackResult() const { return m_lastReadbackResult; }
 
         // True when the installed shader declares SHADERLAB_IMAGE_PASS.
         bool UsesImagePass() const { return m_usesImagePass; }
@@ -135,11 +140,10 @@ namespace ShaderLab::Rendering
         ID3D11ShaderResourceView* GetResultSRV() const { return m_resultSRV.get(); }
 
         // ---- IUnknown (no-op refcount) ----------------------------------
-        // The runner's lifetime is owned by the GraphEvaluator's cache;
-        // AddRef / Release are no-ops returning a constant. This is
-        // valid for "interior" COM objects whose lifetime is managed
-        // by an external owner -- callers are required not to outlive
-        // the evaluator that vends the pointer.
+        // The runner's lifetime is owned by the bridge effect holding it;
+        // AddRef / Release are no-ops returning a constant, as for any
+        // "interior" COM object with an external owner. Callers must not
+        // outlive that effect.
         HRESULT __stdcall QueryInterface(REFIID iid, void** out) noexcept override;
         ULONG   __stdcall AddRef() noexcept override { return 1; }
         ULONG   __stdcall Release() noexcept override { return 1; }
@@ -156,17 +160,13 @@ namespace ShaderLab::Rendering
         // decide whether to run the copy pass at all.
         bool AnalysisTextureRequested() const { return m_analysisTexWanted; }
 
-        // Called by the evaluator immediately after a successful Dispatch
-        // so consumers can detect freshness via GetLastEvaluatedFrame.
-        void SetLastEvaluatedFrame(uint64_t frame) { m_lastEvaluatedFrame = frame; }
-
     private:
         winrt::com_ptr<ID3D11Device> m_device;
-        // The context every command is RECORDED on: a deferred context owned
-        // by this runner alone. Nothing here is issued on the device's shared
-        // immediate context -- a whole dispatch is recorded, closed into a
-        // command list, and handed over with one ExecuteCommandList. See
-        // SubmitRecorded().
+        // The context a dispatch is issued on: the private deferred context,
+        // so a whole dispatch is recorded, closed into a command list and
+        // handed over with one ExecuteCommandList (SubmitRecorded). It is the
+        // shared immediate context only when the device refused a deferred
+        // one or the benchmark switch above is on.
         winrt::com_ptr<ID3D11DeviceContext> m_context;
         // The shared immediate context. Touched for exactly two single calls:
         // ExecuteCommandList, and the CPU readback Map (which a deferred
@@ -176,6 +176,7 @@ namespace ShaderLab::Rendering
         // one). m_context points at it or at m_immediate, chosen per dispatch.
         winrt::com_ptr<ID3D11DeviceContext> m_deferredCtx;
         bool m_deferred{ false };
+        bool m_immediateForBenchmark{ false };
 
         // Close what has been recorded on m_context into a command list and
         // execute it on the immediate context. No-op in immediate mode.
@@ -184,7 +185,7 @@ namespace ShaderLab::Rendering
         std::vector<uint8_t> m_bytecode;
 
         // Result buffer (RWStructuredBuffer<float4>) -- bound as both
-        // UAV (writer) and SRV (downstream Phase 8 consumer).
+        // UAV (writer) and SRV (lane-1 consumer).
         winrt::com_ptr<ID3D11Buffer> m_resultBuffer;
         // Staging ring. Blocking reads use any slot and Map at once; async
         // reads rotate through the ring so a copy can be in flight while
@@ -199,7 +200,12 @@ namespace ShaderLab::Rendering
         static constexpr size_t kStagingSlots = 3;
         std::array<StagingSlot, kStagingSlots> m_staging{};
         uint64_t m_stagingSeq{ 0 };
+        // Parameter cbuffer: the runner's Width/Height, then the user
+        // constants. 256 bytes unless the constants need more.
+        static constexpr UINT cRunnerConstantBytes = 8;
+        static constexpr UINT cMinConstantBufferBytes = 256;
         winrt::com_ptr<ID3D11Buffer> m_cbuffer;
+        UINT m_cbufferBytes{ 0 };
         winrt::com_ptr<ID3D11UnorderedAccessView> m_resultUAV;
         winrt::com_ptr<ID3D11ShaderResourceView>  m_resultSRV;
         uint32_t m_resultCount{ 0 };
@@ -214,6 +220,7 @@ namespace ShaderLab::Rendering
         winrt::com_ptr<ID3D11UnorderedAccessView> m_analysisTexUAV;
         winrt::com_ptr<ID3D11ShaderResourceView>  m_analysisTexSRV;
         winrt::com_ptr<ID3D11ComputeShader>       m_analysisCopyShader;
+        winrt::com_ptr<ID3D11Buffer>              m_copyConstants;   // the copy pass's count
         bool m_analysisTexFilled{ false };
 
         std::wstring m_compileError;
@@ -239,8 +246,30 @@ namespace ShaderLab::Rendering
         // Reads the scratch / image-pass opt-ins and the group size.
         void ReflectContracts();
         HRESULT m_lastDispatchResult{ S_OK };
+        HRESULT m_lastReadbackResult{ S_OK };
 
-        void EnsureBuffers(uint32_t resultCount);
+        // Result buffer, its views and the staging ring, for resultCount float4s.
+        HRESULT EnsureBuffers(uint32_t resultCount);
+
+        // DispatchWithImageOutput's steps, in order.
+        HRESULT CreateInputViews(const std::vector<ID3D11Texture2D*>& inputTextures,
+                                 std::vector<winrt::com_ptr<ID3D11ShaderResourceView>>& views);
+        // Creates and clears the u1 view; does nothing without an output texture.
+        HRESULT CreateImageOutputView(ID3D11Texture2D* imageOutputTexture,
+                                      winrt::com_ptr<ID3D11UnorderedAccessView>& view,
+                                      D3D11_TEXTURE2D_DESC& desc);
+        HRESULT EnsureConstantBuffer(UINT userBytes);
+        HRESULT PackConstants(const D3D11_TEXTURE2D_DESC& input0, const std::vector<BYTE>& cbufferData);
+        // Binds, dispatches (one pass, or the image contract's two) and unbinds.
+        void RunPasses(const std::vector<ID3D11ShaderResourceView*>& inputViews,
+                       ID3D11UnorderedAccessView* imageView,
+                       const D3D11_TEXTURE2D_DESC& input0, const D3D11_TEXTURE2D_DESC& output,
+                       uint32_t dispatchX, uint32_t dispatchY, uint32_t dispatchZ,
+                       const std::vector<ID3D11ShaderResourceView*>& extraSrvs,
+                       const std::vector<uint32_t>& extraSrvSlots);
+        // Copies the result buffer to a staging slot; nullptr if none exists.
+        StagingSlot* ScheduleReadback();
+        HRESULT CollectBlocking(StagingSlot& slot, uint32_t resultCount, std::vector<float>& out);
         // Creates the lane-3 texture + copy shader on demand. Safe to call
         // every dispatch; returns false if the lane is unavailable.
         bool EnsureAnalysisTexture();

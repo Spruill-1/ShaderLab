@@ -1,12 +1,9 @@
 #include "pch_engine.h"
 #include "McpToolCatalog.h"
 
-// The listJson strings below are the tools/list entries formerly embedded
-// as one giant multi-line raw literal in MainWindow.McpRoutes.cpp. Each is
-// a SINGLE LINE by construction — the stdio transport frames one JSON
-// message per line, so no catalog string may ever contain a newline
-// (invisible over HTTP, fatal over stdio). Content is unchanged from the
-// pre-catalog dispatcher except for the removed `image_stats` phantom.
+// Each listJson string is a tools/list entry on a SINGLE LINE: the stdio
+// transport frames one JSON message per line, so no catalog string may
+// contain a newline.
 
 namespace ShaderLab::Mcp
 {
@@ -19,11 +16,20 @@ namespace ShaderLab::Mcp
 
         // ---- Graph structure ------------------------------------------------
         { "graph_add_node",
-          R"JSON({"name":"graph_add_node","description":"Add a node. Use effectName for built-in/ShaderLab effects. For sources use effectName='Video' or 'Image' with optional filePath.","inputSchema":{"type":"object","properties":{"effectName":{"type":"string","description":"Effect name, or 'Video'/'Image' for source nodes"},"filePath":{"type":"string","description":"File path for Video/Image source nodes (optional)"}},"required":["effectName"]}})JSON",
+          R"JSON({"name":"graph_add_node","description":"Add a node. Use effectName for built-in/ShaderLab effects, 'Custom Pixel Shader' / 'Custom Compute Shader' / 'Custom D3D11 Compute Shader' for an empty shader, 'Output', or 'Desktop Duplication' with adapterIndex/outputIndex. For sources use effectName='Video' or 'Image' with optional filePath.","inputSchema":{"type":"object","properties":{"effectName":{"type":"string","description":"Effect name, or 'Video'/'Image' for source nodes"},"filePath":{"type":"string","description":"File path for Video/Image source nodes (optional)"}},"required":["effectName"]}})JSON",
           L"POST", L"/graph/add-node", M::BodyPassthrough },
         { "graph_remove_node",
           R"JSON({"name":"graph_remove_node","description":"Remove a node by ID","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}})JSON",
           L"POST", L"/graph/remove-node", M::BodyPassthrough },
+        { "graph_duplicate_nodes",
+          R"JSON({"name":"graph_duplicate_nodes","description":"Copy nodes, with the edges between them, as the canvas's copy and paste does. A property binding between two copied nodes reads the copy; one to a node outside the set still reads the original. Returns nodeIds (the copies, in order) and idMap (old id -> new id).","inputSchema":{"type":"object","properties":{"nodeIds":{"type":"array","items":{"type":"number"},"description":"Ids of the nodes to copy"}},"required":["nodeIds"]}})JSON",
+          L"POST", L"/graph/duplicate-nodes", M::BodyPassthrough },
+        { "graph_upgrade_nodes",
+          R"JSON({"name":"graph_upgrade_nodes","description":"Upgrade outdated ShaderLab effect nodes to the registry's current version, keeping the values of properties that still exist (the Properties panel's Update button). Omit nodeId to upgrade every outdated node. Returns the ids upgraded; a node already current is not an error.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number","description":"Node to upgrade (optional; default all outdated nodes)"}}}})JSON",
+          L"POST", L"/graph/upgrade-nodes", M::BodyPassthrough },
+        { "graph_expression_input",
+          R"JSON({"name":"graph_expression_input","description":"Add or remove a Numeric Expression input. 'add' creates the next free single-letter input (A to Z, value 0) and returns its name; 'remove' deletes the named input with its property and any binding to it. The last input and the Expression property cannot be removed.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"action":{"type":"string","enum":["add","remove"]},"name":{"type":"string","description":"Input to remove (required for 'remove')"}},"required":["nodeId","action"]}})JSON",
+          L"POST", L"/graph/expression-input", M::BodyPassthrough },
         { "graph_rename_node",
           R"JSON({"name":"graph_rename_node","description":"Rename a node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"name":{"type":"string"}},"required":["nodeId","name"]}})JSON",
           L"POST", L"/graph/rename-node", M::BodyPassthrough },
@@ -34,7 +40,7 @@ namespace ShaderLab::Mcp
           R"JSON({"name":"graph_disconnect","description":"Disconnect an edge","inputSchema":{"type":"object","properties":{"srcId":{"type":"number"},"srcPin":{"type":"number"},"dstId":{"type":"number"},"dstPin":{"type":"number"}},"required":["srcId","srcPin","dstId","dstPin"]}})JSON",
           L"POST", L"/graph/disconnect", M::BodyPassthrough },
         { "graph_apply",
-          R"JSON({"name":"graph_apply","description":"Apply a graph patch in one call: add nodes (using client refs), connect edges, set property bindings. Call /graph/clear first if you need a fresh graph. Body: { nodes:[{ref,effect,filePath?,properties?}], edges:[{from,to,fromPin?,toPin?}], bindings:[{node,property,from:'ref.field'|{node,field},component?}] }. 'from' and 'to' accept either a ref string or numeric nodeId. Returns refToId map + nodeIds in add order.","inputSchema":{"type":"object","properties":{"nodes":{"type":"array"},"edges":{"type":"array"},"bindings":{"type":"array"}}}})JSON",
+          R"JSON({"name":"graph_apply","description":"Apply a graph patch in one call: add nodes (using client refs), connect edges, set property bindings. Call /graph/clear first if you need a fresh graph. Body: { nodes:[{ref,effect,filePath?,adapterIndex?,outputIndex?,properties?}], edges:[{from,to,fromPin?,toPin?}], bindings:[{node,property,from:'ref.field'|{node,field},component?}] }. 'from' and 'to' accept either a ref string or numeric nodeId. Effect names are those graph_add_node takes. Returns refToId map + nodeIds in add order.","inputSchema":{"type":"object","properties":{"nodes":{"type":"array"},"edges":{"type":"array"},"bindings":{"type":"array"}}}})JSON",
           L"POST", L"/graph/apply", M::BodyPassthrough },
         { "graph_clear",
           R"JSON({"name":"graph_clear","description":"Clear the graph","inputSchema":{"type":"object","properties":{}}})JSON",
@@ -100,7 +106,7 @@ namespace ShaderLab::Mcp
           R"JSON({"name":"read_analysis_output","description":"Read typed analysis output fields from a compute/analysis node. This is the trustworthy path for HDR judgement -- values are full-range scRGB computed on GPU, unlike a captured PNG which clips to SDR. Pair with Delta E Comparator (Method=dE ITP for HDR/WCG) + Luminance Statistics for measured color difference.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}})JSON",
           L"GET", L"/analysis/{}", M::PathNumber, L"nodeId" },
         { "read_pixel_region",
-          R"JSON({"name":"read_pixel_region","description":"Read a small w x h region of FP32 RGBA pixels from a node's output (scRGB linear-light). Full range and unclipped -- values above 1.0 (brighter than 80-nit SDR white) and negative components (wide-gamut chroma) are preserved, so this is the ground truth for HDR checks where a captured PNG would lie. Region is capped at 32x32 (1024 pixels) and per-axis at 64. Pixels are returned row-major as a flat float array (RGBARGBA...). 409 with notReady=true while the node or anything upstream is waiting on a background shader compile (`compiling` lists them); retry in a few seconds.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"x":{"type":"number"},"y":{"type":"number"},"w":{"type":"number"},"h":{"type":"number"}},"required":["nodeId","x","y","w","h"]}})JSON",
+          R"JSON({"name":"read_pixel_region","description":"Read a small w x h region of FP32 RGBA pixels from a node's output (scRGB linear-light). Full range and unclipped -- values above 1.0 (brighter than 80-nit SDR white) and negative components (wide-gamut chroma) are preserved, so this is the ground truth for HDR checks where a captured PNG would lie. Region is at most 64 pixels per axis and 1024 in all. Pixels are returned row-major as a flat float array (RGBARGBA...). 409 with notReady=true while the node or anything upstream is waiting on a background shader compile (`compiling` lists them); retry in a few seconds.","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"x":{"type":"number"},"y":{"type":"number"},"w":{"type":"number"},"h":{"type":"number"}},"required":["nodeId","x","y","w","h"]}})JSON",
           L"POST", L"/render/pixel-region", M::BodyPassthrough },
         { "read_pixel_trace",
           R"JSON({"name":"read_pixel_trace","description":"Run pixel trace at normalized coordinates, returns per-node pixel values and analysis outputs","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"x":{"type":"number","description":"Normalized X (0-1)"},"y":{"type":"number","description":"Normalized Y (0-1)"}},"required":["nodeId","x","y"]}})JSON",

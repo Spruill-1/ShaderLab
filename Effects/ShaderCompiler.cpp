@@ -1,62 +1,12 @@
 #include "pch_engine.h"
 #include "ShaderCompiler.h"
-#include "ShaderLabParamsHlsl.h"
-#include "ShaderLabEffects.h"
 #include "../Graph/PropertyValue.h"
+#include "../Engine/Utf8.h"
 
 #include <cstring>
 
 namespace ShaderLab::Effects
 {
-    namespace
-    {
-        // Serves the engine's embedded headers by file name. Any other name
-        // fails: shaders compile from in-memory strings, so there is no
-        // directory to search.
-        struct EmbeddedIncludeHandler : ID3DInclude
-        {
-            HRESULT __stdcall Open(D3D_INCLUDE_TYPE,
-                LPCSTR pFileName, LPCVOID, LPCVOID* ppData, UINT* pBytes) override
-            {
-                if (!pFileName || !ppData || !pBytes) return E_POINTER;
-                if (std::strcmp(pFileName, kShaderLabParamsIncludeName) == 0)
-                {
-                    *ppData = GetShaderLabParamsHLSL();
-                    *pBytes = static_cast<UINT>(GetShaderLabParamsHLSLLength());
-                    return S_OK;
-                }
-                if (std::strcmp(pFileName, cColorMathIncludeName) == 0)
-                {
-                    const std::string& colorMath = GetColorMathHLSL();
-                    *ppData = colorMath.data();
-                    *pBytes = static_cast<UINT>(colorMath.size());
-                    return S_OK;
-                }
-                if (std::strcmp(pFileName, cGamutIncludeName) == 0)
-                {
-                    const std::string& gamut = GetGamutHLSL();
-                    *ppData = gamut.data();
-                    *pBytes = static_cast<UINT>(gamut.size());
-                    return S_OK;
-                }
-                return E_FAIL;
-            }
-
-            HRESULT __stdcall Close(LPCVOID) override
-            {
-                // Static buffers; nothing to free.
-                return S_OK;
-            }
-        };
-
-        EmbeddedIncludeHandler sIncludeHandler;
-    }
-
-    ID3DInclude* ShaderLabIncludeHandler()
-    {
-        return &sIncludeHandler;
-    }
-
     // -----------------------------------------------------------------------
     // Error message helper
     // -----------------------------------------------------------------------
@@ -69,11 +19,7 @@ namespace ShaderLab::Effects
         auto len = errors->GetBufferSize();
         if (!msg || len == 0)
             return {};
-        // Convert UTF-8 error text to wide string.
-        int wideLen = MultiByteToWideChar(CP_UTF8, 0, msg, static_cast<int>(len), nullptr, 0);
-        std::wstring result(wideLen, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, msg, static_cast<int>(len), result.data(), wideLen);
-        return result;
+        return Utf8ToWide(std::string_view(msg, len));
     }
 
     // -----------------------------------------------------------------------
@@ -132,16 +78,10 @@ namespace ShaderLab::Effects
         // 5-10x slower in debug, which makes perf measurements
         // meaningless and the GUI app unusably slow during dev.
         //
-        // We previously added D3DCOMPILE_DEBUG in debug builds for PIX /
-        // RenderDoc HLSL source mapping, but the FXC compiler's PDB
-        // stream overflows on large shaders -- e.g. ICtCp Gamut Map +
-        // the colorMath library produces a "pdb append
-        // failed: debug info byte count too large" internal error.
-        // We don't actually rely on PIX HLSL mapping in this codebase
-        // (debugging is via the Effect Designer + Pixel Trace tab),
-        // so just drop the flag. Bump cache schema below if PIX
-        // mapping becomes a need again.
-        UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+        // No D3DCOMPILE_DEBUG either: FXC's PDB stream overflows on large
+        // shaders ("pdb append failed: debug info byte count too large" for
+        // ICtCp Gamut Map + the colour-math library).
+        UINT flags = cShaderCompileFlags;
 
         // Convert MacroDef list to D3DCompile's null-terminated form.
         // Names/definitions must outlive the call; the caller-owned
@@ -157,7 +97,7 @@ namespace ShaderLab::Effects
             hlslSource.size(),
             sourceName.c_str(),
             macros.empty() ? nullptr : nativeMacros.data(),
-            &sIncludeHandler,
+            ShaderLabIncludeHandler(),
             entryPoint.c_str(),
             target.c_str(),
             flags,
@@ -173,96 +113,76 @@ namespace ShaderLab::Effects
     // Reflection
     // -----------------------------------------------------------------------
 
-    ShaderReflectionResult ShaderCompiler::Reflect(ID3DBlob* bytecode)
+    namespace
     {
-        ShaderReflectionResult result;
-        if (!bytecode)
-            return result;
-
-        winrt::com_ptr<ID3D11ShaderReflection> reflection;
-        HRESULT hr = D3DReflect(
-            bytecode->GetBufferPointer(),
-            bytecode->GetBufferSize(),
-            IID_ID3D11ShaderReflection,
-            reflection.put_void());
-
-        if (FAILED(hr))
-            return result;
-
-        D3D11_SHADER_DESC shaderDesc{};
-        reflection->GetDesc(&shaderDesc);
-        result.boundResources = shaderDesc.BoundResources;
-
-        // Count texture SRV inputs.
-        for (uint32_t i = 0; i < shaderDesc.BoundResources; ++i)
+        ShaderReflectionResult ReflectBytes(const void* bytes, size_t size)
         {
-            D3D11_SHADER_INPUT_BIND_DESC bindDesc{};
-            reflection->GetResourceBindingDesc(i, &bindDesc);
-            if (bindDesc.Type == D3D_SIT_TEXTURE)
-                ++result.inputCount;
-        }
+            ShaderReflectionResult result;
+            winrt::com_ptr<ID3D11ShaderReflection> reflection;
+            if (FAILED(D3DReflect(bytes, size, IID_ID3D11ShaderReflection, reflection.put_void())))
+                return result;
 
-        // Enumerate constant buffers.
-        for (uint32_t cbIdx = 0; cbIdx < shaderDesc.ConstantBuffers; ++cbIdx)
-        {
-            auto* cbReflection = reflection->GetConstantBufferByIndex(cbIdx);
-            D3D11_SHADER_BUFFER_DESC cbDesc{};
-            cbReflection->GetDesc(&cbDesc);
+            D3D11_SHADER_DESC shaderDesc{};
+            reflection->GetDesc(&shaderDesc);
+            result.boundResources = shaderDesc.BoundResources;
 
-            ShaderConstantBuffer cb;
-            int wideLen = MultiByteToWideChar(CP_UTF8, 0, cbDesc.Name, -1, nullptr, 0);
-            cb.name.resize(wideLen - 1);
-            MultiByteToWideChar(CP_UTF8, 0, cbDesc.Name, -1, cb.name.data(), wideLen);
-            cb.sizeBytes = cbDesc.Size;
-
-            for (uint32_t varIdx = 0; varIdx < cbDesc.Variables; ++varIdx)
+            // Count texture SRV inputs.
+            for (uint32_t i = 0; i < shaderDesc.BoundResources; ++i)
             {
-                auto* varReflection = cbReflection->GetVariableByIndex(varIdx);
-                D3D11_SHADER_VARIABLE_DESC varDesc{};
-                varReflection->GetDesc(&varDesc);
-
-                auto* typeReflection = varReflection->GetType();
-                D3D11_SHADER_TYPE_DESC typeDesc{};
-                typeReflection->GetDesc(&typeDesc);
-
-                ShaderVariable sv;
-                wideLen = MultiByteToWideChar(CP_UTF8, 0, varDesc.Name, -1, nullptr, 0);
-                sv.name.resize(wideLen - 1);
-                MultiByteToWideChar(CP_UTF8, 0, varDesc.Name, -1, sv.name.data(), wideLen);
-                sv.offset = varDesc.StartOffset;
-                sv.size = varDesc.Size;
-                sv.type = typeDesc.Type;
-                sv.rows = typeDesc.Rows;
-                sv.columns = typeDesc.Columns;
-
-                cb.variables.push_back(std::move(sv));
+                D3D11_SHADER_INPUT_BIND_DESC bindDesc{};
+                reflection->GetResourceBindingDesc(i, &bindDesc);
+                if (bindDesc.Type == D3D_SIT_TEXTURE)
+                    ++result.inputCount;
             }
 
-            result.constantBuffers.push_back(std::move(cb));
-        }
+            for (uint32_t cbIdx = 0; cbIdx < shaderDesc.ConstantBuffers; ++cbIdx)
+            {
+                auto* cbReflection = reflection->GetConstantBufferByIndex(cbIdx);
+                D3D11_SHADER_BUFFER_DESC cbDesc{};
+                cbReflection->GetDesc(&cbDesc);
 
-        return result;
+                ShaderConstantBuffer cb;
+                cb.name = Utf8ToWide(cbDesc.Name);
+                cb.sizeBytes = cbDesc.Size;
+
+                for (uint32_t varIdx = 0; varIdx < cbDesc.Variables; ++varIdx)
+                {
+                    auto* varReflection = cbReflection->GetVariableByIndex(varIdx);
+                    D3D11_SHADER_VARIABLE_DESC varDesc{};
+                    varReflection->GetDesc(&varDesc);
+
+                    auto* typeReflection = varReflection->GetType();
+                    D3D11_SHADER_TYPE_DESC typeDesc{};
+                    typeReflection->GetDesc(&typeDesc);
+
+                    ShaderVariable sv;
+                    sv.name = Utf8ToWide(varDesc.Name);
+                    sv.offset = varDesc.StartOffset;
+                    sv.size = varDesc.Size;
+                    sv.type = typeDesc.Type;
+                    sv.rows = typeDesc.Rows;
+                    sv.columns = typeDesc.Columns;
+                    cb.variables.push_back(std::move(sv));
+                }
+
+                result.constantBuffers.push_back(std::move(cb));
+            }
+            return result;
+        }
+    }
+
+    ShaderReflectionResult ShaderCompiler::Reflect(ID3DBlob* bytecode)
+    {
+        if (!bytecode)
+            return {};
+        return ReflectBytes(bytecode->GetBufferPointer(), bytecode->GetBufferSize());
     }
 
     ShaderReflectionResult ShaderCompiler::Reflect(const std::vector<uint8_t>& bytecode)
     {
-        ShaderReflectionResult result;
-        if (bytecode.empty()) return result;
-
-        winrt::com_ptr<ID3D11ShaderReflection> reflection;
-        HRESULT hr = D3DReflect(bytecode.data(), bytecode.size(),
-            IID_PPV_ARGS(reflection.put()));
-        if (FAILED(hr)) return result;
-
-        // Reuse the blob-based Reflect by creating a temporary blob.
-        winrt::com_ptr<ID3DBlob> blob;
-        D3DCreateBlob(bytecode.size(), blob.put());
-        if (blob)
-        {
-            memcpy(blob->GetBufferPointer(), bytecode.data(), bytecode.size());
-            return Reflect(blob.get());
-        }
-        return result;
+        if (bytecode.empty())
+            return {};
+        return ReflectBytes(bytecode.data(), bytecode.size());
     }
 
     // ----- Typed PropertyValue -> cbuffer pack ---------------------------------

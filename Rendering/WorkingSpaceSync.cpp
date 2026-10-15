@@ -1,25 +1,23 @@
 #include "pch_engine.h"
 #include "WorkingSpaceSync.h"
 
-#include "../Graph/EffectGraph.h"
-#include "DisplayMonitor.h"
+#include "../Graph/GraphModel.h"
+#include "DisplayProfile.h"
 
 namespace ShaderLab::Rendering
 {
-    bool UpdateWorkingSpaceNodes(Graph::EffectGraph& graph, DisplayMonitor& monitor)
+    bool UpdateWorkingSpaceNodes(Graph::GraphModel& graph, const DisplayProfile& profile)
     {
         using namespace Graph;
         using winrt::Windows::Foundation::Numerics::float2;
 
-        auto profile = monitor.ActiveProfile();
         const auto& caps = profile.caps;
-        const bool isSim = monitor.IsSimulated();
+        const bool isSim = profile.isSimulated;
 
         // Per-field change epsilons. Displays with adaptive color / auto
         // brightness re-report luminance continuously (sub-nit sensor
         // jitter at several Hz); without a dead-band every drift dirties
-        // the node and re-evaluates every binding consumer — measured as
-        // a full-pipeline eval storm on a 4K graph. 1 nit is invisible
+        // the node and re-evaluates every binding consumer. 1 nit is invisible
         // while slider drags (multi-nit steps) still propagate instantly.
         // Flags/mode use 0 (exact); MinNits values sit near 0.0005 so it
         // gets a proportionally tiny band.
@@ -47,13 +45,10 @@ namespace ShaderLab::Rendering
         };
 
         bool anyChanged = false;
-        // const_cast: EffectGraph::Nodes() returns const&, but the
-        // working-space sync must mutate node.properties + node.dirty.
-        // Same const_cast the original MainWindow helper used.
-        for (auto& node : const_cast<std::vector<EffectNode>&>(graph.Nodes()))
+        for (auto& node : graph.MutableNodes())
         {
             if (!node.customEffect.has_value()) continue;
-            if (node.customEffect->shaderLabEffectId != L"Working Space") continue;
+            if (node.customEffect->nodeKind != Graph::NodeKind::WorkingSpace) continue;
 
             bool nodeChanged = false;
 

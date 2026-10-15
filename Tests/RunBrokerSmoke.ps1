@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    MCP broker smoke (stdio-migration Step 5): election, framing, idle
+    MCP broker smoke: election, framing, idle
     exit, stdout hygiene, initialize / tools/list with no session attached.
 
 .DESCRIPTION
@@ -94,11 +94,10 @@ try {
     #
     # The shim advertises tools.listChanged in initialize and then emits
     # notifications/tools/list_changed immediately after use_session splices
-    # the pinned session's catalog in -- correct MCP behavior. This harness
-    # used to treat every line as a reply, so that one unsolicited line
-    # shifted every subsequent read by one and cascaded into five failures,
-    # including a FALSE PASS on Session.GoneSurfacesDistinctError (it was
-    # reading the previous call's session_gone text). Correlate, don't count.
+    # the pinned session's catalog in -- correct MCP behavior. Treating every
+    # line as a reply would pair each later read with the previous call's
+    # response, which can turn a failure into a false pass. Correlate, don't
+    # count.
     function Recv($timeoutMs = 6000) {
         for ($i = 0; $i -lt 16; $i++) {
             $line = RecvRaw $timeoutMs
@@ -143,7 +142,7 @@ try {
     Check "Shim.UseUnknownSessionError" (($usebad.result.isError -eq $true) -and ($usebad.result.content[0].text -match 'Unknown session'))
 
     # ---- 3b. End-to-end through a real headless session -------------------
-    # This is the Step 6 gate: launch a headless session (WARP), register it
+    # Launch a headless session (WARP), register it
     # with the hub, list it, pin it, drive a real engine route through the
     # sealed shim->hub->session channel, and read the result back.
     if (Test-Path $headless) {

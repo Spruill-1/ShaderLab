@@ -20,6 +20,7 @@ the file (any node with a `customEffect`) becomes one effect:
 | name | the node's name |
 | effect id / version | `customEffect.shaderLabEffectId` / `shaderLabEffectVersion` (id falls back to the name; version to 1) |
 | HLSL, inputs, lookup inputs, parameters, analysis fields, thread groups | the node's `customEffect` |
+| node kind, dispatch shape, output extent, injected values | the node's `customEffect` contracts, derived on load when the file predates them ([Node contracts](../architecture/effect-graph-model.md#node-contracts)) |
 | parameter defaults | each parameter's declared `default` (the node's current values are ignored) |
 | hidden cbuffer values | node properties that are not declared parameters |
 | category | optional top-level `"category"` string in the file, default `User` |

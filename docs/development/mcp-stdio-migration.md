@@ -348,7 +348,9 @@ was reachable at all):
   diverged (`…<SID>` vs `…default`).
 
 **Residual sweep (complete).** The two UI-thread live-graph reads in the 250 ms tick
-now read under a shared `m_graphMutex` lock and act after release; `m_frameGeneration`
+now read under a shared `m_graphMutex` lock and act after release (later replaced by
+`GraphUiSnapshot::hasDirtyNodes` and the snapshot's bindings, so the UI takes no
+graph lock at all; decision #192); `m_frameGeneration`
 is `std::atomic<uint64_t>`; and the dead pre-worker tick path is **deleted** —
 `MainWindow::RenderTickBody` + `RenderFrame` (RenderTick.cpp, ~500 lines) and the
 `MainWindow::CaptureNodeAsPng` / `ReadPixelRegion` shims (xaml.cpp, ~65 lines), all
@@ -523,7 +525,7 @@ Traps (all hit during this migration):
 | `Engine/Mcp/McpPeerIdentity.{h,cpp}` | Peer identity, `EvaluatePairing`, `DefaultPipeBaseName`. |
 | `Engine/Mcp/McpSessionClient.{h,cpp}` | Registers a session with the hub; serves sealed requests via the router. Used by GUI + headless. |
 | `Engine/Mcp/McpTimeouts.h` | The timeout ladder (render < DispatchSync < shim < client). |
-| `ShaderLabMcpBroker/Main.cpp` | The `--hub` relay + `--stdio` shim (compiles the `Mcp{Frame,Crypto,PeerIdentity,Channel}` TUs directly). |
+| `ShaderLabMcpBroker/` | The `--hub` relay (`Hub`) + `--stdio` shim (`Shim`) over shared pipe I/O (`BrokerPipeIo`); compiles the `Mcp{Frame,Crypto,PeerIdentity,Channel}` TUs directly. |
 | `MainWindow.McpRoutes.cpp` | 16 app-side routes, `GuiEngineCommandSink`, session start/stop + shim distribution. |
 | `Tests/RunTests.ps1` / `RunBrokerSmoke.ps1` | The shim-driven integration suite / the broker smoke. |
 
@@ -703,7 +705,7 @@ desync, tampered ciphertext (GCM tag), full handshake, and peer identity resolve
 against the current process as its own peer (which also proves the client-handle call
 actually works).
 
-> **Done.** `TestMcpFrameCrypto` + `TestMcpPeerIdentity` in `Tests/TestRunner.cpp`
+> **Done.** `TestMcpFrameCrypto` + `TestMcpPeerIdentity` in `Tests/Mcp/McpTransportTests.cpp`
 > (33 tests). Every listed check plus: HKDF pinned to RFC 5869 A.1, tampered AAD
 > and wrong-direction-key rejection, `EncodeFrame` refusing an over-cap body, and
 > the full pairing matrix (packaged same/diff PFN, unpackaged gated/ungated/

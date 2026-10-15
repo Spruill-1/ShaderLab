@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Engine">
+      <UniqueIdentifier>{4129C69F-BEEE-5948-8A96-22806760EBF7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests">
+      <UniqueIdentifier>{3B5B11D5-BA14-59DA-B617-165BBA4D5EC3}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Effects">
+      <UniqueIdentifier>{A438B426-BA52-5965-9151-424613FC79FE}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Graph">
+      <UniqueIdentifier>{860E9E76-5B84-5BBD-9DE1-D5296717F39A}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Math">
+      <UniqueIdentifier>{4A568C57-6321-5883-B1C6-0742AD29F225}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Mcp">
+      <UniqueIdentifier>{6D696D1B-C09B-5912-BDCC-D977DC66234A}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Persistence">
+      <UniqueIdentifier>{DB42A441-8403-524D-97AB-5161F3F91A81}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Api">
+      <UniqueIdentifier>{DAEF126C-DE8E-4BE9-B4A9-21155E92E6B6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Rendering">
+      <UniqueIdentifier>{6E905F31-83BF-5D6C-A42F-19FA9372113C}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Sources">
+      <UniqueIdentifier>{6319F5A1-E29A-59B6-91AF-3A8904F20EA7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Hosts">
+      <UniqueIdentifier>{75518B1E-3CD8-4DDA-89D5-4EA99E28A968}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Hosts">
+      <UniqueIdentifier>{616B34F7-7FE0-41CA-8AC9-147DBC994482}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Video">
+      <UniqueIdentifier>{32BE212C-A07C-5B09-9E4E-981F7A7C8A2E}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="EngineExport.h">
+      <Filter>Engine</Filter>
+    </ClInclude>
+    <ClInclude Include="pch_engine.h">
+      <Filter>Engine</Filter>
+    </ClInclude>
+    <ClInclude Include="Tests\TestCommon.h">
+      <Filter>Tests</Filter>
+    </ClInclude>
+    <ClInclude Include="Tests\TestSupport.h">
+      <Filter>Tests</Filter>
+    </ClInclude>
+    <ClInclude Include="Tests\ShaderTestBench.h">
+      <Filter>Tests</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch_engine.cpp">
+      <Filter>Engine</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\TestRunner.cpp">
+      <Filter>Tests</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\TestSupport.cpp">
+      <Filter>Tests</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\FixtureManifestTests.cpp">
+      <Filter>Tests</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\ShaderTestBench.cpp">
+      <Filter>Tests</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Effects\BytecodeCacheTests.cpp">
+      <Filter>Tests\Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Effects\EffectCatalogTests.cpp">
+      <Filter>Tests\Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Effects\ShaderCompilerTests.cpp">
+      <Filter>Tests\Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Effects\HlslScaffoldTests.cpp">
+      <Filter>Tests\Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Effects\StatisticsTests.cpp">
+      <Filter>Tests\Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Effects\ToneMapReferenceTests.cpp">
+      <Filter>Tests\Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Effects\UserEffectLibraryTests.cpp">
+      <Filter>Tests\Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Effects\VariantTests.cpp">
+      <Filter>Tests\Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Graph\GraphContractTests.cpp">
+      <Filter>Tests\Graph</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Graph\GraphEditsTests.cpp">
+      <Filter>Tests\Graph</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Graph\GraphLayoutTests.cpp">
+      <Filter>Tests\Graph</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Graph\GraphModelTests.cpp">
+      <Filter>Tests\Graph</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Graph\GraphPolicyTests.cpp">
+      <Filter>Tests\Graph</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Math\ColorMatrixTests.cpp">
+      <Filter>Tests\Math</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Math\DeltaETests.cpp">
+      <Filter>Tests\Math</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Math\GamutTests.cpp">
+      <Filter>Tests\Math</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Math\MobiusReinhardTests.cpp">
+      <Filter>Tests\Math</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Math\TransferFunctionTests.cpp">
+      <Filter>Tests\Math</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Mcp\McpRouteTests.cpp">
+      <Filter>Tests\Mcp</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Mcp\McpRouterTests.cpp">
+      <Filter>Tests\Mcp</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Mcp\McpTransportTests.cpp">
+      <Filter>Tests\Mcp</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Persistence\PackageTests.cpp">
+      <Filter>Tests\Persistence</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Api\EffectGraphApiTests.cpp">
+      <Filter>Tests\Api</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Effects\EffectBlobTests.cpp">
+      <Filter>Tests\Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Rendering\ComputeTests.cpp">
+      <Filter>Tests\Rendering</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Rendering\EvaluatorTests.cpp">
+      <Filter>Tests\Rendering</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Rendering\GpuBindingTests.cpp">
+      <Filter>Tests\Rendering</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Rendering\HostLoopTests.cpp">
+      <Filter>Tests\Rendering</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Rendering\ReadbackTests.cpp">
+      <Filter>Tests\Rendering</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Rendering\PixelTraceTests.cpp">
+      <Filter>Tests\Rendering</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Sources\ImageLoaderTests.cpp">
+      <Filter>Tests\Sources</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Sources\SourceProviderTests.cpp">
+      <Filter>Tests\Sources</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Video\VideoPlaybackTests.cpp">
+      <Filter>Tests\Video</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Video\VideoSourceTests.cpp">
+      <Filter>Tests\Video</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Hosts\BrokerShimTests.cpp">
+      <Filter>Tests\Hosts</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Hosts\HeadlessArgsTests.cpp">
+      <Filter>Tests\Hosts</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabHeadless\HeadlessArgs.cpp">
+      <Filter>Hosts</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabMcpBroker\BrokerPipeIo.cpp">
+      <Filter>Hosts</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabMcpBroker\Shim.cpp">
+      <Filter>Hosts</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>

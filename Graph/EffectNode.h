@@ -3,6 +3,7 @@
 #include "pch_engine.h"
 #include "NodeType.h"
 #include "PropertyValue.h"
+#include "NodeContracts.h"
 
 namespace ShaderLab::Graph
 {
@@ -13,12 +14,12 @@ namespace ShaderLab::Graph
         uint32_t     index{ 0 };
     };
 
-    // Shader type for custom effects.
+    // Shader type for custom effects. Saved as its number, so the values are fixed.
     enum class CustomShaderType
     {
-        PixelShader,
-        ComputeShader,
-        D3D11ComputeShader,  // Raw D3D11 compute (not D2D-tiled, full atomics/groupshared)
+        PixelShader        = 0,
+        ComputeShader      = 1,
+        D3D11ComputeShader = 2,  // Raw D3D11 compute (not D2D-tiled, full atomics/groupshared)
     };
 
     // Describes a user-defined parameter for a custom effect.
@@ -40,14 +41,12 @@ namespace ShaderLab::Graph
         // Supports ==, !=, <, <=, >, >= with numeric comparison.
         std::wstring visibleWhen;
 
-        // GPU-binding eligibility (Phase 8, opt-in). When true, this
-        // parameter's HLSL declaration uses the SHADERLAB_PARAM /
-        // SHADERLAB_LOAD_PARAM macros from `shaderlab_params.hlsli`,
-        // and a property binding from an upstream IEngineComputeOutput
-        // can route the value GPU→GPU. The host injects the
-        // `_SLPARAM_<name>_GPU=0|1` macro at compile time and (when 1)
-        // binds the upstream SRV to the corresponding t-slot.
-        // Default false: parameter is cbuffer-only, current behavior.
+        // GPU-binding eligibility (opt-in). When true, this parameter's
+        // HLSL declaration uses the SHADERLAB_PARAM / SHADERLAB_LOAD_PARAM
+        // macros from `shaderlab_params.hlsli`, and a property binding from
+        // an upstream compute node can route the value GPU to GPU. The host
+        // injects `_SLPARAM_<name>_GPU=0|1|2` at compile time and binds the
+        // matching resource. Default false: the parameter is cbuffer-only.
         bool gpuBindable{ false };
 
         // Compile one shader variant per option value (needs enumLabels, not
@@ -56,67 +55,14 @@ namespace ShaderLab::Graph
         bool specialize{ false };
     };
 
-    // Evaluate a visibleWhen condition against current property values.
-    // Returns true (visible) if the condition is empty, unparseable, or satisfied.
-    inline bool EvaluateVisibleWhen(
-        const std::wstring& condition,
-        const std::map<std::wstring, PropertyValue>& props)
-    {
-        if (condition.empty()) return true;
-
-        // Parse: "ParamName op value"
-        // Find operator position
-        size_t opPos = std::wstring::npos;
-        size_t opLen = 0;
-        struct { const wchar_t* str; size_t len; } ops[] = {
-            { L"==", 2 }, { L"!=", 2 }, { L"<=", 2 }, { L">=", 2 }, { L"<", 1 }, { L">", 1 }
-        };
-        for (auto& op : ops)
-        {
-            size_t p = condition.find(op.str);
-            if (p != std::wstring::npos) { opPos = p; opLen = op.len; break; }
-        }
-        if (opPos == std::wstring::npos) return true; // Unparseable, fail open.
-
-        // Extract param name (trim spaces).
-        std::wstring paramName = condition.substr(0, opPos);
-        while (!paramName.empty() && paramName.back() == L' ') paramName.pop_back();
-        std::wstring op = condition.substr(opPos, opLen);
-
-        // Extract value (trim spaces).
-        std::wstring valStr = condition.substr(opPos + opLen);
-        while (!valStr.empty() && valStr.front() == L' ') valStr.erase(valStr.begin());
-
-        float rhs = 0;
-        try { rhs = std::stof(valStr); } catch (...) { return true; }
-
-        // Look up the property value.
-        auto it = props.find(paramName);
-        if (it == props.end()) return true; // Missing param, fail open.
-
-        float lhs = 0;
-        if (auto* f = std::get_if<float>(&it->second)) lhs = *f;
-        else if (auto* i = std::get_if<int32_t>(&it->second)) lhs = static_cast<float>(*i);
-        else if (auto* u = std::get_if<uint32_t>(&it->second)) lhs = static_cast<float>(*u);
-        else if (auto* b = std::get_if<bool>(&it->second)) lhs = *b ? 1.0f : 0.0f;
-        else return true; // Non-numeric, fail open.
-
-        if (op == L"==") return std::abs(lhs - rhs) < 0.001f;
-        if (op == L"!=") return std::abs(lhs - rhs) >= 0.001f;
-        if (op == L"<")  return lhs < rhs;
-        if (op == L"<=") return lhs <= rhs;
-        if (op == L">")  return lhs > rhs;
-        if (op == L">=") return lhs >= rhs;
-        return true;
-    }
-
     // Identifies the type of non-image data produced by analysis/compute effects.
+    // Saved as its number, so the values are fixed. 2 was an untyped float
+    // buffer nothing rendered; a saved 2 loads as None.
     enum class AnalysisOutputType
     {
-        None,
-        Histogram,      // Built-in D2D histogram (256 float bins).
-        FloatBuffer,    // Custom compute: array of float4 values read from output pixels.
-        Typed,          // Custom compute: typed named fields (replaces old KeyValue).
+        None        = 0,
+        Histogram   = 1,  // Built-in D2D histogram (256 float bins).
+        Typed       = 3,  // Custom compute: typed named fields.
     };
 
     // Type of a single analysis output field.
@@ -131,6 +77,33 @@ namespace ShaderLab::Graph
         Float3Array,    // N×float3, 1 pixel each (.xyz used)
         Float4Array,    // N×float4, 1 pixel each
     };
+
+    // The tag a field type is saved and reported as.
+    inline const wchar_t* AnalysisFieldTypeTag(AnalysisFieldType type)
+    {
+        switch (type)
+        {
+        case AnalysisFieldType::Float:       return L"float";
+        case AnalysisFieldType::Float2:      return L"float2";
+        case AnalysisFieldType::Float3:      return L"float3";
+        case AnalysisFieldType::Float4:      return L"float4";
+        case AnalysisFieldType::FloatArray:  return L"floatarray";
+        case AnalysisFieldType::Float2Array: return L"float2array";
+        case AnalysisFieldType::Float3Array: return L"float3array";
+        case AnalysisFieldType::Float4Array: return L"float4array";
+        }
+        return L"unknown";
+    }
+
+    // The field type a tag names, or nullopt for an unknown tag.
+    inline std::optional<AnalysisFieldType> AnalysisFieldTypeFromTag(std::wstring_view tag)
+    {
+        for (auto type : { AnalysisFieldType::Float, AnalysisFieldType::Float2, AnalysisFieldType::Float3,
+                           AnalysisFieldType::Float4, AnalysisFieldType::FloatArray, AnalysisFieldType::Float2Array,
+                           AnalysisFieldType::Float3Array, AnalysisFieldType::Float4Array })
+            if (tag == AnalysisFieldTypeTag(type)) return type;
+        return std::nullopt;
+    }
 
     // Returns the number of scalar components per element for a field type.
     inline uint32_t AnalysisFieldComponentCount(AnalysisFieldType type)
@@ -182,7 +155,7 @@ namespace ShaderLab::Graph
         AnalysisFieldType type{ AnalysisFieldType::Float4 };
         uint32_t arrayLength{ 0 };  // only for array types; max 4096 elements
 
-        // GPU-binding publication (Phase 8, opt-in). When true, the
+        // GPU-binding publication (opt-in). When true, the
         // upstream effect implementing IEngineComputeOutput exposes
         // this field's slot as readable from a downstream
         // SHADERLAB_GPU_BUFFER binding. The slot index in the
@@ -190,7 +163,7 @@ namespace ShaderLab::Graph
         // analysisFields vector, so the field's order is part of the
         // binding ABI -- reordering an existing effect's analysisFields
         // requires bumping its effectVersion.
-        // Default false: field is CPU-only, current behavior.
+        // Default false: the field is CPU-only.
         bool gpuPublish{ false };
 
         uint32_t pixelCount() const { return AnalysisFieldPixelCount(type, arrayLength); }
@@ -208,6 +181,49 @@ namespace ShaderLab::Graph
         // For array types. Flat storage, stride = AnalysisFieldComponentCount(type).
         std::vector<float> arrayData;
     };
+
+    // Unpacks typed fields from a row of float4 pixels laid out field after
+    // field by AnalysisFieldPixelCount. Components past floatCount read 0.
+    inline std::vector<AnalysisFieldValue> UnpackAnalysisFields(
+        const std::vector<AnalysisFieldDescriptor>& fieldDescs,
+        const float* float4s,
+        size_t floatCount)
+    {
+        auto at = [&](size_t index) { return index < floatCount ? float4s[index] : 0.0f; };
+        std::vector<AnalysisFieldValue> fields;
+        fields.reserve(fieldDescs.size());
+        size_t pixelOffset = 0;
+        for (const auto& fieldDesc : fieldDescs)
+        {
+            AnalysisFieldValue value;
+            value.name = fieldDesc.name;
+            value.type = fieldDesc.type;
+            const uint32_t componentCount = AnalysisFieldComponentCount(fieldDesc.type);
+            if (!AnalysisFieldIsArray(fieldDesc.type))
+            {
+                for (uint32_t c = 0; c < componentCount; ++c)
+                    value.components[c] = at(pixelOffset * 4 + c);
+            }
+            else if (fieldDesc.type == AnalysisFieldType::FloatArray)
+            {
+                // Four elements per pixel.
+                value.arrayData.resize(fieldDesc.arrayLength);
+                for (uint32_t i = 0; i < fieldDesc.arrayLength; ++i)
+                    value.arrayData[i] = at(pixelOffset * 4 + i);
+            }
+            else
+            {
+                // One element per pixel.
+                value.arrayData.resize(static_cast<size_t>(fieldDesc.arrayLength) * componentCount);
+                for (uint32_t i = 0; i < fieldDesc.arrayLength; ++i)
+                    for (uint32_t c = 0; c < componentCount; ++c)
+                        value.arrayData[static_cast<size_t>(i) * componentCount + c] = at((pixelOffset + i) * 4 + c);
+            }
+            pixelOffset += fieldDesc.pixelCount();
+            fields.push_back(std::move(value));
+        }
+        return fields;
+    }
 
     // Complete definition of a custom effect authored in the Effect Designer.
     // Stored per-node and serialized with the graph JSON.
@@ -233,7 +249,7 @@ namespace ShaderLab::Graph
 
         // Variadic image inputs (pixel shaders). inputNames is the maximum and
         // the D2D effect always has that many inputs; the node shows only the
-        // pins in use plus one spare (EffectGraph::FitVariadicPins).
+        // pins in use plus one spare (GraphModel::FitVariadicPins).
         // Unconnected inputs get the 1x1 zero placeholder, and an `InputMask`
         // cbuffer field, if declared, receives the connected pins (bit i = pin i).
         bool variadicInputs{ false };
@@ -243,21 +259,31 @@ namespace ShaderLab::Graph
         std::wstring shaderLabEffectId;
         uint32_t shaderLabEffectVersion{ 0 };
 
-        // Compute shader settings.
+        // The evaluator's contract with this effect (NodeContracts.h). Built-in
+        // effects declare them; a graph saved without them derives them on
+        // load (DeriveContracts).
+        NodeKind nodeKind{ NodeKind::Shader };
+        DispatchShape dispatchShape{ DispatchShape::PerOutputPixel };
+        OutputExtent outputExtent;
+        InjectedConstants injectedConstants{ InjectedConstants::None };
+
+        // Thread-group size. A D2D compute shader (ComputeShader) needs it to
+        // size its dispatch; D3D11 compute reads [numthreads] from the
+        // bytecode and uses these only to derive dispatchShape for old graphs.
         uint32_t threadGroupX{ 8 };
         uint32_t threadGroupY{ 8 };
         uint32_t threadGroupZ{ 1 };
 
         // Analysis output metadata (for compute effects).
         AnalysisOutputType analysisOutputType{ AnalysisOutputType::None };
-        uint32_t analysisOutputSize{ 256 };
 
         // Typed analysis output field descriptors.
         // The compute shader writes fields sequentially to Output row 0.
         // Each field's pixel offset = sum of prior fields' pixelCount().
         std::vector<AnalysisFieldDescriptor> analysisFields;
 
-        // Runtime: compiled bytecode (not serialized — recompiled from hlslSource on load).
+        // Runtime: compiled bytecode. Not serialized; the evaluator compiles
+        // hlslSource, with its variant macros, the first time it needs the node.
         std::vector<uint8_t> compiledBytecode;
 
         // Runtime: unique shader GUID for this instance (avoids D2D shader ID collisions).
@@ -284,8 +310,8 @@ namespace ShaderLab::Graph
         // Typed field values (for AnalysisOutputType::Typed).
         std::vector<AnalysisFieldValue> fields;
 
-        // Legacy/histogram support.
-        std::vector<float> data;         // Bin values, buffer contents, etc.
+        // The D2D Histogram's output (AnalysisOutputType::Histogram).
+        std::vector<float> data;         // Bin values.
         std::wstring       label;        // Human-readable description.
         uint32_t           channelIndex{ 0 }; // For per-channel data (R=0, G=1, B=2, A=3).
     };
@@ -314,6 +340,30 @@ namespace ShaderLab::Graph
         bool wholeArray{ false };
         uint32_t wholeArraySourceNodeId{ 0 };
         std::wstring wholeArraySourceFieldName;
+
+        // True when pred(sourceNodeId) holds for any node this binding reads:
+        // the whole-array source, or each set per-component source.
+        template <class Pred>
+        bool AnySourceNode(Pred&& pred) const
+        {
+            if (wholeArray) return pred(wholeArraySourceNodeId);
+            for (const auto& source : sources)
+                if (source.has_value() && pred(source->sourceNodeId)) return true;
+            return false;
+        }
+
+        // Calls fn(sourceNodeId) for each node this binding reads. A node
+        // feeding several components is reported once per component.
+        template <class Fn>
+        void ForEachSourceNode(Fn&& fn) const
+        {
+            AnySourceNode([&](uint32_t sourceNodeId) { fn(sourceNodeId); return false; });
+        }
+
+        bool ReadsFrom(uint32_t nodeId) const
+        {
+            return AnySourceNode([nodeId](uint32_t sourceNodeId) { return sourceNodeId == nodeId; });
+        }
     };
 
     // How to read a node's `lastGpuMs`.
@@ -379,8 +429,9 @@ namespace ShaderLab::Graph
         // For built-in D2D effects: the CLSID used to create the effect.
         std::optional<GUID> effectClsid;
 
-        // For custom shaders: path to the HLSL source file.
-        std::optional<std::wstring> shaderPath;
+        // Source nodes: the image or video file (or a media:// token in a
+        // packaged graph). Saved under the JSON key "shaderPath".
+        std::optional<std::wstring> mediaPath;
 
         // For custom effects authored in the Effect Designer.
         std::optional<CustomEffectDefinition> customEffect;
@@ -407,7 +458,23 @@ namespace ShaderLab::Graph
         bool dirty{ true };
 
         // Clock node: time-based animation source.
-        bool isClock{ false };
+        bool IsClock() const
+        {
+            return customEffect.has_value() && customEffect->nodeKind == NodeKind::Clock;
+        }
+        // A custom effect the evaluator serves itself (a parameter, Clock,
+        // expression...): it has data outputs and an inline control, no shader.
+        bool IsParameterNode() const
+        {
+            return type != NodeType::Source && customEffect.has_value() &&
+                   IsParameterKind(customEffect->nodeKind);
+        }
+        // A shader with no image output: it exists for its analysis fields.
+        bool IsDataOnlyEffect() const
+        {
+            return !IsParameterNode() && customEffect.has_value() &&
+                   !customEffect->hlslSource.empty() && outputPins.empty();
+        }
         bool isPlaying{ false };   // runtime: toggled by on-node Play/Pause
         // runtime: GPU milliseconds attributed to this node on the last
         // measured frame, or -1 when it was not measured.
@@ -430,9 +497,28 @@ namespace ShaderLab::Graph
         // frame. Not serialized -- it is a tick artefact, not graph state.
         long long clockTickBucket{ -1 };
 
-        // Set by the host before evaluation: true if this node feeds a visible
-        // output (Output node, output window, preview, or data-only analysis).
+        // Set each frame by GraphModel::ComputeNeeded / MarkAllNeeded
+        // (FrameExecutor): true if this node feeds something the host demands.
         // The evaluator skips nodes where needed == false.
         bool needed{ true };
     };
+
+    // True when pred(sourceNodeId) holds for any node one of `node`'s
+    // property bindings reads.
+    template <class Pred>
+    bool AnyBindingSource(const EffectNode& node, Pred&& pred)
+    {
+        for (const auto& [property, binding] : node.propertyBindings)
+            if (binding.AnySourceNode(pred)) return true;
+        return false;
+    }
+
+    // Calls fn(sourceNodeId) for each node `node`'s property bindings read,
+    // once per binding component.
+    template <class Fn>
+    void ForEachBindingSource(const EffectNode& node, Fn&& fn)
+    {
+        for (const auto& [property, binding] : node.propertyBindings)
+            binding.ForEachSourceNode(fn);
+    }
 }

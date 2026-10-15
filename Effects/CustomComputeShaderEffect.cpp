@@ -4,109 +4,6 @@
 namespace ShaderLab::Effects
 {
     // -----------------------------------------------------------------------
-    // Registration
-    // -----------------------------------------------------------------------
-
-    HRESULT CustomComputeShaderEffect::RegisterEffect(ID2D1Factory1* factory)
-    {
-        return RegisterWithInputCount(factory, CLSID_CustomComputeShader, 1);
-    }
-
-    HRESULT CustomComputeShaderEffect::RegisterWithInputCount(
-        ID2D1Factory1* factory, REFCLSID clsid, UINT32 inputCount)
-    {
-        if (!factory || inputCount == 0 || inputCount > 8)
-            return E_INVALIDARG;
-
-        std::wstring xml =
-            L"<?xml version='1.0'?>\r\n"
-            L"<Effect>\r\n"
-            L"  <Property name='DisplayName' type='string' value='Custom Compute Shader'/>\r\n"
-            L"  <Property name='Author'      type='string' value='ShaderLab'/>\r\n"
-            L"  <Property name='Category'    type='string' value='Custom'/>\r\n"
-            L"  <Property name='Description' type='string' value='Runs a user-supplied compute shader.'/>\r\n"
-            L"  <Inputs>\r\n";
-        for (UINT32 i = 0; i < inputCount; ++i)
-            xml += std::format(L"    <Input name='I{}'/>\r\n", i);
-        xml += L"  </Inputs>\r\n"
-               L"</Effect>\r\n";
-
-        return factory->RegisterEffectFromString(
-            clsid,
-            xml.c_str(),
-            nullptr,
-            0,
-            &CustomComputeShaderEffect::CreateFactory);
-    }
-
-    HRESULT CustomComputeShaderEffect::UnregisterEffect(ID2D1Factory1* factory)
-    {
-        if (!factory)
-            return E_INVALIDARG;
-        return factory->UnregisterEffect(CLSID_CustomComputeShader);
-    }
-
-    thread_local CustomComputeShaderEffect* CustomComputeShaderEffect::s_lastCreated = nullptr;
-    thread_local UINT32 CustomComputeShaderEffect::s_pendingInputCount = 0;
-
-    HRESULT __stdcall CustomComputeShaderEffect::CreateFactory(IUnknown** effect)
-    {
-        auto* impl = new (std::nothrow) CustomComputeShaderEffect();
-        *effect = static_cast<ID2D1EffectImpl*>(impl);
-        s_lastCreated = impl;
-        return *effect ? S_OK : E_OUTOFMEMORY;
-    }
-
-    CustomComputeShaderEffect::CustomComputeShaderEffect()
-    {
-        if (s_pendingInputCount > 0)
-            m_inputCount = s_pendingInputCount;
-        // Sentinel value to detect if MapInputRectsToOutputRect was called.
-        m_inputRect = { 0, 0, 0, 0 };
-    }
-
-    // -----------------------------------------------------------------------
-    // IUnknown
-    // -----------------------------------------------------------------------
-
-    IFACEMETHODIMP CustomComputeShaderEffect::QueryInterface(REFIID riid, void** ppv)
-    {
-        if (!ppv)
-            return E_POINTER;
-
-        *ppv = nullptr;
-
-        if (riid == __uuidof(ID2D1EffectImpl))
-            *ppv = static_cast<ID2D1EffectImpl*>(this);
-        else if (riid == __uuidof(ID2D1ComputeTransform))
-            *ppv = static_cast<ID2D1ComputeTransform*>(this);
-        else if (riid == __uuidof(ID2D1Transform))
-            *ppv = static_cast<ID2D1Transform*>(this);
-        else if (riid == __uuidof(ID2D1TransformNode))
-            *ppv = static_cast<ID2D1TransformNode*>(this);
-        else if (riid == __uuidof(IUnknown))
-            *ppv = static_cast<ID2D1EffectImpl*>(this);
-        else
-            return E_NOINTERFACE;
-
-        AddRef();
-        return S_OK;
-    }
-
-    IFACEMETHODIMP_(ULONG) CustomComputeShaderEffect::AddRef()
-    {
-        return InterlockedIncrement(&m_refCount);
-    }
-
-    IFACEMETHODIMP_(ULONG) CustomComputeShaderEffect::Release()
-    {
-        ULONG count = InterlockedDecrement(&m_refCount);
-        if (count == 0)
-            delete this;
-        return count;
-    }
-
-    // -----------------------------------------------------------------------
     // ID2D1EffectImpl
     // -----------------------------------------------------------------------
 
@@ -115,7 +12,6 @@ namespace ShaderLab::Effects
         ID2D1TransformGraph* transformGraph)
     {
         m_effectContext.copy_from(effectContext);
-        m_transformGraph.copy_from(transformGraph);
 
         // Check compute shader support (feature level 11_0+ required).
         if (!effectContext->IsShaderLoaded(CLSID_CustomComputeShader))
@@ -133,8 +29,7 @@ namespace ShaderLab::Effects
             }
         }
 
-        return transformGraph->SetSingleTransformNode(
-            static_cast<ID2D1ComputeTransform*>(this));
+        return AttachToGraph(transformGraph);
     }
 
     IFACEMETHODIMP CustomComputeShaderEffect::PrepareForRender(D2D1_CHANGE_TYPE /*changeType*/)
@@ -167,19 +62,11 @@ namespace ShaderLab::Effects
             m_shaderLoaded = true;
         }
 
-        // DO NOT upload cbuffer here — D2D latches the cbuffer state at this
-        // point, preventing per-tile updates in CalculateThreadgroups from
-        // taking effect. We upload exclusively in CalculateThreadgroups where
-        // we can inject correct _TileOffset and _ImageSize per tile.
+        // The cbuffer is not uploaded here: D2D latches it at this point,
+        // which would freeze the per-tile _TileOffset CalculateThreadgroups
+        // writes.
 
         return S_OK;
-    }
-
-    IFACEMETHODIMP CustomComputeShaderEffect::SetGraph(ID2D1TransformGraph* transformGraph)
-    {
-        m_transformGraph.copy_from(transformGraph);
-        return transformGraph->SetSingleTransformNode(
-            static_cast<ID2D1ComputeTransform*>(this));
     }
 
     // -----------------------------------------------------------------------
@@ -297,69 +184,8 @@ namespace ShaderLab::Effects
     }
 
     // -----------------------------------------------------------------------
-    // ID2D1TransformNode
-    // -----------------------------------------------------------------------
-
-    IFACEMETHODIMP_(UINT32) CustomComputeShaderEffect::GetInputCount() const
-    {
-        return m_inputCount;
-    }
-
-    // -----------------------------------------------------------------------
-    // Custom property accessors
-    // -----------------------------------------------------------------------
-
-    HRESULT CustomComputeShaderEffect::SetInputCount(UINT32 count)
-    {
-        if (count == m_inputCount)
-            return S_OK;
-
-        m_inputCount = count;
-
-        if (m_transformGraph)
-        {
-            return m_transformGraph->SetSingleTransformNode(
-                static_cast<ID2D1ComputeTransform*>(this));
-        }
-        return S_OK;
-    }
-
-    UINT32 CustomComputeShaderEffect::GetInputCountProp() const
-    {
-        return m_inputCount;
-    }
-
-    // -----------------------------------------------------------------------
     // Host-facing API (outside D2D property system)
     // -----------------------------------------------------------------------
-
-    HRESULT CustomComputeShaderEffect::LoadShaderBytecode(ID3DBlob* bytecode)
-    {
-        if (!bytecode)
-            return E_INVALIDARG;
-        return LoadShaderBytecode(
-            static_cast<const BYTE*>(bytecode->GetBufferPointer()),
-            static_cast<UINT32>(bytecode->GetBufferSize()));
-    }
-
-    HRESULT CustomComputeShaderEffect::LoadShaderBytecode(const BYTE* data, UINT32 dataSize)
-    {
-        if (!data || dataSize == 0)
-            return E_INVALIDARG;
-        m_shaderBytecode.assign(data, data + dataSize);
-        m_shaderDirty = true;
-        return S_OK;
-    }
-
-    void CustomComputeShaderEffect::SetConstantBufferData(const BYTE* data, UINT32 dataSize)
-    {
-        // D3D11 constant buffers must be multiples of 16 bytes.
-        UINT32 paddedSize = (dataSize + 15) & ~15u;
-        m_constantBuffer.assign(paddedSize, 0);
-        if (data && dataSize > 0)
-            memcpy(m_constantBuffer.data(), data, dataSize);
-        m_cbDirty = true;
-    }
 
     HRESULT CustomComputeShaderEffect::ForceUploadConstantBuffer()
     {
@@ -371,37 +197,9 @@ namespace ShaderLab::Effects
             static_cast<UINT32>(m_constantBuffer.size()));
     }
 
-    void CustomComputeShaderEffect::PackConstantBuffer(
-        const std::map<std::wstring, Graph::PropertyValue>& properties,
-        const std::vector<ShaderVariable>& variables,
-        uint32_t cbSizeBytes)
-    {
-        // Pad to 16-byte boundary for D3D11 constant buffer alignment.
-        uint32_t paddedSize = (cbSizeBytes + 15) & ~15u;
-        m_constantBuffer.resize(paddedSize, 0);
-
-        for (const auto& var : variables)
-        {
-            auto it = properties.find(var.name);
-            if (it == properties.end())
-                continue;
-            if (var.offset >= cbSizeBytes)
-                continue;
-
-            BYTE* dest = m_constantBuffer.data() + var.offset;
-            uint32_t remaining = cbSizeBytes - var.offset;
-
-            // Typed pack: see ShaderCompiler.cpp::PackPropertyToCBuffer (Phase 3).
-            PackPropertyToCBuffer(dest, remaining, var.type, var.columns, it->second);
-        }
-
-        m_cbDirty = true;
-    }
-
-    void CustomComputeShaderEffect::SetThreadGroupSize(UINT32 x, UINT32 y, UINT32 z)
+    void CustomComputeShaderEffect::SetThreadGroupSize(UINT32 x, UINT32 y)
     {
         m_threadGroupX = (std::max)(x, 1u);
         m_threadGroupY = (std::max)(y, 1u);
-        m_threadGroupZ = (std::max)(z, 1u);
     }
 }

@@ -39,4 +39,19 @@ namespace ShaderLab::Graph
             else { static_assert(sizeof(T) == 0, "Unhandled PropertyValue type"); return L"unknown"; }
         }, value);
     }
+
+    // How many binding components a property has: 1 to 4 for float to
+    // float4, 0 for a float array (bound whole), 1 for any other scalar.
+    inline uint32_t PropertyComponentCount(const PropertyValue& value)
+    {
+        return std::visit([](auto&& v) -> uint32_t
+        {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>) return 2;
+            else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>) return 3;
+            else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>) return 4;
+            else if constexpr (std::is_same_v<T, std::vector<float>>) return 0;
+            else return 1;
+        }, value);
+    }
 }

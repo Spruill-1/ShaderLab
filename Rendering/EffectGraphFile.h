@@ -5,7 +5,7 @@
 
 namespace ShaderLab::Graph
 {
-	class EffectGraph;
+	class GraphModel;
 }
 
 namespace ShaderLab::Rendering
@@ -15,7 +15,7 @@ namespace ShaderLab::Rendering
 	// The on-disk format is a standard ZIP archive (PKZIP) with two
 	// well-known entries:
 	//
-	//   graph.json   -- the EffectGraph JSON serialization.
+	//   graph.json   -- the GraphModel JSON serialization.
 	//   media/       -- (optional) embedded source files (images,
 	//                   videos, ICC) referenced by the graph. When
 	//                   present, the graph JSON's path properties use
@@ -111,18 +111,51 @@ namespace ShaderLab::Rendering
 												 const ProgressCallback& progress = {});
 
 		// Point every source node whose path is a media:// token at its extracted file.
-		static void ResolveMediaTokens(Graph::EffectGraph& graph,
+		static void ResolveMediaTokens(Graph::GraphModel& graph,
 									   const std::map<std::wstring, std::wstring>& mediaMap);
 
 		// Serialize a copy of the graph for saving. With embedMedia, source nodes
 		// that point at an existing file are listed in media and their paths are
 		// rewritten to media:// tokens; missing files are skipped.
-		static std::wstring SerializeForSave(Graph::EffectGraph graph, bool embedMedia,
+		static std::wstring SerializeForSave(Graph::GraphModel graph, bool embedMedia,
 											 std::vector<MediaEntry>& media);
 
 		// Write bare graph JSON (UTF-8, no BOM) through a temp file renamed into place.
 		static bool SaveJson(const std::wstring& path, const std::wstring& graphJson,
 							 uint64_t* bytesWritten = nullptr);
 	};
+
+	// Extracted media folders (%TEMP%\ShaderLab-*) live while the graph using
+	// them is open. The owning process rewrites <folder>\.heartbeat every
+	// cMediaHeartbeatIntervalSec; a folder whose heartbeat (or, without one, its
+	// own write time) is older than cStaleMediaDirSec is left over from a
+	// process that did not shut down cleanly.
+	inline constexpr uint32_t cMediaHeartbeatIntervalSec = 60;
+	inline constexpr uint32_t cStaleMediaDirSec = 150;   // over two intervals
+
+	// %TEMP% with a trailing separator, or empty when it cannot be read.
+	SHADERLAB_API std::wstring TempDirectory();
+
+	// Writes the current time to <dir>\.heartbeat. False when it cannot.
+	SHADERLAB_API bool TouchMediaHeartbeat(const std::wstring& dir);
+
+	struct StaleMediaDir
+	{
+		std::wstring path;
+		uint64_t     bytes{ 0 };   // filled only when asked for
+	};
+
+	// The ShaderLab-* folders under tempRoot older than staleSec.
+	SHADERLAB_API std::vector<StaleMediaDir> FindStaleMediaDirs(const std::wstring& tempRoot,
+																uint64_t staleSec = cStaleMediaDirSec,
+																bool countBytes = false);
+
+	struct ReapMediaResult
+	{
+		size_t   deleted{ 0 };
+		uint64_t bytesFreed{ 0 };
+		std::vector<std::pair<std::wstring, std::string>> failures;   // path, reason
+	};
+	SHADERLAB_API ReapMediaResult ReapMediaDirs(const std::vector<StaleMediaDir>& dirs);
 }
 

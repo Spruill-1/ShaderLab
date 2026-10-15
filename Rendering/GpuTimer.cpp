@@ -79,21 +79,22 @@ namespace ShaderLab::Rendering
 
     void GpuTimer::SetEnabled(bool on)
     {
-        if (m_enabled.load(std::memory_order_relaxed) == on) return;
+        // Any thread. The frame state belongs to the render thread, which
+        // notices the change at its next BeginFrame.
         m_enabled.store(on, std::memory_order_release);
-        if (!on)
-        {
-            // Abandon anything in flight. Results keep their last values so a
-            // reader that polls across the toggle sees stale-but-labelled
-            // numbers rather than a sudden run of zeros.
-            for (auto& f : m_frames) { f.inFlight = false; }
-            m_frameOpen = false;
-        }
     }
 
     void GpuTimer::BeginFrame()
     {
-        if (!m_enabled || !m_context) return;
+        if (!m_context) return;
+        if (!m_enabled.load(std::memory_order_acquire))
+        {
+            // Abandon anything in flight. Results keep their last values so a
+            // reader that polls across the toggle sees stale-but-labelled
+            // numbers rather than a sudden run of zeros.
+            for (auto& f : m_frames) f.inFlight = false;
+            return;
+        }
 
         // Collect the oldest slot before reusing it. At kLatency frames of
         // distance its data is normally ready, so this does not stall; if it
@@ -101,7 +102,7 @@ namespace ShaderLab::Rendering
         FrameQueries& f = m_frames[m_writeIndex];
         if (f.inFlight) Collect(f);
 
-        for (uint32_t i = 0; i < kSpanCount; ++i) f.used[i] = false;
+        for (uint32_t i = 0; i < kSpanCount; ++i) f.used[i] = f.begun[i] = false;
         // Keep the allocated queries, drop only the used flags: a node that
         // goes unmeasured this frame must not report last frame's number.
         for (auto& ns : f.nodeSpans) ns.used = false;
@@ -120,6 +121,7 @@ namespace ShaderLab::Rendering
         // A timestamp query is ended, never begun -- End() is what samples the
         // clock. Calling Begin() on one is a no-op that some debug layers flag.
         m_context->End(f.begin[i].get());
+        f.begun[i] = true;
     }
 
     void GpuTimer::End(GpuSpan s)
@@ -128,6 +130,7 @@ namespace ShaderLab::Rendering
         auto i = static_cast<uint32_t>(s);
         if (i >= kSpanCount) return;
         FrameQueries& f = m_frames[m_writeIndex];
+        if (!f.begun[i]) return;
         m_context->End(f.end[i].get());
         f.used[i] = true;
     }
@@ -142,7 +145,9 @@ namespace ShaderLab::Rendering
 
     void GpuTimer::EndFrame()
     {
-        if (!m_enabled || !m_frameOpen || !m_context) return;
+        // Close an open frame even if timing was switched off mid-frame, so
+        // its disjoint query is never left begun.
+        if (!m_frameOpen || !m_context) return;
         FrameQueries& f = m_frames[m_writeIndex];
         m_context->End(f.disjoint.get());
         m_frameOpen = false;
@@ -221,32 +226,7 @@ namespace ShaderLab::Rendering
             std::this_thread::yield();
         }
         f.inFlight = false;
-        if (dj.Disjoint || dj.Frequency == 0) { m_disjointDrops.fetch_add(1, std::memory_order_release); return false; }
-
-        const double toMs = 1000.0 / static_cast<double>(dj.Frequency);
-        for (uint32_t i = 0; i < kSpanCount; ++i)
-        {
-            if (!f.used[i]) continue;
-            UINT64 t0 = 0, t1 = 0;
-            if (m_context->GetData(f.begin[i].get(), &t0, sizeof(t0), 0) != S_OK) continue;
-            if (m_context->GetData(f.end[i].get(), &t1, sizeof(t1), 0) != S_OK) continue;
-            if (t1 < t0) continue;
-            m_resultMs[i].store(static_cast<double>(t1 - t0) * toMs, std::memory_order_release);
-        }
-        // Per-node spans. Rebuilt from scratch on each retire, so a node that
-        // stopped being measured disappears instead of going stale.
-        m_nodeResultMs.clear();
-        for (const auto& ns : f.nodeSpans)
-        {
-            if (!ns.used) continue;
-            UINT64 a = 0, b = 0;
-            if (m_context->GetData(ns.begin.get(), &a, sizeof(a), 0) != S_OK) continue;
-            if (m_context->GetData(ns.end.get(), &b, sizeof(b), 0) != S_OK) continue;
-            if (b < a) continue;
-            m_nodeResultMs[ns.nodeId] = static_cast<double>(b - a) * toMs;
-        }
-        m_framesResolved.fetch_add(1, std::memory_order_release);
-        return true;
+        return ResolveFrame(f, dj);
     }
 
     void GpuTimer::Collect(FrameQueries& f)
@@ -262,13 +242,18 @@ namespace ShaderLab::Rendering
         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
         HRESULT hr = m_context->GetData(f.disjoint.get(), &dj, sizeof(dj), 0);
         if (hr != S_OK) return;          // still not retired -- drop, keep old values
+        ResolveFrame(f, dj);
+    }
+
+    bool GpuTimer::ResolveFrame(FrameQueries& f, const D3D11_QUERY_DATA_TIMESTAMP_DISJOINT& dj)
+    {
         if (dj.Disjoint || dj.Frequency == 0)
         {
             // The GPU clock changed frequency mid-frame (DVFS, power state).
             // These samples are meaningless; counting them lets a caller see
             // that a surprising number came from clock instability.
             m_disjointDrops.fetch_add(1, std::memory_order_release);
-            return;
+            return false;
         }
 
         const double toMs = 1000.0 / static_cast<double>(dj.Frequency);
@@ -294,5 +279,6 @@ namespace ShaderLab::Rendering
             m_nodeResultMs[ns.nodeId] = static_cast<double>(b - a) * toMs;
         }
         m_framesResolved.fetch_add(1, std::memory_order_release);
+        return true;
     }
 }

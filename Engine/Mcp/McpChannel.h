@@ -1,6 +1,6 @@
 #pragma once
 
-// Per-channel secure state for the broker relay (stdio-migration Step 6).
+// Per-channel secure state for the broker relay.
 //
 // A "channel" is one shim↔session conversation multiplexed over the hub
 // by {channelId}. The hub relays channel frames blindly; the two

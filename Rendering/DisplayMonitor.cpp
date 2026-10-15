@@ -300,10 +300,13 @@ namespace ShaderLab::Rendering
 
     void DisplayMonitor::SetSimulatedProfile(const DisplayProfile& profile)
     {
+        // Presets and ICC profiles set only the profile's primaries.
+        DisplayProfile simulated = profile;
+        simulated.isSimulated = true;
+        SyncCapsPrimaries(simulated);
         {
             std::lock_guard lock(m_capsMutex);
-            m_simulatedProfile = profile;
-            m_simulatedProfile->isSimulated = true;
+            m_simulatedProfile = simulated;
         }
 
         DisplayChangeCallback cb;
@@ -312,7 +315,7 @@ namespace ShaderLab::Rendering
             cb = m_callback;
         }
         if (cb)
-            cb(profile.caps);
+            cb(simulated.caps);
     }
 
     void DisplayMonitor::ClearSimulatedProfile()
@@ -343,34 +346,12 @@ namespace ShaderLab::Rendering
         std::lock_guard lock(m_capsMutex);
         if (m_simulatedProfile.has_value())
             return *m_simulatedProfile;
-
-        DisplayProfile p{};
-        p.caps = m_caps;
-        p.isSimulated = false;
-        p.profileName = L"Live Display";
-        p.primaryRed   = { m_caps.redPrimaryX,   m_caps.redPrimaryY };
-        p.primaryGreen = { m_caps.greenPrimaryX, m_caps.greenPrimaryY };
-        p.primaryBlue  = { m_caps.bluePrimaryX,  m_caps.bluePrimaryY };
-        p.whitePoint   = { m_caps.whitePointX,   m_caps.whitePointY };
-        // Classify from the EDID primaries we just copied in. Without this the
-        // field keeps its struct default (sRGB), which misreports every
-        // wide-gamut panel as sRGB.
-        p.gamut = DetectGamut(p.primaryRed, p.primaryGreen, p.primaryBlue);
-        return p;
+        return ProfileFromCaps(m_caps);
     }
 
     DisplayProfile DisplayMonitor::LiveProfile() const
     {
         std::lock_guard lock(m_capsMutex);
-        DisplayProfile p{};
-        p.caps = m_caps;
-        p.isSimulated = false;
-        p.profileName = L"Live Display";
-        p.primaryRed   = { m_caps.redPrimaryX,   m_caps.redPrimaryY };
-        p.primaryGreen = { m_caps.greenPrimaryX, m_caps.greenPrimaryY };
-        p.primaryBlue  = { m_caps.bluePrimaryX,  m_caps.bluePrimaryY };
-        p.whitePoint   = { m_caps.whitePointX,   m_caps.whitePointY };
-        p.gamut = DetectGamut(p.primaryRed, p.primaryGreen, p.primaryBlue);
-        return p;
+        return ProfileFromCaps(m_caps);
     }
 }

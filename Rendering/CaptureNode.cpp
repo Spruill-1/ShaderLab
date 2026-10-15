@@ -1,163 +1,60 @@
 #include "pch_engine.h"
 #include "CaptureNode.h"
+#include "ImageCapture.h"
 
-#include "../Graph/EffectGraph.h"
-
-#include <wincodec.h>
-
-#pragma comment(lib, "windowscodecs.lib")
+#include "../Graph/GraphModel.h"
 
 namespace ShaderLab::Rendering
 {
-    namespace
-    {
-        ID2D1Image* ResolveDisplayImage(const Graph::EffectGraph& graph,
-            uint32_t nodeId, CaptureNodeStatus& status)
-        {
-            const auto* node = graph.FindNode(nodeId);
-            if (!node) { status = CaptureNodeStatus::NotFound; return nullptr; }
-            if (!node->cachedOutput || node->dirty) {
-                status = CaptureNodeStatus::NotReady;
-                return nullptr;
-            }
-            if (!node->inputPins.empty())
-            {
-                auto inputs = graph.GetInputEdges(nodeId);
-                if (inputs.empty()) {
-                    status = CaptureNodeStatus::NotReady;
-                    return nullptr;
-                }
-            }
-            return node->cachedOutput;
-        }
-    }
-
     CaptureNodeResult CaptureNodeAsPng(
-        Graph::EffectGraph& graph,
+        Graph::GraphModel& graph,
         uint32_t nodeId,
         ID2D1DeviceContext* dc,
         uint32_t maxDim)
     {
         CaptureNodeResult result;
-        if (!dc) { result.status = CaptureNodeStatus::D2DError; return result; }
+        if (!dc) { result.status = CaptureNodeStatus::D2DError; result.hr = E_POINTER; return result; }
 
-        ID2D1Image* image = ResolveDisplayImage(graph, nodeId, result.status);
-        if (!image) return result;
-
-        // Use 96 DPI so GetImageLocalBounds returns pixel coordinates.
-        // Restore the dc's prior DPI and target afterwards so this helper
-        // doesn't disturb the host's rendering state.
-        float oldDpiX = 0.f, oldDpiY = 0.f;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
-        dc->SetTransform(D2D1::Matrix3x2F::Identity());
+        NodeImageStatus imageStatus = NodeImageStatus::NotFound;
+        ID2D1Image* image = ResolveNodeImage(graph, nodeId, &imageStatus);
+        if (!image)
+        {
+            result.status = imageStatus == NodeImageStatus::NotFound
+                ? CaptureNodeStatus::NotFound : CaptureNodeStatus::NotReady;
+            return result;
+        }
 
         D2D1_RECT_F bounds{};
-        dc->GetImageLocalBounds(image, &bounds);
-        float srcW = bounds.right - bounds.left;
-        float srcH = bounds.bottom - bounds.top;
+        result.hr = GetImageBounds96Dpi(dc, image, bounds);
+        if (FAILED(result.hr)) { result.status = CaptureNodeStatus::D2DError; return result; }
+        const float srcW = bounds.right - bounds.left;
+        const float srcH = bounds.bottom - bounds.top;
+        if (srcW <= 0.f || srcH <= 0.f) { result.status = CaptureNodeStatus::EmptyImage; return result; }
 
-        dc->SetDpi(oldDpiX, oldDpiY);
+        // Fit the longer edge to maxDim, keeping the aspect ratio and never
+        // upscaling, so the whole frame is captured.
+        const float scale = (std::min)(1.0f, static_cast<float>(maxDim) / (std::max)(srcW, srcH));
+        const uint32_t w = (std::max)(1u, static_cast<uint32_t>(srcW * scale + 0.5f));
+        const uint32_t h = (std::max)(1u, static_cast<uint32_t>(srcH * scale + 0.5f));
 
-        if (srcW <= 0.f || srcH <= 0.f) {
-            result.status = CaptureNodeStatus::EmptyImage;
-            return result;
-        }
+        // An _SRGB target gamma-encodes the linear scRGB scene on write, so
+        // the PNG bytes are display-ready (pairs with the loader's decode).
+        PixelBuffer pixels;
+        result.hr = RenderToPixels(dc, w, h, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, D2D1::ColorF(D2D1::ColorF::Black),
+            [&](ID2D1DeviceContext* target)
+            {
+                target->SetTransform(D2D1::Matrix3x2F::Translation(-bounds.left, -bounds.top) *
+                                     D2D1::Matrix3x2F::Scale(scale, scale));
+                target->DrawImage(image);
+            },
+            pixels);
+        if (SUCCEEDED(result.hr))
+            result.hr = EncodePng(pixels, result.png);
+        if (FAILED(result.hr)) { result.status = CaptureNodeStatus::D2DError; return result; }
 
-        // Fit the LONGER edge to maxDim, preserving aspect ratio (never
-        // upscale). The previous code clamped each edge to maxDim
-        // independently and drew at native scale, so any image whose *both*
-        // dimensions exceeded maxDim was cropped to a maxDim-square of its
-        // top-left corner. Scale-to-fit captures the whole frame instead.
-        float scale = (std::min)(1.0f,
-            static_cast<float>(maxDim) / (std::max)(srcW, srcH));
-        uint32_t w = (std::max)(1u, static_cast<uint32_t>(srcW * scale + 0.5f));
-        uint32_t h = (std::max)(1u, static_cast<uint32_t>(srcH * scale + 0.5f));
-
-        try
-        {
-            winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
-            // _SRGB target: the scene is linear scRGB; encode-on-write
-            // produces correctly gamma-encoded PNG bytes. (Paired with the
-            // loader's decode-on-sample — a plain-UNORM target would write
-            // linear values as bytes and captures would come out dark.)
-            D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_TARGET,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, D2D1_ALPHA_MODE_PREMULTIPLIED));
-            winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0,
-                bmpProps, renderBitmap.put()));
-
-            winrt::com_ptr<ID2D1Image> oldTarget;
-            dc->GetTarget(oldTarget.put());
-            dc->SetTarget(renderBitmap.get());
-            dc->BeginDraw();
-            dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-            // Shift the image's local origin to 0,0, then scale to fit the
-            // (w,h) target so the whole frame lands aspect-correct.
-            dc->SetTransform(
-                D2D1::Matrix3x2F::Translation(-bounds.left, -bounds.top) *
-                D2D1::Matrix3x2F::Scale(scale, scale));
-            dc->DrawImage(image);
-            dc->EndDraw();
-            dc->SetTarget(oldTarget.get());
-
-            winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
-            // Same _SRGB variant as the render target — CopyFromBitmap
-            // requires matching formats; the bytes are already encoded.
-            D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, D2D1_ALPHA_MODE_PREMULTIPLIED));
-            winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0,
-                cpuProps, cpuBitmap.put()));
-            D2D1_POINT_2U destPt = { 0, 0 };
-            D2D1_RECT_U srcRc = { 0, 0, w, h };
-            winrt::check_hresult(cpuBitmap->CopyFromBitmap(&destPt, renderBitmap.get(), &srcRc));
-
-            D2D1_MAPPED_RECT mapped{};
-            winrt::check_hresult(cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped));
-
-            // PNG-encode mapped BGRA bits via WIC on an in-memory IStream.
-            winrt::com_ptr<IWICImagingFactory> wicFactory;
-            winrt::check_hresult(::CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(wicFactory.put())));
-
-            winrt::com_ptr<IStream> memStream;
-            ::CreateStreamOnHGlobal(nullptr, TRUE, memStream.put());
-
-            winrt::com_ptr<IWICBitmapEncoder> encoder;
-            winrt::check_hresult(wicFactory->CreateEncoder(GUID_ContainerFormatPng,
-                nullptr, encoder.put()));
-            winrt::check_hresult(encoder->Initialize(memStream.get(), WICBitmapEncoderNoCache));
-
-            winrt::com_ptr<IWICBitmapFrameEncode> frame;
-            winrt::check_hresult(encoder->CreateNewFrame(frame.put(), nullptr));
-            winrt::check_hresult(frame->Initialize(nullptr));
-            winrt::check_hresult(frame->SetSize(w, h));
-            WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
-            winrt::check_hresult(frame->SetPixelFormat(&fmt));
-            winrt::check_hresult(frame->WritePixels(h, mapped.pitch, mapped.pitch * h, mapped.bits));
-            winrt::check_hresult(frame->Commit());
-            winrt::check_hresult(encoder->Commit());
-
-            cpuBitmap->Unmap();
-
-            STATSTG stat{};
-            memStream->Stat(&stat, STATFLAG_NONAME);
-            ULONG pngSize = static_cast<ULONG>(stat.cbSize.QuadPart);
-            result.png.resize(pngSize);
-            LARGE_INTEGER zero{};
-            memStream->Seek(zero, STREAM_SEEK_SET, nullptr);
-            memStream->Read(result.png.data(), pngSize, nullptr);
-
-            result.status = CaptureNodeStatus::Success;
-            result.width = w;
-            result.height = h;
-            return result;
-        }
-        catch (...)
-        {
-            result.status = CaptureNodeStatus::D2DError;
-            return result;
-        }
+        result.status = CaptureNodeStatus::Success;
+        result.width = w;
+        result.height = h;
+        return result;
     }
 }

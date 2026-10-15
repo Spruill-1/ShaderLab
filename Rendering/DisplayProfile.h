@@ -85,6 +85,35 @@ namespace ShaderLab::Rendering
         bool isSimulated{ false };
     };
 
+    // The live display as a profile: the caps, and the primaries and gamut
+    // they report.
+    inline DisplayProfile ProfileFromCaps(const DisplayCapabilities& caps)
+    {
+        DisplayProfile p{};
+        p.caps = caps;
+        p.isSimulated = false;
+        p.profileName = L"Live Display";
+        p.primaryRed   = { caps.redPrimaryX,   caps.redPrimaryY };
+        p.primaryGreen = { caps.greenPrimaryX, caps.greenPrimaryY };
+        p.primaryBlue  = { caps.bluePrimaryX,  caps.bluePrimaryY };
+        p.whitePoint   = { caps.whitePointX,   caps.whitePointY };
+        // Classified from the panel's primaries; the struct default (sRGB)
+        // would misreport every wide-gamut panel.
+        p.gamut = DetectGamut(p.primaryRed, p.primaryGreen, p.primaryBlue);
+        return p;
+    }
+
+    // Copies a profile's primaries into its caps, so code reading only the
+    // caps (CachedCapabilities, the display-change callback) sees the same
+    // colorimetry as code reading the profile.
+    inline void SyncCapsPrimaries(DisplayProfile& p)
+    {
+        p.caps.redPrimaryX   = p.primaryRed.x;   p.caps.redPrimaryY   = p.primaryRed.y;
+        p.caps.greenPrimaryX = p.primaryGreen.x; p.caps.greenPrimaryY = p.primaryGreen.y;
+        p.caps.bluePrimaryX  = p.primaryBlue.x;  p.caps.bluePrimaryY  = p.primaryBlue.y;
+        p.caps.whitePointX   = p.whitePoint.x;   p.caps.whitePointY   = p.whitePoint.y;
+    }
+
     // -----------------------------------------------------------------------
     // Preset factory functions
     // -----------------------------------------------------------------------

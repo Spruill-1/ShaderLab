@@ -263,7 +263,7 @@ Custom compute effects that produce non-image outputs should follow this convent
 ### 1. Declare Output Type
 Set `AnalysisOutputType` on the node after evaluation:
 ```cpp
-node.analysisOutput.type = AnalysisOutputType::Histogram;  // or FloatBuffer
+node.analysisOutput.type = AnalysisOutputType::Histogram;
 node.analysisOutput.data = { ... };  // float array
 node.analysisOutput.label = L"My Analysis";
 node.analysisOutput.channelIndex = 0;  // optional, for per-channel data
@@ -273,7 +273,7 @@ node.analysisOutput.channelIndex = 0;  // optional, for per-channel data
 | Type          | Description                                    | Visualization        |
 |--------------|------------------------------------------------|----------------------|
 | `Histogram`  | Float array of bin counts/weights              | Bar chart            |
-| `FloatBuffer`| Generic float array (future)                   | Line graph / table   |
+| `Typed`      | Named, typed fields (`analysisFields`)         | Properties panel, data pins |
 
 ### 3. Readback Pattern
 After forcing D2D to compute the effect (by drawing its output to a temp target),

@@ -1,12 +1,8 @@
 #pragma once
 
-// Transport-neutral MCP types (stdio-migration Step 2).
-//
-// Response used to live inside McpHttpServer as a nested struct, which
-// welded the engine ABI (IEngineCommandSink::Dispatch, every route
-// handler) to the HTTP transport header. Routes and sinks now depend on
-// this header only; the transport (McpRouter's HTTP listener today, the
-// stdio session client later) is an implementation detail behind it.
+// Transport-neutral MCP types: the Response every route and sink returns,
+// and the JSON string helpers. Routes depend on this header, never on a
+// transport.
 
 #include <string>
 #include <string_view>
@@ -14,30 +10,15 @@
 #include <cstdio>
 #include <format>   // JsonFloat
 #include <cmath>    // std::isfinite
+#include "../Utf8.h"
 
 namespace ShaderLab::Mcp
 {
-    // ---- Shared JSON string utilities (stdio-migration Step 3) ------------
-    //
-    // There used to be THREE divergent JSON escapers (EngineMcpRoutes' full
-    // one, plus two ad-hoc loops in the GUI dispatcher that missed raw
-    // control characters — HLSL compiler output could produce invalid
-    // JSON). This is now the single authority; everything that embeds text
-    // in a JSON string literal goes through it.
+    using ::ShaderLab::WideToUtf8;
+    using ::ShaderLab::Utf8ToWide;
 
-    inline std::string WideToUtf8(std::wstring_view ws)
-    {
-        if (ws.empty()) return {};
-        int len = ::WideCharToMultiByte(CP_UTF8, 0,
-            ws.data(), static_cast<int>(ws.size()),
-            nullptr, 0, nullptr, nullptr);
-        std::string out(len, '\0');
-        ::WideCharToMultiByte(CP_UTF8, 0,
-            ws.data(), static_cast<int>(ws.size()),
-            out.data(), len, nullptr, nullptr);
-        return out;
-    }
-
+    // The one JSON string escaper: everything embedded in a JSON string
+    // literal goes through it, raw control characters included.
     inline std::string JsonEscape(std::string_view s)
     {
         std::string out;
@@ -75,19 +56,16 @@ namespace ShaderLab::Mcp
         std::string body;
         std::string contentType{ "application/json" };
 
-        // No-reply discriminator. Over HTTP an empty 202 body and "no
-        // response" are the same wire bytes, so the distinction never
-        // mattered. Over stdio they are different things: a JSON-RPC
-        // notification must produce ZERO bytes (an empty line is not
-        // valid JSON), while an empty-body reply still produces a framed
-        // message. Handlers that answer notifications return None();
-        // transports check noReply before serializing anything.
+        // No reply at all, as opposed to an empty one: a JSON-RPC
+        // notification must produce zero bytes on the stream, while an
+        // empty-body reply is still a framed message. Handlers that answer
+        // notifications return None(); transports check noReply first.
         bool        noReply{ false };
 
         static Response None()
         {
             Response r;
-            r.statusCode = 202;   // HTTP transport still sends 202 Accepted
+            r.statusCode = 202;
             r.noReply = true;
             return r;
         }

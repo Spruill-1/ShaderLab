@@ -4,15 +4,20 @@
 namespace ShaderLab::Graph
 {
     std::shared_ptr<const GraphUiSnapshot> BuildGraphUiSnapshot(
-        const EffectGraph& graph,
+        const GraphModel& graph,
         std::uint32_t previewNodeId,
         std::uint64_t graphGeneration,
-        std::uint64_t frameGeneration)
+        std::uint64_t frameGeneration,
+        std::vector<VideoSourceStatus> videoSources)
     {
         auto snap = std::make_shared<GraphUiSnapshot>();
         snap->graphGeneration = graphGeneration;
         snap->frameGeneration = frameGeneration;
         snap->previewNodeId = previewNodeId;
+        snap->hasDirtyNodes = graph.HasDirtyNodes();
+        for (const auto& video : videoSources)
+            snap->totalVideoUploads += video.uploads;
+        snap->videoSources = std::move(videoSources);
 
         // Copy nodes; clear cachedOutput so raw render-thread pointers can't
         // escape via the snapshot.

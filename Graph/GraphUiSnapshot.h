@@ -2,9 +2,9 @@
 
 // GraphUiSnapshot
 //
-// Immutable copy of EffectGraph + per-node runtime data, published by the
+// Immutable copy of GraphModel + per-node runtime data, published by the
 // render thread after each frame for UI / MCP consumers. The render thread
-// is the single writer to the live `EffectGraph`; every other reader pulls
+// is the single writer to the live `GraphModel`; every other reader pulls
 // the latest snapshot via `std::atomic<std::shared_ptr<const GraphUiSnapshot>>`.
 //
 // Why a copy instead of just exposing the live graph behind a lock:
@@ -17,18 +17,16 @@
 //    to consume it), so the cost only applies to the GUI host.
 //
 // Cost: a 50-node graph with ~5-10 properties per node is ~50KB per snapshot.
-// At 60 fps that's ~3 MB/s of allocation traffic. Acceptable; later we can
-// pool snapshot allocations or skip rebuilding when graphGeneration hasn't
-// bumped, but neither is needed for the initial cut.
+// At 60 fps that's ~3 MB/s of allocation traffic, which is acceptable.
 //
 // Invariants:
 //  * `cachedOutput` on every snapshot node is `nullptr` -- raw `ID2D1Image*`
 //    pointers are render-thread-only and must never escape into UI code.
-//  * Snapshot nodes/edges are value copies of EffectGraph state at the
+//  * Snapshot nodes/edges are value copies of GraphModel state at the
 //    moment Build was called.
 
 #include "../EngineExport.h"
-#include "EffectGraph.h"
+#include "GraphModel.h"
 #include "EffectEdge.h"
 #include "EffectNode.h"
 
@@ -39,6 +37,21 @@
 
 namespace ShaderLab::Graph
 {
+    // Playback state of one video source, copied from its provider on the
+    // render thread so the UI never touches a live provider.
+    struct VideoSourceStatus
+    {
+        std::uint32_t nodeId{ 0 };
+        bool open{ false };
+        bool loop{ false };
+        std::uint32_t width{ 0 };
+        std::uint32_t height{ 0 };
+        double frameRate{ 0.0 };
+        double duration{ 0.0 };
+        double position{ 0.0 };
+        std::uint64_t uploads{ 0 };
+    };
+
     struct GraphUiSnapshot
     {
         // Bumps every time a graph mutation is applied on the render thread
@@ -51,6 +64,10 @@ namespace ShaderLab::Graph
         // analysisOutput / runtimeError / dirty values).
         std::uint64_t frameGeneration{ 0 };
 
+        // GraphModel::HasDirtyNodes when the snapshot was built: a needed
+        // node still has a change to evaluate (a bound value just arrived).
+        bool hasDirtyNodes{ false };
+
         // Value copies of every node and edge from the live graph. Every
         // node's `cachedOutput` is forced to nullptr in the snapshot.
         std::vector<EffectNode> nodes;
@@ -59,12 +76,23 @@ namespace ShaderLab::Graph
         // O(1) lookup by node id.
         std::unordered_map<std::uint32_t, std::size_t> nodeIndexById;
 
-        // Node ids in EffectGraph::TopologicalSort order; empty when the
+        // Node ids in GraphModel::TopologicalSort order; empty when the
         // graph has a cycle.
         std::vector<std::uint32_t> topologicalOrder;
 
         // Currently-selected preview node. 0 means no preview.
         std::uint32_t previewNodeId{ 0 };
+
+        // One entry per video provider, and the sum of their uploads.
+        std::vector<VideoSourceStatus> videoSources;
+        std::uint64_t totalVideoUploads{ 0 };
+
+        const VideoSourceStatus* FindVideoSource(std::uint32_t nodeId) const
+        {
+            for (const auto& video : videoSources)
+                if (video.nodeId == nodeId) return &video;
+            return nullptr;
+        }
 
         // Returns a pointer into `nodes` (stable for the lifetime of this
         // snapshot) or nullptr if no node with that id exists.
@@ -79,8 +107,9 @@ namespace ShaderLab::Graph
     // Build an immutable snapshot from the live graph. Caller must already
     // be on the render thread (the single writer of `graph`).
     SHADERLAB_API std::shared_ptr<const GraphUiSnapshot> BuildGraphUiSnapshot(
-        const EffectGraph& graph,
+        const GraphModel& graph,
         std::uint32_t previewNodeId,
         std::uint64_t graphGeneration,
-        std::uint64_t frameGeneration);
+        std::uint64_t frameGeneration,
+        std::vector<VideoSourceStatus> videoSources = {});
 }

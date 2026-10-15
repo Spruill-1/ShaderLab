@@ -1,16 +1,42 @@
-// MainWindow partial (Phase 4 split): the OnRenderTick / RenderWorkerLoop
-// render loop, including the dirty-propagation pre-pass, video tick,
-// and output-window present. All methods are members of
-// `winrt::ShaderLab::implementation::MainWindow`. Extracted from
-// MainWindow.xaml.cpp at commit c177770. (The pre-worker RenderTickBody /
-// RenderFrame were removed in stdio-migration Step 7 — dead since v1.7.0.)
+// MainWindow partial: the render loop -- the UI tick (OnRenderTick), the
+// render worker (RenderWorkerLoop) and its frame, and output-window present.
 
 #include "pch.h"
 #include "MainWindow.xaml.h"
 
 #include "Rendering/FramePacer.h"
+#include "Rendering/FrameExecutor.h"
+#include "Rendering/SourceRuntime.h"
+#include "Graph/ClockModel.h"
+#include "Graph/GraphEdits.h"
 #include "Rendering/PipelineFormat.h"
 #include "Effects/Performance.h"
+#include "Rendering/HostRenderSettings.h"
+#include "Controls/OutputSinkRenderer.h"
+
+namespace
+{
+    using OutputSinkList = std::vector<std::shared_ptr<::ShaderLab::Controls::OutputSinkRenderState>>;
+
+    // Node ids of the output windows still open. Read from the sinks: the
+    // worker never touches the UI-owned OutputWindow list.
+    std::vector<uint32_t> LiveSinkNodeIds(std::mutex& listMutex, const OutputSinkList& sinks)
+    {
+        OutputSinkList copy;
+        {
+            std::scoped_lock lock(listMutex);
+            copy = sinks;
+        }
+        std::vector<uint32_t> nodeIds;
+        for (const auto& sink : copy)
+        {
+            if (!sink) continue;
+            std::scoped_lock viewLock(sink->viewMutex);
+            if (!sink->closed) nodeIds.push_back(sink->nodeId);
+        }
+        return nodeIds;
+    }
+}
 
 namespace winrt::ShaderLab::implementation
 {
@@ -58,33 +84,22 @@ namespace winrt::ShaderLab::implementation
         auto tTickStart = std::chrono::high_resolution_clock::now();
 
         // Cache the preview panel's DIP size (UI-thread-only XAML read) so the
-        // render worker can fit a newly-selected node to view after eval
-        // without touching XAML. See FitPreviewToView / m_needsFitPreview.
+        // render worker can fit the preview after eval without touching XAML.
         if (auto panel = PreviewPanel())
         {
-            m_previewViewportW = static_cast<float>(panel.ActualWidth());
-            m_previewViewportH = static_cast<float>(panel.ActualHeight());
+            Preview().SetViewport(static_cast<float>(panel.ActualWidth()), static_cast<float>(panel.ActualHeight()));
             m_previewPixelScale.store((std::max)(1e-3f, static_cast<float>(panel.CompositionScaleX())),
                                       std::memory_order_relaxed);
         }
 
-        // Drain pending dispatcher closures: NO-OP from the UI side post-P7.
-        // The worker thread is the registered consumer and drains its own
-        // queue. UI thread reading the queue would race graph mutations and
-        // process closures slowly because OnRenderTick also does blit /
-        // canvas redraw / event handling. Leaving Drain() here is the
-        // primary cause of UI dropdown / hover input lag under load:
-        // long-running MCP closures end up running on the UI thread,
-        // blocking input event delivery for the duration. Worker calls
-        // m_renderDispatcher.Drain() in RenderWorkerLoop -- that's the only
-        // path closures should run on.
-        // m_renderDispatcher.Drain();   // <-- removed in 7fa7021+
+        // The dispatcher is drained by the worker only: a closure run here
+        // would race the graph and hold up input.
 
         // Blit the most recently published offscreen frame into the
         // SwapChainPanel-bound swap chain and Present.
         BlitOffscreenToSwapChain();
 
-        // Editor canvas redraw (UI-side D2D context, P4).
+        // Editor canvas redraw (UI-side D2D context).
         // Trigger a redraw whenever the worker has published a new snapshot
         // since our last UI tick -- the canvas reads runtime fields like
         // clockTime / analysisOutput from the live graph, but doesn't
@@ -99,10 +114,8 @@ namespace winrt::ShaderLab::implementation
         }
         RenderNodeGraph();
 
-        // P7: present any open output windows on the UI thread. Render
-        // worker has already drawn into each sink's offscreen pair (see
-        // MainWindow::RenderOutputSinks called from RenderFrameToOffscreen);
-        // here we just sync UI view state + blit + Present1 per window.
+        // Output windows blit what the worker drew into their sinks
+        // (RenderOutputSinks) and present.
         PresentOutputWindows();
         auto tNodeGraphEnd = std::chrono::high_resolution_clock::now();
 
@@ -112,23 +125,9 @@ namespace winrt::ShaderLab::implementation
                 return std::chrono::duration<double, std::micro>(b - a).count();
             };
             const double a = 0.1;
-            auto& t = m_frameTiming;
+            auto& t = m_uiTiming;
             t.uiTickUs      = t.uiTickUs * (1-a) + usec(tTickStart, tNodeGraphEnd) * a;
-        }
-
-        // Update video seek slider and position label while playing.
-        if (m_videoSeekSlider && m_videoSeekNodeId != 0)
-        {
-            auto* vp = m_sourceFactory.GetVideoProvider(m_videoSeekNodeId);
-            if (vp && vp->IsOpen())
-            {
-                double pos = vp->CurrentPosition();
-                m_videoSeekSuppressEvents = true;
-                m_videoSeekSlider.Value(pos);
-                m_videoSeekSuppressEvents = false;
-                if (m_videoPositionLabel)
-                    m_videoPositionLabel.Text(std::format(L"Position: {:.1f}s / {:.1f}s", pos, vp->Duration()));
-            }
+            m_frameTimings.Publish(t);
         }
 
         // Periodic UI updates at 250 ms (log windows, properties panel,
@@ -139,25 +138,11 @@ namespace winrt::ShaderLab::implementation
         {
             if (!m_logWindows.empty())
                 UpdateLogWindows();
-            // Decide whether the selected node's Properties panel needs a
-            // refresh WITHOUT holding a live-graph pointer on the UI thread
-            // (the decision-#70 race). Read under a shared lock on
-            // m_graphMutex, capture a plain bool, release, THEN act -- never
-            // hold the lock across UpdatePropertiesPanel, which dispatches to
-            // the render worker (m_graphMutex is taken exclusively there;
-            // holding it across the dispatch would deadlock). Step 7 residual.
-            bool refreshBoundProps = false;
-            if (m_selectedNodeId != 0)
-            {
-                std::shared_lock<std::shared_mutex> graphLock(m_graphMutex);
-                if (m_graph.HasDirtyNodes())
-                {
-                    auto* selNode = m_graph.FindNode(m_selectedNodeId);
-                    refreshBoundProps = selNode && !selNode->propertyBindings.empty();
-                }
-            }
-            if (refreshBoundProps && !IsPropertiesPanelInteracting())
-                UpdatePropertiesPanel();
+            // Bound values change without an edit: while the graph has
+            // pending changes, refresh a selected node that has bindings.
+            if (SelectedNodeId() != 0)
+                if (const auto snapshot = CurrentGraphSnapshot(); snapshot && snapshot->hasDirtyNodes)
+                    m_propertiesPanel.RefreshBoundValues();
             UpdateMcpActivityIndicator();
             UpdateFpsTooltip();
         }
@@ -166,7 +151,8 @@ namespace winrt::ShaderLab::implementation
             uint64_t framesSeen = m_frameCount.exchange(0, std::memory_order_relaxed);
             float fps = static_cast<float>(framesSeen) * 1000.0f / static_cast<float>(elapsed);
 
-            uint64_t currentVideoUploads = m_sourceFactory.TotalVideoUploads();
+            const auto snapshot = CurrentGraphSnapshot();
+            const uint64_t currentVideoUploads = snapshot ? snapshot->totalVideoUploads : m_lastVideoUploadCount;
             float videoFps = static_cast<float>(currentVideoUploads - m_lastVideoUploadCount) * 1000.0f / static_cast<float>(elapsed);
             m_lastVideoUploadCount = currentVideoUploads;
             m_lastVideoFps = videoFps;
@@ -205,6 +191,8 @@ namespace winrt::ShaderLab::implementation
     {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
         m_renderDispatcher.RegisterConsumer();
+        // The source runtime is this thread's while it runs.
+        m_sourceFactory.SetOwnerThread(std::this_thread::get_id());
 
         auto last = std::chrono::steady_clock::now();
         ::ShaderLab::Rendering::FramePacer pacer(m_targetRefreshHz.load(std::memory_order_relaxed));
@@ -213,22 +201,11 @@ namespace winrt::ShaderLab::implementation
             // Pacing. In both modes a queued MCP closure wakes the worker
             // early, so MCP traffic raises the tick rate, which matters when
             // benchmarking over MCP.
-            const bool unthrottled = ::ShaderLab::Performance::IsUnthrottledRenderEnabled();
+            const bool unthrottled = ::ShaderLab::Rendering::HostRenderSettings::IsUnthrottledRenderEnabled();
             if (unthrottled)
             {
-                // Drain without blocking, then hand the timeslice over before
-                // re-entering the loop.
-                //
-                // The yield is not politeness, it is required. Each iteration
-                // takes m_graphMutex EXCLUSIVELY twice, and with no wait at
-                // all the next acquire follows the previous release by
-                // essentially zero time. std::shared_mutex is an SRWLOCK and
-                // SRWLOCK is not fair, so the UI thread's shared read for a
-                // canvas paint can lose that race indefinitely -- the app
-                // stays alive and keeps rendering while its UI stops
-                // responding, which is indistinguishable from a hang.
-                // SwitchToThread gives a ready thread on this processor its
-                // chance between iterations.
+                // Drain without blocking, then hand the timeslice to any
+                // ready thread on this processor before the next iteration.
                 m_renderDispatcher.WaitFor(std::chrono::milliseconds(0));
                 std::this_thread::yield();
             }
@@ -237,21 +214,13 @@ namespace winrt::ShaderLab::implementation
                 // Wait for the next frame deadline at the display refresh
                 // rate (60 Hz minimum), so a static graph does not spin a
                 // core and the frame's own work is absorbed in the period.
-                // A frame that overran still idles briefly, for the same
-                // lock-fairness reason as the yield above.
+                // A frame that overran still idles briefly (FramePacer).
                 pacer.SetRate(m_targetRefreshHz.load(std::memory_order_relaxed));
                 m_renderDispatcher.WaitUntil(pacer.WaitDeadline(std::chrono::steady_clock::now()));
                 pacer.BeginFrame(std::chrono::steady_clock::now());
             }
-            {
-                // Every MCP mutation arrives as a closure drained here. Hold the
-                // graph exclusively across the whole drain rather than per
-                // closure: RenderThreadDispatcher runs a nested DispatchSync
-                // inline when already on the consumer thread, which would
-                // self-deadlock a non-recursive mutex taken per closure.
-                std::unique_lock<std::shared_mutex> graphLock(m_graphMutex);
-                m_renderDispatcher.Drain();
-            }
+            // Every UI and MCP mutation arrives as a closure drained here.
+            m_renderDispatcher.Drain();
             if (stop.stop_requested() || m_renderShouldStop.load(std::memory_order_acquire))
                 break;
             if (m_isShuttingDown) break;
@@ -264,19 +233,8 @@ namespace winrt::ShaderLab::implementation
 
             try
             {
-                // Per-tick non-GPU work that previously lived in OnRenderTick:
-                // working space sync, capture/clock tick, video upload, dirty
+                // Per-tick non-GPU work: working space sync, capture/clock tick, video upload, dirty
                 // propagation. Then the offscreen render itself.
-                //
-                // This whole body mutates m_graph -- UpdateWorkingSpaceNodes
-                // writes Working Space properties, the clock tick does
-                // node.properties[...] = (a std::map INSERT), and the evaluator
-                // walks and dirties nodes. Hold the graph exclusively so the UI
-                // thread's canvas paint cannot read a half-mutated node. Taken
-                // in a separate scope from the Drain() lock above so the two
-                // never nest.
-                std::unique_lock<std::shared_mutex> graphLock(m_graphMutex);
-
                 UpdateWorkingSpaceNodes();
 
                 // Use the render-thread D2D context for source uploads. They
@@ -285,154 +243,35 @@ namespace winrt::ShaderLab::implementation
                 // context to avoid cross-context state races.
                 if (auto* dc5 = static_cast<ID2D1DeviceContext5*>(m_renderEngine.RenderD2DContext()))
                 {
-                    auto& nodes = const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes());
+                    auto nodes = m_graph.MutableNodes();
                     if (m_sourceFactory.TickAndUploadLiveCaptures(nodes, dc5))
                         m_forceRender = true;
                 }
 
-                // Tick clock nodes: advance time. (Same code as OnRenderTick's
-                // body uses; safe to call from render thread because m_graph
-                // is single-writer in this design.)
-                for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-                {
-                    if (!node.isClock) continue;
-                    auto getF = [&](const std::wstring& k, float def) {
-                        auto it = node.properties.find(k);
-                        if (it != node.properties.end())
-                            if (auto* f = std::get_if<float>(&it->second)) return *f;
-                        return def;
-                    };
-                    bool autoDuration = getF(L"AutoDuration", 1.0f) > 0.5f;
-                    if (autoDuration && node.propertyBindings.count(L"StopTime"))
-                    {
-                        autoDuration = false;
-                        node.properties[L"AutoDuration"] = 0.0f;
-                    }
-                    if (autoDuration)
-                    {
-                        float maxDur = 0.0f;
-                        for (const auto& other : m_graph.Nodes())
-                        {
-                            if (other.id == node.id) continue;
-                            bool boundToThisClock = false;
-                            for (const auto& [propName, binding] : other.propertyBindings)
-                            {
-                                for (const auto& src : binding.sources)
-                                {
-                                    if (src && src->sourceNodeId == node.id)
-                                    { boundToThisClock = true; break; }
-                                }
-                                if (boundToThisClock) break;
-                            }
-                            if (!boundToThisClock) continue;
-                            for (const auto& field : other.analysisOutput.fields)
-                            {
-                                if (field.name == L"Duration" && field.components[0] > 0.0f)
-                                    if (field.components[0] > maxDur) maxDur = field.components[0];
-                            }
-                        }
-                        if (maxDur > 0.0f)
-                            node.properties[L"StopTime"] = maxDur;
-                    }
-                    if (node.isPlaying)
-                    {
-                        float startTime = getF(L"StartTime", 0.0f);
-                        float stopTime = getF(L"StopTime", 10.0f);
-                        float speed = getF(L"Speed", 1.0f);
-                        bool loop = getF(L"Loop", 1.0f) > 0.5f;
-                        double duration = static_cast<double>(stopTime - startTime);
-                        if (duration <= 0.0) duration = 1.0;
-                        node.clockTime += dt * speed;
-                        if (loop)
-                        {
-                            while (node.clockTime >= duration) node.clockTime -= duration;
-                            while (node.clockTime < 0.0) node.clockTime += duration;
-                        }
-                        else
-                        {
-                            node.clockTime = std::clamp(node.clockTime, 0.0, duration);
-                            if (node.clockTime >= duration) node.isPlaying = false;
-                        }
-
-                        // UpdateRate gates the DIRTY, not just the value. At 0
-                        // the clock behaves as it always has: every frame is a
-                        // tick, and every consumer re-evaluates. Above 0 it
-                        // only ticks when clockTime crosses into a new 1/rate
-                        // bucket, so a 10 Hz clock invalidates downstream work
-                        // ten times a second however fast the renderer runs.
-                        // GraphEvaluator quantises Time/Progress with the same
-                        // rule, so the value a consumer sees always matches the
-                        // tick it was woken for.
-                        float updateRate = getF(L"UpdateRate", 0.0f);
-                        bool emit = true;
-                        if (updateRate > 0.0f)
-                        {
-                            const double step = 1.0 / static_cast<double>(updateRate);
-                            const long long bucket =
-                                static_cast<long long>(std::floor(node.clockTime / step));
-                            emit = (bucket != node.clockTickBucket);
-                            node.clockTickBucket = bucket;
-                        }
-                        if (emit) node.dirty = true;
-                    }
-                }
+                ::ShaderLab::Graph::AdvanceClocks(m_graph, dt);
 
                 m_graphEvaluator.ResolveSourceBindings(m_graph);
 
                 if (auto* dc = m_renderEngine.RenderD2DContext())
                 {
-                    try {
-                        m_sourceFactory.TickAndUploadVideos(
-                            const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()),
-                            dc, dt);
-                    } catch (...) {}
+                    // Per-video failures land on their nodes; anything else
+                    // reaches the tick's own handler.
+                    m_sourceFactory.TickAndUploadVideos(m_graph.MutableNodes(), dc);
                 }
 
-                // Dirty propagation downstream.
-                {
-                    std::vector<uint32_t> queue;
-                    for (const auto& node : m_graph.Nodes())
-                        if (node.dirty) queue.push_back(node.id);
-                    for (size_t i = 0; i < queue.size(); ++i)
-                    {
-                        for (const auto* edge : m_graph.GetOutputEdges(queue[i]))
-                        {
-                            auto* dn = m_graph.FindNode(edge->destNodeId);
-                            if (dn && !dn->dirty)
-                            {
-                                dn->dirty = true;
-                                queue.push_back(edge->destNodeId);
-                            }
-                        }
-                    }
-                }
+                // Before the dirty check, so a change counts for the nodes it reaches.
+                m_graph.PropagateDirtyDownstream();
 
                 bool wasForceRender = m_forceRender;
                 bool hasDirty = m_graph.HasDirtyNodes();
-                // P7: when output windows are open, force eval every frame
-                // so the worker keeps producing frames into their offscreen
-                // pairs even if no graph node is dirty (e.g. static Gamut
-                // Source feeding an Output node). Same gate as the legacy
-                // RenderFrame had.
-                bool hasOutputWindows = false;
-                {
-                    std::scoped_lock lk(m_outputSinksMutex);
-                    hasOutputWindows = !m_outputSinks.empty();
-                }
-                // GPU timing implies "keep rendering". With a static graph
-                // nothing is dirty, so the worker idles and RenderFrameToOffscreen
-                // never runs -- the timer opens ONE frame, the 4-deep ring never
-                // retires, and every span reads 0.00 ms. That looks exactly like
-                // a broken timer rather than an idle renderer, and cost real time
-                // to diagnose. Asking to measure GPU time is asking for frames to
-                // measure, so supply them.
-                // GPU timing implies "keep rendering", and the flyout's
-                // Force-continuous-redraw box says so explicitly. With a static
-                // graph nothing is dirty, so the worker idles and
-                // RenderFrameToOffscreen never runs -- the timer opens ONE
-                // frame, the 4-deep ring never retires, and every span reads
-                // 0.00 ms. That looks exactly like a broken timer rather than
-                // an idle renderer, and cost real time to diagnose.
+                // Open output windows need a frame every tick even when
+                // nothing is dirty (a static source feeding an Output node).
+                const bool hasOutputWindows = !LiveSinkNodeIds(m_outputSinksMutex, m_outputSinks).empty();
+                // GPU timing implies "keep rendering", as does the flyout's
+                // Force-continuous-redraw box. With a static graph nothing is
+                // dirty, so the worker would idle, the timer's 4-deep ring
+                // would never retire, and every span would read 0.00 ms --
+                // indistinguishable from a broken timer.
                 bool gpuTiming = m_renderEngine.Timer().IsEnabled();
                 bool forceRedraw = m_forceContinuousRedraw.load(std::memory_order_acquire);
                 // `unthrottled` implies evaluate-every-tick. Without that
@@ -444,7 +283,7 @@ namespace winrt::ShaderLab::implementation
                 // land: its values arrive on a later Evaluate, which then
                 // re-dirties whatever is bound to them.
                 bool pendingReadback = m_graphEvaluator.HasPendingReadbacks();
-                bool needsEval = hasDirty || m_needsFitPreview || m_forceRender
+                bool needsEval = hasDirty || Preview().FitPending() || m_forceRender
                               || hasOutputWindows || gpuTiming || forceRedraw
                               || unthrottled || pendingReadback;
                 // Force redraw means the WORST case, every frame: every node
@@ -467,30 +306,20 @@ namespace winrt::ShaderLab::implementation
                     m_graph.MarkAllDirty();
                 if (needsEval)
                 {
-                    RenderFrameToOffscreen(dt);
+                    // Taken before the frame, so an edit made while it renders
+                    // wins over the fit computed from it.
+                    const auto previewFrame = Preview().Frame();
+                    RenderFrameToOffscreen();
                     m_forceRender = false;
                     m_frameCount.fetch_add(1, std::memory_order_relaxed);
                     if (hasDirty || wasForceRender)
                         ++m_graphGeneration;
-                    // Fit-after-eval: the selected node's cachedOutput now has
-                    // valid bounds, so a pending fit (set by SelectPreviewNode)
-                    // computes zoom/pan here on the worker -- worker-owned
-                    // bounds + the UI-cached viewport, no XAML. Force one more
-                    // frame so the fitted transform actually renders.
-                    // Auto-fit re-runs the fit every evaluated frame, so only
-                    // force a further frame when the fit actually MOVED the
-                    // view -- forcing unconditionally would keep a static
-                    // graph rendering forever.
-                    if (m_needsFitPreview || m_previewAutoFit.load(std::memory_order_acquire))
-                    {
-                        const float z0 = m_previewZoom, x0 = m_previewPanX, y0 = m_previewPanY;
-                        if (FitPreviewToView())
-                        {
-                            m_needsFitPreview = false;
-                            if (m_previewZoom != z0 || m_previewPanX != x0 || m_previewPanY != y0)
-                                m_forceRender = true;
-                        }
-                    }
+                    // Fit after the frame, from the bounds it measured. Auto-fit
+                    // re-fits every evaluated frame, so a further frame is
+                    // forced only when the fit moved the view; otherwise a
+                    // static graph would keep rendering.
+                    if (previewFrame.fitWanted && Preview().FitTo(previewFrame, GetPreviewImageBounds()))
+                        m_forceRender = true;
                 }
 
                 // Every iteration, rendered or not, so the rate ages to N/A.
@@ -512,13 +341,15 @@ namespace winrt::ShaderLab::implementation
         }
 
         m_renderDispatcher.Drain();
+        m_sourceFactory.SetOwnerThread({});
     }
 
     void MainWindow::PublishGraphSnapshot()
     {
         auto snapshot = ::ShaderLab::Graph::BuildGraphUiSnapshot(
-            m_graph, m_previewNodeId, m_graphGeneration,
-            m_frameGeneration.load(std::memory_order_acquire));
+            m_graph, Preview().NodeId(), m_graphGeneration,
+            m_frameGeneration.load(std::memory_order_acquire),
+            m_sourceFactory.VideoSourceStatuses());
         std::atomic_store(&m_uiGraphSnapshot,
             std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>(std::move(snapshot)));
     }
@@ -526,10 +357,10 @@ namespace winrt::ShaderLab::implementation
     // -------------------------------------------------------------------------
     // RenderFrameToOffscreen / BlitOffscreenToSwapChain
     //
-    // Phase 7 split: render thread renders the preview image into a double-
-    // buffered offscreen D2D bitmap (no swap-chain Present); UI thread later
-    // blits the most recently published buffer into the SwapChainPanel-bound
-    // swap chain and Presents it.
+    // The render thread renders the preview image into a double-buffered
+    // offscreen D2D bitmap (no swap-chain Present); the UI thread blits the
+    // most recently published buffer into the SwapChainPanel-bound swap
+    // chain and presents it.
     //
     // The two-buffer publish protocol uses m_offscreenPublishedIdx (atomic
     // int32 with -1 = nothing published yet) and m_offscreenPublishedVersion
@@ -582,15 +413,13 @@ namespace winrt::ShaderLab::implementation
         return true;
     }
 
-    void MainWindow::RenderFrameToOffscreen(double deltaSec)
+    void MainWindow::RenderFrameToOffscreen()
     {
-        // Runs on render thread once that path is enabled. Currently still
-        // safe to call from UI thread for the inline-fallback case (the
-        // synchronous dispatcher mode preserves today's behaviour).
+        // Render worker only: it writes m_graph and uses the render context.
         if (m_isShuttingDown) return;
         if (!m_renderEngine.IsInitialized()) return;
 
-        // Pick offscreen size = swap chain back buffer size for now.
+        // The offscreen target matches the swap chain's back buffer.
         uint32_t w = m_renderEngine.BackBufferWidth();
         uint32_t h = m_renderEngine.BackBufferHeight();
         if (w == 0 || h == 0) return;
@@ -598,7 +427,10 @@ namespace winrt::ShaderLab::implementation
         if (!m_renderEngine.EnsureOffscreenTargets(w, h))
             return;
 
-        auto tFrameStart = std::chrono::high_resolution_clock::now();
+        auto tFrameStart = std::chrono::steady_clock::now();
+
+        // The preview's node, view and selection, read once for the frame.
+        const auto preview = Preview().Frame();
 
         // GPU spans. No-ops unless GPU timing is switched on, which it is not
         // by default: closing a span around D2D work needs a Flush, and that
@@ -632,204 +464,118 @@ namespace winrt::ShaderLab::implementation
         // Whether the previewed node renders in this frame: its output-change
         // count moves in any of the frame's evaluation passes.
         m_previewRenderStats.Initialize(m_renderEngine.D3DDevice());
-        m_previewRenderStats.SetNode(m_previewNodeId);
-        const uint64_t previewChangesBefore = m_graphEvaluator.OutputChangeCount(m_previewNodeId);
+        m_previewRenderStats.SetNode(preview.nodeId);
+        const uint64_t previewChangesBefore = m_graphEvaluator.OutputChangeCount(preview.nodeId);
         m_previewRenderStats.BeginFrame(std::chrono::steady_clock::now());
         gpu.Begin(::ShaderLab::Rendering::GpuSpan::SourcesPrep);
 
         // The timer flushes above wait here when the GPU is still busy with
         // earlier frames; that wait is reported as frameStartUs, not as
         // source preparation.
-        auto tSourcesStart = std::chrono::high_resolution_clock::now();
+        auto tSourcesStart = std::chrono::steady_clock::now();
 
-        // ---- Source preparation + graph evaluation (same as RenderFrame) ----
-        for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-        {
-            if (node.type == ::ShaderLab::Graph::NodeType::Source &&
-                (node.dirty || m_sourceFactory.GetVideoProvider(node.id)))
-            {
-                try {
-                    m_sourceFactory.PrepareSourceNode(node, dc, deltaSec,
-                        m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-                } catch (...) {
-                    node.runtimeError = L"Source preparation failed";
-                    node.dirty = false;
-                }
-            }
-        }
+        ::ShaderLab::Rendering::PrepareSources(m_graph, m_sourceFactory,
+            { dc, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext() }, ::ShaderLab::Rendering::SourceScope::Changed);
 
-        auto tSourcesEnd = std::chrono::high_resolution_clock::now();
+        auto tSourcesEnd = std::chrono::steady_clock::now();
         gpu.End(::ShaderLab::Rendering::GpuSpan::SourcesPrep);
-        gpu.Begin(::ShaderLab::Rendering::GpuSpan::Evaluate);
 
-        // Compute which nodes are needed (mark roots + propagate upstream).
-        {
-            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-                node.needed = false;
-            std::vector<uint32_t> roots;
-            for (const auto& node : m_graph.Nodes())
-            {
-                if (node.type == ::ShaderLab::Graph::NodeType::Output)
-                    roots.push_back(node.id);
-                if (node.dirty && node.customEffect.has_value() &&
-                    node.customEffect->analysisOutputType == ::ShaderLab::Graph::AnalysisOutputType::Typed)
-                    roots.push_back(node.id);
-            }
-            if (m_previewNodeId != 0)
-                roots.push_back(m_previewNodeId);
-            if (m_readbackNodeId != 0)
-                roots.push_back(m_readbackNodeId);
-            for (const auto& window : m_outputWindows)
-                roots.push_back(window->NodeId());
-            std::unordered_set<uint32_t> visited;
-            std::vector<uint32_t> queue = roots;
-            while (!queue.empty())
-            {
-                uint32_t id = queue.back();
-                queue.pop_back();
-                if (visited.count(id)) continue;
-                visited.insert(id);
-                auto* node = m_graph.FindNode(id);
-                if (node) node->needed = true;
-                for (const auto* edge : m_graph.GetInputEdges(id))
-                    queue.push_back(edge->sourceNodeId);
-                if (node)
-                {
-                    for (const auto& [propName, binding] : node->propertyBindings)
-                    {
-                        if (binding.wholeArray)
-                            queue.push_back(binding.wholeArraySourceNodeId);
-                        for (const auto& src : binding.sources)
-                            if (src.has_value()) queue.push_back(src->sourceNodeId);
-                    }
-                }
-            }
-        }
+        ::ShaderLab::Rendering::FrameRequest request;
+        request.target = targetBitmap;
+        request.timer = &gpu;
 
-        m_graphEvaluator.Evaluate(m_graph, dc);
-        if (m_graph.HasDirtyNodes())
-            m_graphEvaluator.Evaluate(m_graph, dc); // second pass for new effects
+        // Demand: what is on screen or about to be read, besides the Output
+        // nodes and pending analysis the graph demands by itself.
+        request.demand = ::ShaderLab::Rendering::FrameDemand::Roots;
+        if (preview.nodeId != 0)
+            request.roots.push_back(preview.nodeId);
+        if (m_readbackNodeId != 0)
+            request.roots.push_back(m_readbackNodeId);
+        for (uint32_t sinkNodeId : LiveSinkNodeIds(m_outputSinksMutex, m_outputSinks))
+            request.roots.push_back(sinkNodeId);
 
-        auto tEvalEnd = std::chrono::high_resolution_clock::now();
-        gpu.End(::ShaderLab::Rendering::GpuSpan::Evaluate);
-
-        // ---- BeginDraw on offscreen + ProcessDeferredCompute + draw preview --
-        winrt::com_ptr<ID2D1Image> oldTarget;
-        dc->GetTarget(oldTarget.put());
-        dc->SetTarget(targetBitmap);
-        dc->BeginDraw();
-        gpu.Begin(::ShaderLab::Rendering::GpuSpan::DeferredCompute);
-
-        // CPU-analysis interest set (same as old RenderFrame).
+        // CPU-analysis interest: the selected node and what it is bound to,
+        // or every compute node when "Refresh analysis readouts" says so, so
+        // canvas labels refresh at the throttle interval.
         {
             std::unordered_set<uint32_t> interest;
-            // "Refresh analysis readouts" set to all nodes: hint every
-            // compute node so the canvas labels on unselected nodes refresh
-            // at the throttle interval, not only the selected node's.
-            if (::ShaderLab::Performance::IsCpuAnalysisHintAllNodesEnabled())
+            if (::ShaderLab::Rendering::HostRenderSettings::IsCpuAnalysisHintAllNodesEnabled())
             {
                 for (const auto& n : m_graph.Nodes())
                     if (n.type == ::ShaderLab::Graph::NodeType::ComputeShader)
                         interest.insert(n.id);
             }
-            if (m_selectedNodeId != 0)
+            if (preview.selectedNodeId != 0)
             {
-                interest.insert(m_selectedNodeId);
-                if (auto* sel = m_graph.FindNode(m_selectedNodeId))
+                interest.insert(preview.selectedNodeId);
+                if (auto* sel = m_graph.FindNode(preview.selectedNodeId))
                 {
-                    for (const auto& [propName, binding] : sel->propertyBindings)
-                    {
-                        if (binding.wholeArray)
-                            interest.insert(binding.wholeArraySourceNodeId);
-                        for (const auto& srcOpt : binding.sources)
-                            if (srcOpt.has_value())
-                                interest.insert(srcOpt->sourceNodeId);
-                    }
+                    ::ShaderLab::Graph::ForEachBindingSource(*sel,
+                        [&](uint32_t sourceNodeId) { interest.insert(sourceNodeId); });
                 }
             }
-            m_graphEvaluator.SetCpuAnalysisInterest(std::move(interest));
+            request.analysisInterest = std::move(interest);
         }
 
-        if (m_graphEvaluator.ProcessDeferredCompute(m_graph, dc))
+        request.draw = [&](ID2D1DeviceContext5* ctx)
         {
-            m_nodeGraphController.SetNeedsRedraw();
-            if (m_graph.HasDirtyNodes())
+            // Set DPI to 96 to match WinUI DIPs -- but only when the context
+            // isn't already there: a real per-frame DPI flip invalidates every
+            // D2D1_PROPERTY_CACHED effect intermediate in the context. The
+            // render context is pinned at 96 (RenderEngine), so this is
+            // normally a no-op kept as a safety net.
+            float oldDpiX, oldDpiY;
+            ctx->GetDpi(&oldDpiX, &oldDpiY);
+            const bool dpiFlip = (oldDpiX != 96.0f || oldDpiY != 96.0f);
+            if (dpiFlip)
+                ctx->SetDpi(96.0f, 96.0f);
+
+            ctx->Clear(D2D1::ColorF(D2D1::ColorF::Black));
+
+            // Pan / zoom are in DIPs (they follow pointer positions); the back
+            // buffer is in physical pixels, shown 1:1 via the swap chain's
+            // inverse composition-scale matrix. The final Scale maps DIPs onto
+            // those pixels.
+            const float pxPerDip = m_previewPixelScale.load(std::memory_order_relaxed);
+            ctx->SetTransform(
+                D2D1::Matrix3x2F::Scale(preview.view.zoom, preview.view.zoom) *
+                D2D1::Matrix3x2F::Translation(preview.view.panX, preview.view.panY) *
+                D2D1::Matrix3x2F::Scale(pxPerDip, pxPerDip));
+
+            auto* previewImage = ResolveDisplayImage(preview.nodeId);
+            if (previewImage)
+                ctx->DrawImage(previewImage);
+
+            // Publish the preview image's bounds for the fit, pointer mapping,
+            // Pixel Trace and MCP. Measured here, on the render context that
+            // owns the image: an effect image is bound to the context that
+            // built it, and asking the UI context returns an empty rect.
             {
-                m_graphEvaluator.SetDeferredComputeFrozen(true);
-                m_graphEvaluator.Evaluate(m_graph, dc);
-                m_graphEvaluator.SetDeferredComputeFrozen(false);
+                D2D1_RECT_F pb{};
+                if (!previewImage || FAILED(ctx->GetImageLocalBounds(previewImage, &pb)))
+                    pb = D2D1_RECT_F{};
+                std::scoped_lock lock(m_previewBoundsMutex);
+                m_previewBounds = pb;
             }
-        }
 
-        gpu.End(::ShaderLab::Rendering::GpuSpan::DeferredCompute, dc);
-        auto tComputeEnd = std::chrono::high_resolution_clock::now();
-        // The Draw span is where the tone mapper actually costs something:
-        // D2D evaluates the effect chain lazily at DrawImage/EndDraw, not
-        // during Evaluate, so shader time lands here and nowhere else.
-        gpu.Begin(::ShaderLab::Rendering::GpuSpan::Draw);
-        // Dispatches actually issued, not queue depth: ProcessDeferredCompute
-        // drains its queue before returning, so DeferredComputeCount() here
-        // read 0 on every frame the app has ever run.
-        uint32_t computeCount = m_graphEvaluator.DispatchesLastFrame();
+            ctx->SetTransform(D2D1::Matrix3x2F::Identity());
+            if (dpiFlip)
+                ctx->SetDpi(oldDpiX, oldDpiY);
+        };
 
-        // Set DPI to 96 to match WinUI DIPs — but only when the context
-        // isn't already there: a real per-frame DPI flip invalidates every
-        // D2D1_PROPERTY_CACHED effect intermediate in the context. The
-        // render context is pinned at 96 (RenderEngine), so this is
-        // normally a no-op kept as a safety net.
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
-        const bool dpiFlip = (oldDpiX != 96.0f || oldDpiY != 96.0f);
-        if (dpiFlip)
-            dc->SetDpi(96.0f, 96.0f);
+        const auto frame = ::ShaderLab::Rendering::FrameExecutor::Run(m_graph, m_graphEvaluator, dc, request);
+        if (frame.computeRan)
+            m_nodeGraphController.SetNeedsRedraw();
+        const HRESULT hrEnd = frame.endDraw;
+        const uint32_t computeCount = frame.dispatches;
+        const auto tEvalEnd = frame.evaluateEnd;
+        const auto tComputeEnd = frame.computeEnd;
+        const auto tDrawEnd = frame.drawEnd;
 
-        dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-
-        // Pan / zoom are in DIPs (they follow pointer positions); the back
-        // buffer is in physical pixels, shown 1:1 via the swap chain's inverse
-        // composition-scale matrix. The final Scale maps DIPs onto those
-        // pixels. Without it -- and without the matrix -- the preview was
-        // magnified by the display scale and anchored top-left.
-        const float pxPerDip = m_previewPixelScale.load(std::memory_order_relaxed);
-        D2D1_MATRIX_3X2_F previewTransform =
-            D2D1::Matrix3x2F::Scale(m_previewZoom, m_previewZoom) *
-            D2D1::Matrix3x2F::Translation(m_previewPanX, m_previewPanY) *
-            D2D1::Matrix3x2F::Scale(pxPerDip, pxPerDip);
-        dc->SetTransform(previewTransform);
-
-        auto* previewImage = ResolveDisplayImage(m_previewNodeId);
-        if (previewImage)
-            dc->DrawImage(previewImage);
-
-        // Publish the preview image's bounds for everyone else (the fit below
-        // this frame, pointer mapping, Pixel Trace, MCP). They must be measured
-        // HERE, on the render context that owns the image: an effect image is
-        // bound to the context that built it, and the old code asked the UI
-        // context, which failed and returned an empty rect -- so the fit
-        // deferred forever and the preview sat at zoom 1 on the top-left of the
-        // image, and pointer/trace mapping fell back to the viewport size.
-        {
-            D2D1_RECT_F pb{};
-            if (!previewImage || FAILED(dc->GetImageLocalBounds(previewImage, &pb)))
-                pb = D2D1_RECT_F{};
-            std::scoped_lock lock(m_previewBoundsMutex);
-            m_previewBounds = pb;
-        }
-
-        dc->SetTransform(D2D1::Matrix3x2F::Identity());
-        if (dpiFlip)
-            dc->SetDpi(oldDpiX, oldDpiY);
-
-        auto tDrawEnd = std::chrono::high_resolution_clock::now();
-
-        HRESULT hrEnd = dc->EndDraw();
-        dc->SetTarget(oldTarget.get());
-
-        gpu.End(::ShaderLab::Rendering::GpuSpan::Draw);
         gpu.End(::ShaderLab::Rendering::GpuSpan::Frame);
         gpu.EndFrame();
         m_previewRenderStats.EndFrame(
-            m_previewNodeId != 0 && m_graphEvaluator.OutputChangeCount(m_previewNodeId) != previewChangesBefore,
+            preview.nodeId != 0 && m_graphEvaluator.OutputChangeCount(preview.nodeId) != previewChangesBefore,
             std::chrono::steady_clock::now());
 
         // Publish per-node GPU results onto the nodes, where the canvas picks
@@ -855,7 +601,7 @@ namespace winrt::ShaderLab::implementation
             const double chainMs = gpu.SpanMs(::ShaderLab::Rendering::GpuSpan::Draw);
             const bool timing = gpu.IsEnabled();
 
-            for (auto& n : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
+            for (auto& n : m_graph.MutableNodes())
             {
                 // Same rule the evaluator uses to route a node to the D3D11
                 // bridge. Kept in sync deliberately: a node the evaluator
@@ -881,7 +627,7 @@ namespace winrt::ShaderLab::implementation
                     // Its own bracketed dispatch.
                     state = GpuNodeState::Measured;
                 }
-                else if (n.id == m_previewNodeId && chainMs > 0.0)
+                else if (n.id == preview.nodeId && chainMs > 0.0)
                 {
                     // The drawn node is the chain end, so it carries the cost
                     // of everything D2D fused into the draw that produced it.
@@ -919,8 +665,7 @@ namespace winrt::ShaderLab::implementation
                     state = GpuNodeState::Fused;
                 }
 
-                n.lastGpuMs = ms;
-                n.gpuState = state;
+                ::ShaderLab::Graph::RecordNodeGpuTime(n, ms, state);
             }
 
             // The figures change every frame, so the canvas has to be told
@@ -931,7 +676,7 @@ namespace winrt::ShaderLab::implementation
                 m_nodeGraphController.SetNeedsRedraw();
         }
 
-        auto tEndDraw = std::chrono::high_resolution_clock::now();
+        auto tEndDraw = std::chrono::steady_clock::now();
 
         // Always bump framesSampled BEFORE deciding whether to publish, so
         // /perf accurately reflects worker activity even when EndDraw fails
@@ -942,7 +687,7 @@ namespace winrt::ShaderLab::implementation
                 return std::chrono::duration<double, std::micro>(b - a).count();
             };
             const double a = 0.1;
-            auto& t = m_frameTiming;
+            auto& t = m_renderTiming;
             t.frameStartUs      = t.frameStartUs      * (1-a) + usec(tFrameStart,  tSourcesStart) * a;
             t.sourcesPrepUs     = t.sourcesPrepUs     * (1-a) + usec(tSourcesStart, tSourcesEnd) * a;
             t.evaluateUs        = t.evaluateUs        * (1-a) + usec(tSourcesEnd,  tEvalEnd)    * a;
@@ -950,6 +695,8 @@ namespace winrt::ShaderLab::implementation
             t.drawUs            = t.drawUs            * (1-a) + usec(tComputeEnd,  tDrawEnd)    * a;
             t.endDrawFlushUs    = t.endDrawFlushUs    * (1-a) + usec(tDrawEnd,     tEndDraw)    * a;
             t.computeDispatches = computeCount;
+            t.cachedEffects      = m_graphEvaluator.CachedEffectCount();
+            t.cacheInvalidations = m_graphEvaluator.CacheInvalidations();
             using GS = ::ShaderLab::Rendering::GpuSpan;
             t.gpuAvailable       = gpu.IsInitialized();
             t.gpuEnabled         = gpu.IsEnabled();
@@ -967,8 +714,7 @@ namespace winrt::ShaderLab::implementation
             t.totalUs           = t.totalUs           * (1-a) + usec(tFrameStart,  tEndDraw)    * a;
             t.framesSampled++;
             t.endDrawFailed     = FAILED(hrEnd) ? (t.endDrawFailed + 1) : t.endDrawFailed;
-            if (t.framesSampled % 30 == 0)
-                m_lastFrameTiming = t;
+            m_frameTimings.Publish(t);
         }
 
         if (FAILED(hrEnd))
@@ -979,159 +725,32 @@ namespace winrt::ShaderLab::implementation
         m_offscreenPublishedIdx.store(writeIdx, std::memory_order_release);
         m_offscreenPublishedVersion.fetch_add(1, std::memory_order_release);
 
-        // P7: render any open output windows into THEIR offscreen pairs.
-        // Each sink has its own double-buffered offscreen managed by this
-        // method. UI thread blits the published buffer in BlitAndPresent.
         RenderOutputSinks();
     }
 
-    // ---------------------------------------------------------------------
-    // RenderOutputSinks -- render-thread output-window rendering. Iterates
-    // a snapshot of m_outputSinks (so we don't hold m_outputSinksMutex while
-    // doing GPU work), and for each non-closed sink:
-    //   - reads view state under sink->viewMutex
-    //   - ensures buffers exist at requested size (creates D3D textures +
-    //     render-side D2D bitmap targets, bumps bufferGen on size change)
-    //   - resolves the node's cachedOutput
-    //   - picks the write idx (opposite of publishedIdx)
-    //   - BeginDraw on render-side bitmap, Clear, apply pan/zoom transform,
-    //     DrawImage, EndDraw
-    //   - publishes the new idx + version
-    // The actual blit-to-swap-chain + Present1 happens on the UI thread.
-    // ---------------------------------------------------------------------
+    // Render thread: draws each open output window's node into its sink
+    // (Controls/OutputSinkRenderer); the windows blit on the UI thread.
     void MainWindow::RenderOutputSinks()
     {
-        std::vector<std::shared_ptr<::ShaderLab::Controls::OutputSinkRenderState>> snapshot;
+        std::vector<std::shared_ptr<::ShaderLab::Controls::OutputSinkRenderState>> sinks;
         {
             std::scoped_lock lock(m_outputSinksMutex);
-            snapshot = m_outputSinks;
+            sinks = m_outputSinks;
         }
-        if (snapshot.empty()) return;
-
         auto* dc = m_renderEngine.RenderD2DContext();
-        auto* d3dDevice = m_renderEngine.D3DDevice();
-        if (!dc || !d3dDevice) return;
-        const auto& fmt = m_renderEngine.ActiveFormat();
-
-        for (auto& sink : snapshot)
+        auto* device = m_renderEngine.D3DDevice();
+        for (auto& sink : sinks)
         {
             if (!sink) continue;
-
-            bool closed = false;
             {
                 std::scoped_lock lock(sink->viewMutex);
-                closed = sink->closed;
+                if (sink->closed) continue;
             }
-            if (closed) continue;
-
-            // Resolve the source image (the node's cachedOutput).
-            auto* image = ResolveDisplayImage(sink->nodeId);
-            if (!image) continue;
-
-            // Get the image's natural bounds in DIPs at 96 DPI.
-            float oldDpiX, oldDpiY;
-            dc->GetDpi(&oldDpiX, &oldDpiY);
-            dc->SetDpi(96.0f, 96.0f);
-            D2D1_RECT_F bounds{};
-            HRESULT bhr = dc->GetImageLocalBounds(image, &bounds);
-            if (FAILED(bhr))
-            {
-                dc->SetDpi(oldDpiX, oldDpiY);
-                continue;
-            }
-            uint32_t imgW = static_cast<uint32_t>(bounds.right - bounds.left);
-            uint32_t imgH = static_cast<uint32_t>(bounds.bottom - bounds.top);
-            if (imgW == 0 || imgH == 0)
-            {
-                dc->SetDpi(oldDpiX, oldDpiY);
-                continue;
-            }
-            // Cap to a sensible max so a runaway-bounds source can't OOM
-            // us. 8192 matches the per-effect cap in PreRenderInputBitmap.
-            imgW = (std::min)(imgW, 8192u);
-            imgH = (std::min)(imgH, 8192u);
-
-            // Allocate the offscreen at the IMAGE's native size. This
-            // keeps the render path stateless about the panel's display
-            // size / DPI -- UI's BlitAndPresent does the fit when blitting
-            // into the swap chain back buffer (which it knows the size of
-            // first-hand). Avoids the cross-thread DPI/scale math that
-            // produced misaligned output earlier.
-            if (sink->bufW != imgW || sink->bufH != imgH ||
-                !sink->textures[0] || !sink->textures[1])
-            {
-                D3D11_TEXTURE2D_DESC td{};
-                td.Width = imgW;
-                td.Height = imgH;
-                td.MipLevels = 1;
-                td.ArraySize = 1;
-                td.Format = fmt.dxgiFormat;
-                td.SampleDesc.Count = 1;
-                td.Usage = D3D11_USAGE_DEFAULT;
-                td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
-                bool ok = true;
-                for (uint32_t i = 0; i < 2 && ok; ++i)
-                {
-                    sink->renderTargets[i] = nullptr;
-                    sink->textures[i] = nullptr;
-                    if (FAILED(d3dDevice->CreateTexture2D(&td, nullptr,
-                            sink->textures[i].put())))
-                    { ok = false; break; }
-                    winrt::com_ptr<IDXGISurface> surface;
-                    if (FAILED(sink->textures[i]->QueryInterface(
-                            IID_PPV_ARGS(surface.put()))))
-                    { ok = false; break; }
-                    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
-                        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                        D2D1::PixelFormat(fmt.dxgiFormat,
-                            D2D1_ALPHA_MODE_PREMULTIPLIED),
-                        96.0f, 96.0f);
-                    if (FAILED(dc->CreateBitmapFromDxgiSurface(
-                            surface.get(), bp, sink->renderTargets[i].put())))
-                    { ok = false; break; }
-                }
-                if (!ok)
-                {
-                    for (uint32_t i = 0; i < 2; ++i)
-                    {
-                        sink->renderTargets[i] = nullptr;
-                        sink->textures[i] = nullptr;
-                    }
-                    sink->bufW = sink->bufH = 0;
-                    dc->SetDpi(oldDpiX, oldDpiY);
-                    continue;
-                }
-                sink->bufW = imgW;
-                sink->bufH = imgH;
-                sink->bufferGen.fetch_add(1, std::memory_order_release);
-            }
-
-            // Pick write idx = opposite of last published.
-            int32_t lastPub = sink->publishedIdx.load(std::memory_order_acquire);
-            int32_t writeIdx = (lastPub == 0) ? 1 : 0;
-            auto* target = sink->renderTargets[writeIdx].get();
-            if (!target)
-            {
-                dc->SetDpi(oldDpiX, oldDpiY);
-                continue;
-            }
-
-            winrt::com_ptr<ID2D1Image> prevTarget;
-            dc->GetTarget(prevTarget.put());
-            dc->SetTarget(target);
-            dc->SetTransform(D2D1::Matrix3x2F::Translation(-bounds.left, -bounds.top));
-            dc->BeginDraw();
-            dc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-            dc->DrawImage(image);
-            dc->SetTransform(D2D1::Matrix3x2F::Identity());
-            HRESULT hr = dc->EndDraw();
-            dc->SetTarget(prevTarget.get());
-            dc->SetDpi(oldDpiX, oldDpiY);
-            if (FAILED(hr)) continue;
-
-            sink->publishedIdx.store(writeIdx, std::memory_order_release);
-            sink->publishedVersion.fetch_add(1, std::memory_order_release);
+            const HRESULT hr = ::ShaderLab::Controls::RenderOutputSink(*sink, ResolveDisplayImage(sink->nodeId),
+                                                                       dc, device, m_renderEngine.ActiveFormat());
+            if (FAILED(hr))
+                OutputDebugStringW(std::format(L"[OutputWindow] node {} render failed 0x{:08X}\n",
+                    sink->nodeId, static_cast<uint32_t>(hr)).c_str());
         }
     }
 
@@ -1182,10 +801,8 @@ namespace winrt::ShaderLab::implementation
         m_uiD2dContext->SetTarget(backBufferBitmap.get());
         // A 1:1 pixel copy: pin the DPI and transform instead of inheriting
         // them. This context is SHARED with the node-graph canvas, which sets
-        // it to 96 * CompositionScale on every repaint and leaves it there; the
-        // preview blit used to inherit that, upscaling the finished frame 1.5x
-        // at 150% scaling on top of the panel's own composition scale -- the
-        // preview showed a zoomed-in corner of a correctly fitted image.
+        // it to 96 * CompositionScale on every repaint and leaves it there;
+        // inheriting that would scale the finished frame a second time.
         m_uiD2dContext->SetDpi(96.0f, 96.0f);
         m_uiD2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
         m_uiD2dContext->BeginDraw();
@@ -1199,9 +816,9 @@ namespace winrt::ShaderLab::implementation
         // scanout, and with the worker free-running there is a new frame to
         // blit on nearly every UI tick -- so the UI thread would spend most
         // of its time parked in Present1 and input would starve. Tearing is
-        // the accepted cost; see Performance::IsUnthrottledRenderEnabled.
+        // the accepted cost; see HostRenderSettings::IsUnthrottledRenderEnabled.
         const UINT interval =
-            ::ShaderLab::Performance::IsUnthrottledRenderEnabled() ? 0u : 1u;
+            ::ShaderLab::Rendering::HostRenderSettings::IsUnthrottledRenderEnabled() ? 0u : 1u;
         DXGI_PRESENT_PARAMETERS params{};
         swap->Present1(interval, 0, &params);
     }

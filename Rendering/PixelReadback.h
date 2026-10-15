@@ -1,13 +1,7 @@
 #pragma once
 
-// Pixel readback helpers for the engine. Used by:
-//   - The MCP `read_pixel_region` route (today via MainWindow shim;
-//     post-`p7-mcp-move` directly engine-side).
-//   - ShaderLabHeadless `--pixels x,y,w,h` mode for scripted full-
-//     accuracy sampling.
-//   - The PixelInspectorController and PixelTraceController follow a
-//     similar pattern but read 1x1 regions for the live UI overlay;
-//     this header is for the small-region readback case.
+// Pixel readback for the MCP `read_pixel_region` route and headless
+// `--pixels x,y,w,h`. Rendering/PixelTrace reads single pixels the same way.
 //
 // The output is FP32 RGBA in scRGB linear-light, row-major, no
 // gamma encoding. Caller decides what to do with it (encode PNG,
@@ -15,7 +9,7 @@
 
 #include "pch_engine.h"
 #include "../EngineExport.h"
-#include "../Graph/EffectGraph.h"
+#include "../Graph/GraphModel.h"
 
 #include <cstdint>
 #include <vector>
@@ -44,6 +38,10 @@ namespace ShaderLab::Rendering
         // (0, 0) when status != Success.
         uint32_t actualWidth{ 0 };
         uint32_t actualHeight{ 0 };
+
+        // The failing call's HRESULT when status == D2DError (EndDraw's
+        // included), else S_OK.
+        HRESULT hr{ S_OK };
     };
 
     // Read an FP32 RGBA region from a graph node's cachedOutput.
@@ -57,7 +55,7 @@ namespace ShaderLab::Rendering
     // request is clipped to the image's bounds (via GetImageLocalBounds
     // on the DC) before the readback.
     SHADERLAB_API ReadPixelRegionResult ReadPixelRegion(
-        const Graph::EffectGraph& graph,
+        const Graph::GraphModel& graph,
         uint32_t nodeId,
         int32_t x, int32_t y, uint32_t w, uint32_t h,
         ID2D1DeviceContext* dc);

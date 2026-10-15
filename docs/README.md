@@ -13,12 +13,13 @@ Reference for "how does ShaderLab work under the hood".
 - [Architecture Overview](architecture/overview.md) — high-level diagram of the components (rendering, graph, effects, UI controllers, hosts).
 - [Threading Model](architecture/threading-model.md) — UI thread vs render worker, offscreen-blit composition, dispatcher, output-window sinks.
 - [Pipeline Format Strategy](architecture/pipeline-format.md) — why the pipeline is always scRGB FP16 and how DWM/ACM handles the final display conversion.
-- [Effect Graph Model](architecture/effect-graph-model.md) — `EffectGraph` / `EffectNode` / `EffectEdge` / `PropertyValue`, JSON serialization, dirty tracking.
+- [Graph Model](architecture/effect-graph-model.md) — `GraphModel` / `EffectNode` / `EffectEdge` / `PropertyValue`, JSON serialization, dirty tracking.
 - [Topological Evaluation](architecture/topological-evaluation.md) — Kahn's algorithm, evaluation order, cycle detection.
 - [Display Monitoring](architecture/display-monitoring.md) — WinRT `AdvancedColorInfo` + `AdvancedColorInfoChanged` event, ICC profile parsing, SDR white level.
 - [Display Profile Mocking](architecture/display-profile-mocking.md) — simulated SDR/HDR/WCG environments and the testing harness.
 - [Compute Shader Analysis Pipeline](architecture/compute-analysis-pipeline.md) — D2D compute conventions, CPU readback, analysis output schema.
 - [D2D / D3D11 Hybrid Compute System](architecture/d2d-d3d11-hybrid-compute.md) — `CustomComputeBridgeEffect`, `D3D11ComputeRunner`, GPU-binding routing, COM class hierarchy.
+- [EffectGraph API](architecture/effectgraph-api.md) — the engine as a COM library for any D3D11 program: `IEffectGraphContext`, `IEffectGraphNode`, texture inputs, `Realize` / `RealizeTo`.
 - [Engine / Host Split](architecture/engine-host-split.md) — `ShaderLabEngine.dll` ABI, `IEngineCommandSink`, host event hooks.
 
 ## Effects

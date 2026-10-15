@@ -1,5 +1,7 @@
 #include "pch_engine.h"
 #include "CustomComputeBridgeEffect.h"
+#include "CustomEffectBase.h"
+#include "../Rendering/D2DHelpers.h"
 
 #include <d3dcompiler.h>
 
@@ -7,19 +9,21 @@ namespace ShaderLab::Effects
 {
     // ---- Static pass-through pixel shader -------------------------------
     //
-    // Compiled once on the first effect instance's PrepareForRender, and
-    // cached for every subsequent instance. The shader is purely
-    // decorative -- the bridge's D2D output is never consumed by
-    // downstream graph consumers (they wire to `node->cachedOutput`
-    // directly, exactly like the rest of the engine). It exists only
-    // so the effect satisfies D2D's "one input -> one output" contract.
+    // Compiled once per process and loaded into each D2D device that hosts
+    // a bridge. The shader is purely decorative -- the bridge's D2D output
+    // is never consumed by downstream graph consumers (they wire to
+    // `node->cachedOutput` directly, exactly like the rest of the engine).
+    // It exists only so the effect satisfies D2D's "one input -> one
+    // output" contract.
 
-    GUID CustomComputeBridgeEffect::s_passThroughGuid{};
-    bool CustomComputeBridgeEffect::s_passThroughLoaded = false;
     thread_local CustomComputeBridgeEffect* CustomComputeBridgeEffect::s_lastCreated = nullptr;
 
     namespace
     {
+        // {2119663A-884E-4397-8BF8-108659278150}
+        constexpr GUID cPassThroughShaderGuid =
+        { 0x2119663a, 0x884e, 0x4397, { 0x8b, 0xf8, 0x10, 0x86, 0x59, 0x27, 0x81, 0x50 } };
+
         // Minimal pass-through pixel shader. D2D pixel shaders take the
         // shape of a free function with the correct signature; the host
         // (D2D) sets up the input texture binding via the effect's
@@ -54,7 +58,15 @@ float4 main(
                 flags, 0,
                 blob.put(), errors.put());
             if (FAILED(hr) || !blob)
+            {
+                std::string message = std::format("[ShaderLab] Compute bridge pass-through shader failed to compile (0x{:08X})",
+                    static_cast<uint32_t>(hr));
+                if (errors)
+                    message += std::string(": ") + std::string(static_cast<const char*>(errors->GetBufferPointer()),
+                        errors->GetBufferSize());
+                fprintf(stderr, "%s\n", message.c_str());
                 return {};
+            }
             std::vector<BYTE> bytecode(blob->GetBufferSize());
             std::memcpy(bytecode.data(), blob->GetBufferPointer(), blob->GetBufferSize());
             return bytecode;
@@ -67,23 +79,12 @@ float4 main(
     {
         if (!factory) return E_INVALIDARG;
 
-        // XML schema. One image input, no D2D properties (the bridge's
-        // shader bytecode + cbuffer data is set via ICustomComputeBridge,
-        // not through D2D's property system).
-        static constexpr PCWSTR xml =
-            L"<?xml version='1.0'?>"
-            L"<Effect>"
-            L"  <Property name='DisplayName' type='string' value='Custom Compute Bridge'/>"
-            L"  <Property name='Author'      type='string' value='ShaderLab'/>"
-            L"  <Property name='Category'    type='string' value='Compute'/>"
-            L"  <Property name='Description' type='string' value='D2D wrapper around D3D11 compute shaders for analysis + image output'/>"
-            L"  <Inputs>"
-            L"    <Input name='Source'/>"
-            L"  </Inputs>"
-            L"</Effect>";
-
+        // One image input. The bridge's shader and cbuffer are set through
+        // ICustomComputeBridge, not D2D properties.
+        const std::wstring xml = BuildCustomEffectXml(L"Custom Compute Bridge",
+            L"D2D wrapper around D3D11 compute shaders for analysis + image output", L"Compute", { L"Source" });
         return factory->RegisterEffectFromString(
-            CLSID_CustomComputeBridge, xml, nullptr, 0, &CreateFactory);
+            CLSID_CustomComputeBridge, xml.c_str(), nullptr, 0, &CreateFactory);
     }
 
     HRESULT __stdcall CustomComputeBridgeEffect::CreateFactory(IUnknown** effect)
@@ -94,6 +95,18 @@ float4 main(
         s_lastCreated = impl;
         *effect = static_cast<ID2D1EffectImpl*>(impl);
         return S_OK;
+    }
+
+    HRESULT CustomComputeBridgeEffect::Create(ID2D1DeviceContext* dc,
+        winrt::com_ptr<ID2D1Effect>& outEffect, CustomComputeBridgeEffect** outImpl)
+    {
+        *outImpl = nullptr;
+        s_lastCreated = nullptr;
+        const HRESULT hr = dc->CreateEffect(CLSID_CustomComputeBridge, outEffect.put());
+        if (SUCCEEDED(hr))
+            *outImpl = s_lastCreated;
+        s_lastCreated = nullptr;
+        return hr;
     }
 
     // ---- IUnknown -------------------------------------------------------
@@ -154,22 +167,19 @@ float4 main(
 
     HRESULT CustomComputeBridgeEffect::EnsurePassThroughShader()
     {
-        // Lazy first-instance compile + load. Subsequent instances skip
-        // the compile (D2D effect contexts share their loaded shaders
-        // by GUID at the factory level).
-        if (!s_passThroughLoaded)
+        // Loaded shaders belong to the D2D device, and a process can hold
+        // several, so each effect context is asked.
+        if (!m_effectContext->IsShaderLoaded(cPassThroughShaderGuid))
         {
-            auto bytecode = CompilePassThrough();
+            static const std::vector<BYTE> bytecode = CompilePassThrough();
             if (bytecode.empty())
                 return E_FAIL;
-            ::CoCreateGuid(&s_passThroughGuid);
             HRESULT hr = m_effectContext->LoadPixelShader(
-                s_passThroughGuid, bytecode.data(),
+                cPassThroughShaderGuid, bytecode.data(),
                 static_cast<UINT32>(bytecode.size()));
             if (FAILED(hr)) return hr;
-            s_passThroughLoaded = true;
         }
-        return m_drawInfo->SetPixelShader(s_passThroughGuid);
+        return m_drawInfo->SetPixelShader(cPassThroughShaderGuid);
     }
 
     // ---- ID2D1DrawTransform ---------------------------------------------
@@ -191,8 +201,9 @@ float4 main(
     {
         if (inputRectCount == 0 || !inputRects || !outputRect)
             return E_INVALIDARG;
-        // Pass-through: output rect = input rect. Don't pass through
-        // infinite rects (gotcha #7 in copilot-instructions).
+        // Output rect = input rect (infinite included), or the fixed
+        // image-output size. Nothing draws this output: consumers read
+        // node->cachedOutput.
         m_inputRect = inputRects[0];
         if (m_imageOutputW > 0 && m_imageOutputH > 0)
         {
@@ -240,10 +251,9 @@ float4 main(
         // Content-compare, cheaply: every DXBC blob carries a 16-byte
         // compiler checksum at offset 4. The evaluator calls this before
         // every dispatch with whatever variant the binding plan implies, so
-        // it MUST be a no-op when nothing changed -- it used to mark the
-        // shader dirty unconditionally, and the evaluator's post-dispatch
-        // "restore baseline" made that two CreateComputeShader calls per
-        // frame for every GPU-bound consumer.
+        // it MUST be a no-op when nothing changed, or every GPU-bound
+        // consumer recreates its shader twice a frame (variant, then the
+        // evaluator's post-dispatch restore of the baseline).
         const ShaderId id = IdOf(bytecode, bytecodeSize);
         const ShaderId& current = m_bytecodeDirty ? m_pendingId : m_installedId;
         if ((m_bytecodeDirty || m_hasInstalled) && id == current)
@@ -252,6 +262,128 @@ float4 main(
         m_pendingId = id;
         m_bytecodeDirty = true;
         return S_OK;
+    }
+
+    const wchar_t* CustomComputeBridgeEffect::DescribeStage(DispatchStage stage)
+    {
+        switch (stage)
+        {
+        case DispatchStage::None:         return L"";
+        case DispatchStage::Arguments:    return L"checking its inputs";
+        case DispatchStage::Device:       return L"finding the D3D11 device";
+        case DispatchStage::ShaderCreate: return L"creating the compute shader";
+        case DispatchStage::NoShader:     return L"with no shader installed";
+        case DispatchStage::InputBounds:  return L"sizing an input";
+        case DispatchStage::InputCopy:    return L"copying an input to a texture";
+        case DispatchStage::ImageOutput:  return L"creating the output texture";
+        case DispatchStage::Run:          return L"running the dispatch";
+        }
+        return L"";
+    }
+
+    HRESULT CustomComputeBridgeEffect::Fail(DispatchStage stage, HRESULT hr)
+    {
+        m_lastFailure = stage;
+        return hr;
+    }
+
+    HRESULT CustomComputeBridgeEffect::D3D11DeviceOf(ID2D1DeviceContext5* dc, winrt::com_ptr<ID3D11Device>& device)
+    {
+        winrt::com_ptr<ID2D1Device> d2dDevice;
+        dc->GetDevice(d2dDevice.put());
+        auto d2dDevice2 = d2dDevice.try_as<ID2D1Device2>();
+        if (!d2dDevice2) return E_NOINTERFACE;
+        winrt::com_ptr<IDXGIDevice> dxgiDevice;
+        if (const HRESULT hr = d2dDevice2->GetDxgiDevice(dxgiDevice.put()); FAILED(hr)) return hr;
+        return dxgiDevice->QueryInterface(device.put());
+    }
+
+    HRESULT CustomComputeBridgeEffect::InstallPendingShader(ID3D11Device* device)
+    {
+        if (!m_bytecodeDirty)
+            return S_OK;
+        // Bytecode that failed once fails again; say so without retrying.
+        if (m_hasFailedShader && m_failedShaderId == m_pendingId)
+            return m_failedShaderHr;
+
+        // Switching between the baseline and a GPU-binding variant reuses a
+        // shader created earlier rather than creating it again.
+        winrt::com_ptr<ID3D11ComputeShader> shader;
+        for (const auto& v : m_shaderVariants)
+            if (v.id == m_pendingId) { shader = v.shader; break; }
+        if (!shader)
+        {
+            const HRESULT hr = device->CreateComputeShader(m_pendingBytecode.data(), m_pendingBytecode.size(),
+                                                           nullptr, shader.put());
+            if (FAILED(hr))
+            {
+                m_hasFailedShader = true;
+                m_failedShaderId = m_pendingId;
+                m_failedShaderHr = hr;
+                return hr;
+            }
+            constexpr size_t cMaxShaderVariants = 4;
+            if (m_shaderVariants.size() >= cMaxShaderVariants)
+                m_shaderVariants.erase(m_shaderVariants.begin());
+            m_shaderVariants.push_back({ m_pendingId, shader });
+        }
+        m_runner.InstallPrecompiledShader(m_pendingBytecode, shader);
+        m_installedId = m_pendingId;
+        m_hasInstalled = true;
+        m_bytecodeDirty = false;
+        return S_OK;
+    }
+
+    HRESULT CustomComputeBridgeEffect::PrepareInputTexture(ID2D1DeviceContext5* dc, ID2D1Image* image,
+                                                           UINT32 slot, winrt::com_ptr<ID3D11Texture2D>& texture)
+    {
+        D2D1_RECT_L px{};
+        if (const HRESULT hr = Rendering::GetSnappedPixelBounds(dc, image, px); FAILED(hr))
+            return Fail(DispatchStage::InputBounds, hr);
+        const UINT32 w = static_cast<UINT32>(px.right - px.left);
+        const UINT32 h = static_cast<UINT32>(px.bottom - px.top);
+
+        // A bitmap the shader can read in place -- the evaluator's shared
+        // pre-render, a source's frame, an upstream compute node's output:
+        // bind its texture directly.
+        if (texture = Rendering::ComputeReadableTexture(image, px); texture)
+            return S_OK;
+
+        auto& cache = m_inputBitmaps[slot];
+        if (!cache.bitmap || cache.width != w || cache.height != h)
+        {
+            D2D1_BITMAP_PROPERTIES1 bp{};
+            bp.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+            bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+            bp.dpiX = 96.0f;
+            bp.dpiY = 96.0f;
+            winrt::com_ptr<ID2D1Bitmap1> created;
+            if (const HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bp, created.put()); FAILED(hr))
+                return Fail(DispatchStage::InputCopy, hr);
+            cache = { std::move(created), w, h };
+        }
+        // Draw the upstream chain into it; DrawImage does the format
+        // conversion, and Flush submits it (D2D batches until then).
+        {
+            Rendering::ScopedTarget target(dc, cache.bitmap.get());
+            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+            dc->DrawImage(image, D2D1::Point2F(-static_cast<float>(px.left), -static_cast<float>(px.top)));
+        }
+        dc->Flush();
+
+        winrt::com_ptr<IDXGISurface> surface;
+        if (const HRESULT hr = cache.bitmap->GetSurface(surface.put()); FAILED(hr))
+            return Fail(DispatchStage::InputCopy, hr);
+        if (const HRESULT hr = surface->QueryInterface(texture.put()); FAILED(hr))
+            return Fail(DispatchStage::InputCopy, hr);
+        return S_OK;
+    }
+
+    Rendering::D3D11ComputeRunner::Readback CustomComputeBridgeEffect::ChooseReadback(bool wantCpu) const
+    {
+        if (!wantCpu) return Rendering::D3D11ComputeRunner::Readback::None;
+        return m_asyncReadback ? Rendering::D3D11ComputeRunner::Readback::Async
+                               : Rendering::D3D11ComputeRunner::Readback::Blocking;
     }
 
     HRESULT STDMETHODCALLTYPE CustomComputeBridgeEffect::Dispatch(
@@ -265,155 +397,55 @@ float4 main(
         UINT32 imageOutputH,
         std::vector<float>* outAnalysisFloats)
     {
-        if (!dc || !inputImages || inputCount == 0 || !inputImages[0])
-            return E_INVALIDARG;
-
-        // Pre-render each input to its own FP32 D3D11 texture. 96 DPI
-        // keeps GetImageLocalBounds in pixels.
-        float oldDpiX = 0, oldDpiY = 0;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
-
-        if (m_inputBitmaps.size() < inputCount)
-            m_inputBitmaps.resize(inputCount);
-
-        // Hold a reference per slot so the textures don't get released
-        // while we're building SRVs / driving the dispatch below.
-        std::vector<winrt::com_ptr<ID3D11Texture2D>> inputTextures;
-        inputTextures.reserve(inputCount);
-        UINT32 firstW = 0, firstH = 0;
-
-        for (UINT32 idx = 0; idx < inputCount; ++idx)
+        // Bindings, dims and the readback mode apply to this call only, on
+        // every exit path: the bindings are raw SRVs the caller owns.
+        struct ResetPerCallState
         {
-            ID2D1Image* inputImage = inputImages[idx];
-            if (!inputImage)
+            CustomComputeBridgeEffect* self;
+            ~ResetPerCallState()
             {
-                dc->SetDpi(oldDpiX, oldDpiY);
-                return E_INVALIDARG;
+                self->m_asyncReadback = false;
+                self->m_gpuBindingSrvs.clear();
+                self->m_gpuBindingSlots.clear();
+                self->m_dispatchX = self->m_dispatchY = self->m_dispatchZ = 1;
             }
+        } resetPerCallState{ this };
+        m_lastFailure = DispatchStage::None;
 
-            D2D1_RECT_F bounds{};
-            dc->GetImageLocalBounds(inputImage, &bounds);
-            D2D1_RECT_L px{};
-            if (HRESULT snapHr = SnapComputeInputRect(bounds, px); FAILED(snapHr))
-            {
-                dc->SetDpi(oldDpiX, oldDpiY);
-                return snapHr;
-            }
-            const UINT32 w = static_cast<UINT32>(px.right - px.left);
-            const UINT32 h = static_cast<UINT32>(px.bottom - px.top);
-            if (idx == 0) { firstW = w; firstH = h; }
+        // 1. Arguments.
+        if (!dc || !inputImages || inputCount == 0)
+            return Fail(DispatchStage::Arguments, E_INVALIDARG);
+        for (UINT32 slot = 0; slot < inputCount; ++slot)
+            if (!inputImages[slot]) return Fail(DispatchStage::Arguments, E_INVALIDARG);
 
-            winrt::com_ptr<ID2D1Bitmap1> inputBmp;
-            // Fast path: input is already an FP32-RGBA D2D bitmap of the
-            // expected size (e.g. produced by GraphEvaluator's
-            // PreRenderInputBitmap and shared across multiple deferred-
-            // compute consumers). Skip the per-dispatch DrawImage
-            // round-trip and grab the DXGI surface directly.
-            bool inputIsAlreadyFp32Bitmap = false;
-            {
-                winrt::com_ptr<ID2D1Bitmap1> asBitmap;
-                if (SUCCEEDED(inputImage->QueryInterface(asBitmap.put())) && asBitmap)
-                {
-                    auto fmt = asBitmap->GetPixelFormat();
-                    auto sz = asBitmap->GetPixelSize();
-                    if (fmt.format == DXGI_FORMAT_R32G32B32A32_FLOAT &&
-                        px.left == 0 && px.top == 0 &&
-                        sz.width == w && sz.height == h)
-                    {
-                        inputBmp = asBitmap;
-                        inputIsAlreadyFp32Bitmap = true;
-                    }
-                }
-            }
-
-            if (!inputIsAlreadyFp32Bitmap)
-            {
-                auto& cache = m_inputBitmaps[idx];
-                if (cache.bitmap && cache.width == w && cache.height == h)
-                {
-                    inputBmp = cache.bitmap;
-                }
-                else
-                {
-                    D2D1_BITMAP_PROPERTIES1 bp{};
-                    bp.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-                    bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-                    bp.dpiX = 96.0f;
-                    bp.dpiY = 96.0f;
-                    HRESULT hrAlloc = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bp, inputBmp.put());
-                    if (FAILED(hrAlloc)) { dc->SetDpi(oldDpiX, oldDpiY); return hrAlloc; }
-                    cache.bitmap = inputBmp;
-                    cache.width  = w;
-                    cache.height = h;
-                }
-
-                // Render upstream chain into our cached bitmap. Necessary
-                // when inputImage is a D2D effect output (not already an
-                // FP32 bitmap) -- the format-convert happens via DrawImage.
-                winrt::com_ptr<ID2D1Image> prevTarget;
-                dc->GetTarget(prevTarget.put());
-                dc->SetTarget(inputBmp.get());
-                dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-                dc->DrawImage(inputImage, D2D1::Point2F(
-                    -static_cast<float>(px.left), -static_cast<float>(px.top)));
-                dc->SetTarget(prevTarget.get());
-                dc->Flush();  // D2D batches DrawImage until Flush/EndDraw.
-            }
-
-            winrt::com_ptr<IDXGISurface> surface;
-            HRESULT hr = inputBmp->GetSurface(surface.put());
-            if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return hr; }
-            winrt::com_ptr<ID3D11Texture2D> tex;
-            hr = surface->QueryInterface(tex.put());
-            if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return hr; }
-            inputTextures.push_back(std::move(tex));
-        }
-
-        dc->SetDpi(oldDpiX, oldDpiY);
-
-        // Lazily initialize the runner with the same D3D11 device as the
-        // input texture (matches D2D's underlying device).
+        // 2. The shader, before the inputs: it is the cheap step, and a
+        // shader that cannot be created must not cost an input copy a frame.
         winrt::com_ptr<ID3D11Device> device;
-        inputTextures[0]->GetDevice(device.put());
+        if (const HRESULT hr = D3D11DeviceOf(dc, device); FAILED(hr))
+            return Fail(DispatchStage::Device, hr);
         if (!m_runner.IsInitialized())
             m_runner.Initialize(device.get());
+        if (const HRESULT hr = InstallPendingShader(device.get()); FAILED(hr))
+            return Fail(DispatchStage::ShaderCreate, hr);
+        if (!m_runner.HasShader())
+            return Fail(DispatchStage::NoShader, E_NOT_VALID_STATE);
 
-        if (m_bytecodeDirty)
+        // 3. Each input as an FP32 texture; 96 DPI keeps bounds in pixels.
+        std::vector<winrt::com_ptr<ID3D11Texture2D>> inputTextures(inputCount);
         {
-            // Switching between the baseline and a GPU-binding variant (a
-            // binding added or removed) reuses a shader created earlier
-            // rather than creating it again.
-            winrt::com_ptr<ID3D11ComputeShader> shader;
-            for (const auto& v : m_shaderVariants)
-                if (v.id == m_pendingId) { shader = v.shader; break; }
-            if (!shader)
-            {
-                HRESULT hr = device->CreateComputeShader(
-                    m_pendingBytecode.data(),
-                    m_pendingBytecode.size(),
-                    nullptr, shader.put());
-                if (FAILED(hr)) return hr;
-                constexpr size_t kMaxVariants = 4;
-                if (m_shaderVariants.size() >= kMaxVariants)
-                    m_shaderVariants.erase(m_shaderVariants.begin());
-                m_shaderVariants.push_back({ m_pendingId, shader });
-            }
-            m_runner.InstallPrecompiledShader(m_pendingBytecode, shader);
-            m_installedId = m_pendingId;
-            m_hasInstalled = true;
-            m_bytecodeDirty = false;
+            Rendering::ScopedDpi96 dpi(dc);
+            if (m_inputBitmaps.size() < inputCount)
+                m_inputBitmaps.resize(inputCount);
+            for (UINT32 slot = 0; slot < inputCount; ++slot)
+                if (const HRESULT hr = PrepareInputTexture(dc, inputImages[slot], slot, inputTextures[slot]); FAILED(hr))
+                    return hr;
         }
 
-        if (!m_runner.HasShader())
-            return E_NOT_VALID_STATE;
-
-        // Image-output texture (when requested). Created lazily and
-        // re-created on size change.
+        // 4. The image-output texture, when one is requested.
         if (imageOutputW > 0 && imageOutputH > 0)
         {
-            HRESULT hr = EnsureImageOutputTexture(device.get(), dc, imageOutputW, imageOutputH);
-            if (FAILED(hr)) return hr;
+            if (const HRESULT hr = EnsureImageOutputTexture(device.get(), dc, imageOutputW, imageOutputH); FAILED(hr))
+                return Fail(DispatchStage::ImageOutput, hr);
         }
         else if (m_imageOutputTex)
         {
@@ -423,31 +455,16 @@ float4 main(
             m_imageOutputH = 0;
         }
 
-        // Build the cbuffer bytes the runner expects: it prepends
-        // Width/Height itself, so cbufferData starts at user-param
-        // offset.
+        // 5. Dispatch. The runner prepends Width/Height to the cbuffer, and
+        // records the whole dispatch on its own deferred context (see
+        // D3D11ComputeRunner::Initialize), so no lock is taken here. A null
+        // outAnalysisFloats skips the CopyResource + Map.
         std::vector<BYTE> cbBytes;
         if (cbufferData && cbufferSize > 0)
             cbBytes.assign(cbufferData, cbufferData + cbufferSize);
-
-        // Drive the dispatch through the runner. Phase 8c: when caller
-        // passes outAnalysisFloats=nullptr it signals "no CPU consumer
-        // this frame" -- skip the runner's CopyResource + Map.
-        const bool readbackToCpu = (outAnalysisFloats != nullptr);
-        const auto readbackMode = !readbackToCpu
-            ? Rendering::D3D11ComputeRunner::Readback::None
-            : (m_asyncReadback ? Rendering::D3D11ComputeRunner::Readback::Async
-                               : Rendering::D3D11ComputeRunner::Readback::Blocking);
-
-        // Build a raw-pointer array of input textures for the runner.
         std::vector<ID3D11Texture2D*> inputRaw;
         inputRaw.reserve(inputTextures.size());
         for (const auto& t : inputTextures) inputRaw.push_back(t.get());
-
-        // The runner records the whole dispatch on its own deferred context
-        // and submits it as a single ExecuteCommandList -- see
-        // D3D11ComputeRunner::Initialize. No lock is needed here, and none is
-        // taken: compute has no dependency on Direct2D's threading.
 
         auto floats = m_runner.DispatchWithImageOutput(
             inputRaw,
@@ -456,18 +473,13 @@ float4 main(
             m_imageOutputTex.get(),
             m_dispatchX, m_dispatchY, m_dispatchZ,
             m_gpuBindingSrvs, m_gpuBindingSlots,
-            readbackMode);
+            ChooseReadback(outAnalysisFloats != nullptr));
 
         if (outAnalysisFloats)
             *outAnalysisFloats = std::move(floats);
 
-        // Reset per-frame state so the next dispatch starts clean.
-        m_asyncReadback = false;
-        m_gpuBindingSrvs.clear();
-        m_gpuBindingSlots.clear();
-        m_dispatchX = m_dispatchY = m_dispatchZ = 1;
         if (FAILED(m_runner.LastDispatchResult()))
-            return m_runner.LastDispatchResult();
+            return Fail(DispatchStage::Run, m_runner.LastDispatchResult());
 
         m_lastEvaluatedFrame++;
         return S_OK;

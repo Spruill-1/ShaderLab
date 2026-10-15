@@ -1,16 +1,14 @@
 #include "pch_engine.h"
 #include "../ShaderTestBench.h"
-#include "../TestCommon.h"
+#include "../TestSupport.h"
 
 #include <cstdio>
 #include <cmath>
 
 namespace ShaderLab::Tests
 {
-    // Phase 2 proof-of-concept: a small handful of tests on PQ_EOTF /
-    // PQ_InvEOTF + a no-NaN-on-out-of-range guard. Once we're happy with
-    // the harness shape, the full ~60-80-test catalog (decision: math test
-    // bench, plan.md Phase 2) lands as additional Tests/Math/*.cpp files.
+    // PQ_EOTF / PQ_InvEOTF round trips and a no-NaN guard for out-of-range
+    // input.
     void TestTransferFunctions(ShaderTestBench& bench)
     {
         std::printf("\n=== Math: Transfer Functions ===\n");
@@ -127,5 +125,13 @@ namespace ShaderLab::Tests
             TEST("ICtCpToScRGB is finite on out-of-domain ICtCp (saturate guard)",
                 !r.empty() && Near(r[0].x, 1.0f, 1e-6f));
         }
+    }
+}
+
+namespace ShaderLab::Tests
+{
+    namespace
+    {
+        SL_REGISTER_TEST(TestTransferFunctions, Tag::Gpu | Tag::Math, [] { TestTransferFunctions(Bench()); });
     }
 }

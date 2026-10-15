@@ -13,8 +13,9 @@
 // Fit to Shell measured 1.9 s per frame at 1 Mpx). Those tables are now built
 // here once per parameter change and uploaded as cbuffer arrays.
 //
-// Constants are copied verbatim from the HLSL. Tests/TestRunner.cpp compares
-// this port against the shader on the GPU, so the two cannot drift silently.
+// Constants are copied verbatim from the HLSL. Tests/Math/ColorMatrixTests.cpp
+// compares this port against the shader on the GPU, so the two cannot drift
+// silently.
 // Math is in double; the HLSL is float, so expect ~1e-6 relative agreement.
 namespace ShaderLab::Effects::ColorMathCpu
 {
@@ -75,6 +76,21 @@ namespace ShaderLab::Effects::ColorMathCpu
     }
 
     inline V3 XYZToScRGB(V3 xyz) { return Mul(XYZ_TO_REC709, xyz); }
+
+    // Linear Rec.709 to linear BT.2020 primaries (ITU-R BT.2087).
+    inline constexpr double REC709_TO_REC2020[9] = {
+        0.6274040, 0.3292820, 0.0433136,
+        0.0690970, 0.9195400, 0.0113612,
+        0.0163916, 0.0880132, 0.8955950 };
+
+    // An scRGB value (1.0 = 80 nits) as an HDR10 signal: BT.2020 primaries,
+    // then the PQ curve. A component still negative in BT.2020 lies outside
+    // that gamut, which HDR10 cannot carry, and encodes as 0.
+    inline V3 ScRGBToHdr10(V3 rgb)
+    {
+        const V3 bt2020 = Mul(REC709_TO_REC2020, { rgb.x * 80.0, rgb.y * 80.0, rgb.z * 80.0 });
+        return { PQ_InvEOTF(bt2020.x), PQ_InvEOTF(bt2020.y), PQ_InvEOTF(bt2020.z) };
+    }
 
     inline V3 ScRGBToICtCp(V3 rgb)
     {

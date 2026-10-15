@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "RenderEngine.h"
+#include "DeviceStack.h"
 
 #include <microsoft.ui.xaml.media.dxinterop.h>
 
@@ -28,13 +29,9 @@ namespace ShaderLab::Rendering
     void RenderEngine::Shutdown()
     {
         ReleaseRenderTarget();
-        // P7: release the offscreen pair too. These hold raw D3D textures +
-        // D2D bitmap wrappers for the render-thread offscreen-blit path. If
-        // we don't drop them here, a SwitchAdapter teardown leaves stale
-        // references to the OLD device, EnsureOffscreenTargets sees the
-        // bitmaps still populated at the right size and skips recreate, and
-        // every subsequent EndDraw fails (~40% of frames) because the
-        // bitmaps target a destroyed device.
+        // The offscreen pair belongs to this device. Kept across an adapter
+        // switch, EnsureOffscreenTargets would see the right size, skip the
+        // recreate, and every later EndDraw would target the old device.
         ReleaseOffscreenTargets();
 
         // Clear the swap chain reference from the XAML panel BEFORE
@@ -57,7 +54,7 @@ namespace ShaderLab::Rendering
 
         m_swapChain = nullptr;
         m_d2dDeviceContext = nullptr;
-        m_renderD2dContext = nullptr; // P7: dedicated render-thread context.
+        m_renderD2dContext = nullptr;
         m_d2dDevice = nullptr;
         m_d2dFactory = nullptr;
         m_gpuTimer.Shutdown();
@@ -73,139 +70,35 @@ namespace ShaderLab::Rendering
 
     void RenderEngine::CreateDeviceResources(DevicePreference devicePref)
     {
-        // --- DXGI Factory ---
-        UINT factoryFlags = 0;
-        winrt::check_hresult(
-            CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(m_dxgiFactory.put())));
-
-        // --- D3D11 Device ---
-        UINT d3dFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT; // required for D2D interop
-        D3D_FEATURE_LEVEL featureLevels[] = {
-            D3D_FEATURE_LEVEL_11_1,
-            D3D_FEATURE_LEVEL_11_0,
-        };
-
-        winrt::com_ptr<ID3D11Device> baseDevice;
-        winrt::com_ptr<ID3D11DeviceContext> baseContext;
-        HRESULT hr = E_FAIL;
-
-        if (devicePref == DevicePreference::Adapter)
+        DeviceStackOptions options;
+        options.adapterLuid = m_preferredAdapterLuid;
+        switch (devicePref)
         {
-            // Create on a specific adapter identified by LUID.
-            winrt::com_ptr<IDXGIAdapter1> adapter;
-            for (UINT i = 0; m_dxgiFactory->EnumAdapters1(i, adapter.put()) != DXGI_ERROR_NOT_FOUND; ++i)
-            {
-                DXGI_ADAPTER_DESC1 desc{};
-                adapter->GetDesc1(&desc);
-                if (desc.AdapterLuid.LowPart == m_preferredAdapterLuid.LowPart &&
-                    desc.AdapterLuid.HighPart == m_preferredAdapterLuid.HighPart)
-                {
-                    hr = D3D11CreateDevice(
-                        adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, d3dFlags,
-                        featureLevels, ARRAYSIZE(featureLevels),
-                        D3D11_SDK_VERSION, baseDevice.put(), nullptr, baseContext.put());
-                    break;
-                }
-                adapter = nullptr;
-            }
+        case DevicePreference::Default:  options.choice = AdapterChoice::Default;  break;
+        case DevicePreference::Hardware: options.choice = AdapterChoice::Hardware; break;
+        case DevicePreference::Warp:     options.choice = AdapterChoice::Warp;     break;
+        case DevicePreference::Adapter:  options.choice = AdapterChoice::Adapter;  break;
         }
+        DeviceStack stack;
+        std::wstring failedStep;
+        if (const HRESULT hr = CreateDeviceStack(options, stack, &failedStep); FAILED(hr))
+            throw winrt::hresult_error(hr, winrt::hstring(L"Creating the GPU device failed at " + failedStep));
 
-        if (FAILED(hr))
-        {
-            D3D_DRIVER_TYPE driverType = D3D_DRIVER_TYPE_HARDWARE;
-            if (devicePref == DevicePreference::Warp)
-                driverType = D3D_DRIVER_TYPE_WARP;
-
-            hr = D3D11CreateDevice(
-                nullptr, driverType, nullptr, d3dFlags,
-                featureLevels, ARRAYSIZE(featureLevels),
-                D3D11_SDK_VERSION, baseDevice.put(), nullptr, baseContext.put());
-
-            // Default: fallback to WARP if hardware fails.
-            if (FAILED(hr) && (devicePref == DevicePreference::Default || devicePref == DevicePreference::Adapter))
-            {
-                hr = D3D11CreateDevice(
-                    nullptr, D3D_DRIVER_TYPE_WARP, nullptr, d3dFlags,
-                    featureLevels, ARRAYSIZE(featureLevels),
-                    D3D11_SDK_VERSION, baseDevice.put(), nullptr, baseContext.put());
-            }
-        }
-        winrt::check_hresult(hr);
-
-        m_d3dDevice = baseDevice.as<ID3D11Device5>();
-        m_d3dContext = baseContext.as<ID3D11DeviceContext4>();
+        m_dxgiFactory = stack.dxgiFactory;
+        m_d3dDevice   = stack.d3dDevice;
+        m_d3dContext  = stack.d3dContext;
+        m_d2dFactory  = stack.d2dFactory;
+        m_d2dDevice   = stack.d2dDevice;
+        m_adapterName = stack.adapterName;
+        m_isWarp      = stack.isWarp;
         m_gpuTimer.Initialize(m_d3dDevice.get());
 
-        // Enable multithread protection for DXVA2 video decode on background threads.
-        {
-            winrt::com_ptr<ID3D10Multithread> mt;
-            m_d3dDevice.as(mt);
-            if (mt) mt->SetMultithreadProtected(TRUE);
-        }
-
-        // Query adapter info (GPU name, WARP detection).
-        {
-            winrt::com_ptr<IDXGIDevice> dxgiDev;
-            m_d3dDevice.as(dxgiDev);
-            if (dxgiDev)
-            {
-                winrt::com_ptr<IDXGIAdapter> adapter;
-                dxgiDev->GetAdapter(adapter.put());
-                if (adapter)
-                {
-                    DXGI_ADAPTER_DESC desc{};
-                    adapter->GetDesc(&desc);
-                    m_adapterName = desc.Description;
-                    // WARP adapter has VendorId 0x1414 (Microsoft) and DeviceId 0x8C
-                    m_isWarp = (desc.VendorId == 0x1414 && desc.DeviceId == 0x008C);
-                }
-            }
-        }
-
-        // --- D2D Factory ---
-        D2D1_FACTORY_OPTIONS d2dOptions{};
-        d2dOptions.debugLevel = D2D1_DEBUG_LEVEL_NONE;
-        winrt::check_hresult(
-            D2D1CreateFactory(
-                // Multi-threaded factory: the engine D2D context is owned by
-                // the render-worker thread but the live capture providers
-                // (DXGI Desktop Duplication, Windows Graphics Capture) deliver
-                // frames on background threads, and adapter switch / device
-                // teardown runs on the UI thread. ID2D1Multithread serializes
-                // factory + device + context calls automatically.
-                D2D1_FACTORY_TYPE_MULTI_THREADED,
-                __uuidof(ID2D1Factory7),
-                &d2dOptions,
-                m_d2dFactory.put_void()));
-
-        // --- D2D Device (from D3D11 device via DXGI) ---
-        winrt::com_ptr<IDXGIDevice4> dxgiDevice;
-        dxgiDevice = m_d3dDevice.as<IDXGIDevice4>();
-
-        winrt::com_ptr<ID2D1Device> baseD2DDevice;
-        winrt::check_hresult(
-            m_d2dFactory->CreateDevice(dxgiDevice.get(), baseD2DDevice.put()));
-        m_d2dDevice = baseD2DDevice.as<ID2D1Device6>();
-
-        // --- D2D Device Context ---
-        winrt::com_ptr<ID2D1DeviceContext> baseDC;
-        winrt::check_hresult(
-            m_d2dDevice->CreateDeviceContext(
-                D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
-                baseDC.put()));
-        m_d2dDeviceContext = baseDC.as<ID2D1DeviceContext5>();
-
-        // P7: dedicated render-thread D2D context, sharing the same
-        // multi-threaded D2D device. State (target/transform/dpi) is
-        // independent so the render worker's BeginDraw/EndDraw can't be
-        // corrupted by concurrent UI-thread draws on m_d2dDeviceContext
-        // (capture path, pixel inspector, etc.).
-        winrt::com_ptr<ID2D1DeviceContext> baseRenderDC;
-        winrt::check_hresult(
-            m_d2dDevice->CreateDeviceContext(
-                D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
-                baseRenderDC.put()));
-        m_renderD2dContext = baseRenderDC.as<ID2D1DeviceContext5>();
+        // Two contexts on the one device: the UI thread's, and the render
+        // worker's. Target, transform and DPI are per context, so the worker's
+        // BeginDraw/EndDraw cannot be disturbed by UI-thread draws (capture,
+        // pixel inspector).
+        winrt::check_hresult(stack.CreateDeviceContext(m_d2dDeviceContext));
+        winrt::check_hresult(stack.CreateDeviceContext(m_renderD2dContext));
     }
 
     // -----------------------------------------------------------------------
@@ -307,16 +200,9 @@ namespace ShaderLab::Rendering
         m_renderTarget = std::move(targetBitmap);
         m_d2dDeviceContext->SetTarget(m_renderTarget.get());
 
-        // The render context runs at a FIXED 96 DPI. It used to be set to
-        // the panel's composition scale (96 * CompositionScaleX, e.g. 144
-        // at 150% display scaling), but post-P7 every render-side consumer
-        // — the offscreen preview draw, evaluator bounds math, captures,
-        // output sinks — immediately flipped it to 96 for its work and
-        // restored afterwards. Those per-frame DPI changes invalidated
-        // every D2D1_PROPERTY_CACHED effect intermediate in the context
-        // (caches are DPI-referenced), silently defeating clean-subgraph
-        // caching. Pixel-exact sizing is handled with explicit transforms,
-        // not context DPI; the UI thread blits through its own context.
+        // Fixed 96 DPI: a per-frame DPI change invalidates every
+        // D2D1_PROPERTY_CACHED intermediate (caches are DPI-referenced).
+        // Pixel-exact sizing uses explicit transforms, not context DPI.
         m_d2dDeviceContext->SetDpi(96.0f, 96.0f);
     }
 
@@ -364,38 +250,6 @@ namespace ShaderLab::Rendering
     }
 
     // -----------------------------------------------------------------------
-    // Pipeline format change
-    // -----------------------------------------------------------------------
-
-    void RenderEngine::SetPipelineFormat(const PipelineFormat& format)
-    {
-        if (m_format == format)
-            return;
-
-        m_format = format;
-
-        if (!m_swapChain)
-            return;
-
-        // Must release RT before resizing/reformatting.
-        ReleaseRenderTarget();
-        m_d3dContext->Flush();
-
-        // ResizeBuffers with new format.
-        winrt::check_hresult(
-            m_swapChain->ResizeBuffers(
-                0,
-                m_width,
-                m_height,
-                m_format.dxgiFormat,
-                0));
-
-        ConfigureSwapChainColorSpace();
-        ApplyCompositionScaleMatrix();
-        CreateRenderTarget();
-    }
-
-    // -----------------------------------------------------------------------
     // Per-frame rendering
     // -----------------------------------------------------------------------
 
@@ -428,7 +282,7 @@ namespace ShaderLab::Rendering
     }
 
     // -----------------------------------------------------------------------
-    // Offscreen target pair (Phase 7 -- render-thread split)
+    // Offscreen target pair
     // -----------------------------------------------------------------------
 
     bool RenderEngine::EnsureOffscreenTargets(uint32_t width, uint32_t height)

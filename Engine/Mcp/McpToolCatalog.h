@@ -1,6 +1,6 @@
 #pragma once
 
-// Declarative MCP tool catalog (stdio-migration Step 3).
+// Declarative MCP tool catalog.
 //
 // One row per tool: the single-line tools/list JSON entry plus how a
 // tools/call invocation maps onto the route registry. The dispatcher

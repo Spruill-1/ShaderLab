@@ -38,7 +38,9 @@ namespace ShaderLab::Effects
     {
         for (const auto& d : m_descriptors)
         {
-            if (_wcsicmp(d.name.c_str(), name.data()) == 0)
+            // Lengths are explicit: a string_view need not be null-terminated.
+            if (::CompareStringOrdinal(d.name.data(), static_cast<int>(d.name.size()),
+                    name.data(), static_cast<int>(name.size()), TRUE) == CSTR_EQUAL)
                 return &d;
         }
         return nullptr;

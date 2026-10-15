@@ -7,28 +7,27 @@
 // node properties. Downstream effects can bind any property to one of
 // these fields to track the active display profile automatically.
 //
-// This is a pure walk over the graph + DisplayMonitor query. It is
-// intentionally engine-side so the GUI, the headless host, and any
-// MCP route that mutates the active profile can all keep Working
-// Space nodes in sync via the same code path.
+// A pure walk over the graph and one DisplayProfile value, so the GUI, the
+// headless host and the display-profile MCP routes share it and it needs no
+// device or DisplayMonitor.
 
 #include "../EngineExport.h"
 
 namespace ShaderLab::Graph
 {
-    class EffectGraph;
+    class GraphModel;
 }
 
 namespace ShaderLab::Rendering
 {
-    class DisplayMonitor;
+    struct DisplayProfile;
 
     // Walk the graph and refresh every "Working Space" parameter node's
-    // properties from `monitor.ActiveProfile()`. Marks the node dirty
-    // only when at least one field changed value, so callers can pump
-    // this every render tick without invalidating the cache when the
-    // profile is stable. Returns true if any node was modified.
+    // properties from `profile` (callers pass DisplayMonitor::ActiveProfile()).
+    // Marks the node dirty only when at least one field changed value, so
+    // callers can pump this every render tick without invalidating the cache
+    // when the profile is stable. Returns true if any node was modified.
     SHADERLAB_API bool UpdateWorkingSpaceNodes(
-        Graph::EffectGraph& graph,
-        DisplayMonitor& monitor);
+        Graph::GraphModel& graph,
+        const DisplayProfile& profile);
 }

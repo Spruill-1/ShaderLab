@@ -7,8 +7,8 @@
 // helpers that ship inside Effects/ShaderLabEffects.cpp. Each test author
 // writes a few lines of HLSL that compute a value and write it into a
 // `RWStructuredBuffer<float4> Result` slot; the bench compiles + dispatches
-// + reads back, and the caller asserts on the result via the existing
-// TEST() pattern in Tests/TestRunner.cpp.
+// + reads back, and the caller asserts on the result with TEST()
+// (Tests/TestCommon.h).
 //
 // Why test the HLSL directly (and not a C++ port)? The HLSL is what ships.
 // Maintaining a parallel C++ implementation of every helper would create

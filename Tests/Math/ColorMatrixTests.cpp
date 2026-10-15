@@ -1,6 +1,6 @@
 #include "pch_engine.h"
 #include "../ShaderTestBench.h"
-#include "../TestCommon.h"
+#include "../TestSupport.h"
 #include "Effects/ColorMathCpu.h"
 
 #include <cstdio>
@@ -190,9 +190,9 @@ namespace ShaderLab::Tests
 
         // ---- Wide-gamut (negative scRGB) survival --------------------------
         // scRGB carries wide-gamut colour as negative Rec.709 components, so
-        // the ICtCp round trip must preserve them. It previously clamped
-        // `max(rgb, 0)` on entry, which silently sRGB-clipped every
-        // wide-gamut pixel *before* any tone/gamut mapping ran.
+        // the ICtCp round trip must preserve them. A `max(rgb, 0)` on entry
+        // would silently sRGB-clip every wide-gamut pixel before any
+        // tone/gamut mapping ran.
         {
             // BT.2020 and DCI-P3 primaries at 80 nits, expressed in scRGB.
             // Each has at least one strongly negative component.
@@ -216,9 +216,9 @@ namespace ShaderLab::Tests
                 !r.empty() && r[0].x < 5e-3f);
         }
         {
-            // The specific regression: a negative component must NOT collapse
-            // to zero. Pin the sign and rough magnitude explicitly so a
-            // reintroduced clamp fails loudly rather than drifting.
+            // A negative component must not collapse to zero. Pin the sign
+            // and rough magnitude so a clamp fails loudly rather than
+            // drifting.
             auto r = bench.Run(R"(
                 float3 rt = ICtCpToScRGB(ScRGBToICtCp(float3(-0.8667, 1.0, 0.0596)));
                 Result[0] = float4(rt, 0);
@@ -237,14 +237,12 @@ namespace ShaderLab::Tests
                 !r.empty() && r[0].x < -0.09f && r[0].x > -0.11f);
         }
         {
-            // Regression: a single non-finite texel used to leave ICtCpToScRGB
-            // as roughly -10000 nits (scRGB -125), because clamp() with a NaN
-            // operand is not required to pick either bound and the observed
-            // result was -1, which PQ_EOTF_Signed then expands. One bad texel
-            // from a third-party HDR swapchain therefore poisoned every
-            // downstream mean, max and dE with a large, confidently-signed
-            // value. Bit patterns, not 0.0/0.0, so the optimizer cannot fold
-            // the inputs away at compile time.
+            // A non-finite texel must not leave ICtCpToScRGB at roughly
+            // -10000 nits (scRGB -125): clamp() with a NaN operand need not
+            // pick either bound, and a -1 there is what PQ_EOTF_Signed
+            // expands. One such texel from an HDR swapchain would poison
+            // every downstream mean, max and dE. Bit patterns, not 0.0/0.0,
+            // so the optimizer cannot fold the inputs away at compile time.
             auto r = bench.Run(R"(
                 float qnan = asfloat(0x7FC00000u);
                 float pinf = asfloat(0x7F800000u);
@@ -280,5 +278,13 @@ namespace ShaderLab::Tests
                 !r.empty() && r[0].x == 1.0f && r[0].y == 1.0f
                            && r[0].z == 1.0f && r[0].w == 0.0f);
         }
+    }
+}
+
+namespace ShaderLab::Tests
+{
+    namespace
+    {
+        SL_REGISTER_TEST(TestColorMatrices, Tag::Gpu | Tag::Math, [] { TestColorMatrices(Bench()); });
     }
 }

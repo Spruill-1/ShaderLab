@@ -31,7 +31,6 @@
       "PowerShell(pwsh -NoProfile -File .\\\\Tests\\\\RunHeadlessSmoke.ps1:*)",
       "PowerShell(pwsh -NoProfile -File .\\\\Tests\\\\RunBrokerSmoke.ps1:*)",
       "PowerShell(pwsh -NoProfile -File .\\\\Tests\\\\RunMathTests.ps1:*)",
-      "PowerShell(pwsh -NoProfile -File .\\\\Tests\\\\RunCliTests.ps1:*)",
       "PowerShell(.\\\\Tests\\\\RunHeadlessSmoke.ps1:*)",
       "PowerShell(.\\\\Tests\\\\RunBrokerSmoke.ps1:*)",
       "PowerShell(Get-Process:*)",

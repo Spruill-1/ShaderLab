@@ -1,11 +1,9 @@
 #pragma once
 
-// Session crypto for the MCP broker pipe (stdio-migration Step 4).
+// Session crypto for the MCP broker pipe.
 //
 // Ephemeral P-256 ECDH -> HKDF-SHA256 -> AES-256-GCM, all via BCrypt —
-// no new dependency. X25519 was rejected: CNG named-curve support was
-// unverified at the OS floor declared at the time (10.0.17763; since
-// raised to 10.0.22621) and buys nothing against an empty threat model.
+// no new dependency. X25519 would buy nothing against an empty threat model.
 //
 // WHY ENCRYPT AT ALL: not defence against a local attacker (same-user
 // isolation is not a hard boundary on Windows, and this must never be
@@ -93,9 +91,11 @@ namespace ShaderLab::Mcp
         bool isInitiator);
 
     // One AES-256-GCM direction. Nonce = 4 zero bytes + 8-byte LE seq —
-    // safe because each direction has its own key, and binding the seq
-    // into the nonce (plus the clear frame header into the AAD) makes a
-    // desynchronized or replayed sequence fail authentication.
+    // safe because each direction has its own key. Binding the seq into the
+    // nonce (plus the clear frame header into the AAD) makes a frame opened
+    // at any other seq fail authentication; a replay of a frame at its own
+    // seq still opens, so receivers drop any seq at or below the last one
+    // they opened.
     class SHADERLAB_API GcmChannel
     {
     public:

@@ -2,7 +2,9 @@
 #include "ShaderLabEffects.h"
 #include "ShaderCompiler.h"
 #include "ShaderVariants.h"
-#include "../Graph/EffectGraph.h"
+#include "BytecodeCache.h"
+#include "../Engine/Utf8.h"
+#include "../Graph/GraphModel.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -39,21 +41,17 @@ namespace ShaderLab::Effects
             return true;
         }
 
-        // Compile with the evaluator's generic-variant macros. Graph loading
-        // compiles without them, so its result cannot validate an effect
-        // that uses shaderlab_params.hlsli.
-        bool CompilesLikeTheEvaluator(const Graph::CustomEffectDefinition& def, std::wstring& error)
+        // Compile the baseline exactly as the evaluator requests it. Graph
+        // loading compiles without the variant macros, so its result cannot
+        // validate an effect that uses shaderlab_params.hlsli.
+        bool CompilesLikeTheEvaluator(const Graph::EffectNode& node, std::wstring& error)
         {
-            std::string hlsl(def.hlslSource.begin(), def.hlslSource.end());
-            for (auto& ch : hlsl) if (ch == '\r') ch = '\n';
-            const auto macroDefs = GenericVariantMacros(def);
-            std::vector<ShaderCompiler::MacroDef> macros;
-            for (const auto& [name, value] : macroDefs) macros.push_back({ name.c_str(), value.c_str() });
-            const std::string target =
-                def.shaderType == Graph::CustomShaderType::PixelShader ? "ps_5_0" : "cs_5_0";
-            auto result = ShaderCompiler::CompileFromString(hlsl, "UserEffect", "main", target, macros);
-            if (result.succeeded) return true;
-            error = result.ErrorMessage();
+            const auto& def = *node.customEffect;
+            const auto identity = CompileIdentityOf(node);
+            auto result = BytecodeCache::Instance().GetOrCompile(MakeVariantRequest(
+                def, identity.effectId, identity.effectVersion, ShaderTargetFor(def), 0, 0));
+            if (result.status == BytecodeStatus::Ready) return true;
+            error = result.errorMessage;
             return false;
         }
 
@@ -61,16 +59,6 @@ namespace ShaderLab::Effects
         {
             std::string narrow(text ? text : "");
             return std::wstring(narrow.begin(), narrow.end());
-        }
-
-        // Inverse of CreateNode's byte-wise widening of hlslSource. Characters
-        // above 255 can only appear in HLSL comments, so they become '?'.
-        std::string NarrowHlsl(const std::wstring& wide)
-        {
-            std::string narrow;
-            narrow.reserve(wide.size());
-            for (wchar_t ch : wide) narrow.push_back(ch < 256 ? static_cast<char>(ch) : '?');
-            return narrow;
         }
 
         ShaderLabEffectDescriptor DescriptorFromNode(const Graph::EffectNode& node,
@@ -84,7 +72,7 @@ namespace ShaderLab::Effects
             descriptor.shaderType = def.shaderType;
             descriptor.effectId = def.shaderLabEffectId.empty() ? node.name : def.shaderLabEffectId;
             descriptor.effectVersion = (std::max)(def.shaderLabEffectVersion, 1u);
-            descriptor.hlslSource = NarrowHlsl(def.hlslSource);
+            descriptor.hlslSource = WideToUtf8(def.hlslSource);
             descriptor.inputNames = def.inputNames;
             descriptor.lookupInputCount = def.lookupInputCount;
             descriptor.variadicInputs = def.variadicInputs;
@@ -94,6 +82,10 @@ namespace ShaderLab::Effects
             descriptor.threadGroupX = def.threadGroupX;
             descriptor.threadGroupY = def.threadGroupY;
             descriptor.threadGroupZ = def.threadGroupZ;
+            descriptor.nodeKind = def.nodeKind;
+            descriptor.dispatchShape = def.dispatchShape;
+            descriptor.outputExtent = def.outputExtent;
+            descriptor.injectedConstants = def.injectedConstants;
             // Read back off the node what CreateNode derives these from.
             descriptor.dataOnly = node.outputPins.empty();
             // Both compute shader kinds can produce an image.
@@ -164,73 +156,97 @@ namespace ShaderLab::Effects
 
         for (const auto& file : files)
         {
-            const std::wstring fileName = file.filename().wstring();
-            auto fail = [&](const std::wstring& why) { report.errors.push_back(fileName + L": " + why); };
-
             std::wstring text, readError;
-            if (!ReadUtf8File(file, text, readError)) { fail(readError); continue; }
-
-            Graph::EffectGraph graph;
-            std::wstring category = L"User";
-            try
+            if (!ReadUtf8File(file, text, readError))
             {
-                graph = Graph::EffectGraph::FromJson(winrt::hstring(text));
-                auto root = WDJ::JsonObject::Parse(text);
-                if (root.HasKey(L"category"))
-                {
-                    std::wstring fileCategory(root.GetNamedString(L"category"));
-                    if (!fileCategory.empty()) category = fileCategory;
-                }
+                report.errors.push_back(file.filename().wstring() + L": " + readError);
+                continue;
             }
-            catch (winrt::hresult_error const& error) { fail(L"not a ShaderLab graph (" + std::wstring(error.message()) + L")"); continue; }
-            catch (std::exception const& error)       { fail(Widen(error.what())); continue; }
+            RegisterEffectsFromJson(text, file.wstring(), /*compileCheck*/ true, report);
+        }
+        return report;
+    }
 
-            bool anyShader = false;
-            for (const auto& node : graph.Nodes())
+    std::vector<ShaderLabEffectDescriptor> ShaderLabEffects::ParseEffectsFromJson(
+        std::wstring_view json, const std::wstring& source, UserEffectLoadReport& report)
+    {
+        std::vector<ShaderLabEffectDescriptor> descriptors;
+        const std::wstring label = fs::path(source).filename().wstring();
+        auto fail = [&](const std::wstring& why) { report.errors.push_back(label + L": " + why); };
+
+        Graph::GraphModel graph;
+        std::wstring category = L"User";
+        try
+        {
+            const winrt::hstring text(json);
+            graph = Graph::GraphModel::FromJson(text);
+            auto root = WDJ::JsonObject::Parse(text);
+            if (root.HasKey(L"category"))
             {
-                if (!node.customEffect.has_value()) continue;   // sources, D2D built-ins, outputs
-                anyShader = true;
-                std::wstring compileError;
-                if (!CompilesLikeTheEvaluator(*node.customEffect, compileError))
-                {
-                    // Report only the first line of the compiler log.
-                    auto lineEnd = compileError.find_first_of(L"\r\n");
-                    fail(L"'" + node.name + L"' does not compile: " + compileError.substr(0, lineEnd));
-                    continue;
-                }
+                std::wstring fileCategory(root.GetNamedString(L"category"));
+                if (!fileCategory.empty()) category = fileCategory;
+            }
+        }
+        catch (winrt::hresult_error const& error) { fail(L"not a ShaderLab graph (" + std::wstring(error.message()) + L")"); return descriptors; }
+        catch (std::exception const& error)       { fail(Widen(error.what())); return descriptors; }
 
-                auto incoming = DescriptorFromNode(node, category, file);
+        for (const auto& node : graph.Nodes())
+            if (node.customEffect.has_value())   // not sources, D2D built-ins, outputs
+                descriptors.push_back(DescriptorFromNode(node, category, fs::path(source)));
+        if (descriptors.empty()) fail(L"contains no shader nodes");
+        return descriptors;
+    }
 
-                // A taken id or name is a conflict: ids key the upgrade path,
-                // names key the menu and graph_add_node.
-                auto existing = std::find_if(m_effects.begin(), m_effects.end(),
-                    [&](const ShaderLabEffectDescriptor& effect)
-                    {
-                        return effect.effectId == incoming.effectId ||
-                               _wcsicmp(effect.name.c_str(), incoming.name.c_str()) == 0;
-                    });
-                if (existing != m_effects.end())
+    std::vector<std::wstring> ShaderLabEffects::RegisterEffectsFromJson(
+        std::wstring_view json, const std::wstring& source, bool compileCheck, UserEffectLoadReport& report,
+        const std::function<bool(const ShaderLabEffectDescriptor&)>& accept)
+    {
+        std::vector<std::wstring> registered;
+        const std::wstring label = fs::path(source).filename().wstring();
+        auto fail = [&](const std::wstring& why) { report.errors.push_back(label + L": " + why); };
+
+        for (auto& incoming : ParseEffectsFromJson(json, source, report))
+        {
+            if (accept && !accept(incoming)) continue;
+            std::wstring compileError;
+            if (compileCheck && !CompilesLikeTheEvaluator(CreateNode(incoming), compileError))
+            {
+                // Report only the first line of the compiler log.
+                auto lineEnd = compileError.find_first_of(L"\r\n");
+                fail(L"'" + incoming.name + L"' does not compile: " + compileError.substr(0, lineEnd));
+                continue;
+            }
+
+            // A taken id or name is a conflict: ids key the upgrade path,
+            // names key the menu and graph_add_node.
+            auto existing = std::find_if(m_effects.begin(), m_effects.end(),
+                [&](const ShaderLabEffectDescriptor& effect)
                 {
-                    if (ResolveUserEffectConflict(*existing, incoming) == UserEffectConflict::Reject)
-                    {
-                        if (!existing->IsUserEffect())
-                            fail(L"'" + incoming.name + L"' has the id or name of the built-in '" +
-                                 existing->name + L"', and built-ins are never replaced; not loaded");
-                        else
-                            fail(L"'" + incoming.name + L"' v" + std::to_wstring(incoming.effectVersion) +
-                                 L" is not newer than v" + std::to_wstring(existing->effectVersion) + L" from " +
-                                 fs::path(existing->sourcePath).filename().wstring() + L"; not loaded");
-                        continue;
-                    }
-                    report.loaded.push_back(incoming.name);
-                    *existing = std::move(incoming);   // in place: pointers into m_effects stay valid
+                    return effect.effectId == incoming.effectId ||
+                           _wcsicmp(effect.name.c_str(), incoming.name.c_str()) == 0;
+                });
+            if (existing != m_effects.end())
+            {
+                if (ResolveUserEffectConflict(*existing, incoming) == UserEffectConflict::Reject)
+                {
+                    if (!existing->IsUserEffect())
+                        fail(L"'" + incoming.name + L"' has the id or name of the built-in '" +
+                             existing->name + L"', and built-ins are never replaced; not loaded");
+                    else
+                        fail(L"'" + incoming.name + L"' v" + std::to_wstring(incoming.effectVersion) +
+                             L" is not newer than v" + std::to_wstring(existing->effectVersion) + L" from " +
+                             fs::path(existing->sourcePath).filename().wstring() + L"; not loaded");
                     continue;
                 }
                 report.loaded.push_back(incoming.name);
-                m_effects.push_back(std::move(incoming));
+                registered.push_back(incoming.name);
+                *existing = std::move(incoming);   // in place: pointers into m_effects stay valid
+                continue;
             }
-            if (!anyShader) fail(L"contains no shader nodes");
+            report.loaded.push_back(incoming.name);
+            registered.push_back(incoming.name);
+            m_effects.push_back(std::move(incoming));
         }
-        return report;
+        return registered;
     }
 }

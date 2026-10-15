@@ -87,8 +87,14 @@ model, evaluator, bindings, bytecode cache, `GraphUiSnapshot`, dispatcher, MCP r
 + JSON-RPC contracts, broker frame codec / crypto / peer identity, GPU-binding
 matrices, and the HLSL math bench.
 
+Cases register themselves (`SL_TEST_CASE` in `Tests/TestCommon.h`), so a subset is a
+flag away: `--tag fast` (no device), `--tag video`, `--tag mcp`, `--tag math`,
+`--filter <name>` (substring of the case name), `--list` to see cases and tags.
+`--require-fixtures` turns a skip for a missing fixture into a failure. A failing
+`TEST` prints the case and `file:line`.
+
 Other suites: `Tests\RunHeadlessSmoke.ps1`, `Tests\RunBrokerSmoke.ps1`,
-`Tests\RunCliTests.ps1`, `Tests\RunMathTests.ps1`, and `Tests\RunTests.ps1` (MCP —
+`Tests\RunMathTests.ps1` (`--tag math`), and `Tests\RunTests.ps1` (MCP —
 see the **shaderlab-run** skill).
 
 ## Headless probes

@@ -78,8 +78,8 @@ are dropped, not slowed.
   evaluator's separate fields-changed set, which reaches binding consumers but
   not image consumers. Other sources keep the general rule: a bound value
   that moves dirties the node.
-- **Free running.** `VideoSourceProvider::Tick(delta)` advances its own
-  position by wall time times `Speed()` and wraps at the end when looping;
+- **Free running.** `VideoSourceProvider::Tick(delta)` (after `Play()`)
+  advances its own position by wall time and wraps at the end when looping;
   `RequestNextFrame()` steps one frame. Neither is used by the graph, which
   always drives video through `Time`.
 
@@ -95,7 +95,7 @@ frame. `Time` is not offset by it, so `Time` T shows the frame encoded at
 T minus that delay, and the last frames of such a clip (two, for the test
 clips) are never shown; this is open.
 
-`Tests/VideoPlaybackTests.cpp` measures all of this in real time against
+`Tests/Video/VideoPlaybackTests.cpp` measures all of this in real time against
 frame-indexed clips; see `TestVideoPlaybackRate`, `TestVideoPlaybackControl`,
 `TestVideoSeekWhilePlaying` (scrubbing a running Clock, including a clip with
 one keyframe in 10 s) and `TestVideoPastEndShowsBlack`.

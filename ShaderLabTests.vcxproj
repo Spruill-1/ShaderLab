@@ -77,7 +77,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>d3d11.lib;d2d1.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;windowscodecs.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;dwrite.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;d2d1.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;windowscodecs.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
@@ -98,6 +98,7 @@
     <ClInclude Include="EngineExport.h" />
     <ClInclude Include="pch_engine.h" />
     <ClInclude Include="Tests\TestCommon.h" />
+    <ClInclude Include="Tests\TestSupport.h" />
     <ClInclude Include="Tests\ShaderTestBench.h" />
   </ItemGroup>
   <ItemGroup>
@@ -105,13 +106,48 @@
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Tests\TestRunner.cpp" />
-    <ClCompile Include="Tests\VideoPlaybackTests.cpp" />
+    <ClCompile Include="Tests\TestSupport.cpp" />
+    <ClCompile Include="Tests\FixtureManifestTests.cpp" />
     <ClCompile Include="Tests\ShaderTestBench.cpp" />
-    <ClCompile Include="Tests\Math\TransferFunctionTests.cpp" />
+    <ClCompile Include="Tests\Effects\BytecodeCacheTests.cpp" />
+    <ClCompile Include="Tests\Effects\EffectCatalogTests.cpp" />
+    <ClCompile Include="Tests\Effects\ShaderCompilerTests.cpp" />
+    <ClCompile Include="Tests\Effects\HlslScaffoldTests.cpp" />
+    <ClCompile Include="Tests\Effects\StatisticsTests.cpp" />
+    <ClCompile Include="Tests\Effects\ToneMapReferenceTests.cpp" />
+    <ClCompile Include="Tests\Effects\UserEffectLibraryTests.cpp" />
+    <ClCompile Include="Tests\Effects\VariantTests.cpp" />
+    <ClCompile Include="Tests\Graph\GraphContractTests.cpp" />
+    <ClCompile Include="Tests\Graph\GraphEditsTests.cpp" />
+    <ClCompile Include="Tests\Graph\GraphLayoutTests.cpp" />
+    <ClCompile Include="Tests\Graph\GraphModelTests.cpp" />
+    <ClCompile Include="Tests\Graph\GraphPolicyTests.cpp" />
     <ClCompile Include="Tests\Math\ColorMatrixTests.cpp" />
-    <ClCompile Include="Tests\Math\MobiusReinhardTests.cpp" />
     <ClCompile Include="Tests\Math\DeltaETests.cpp" />
     <ClCompile Include="Tests\Math\GamutTests.cpp" />
+    <ClCompile Include="Tests\Math\MobiusReinhardTests.cpp" />
+    <ClCompile Include="Tests\Math\TransferFunctionTests.cpp" />
+    <ClCompile Include="Tests\Mcp\McpRouteTests.cpp" />
+    <ClCompile Include="Tests\Mcp\McpRouterTests.cpp" />
+    <ClCompile Include="Tests\Mcp\McpTransportTests.cpp" />
+    <ClCompile Include="Tests\Hosts\BrokerShimTests.cpp" />
+    <ClCompile Include="Tests\Hosts\HeadlessArgsTests.cpp" />
+    <ClCompile Include="ShaderLabHeadless\HeadlessArgs.cpp" />
+    <ClCompile Include="ShaderLabMcpBroker\BrokerPipeIo.cpp" />
+    <ClCompile Include="ShaderLabMcpBroker\Shim.cpp" />
+    <ClCompile Include="Tests\Persistence\PackageTests.cpp" />
+    <ClCompile Include="Tests\Api\EffectGraphApiTests.cpp" />
+    <ClCompile Include="Tests\Effects\EffectBlobTests.cpp" />
+    <ClCompile Include="Tests\Rendering\ComputeTests.cpp" />
+    <ClCompile Include="Tests\Rendering\EvaluatorTests.cpp" />
+    <ClCompile Include="Tests\Rendering\GpuBindingTests.cpp" />
+    <ClCompile Include="Tests\Rendering\HostLoopTests.cpp" />
+    <ClCompile Include="Tests\Rendering\ReadbackTests.cpp" />
+    <ClCompile Include="Tests\Rendering\PixelTraceTests.cpp" />
+    <ClCompile Include="Tests\Sources\ImageLoaderTests.cpp" />
+    <ClCompile Include="Tests\Sources\SourceProviderTests.cpp" />
+    <ClCompile Include="Tests\Video\VideoPlaybackTests.cpp" />
+    <ClCompile Include="Tests\Video\VideoSourceTests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="ShaderLabEngine.vcxproj">

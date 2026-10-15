@@ -266,7 +266,7 @@
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
 
-            <!-- Cache reaper broom (Phase 8 p8-status-bar-button). Click
+            <!-- Cache reaper broom. Click
                  runs both reapers (graph temps + shader bytecode cache)
                  and reports freed bytes in the adjacent text block. -->
             <StackPanel Orientation="Horizontal" Grid.Column="0" Margin="0,0,12,0"

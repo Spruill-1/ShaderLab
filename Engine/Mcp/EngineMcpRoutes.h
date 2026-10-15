@@ -1,26 +1,13 @@
 #pragma once
 
-// Engine MCP routes — engine-side route handlers for the MCP server.
+// The engine's MCP routes, registered by both hosts through
+// RegisterEngineRoutes. They live under Engine/Mcp/Routes/, one file per
+// concern. Routes that need host UI (the canvas snapshot, preview and graph
+// view, GPU switching) are the GUI's own, in MainWindow.McpRoutes.cpp.
 //
-// Phase 7 architecture: the McpRouter (né McpHttpServer, renamed in
-// stdio-migration Step 2) runs in the engine DLL. The GUI app and
-// headless host both instantiate it and register a mix of routes:
-//
-//   * Engine-pure routes (graph mutation, render capture, pixel
-//     readback, image stats, etc) live in this TU and are registered
-//     by both apps via `RegisterEngineRoutes`.
-//
-//   * UI-coupled routes (graph_snapshot of the canvas, preview pan/zoom,
-//     graph view tools) stay in `MainWindow.McpRoutes.cpp` because
-//     they touch WinUI controls that don't exist headless.
-//
-// Routes execute through `IEngineCommandSink::Dispatch`, which marshals
-// the closure to the right thread for the host:
-//   * GUI app: marshals to the RENDER WORKER thread via
-//     RenderThreadDispatcher::DispatchSync (post-P7 the worker is the
-//     single graph writer; see MainWindow.McpRoutes.cpp).
-//   * Headless host: synchronous direct call on the session client's
-//     run thread (single-threaded MCP access serializes requests).
+// A route reads its arguments, then runs its engine work through
+// IEngineCommandSink::Dispatch, which the host runs on the thread that owns
+// the graph: the GUI's render worker, or headless's session thread.
 
 #include "pch_engine.h"
 #include "../../EngineExport.h"
@@ -36,7 +23,7 @@ namespace ShaderLab
 }
 namespace ShaderLab::Graph
 {
-    class EffectGraph;
+    class GraphModel;
 }
 namespace ShaderLab::Rendering
 {
@@ -50,89 +37,54 @@ namespace ShaderLab::Effects
 
 namespace ShaderLab::Mcp
 {
-    // Bag of references the engine routes need. Built fresh by the host
-    // each time Dispatch fires so the references are valid for the
-    // closure's lifetime. Members are non-owning.
+    // What a route's closure works on. The host builds it for each Dispatch;
+    // the members are non-owning and valid for the closure's lifetime.
     struct EngineContext
     {
-        Graph::EffectGraph*           graph{ nullptr };
+        Graph::GraphModel*           graph{ nullptr };
         Rendering::GraphEvaluator*    evaluator{ nullptr };
         Rendering::DisplayMonitor*    displayMonitor{ nullptr };
         Effects::SourceNodeFactory*   sourceFactory{ nullptr };
-        ID2D1DeviceContext*           dc{ nullptr };
+        ID2D1DeviceContext5*          dc{ nullptr };
         ID3D11Device*                 d3dDevice{ nullptr };
         ID3D11DeviceContext*          d3dContext{ nullptr };
 
-        // Force a fresh evaluation of the graph if the host has any
-        // dirty propagation / tick logic. Headless: runs the eval closure
-        // (runEval). GUI: calls RenderFrameToOffscreen on the render worker
-        // so dirty nodes are repopulated before readback / capture.
-        // Returning void; cannot fail.
-        std::function<void()>         renderFrame;
+        // Renders one frame, synchronously, in which nodeId is evaluated even
+        // when nothing displayed needs it; routes call it before reading a
+        // node back. It runs on the dispatch thread inside the closure, so it
+        // must not dispatch again, and it may add or remove nodes (re-resolve
+        // node pointers after it). The GUI renders an offscreen frame on the
+        // render worker; headless evaluates the whole graph. Unset: no frame
+        // is rendered.
+        std::function<void(uint32_t nodeId)> renderFrame;
 
-        // Optional: renderFrame that also evaluates nodeId when nothing else
-        // needs it. The GUI evaluates only what the preview and output windows
-        // need, so a readback of any other node would never be ready. Unset:
-        // routes call renderFrame.
-        std::function<void(uint32_t)> renderFrameFor;
-
-        // Host-specific "preview node" id for `GET /graph` responses.
-        // GUI returns m_previewNodeId; headless returns 0 (no preview pane).
-        // Optional — if unset, routes that surface previewNodeId default
-        // to 0.
+        // The preview node for GET /graph. Unset: 0 (headless has no preview).
         std::function<uint32_t()>     getPreviewNodeId;
 
-        // Active pipeline-format display name (e.g. "scRGB FP16") for
-        // /display/info. The GUI reads RenderEngine::ActiveFormat();
-        // headless supplies the FormatScRgbFP16 constant. Optional — if
-        // unset the route reports "unknown". This is the EngineContext
-        // extension that made get_display_info engine-pure
-        // (stdio-migration Step 2; deferred from Step 1 pending the ABI
-        // bump).
+        // The pipeline format's display name for /display/info. Unset: "unknown".
         std::function<std::wstring()> getPipelineFormatName;
 
-        // Optional host-state shim for the most-recently-loaded ICC
-        // profile (so it can appear under "loadedIcc" in the
-        // /display/profiles response and be re-applied through the
-        // profile dropdown without re-parsing the file). The GUI
-        // installs both; headless leaves both null.
+        // The last ICC profile loaded, reported as "loadedIcc" by
+        // /display/profiles and offered again by the GUI's profile picker.
+        // The GUI installs both; headless neither.
         std::function<std::optional<Rendering::DisplayProfile>()> getLoadedIccProfile;
         std::function<void(const Rendering::DisplayProfile&)>     setLoadedIccProfile;
     };
 
-    // Functional / closure-based command sink (Q4 architecture choice).
-    // The route handler hands a closure to Dispatch; the host runs it
-    // on the right thread and returns the Mcp::Response back
-    // to the listener thread that the route returns on.
-    //
-    // Engine state mutations also fire **events** (the OnXxx virtuals
-    // below). Hosts override them to keep their own UI / output windows
-    // / preview selector in sync — mirroring the path the user's own
-    // UI interactions take. Events fire **inside** Dispatch (i.e., on
-    // the dispatch thread) immediately after the closure mutates engine
-    // state, so the GUI sees changes synchronously and the engine route
-    // returns to the listener with the UI already up-to-date.
+    // Runs route closures on the host's graph thread and tells the host what
+    // changed. The On* events fire inside Dispatch, on the dispatch thread,
+    // right after the closure's mutation, so a host can bring its UI in line
+    // the way its own controls would; the defaults do nothing.
     class SHADERLAB_API IEngineCommandSink
     {
     public:
         virtual ~IEngineCommandSink() = default;
 
-        // Run `closure` on whichever thread is appropriate for this
-        // host. Closure receives a freshly-built EngineContext.
-        // Synchronous: the calling thread blocks until the closure
-        // completes. Closure exceptions propagate.
+        // Runs `closure` on the host's graph thread with a fresh
+        // EngineContext and blocks until it returns. Exceptions propagate.
         virtual Response Dispatch(
             std::function<Response(EngineContext&)> closure) = 0;
 
-        // ---- Engine state-change events (UI hooks) -----------------------
-        //
-        // Routes call these AFTER successful engine mutation, from
-        // inside the Dispatch closure. Default impls are no-ops; the
-        // headless host doesn't override them. The GUI host wires them
-        // to the same methods that handle native user UI interactions
-        // (e.g. OnNodeAdded -> PopulatePreviewNodeSelector + AutoLayout,
-        // matching what happens when the user adds a node via the
-        // toolbar).
         virtual void OnNodeAdded(uint32_t /*nodeId*/) {}
         virtual void OnNodeRemoved(uint32_t /*nodeId*/) {}
         virtual void OnNodeChanged(uint32_t /*nodeId*/) {}
@@ -148,24 +100,26 @@ namespace ShaderLab::Mcp
         // shutdown. The default leaves it in the temp folder.
         virtual void OnGraphMediaDirChanged(const std::wstring& /*extractDir*/) {}
 
-        // Custom effect HLSL recompiled: shader bytecode + parameters
-        // changed. GUI rebuilds the canvas layout (parameter pins may
-        // have changed), enforces unique effect names, and refreshes
-        // the Add Node flyout. Default = no-op (headless).
+        // A custom effect was recompiled: its bytecode and parameters, and
+        // so its pins, may have changed.
         virtual void OnCustomEffectRecompiled(uint32_t /*nodeId*/) {}
 
-        // Active display profile changed: simulated / live / ICC. GUI
-        // marks all nodes dirty, refreshes the status bar and profile
-        // selector to match. Headless = no-op. The route already runs
-        // Rendering::UpdateWorkingSpaceNodes inside its closure so
-        // Working Space nodes are sync'd before this fires.
+        // The active display profile changed (simulated, live or ICC).
+        // Working Space nodes already follow it when this fires.
         virtual void OnDisplayProfileChanged() {}
     };
 
-    // Register all engine-pure routes on the given server. Idempotent:
-    // call once per process. The sink must outlive the server (handlers
-    // capture it by reference).
+    // Registers the engine routes on `server`, once. The sink must outlive
+    // the server: handlers hold it by reference.
     SHADERLAB_API void RegisterEngineRoutes(
+        McpRouter& server,
+        IEngineCommandSink& sink);
+
+    // Registers POST /render/video (Rendering/VideoExport). Separate from
+    // RegisterEngineRoutes because the export runs inside one Dispatch for
+    // its whole encode: only a host whose dispatch thread can block that
+    // long (headless) registers it.
+    SHADERLAB_API void RegisterVideoExportRoute(
         McpRouter& server,
         IEngineCommandSink& sink);
 }

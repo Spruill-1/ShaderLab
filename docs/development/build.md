@@ -102,19 +102,23 @@ git commit -m "Bump miniz to <new-tag>"
 
 GitHub Actions workflow `.github/workflows/release.yml` runs as a matrix (`x64`, `ARM64`). Just before MSBuild, the workflow injects the unsigned-namespace OID into the manifest's `Publisher` so that the resulting MSIX is installable via `Add-AppxPackage -AllowUnsigned`. The in-repo `Package.appxmanifest` keeps the plain `CN=ShaderLab` publisher so signed F5 deploys keep working.
 
-## Required Libraries (linked via vcxproj)
+## Required Libraries
 
-| Library | Purpose |
-|---------|---------|
-| `d3d11.lib` | Direct3D 11 device and context |
-| `d2d1.lib` | Direct2D rendering and effects |
-| `dxgi.lib` | DXGI swap chain, HDR output queries |
-| `d3dcompiler.lib` | Runtime HLSL compilation (D3DCompile) |
-| `dxguid.lib` | DirectX GUIDs (IID_ID2D1Factory, etc.) |
-| `windowscodecs.lib` | WIC image loading |
-| `mfplat.lib`, `mfreadwrite.lib`, `mfuuid.lib` | Media Foundation video source decoding |
-| `mscms.lib` | ICC profile reading (Image Color Management) |
-| `windowsapp.lib` | Windows Graphics Capture interop (CreateDirect3D11DeviceFromDXGIDevice) |
+Linked through each project's `AdditionalDependencies`, except where a source file pulls its own in with `#pragma comment(lib, ...)`:
+
+| Library | Purpose | Linked by |
+|---------|---------|-----------|
+| `d3d11.lib` | Direct3D 11 device and context | engine, app, headless, tests |
+| `d2d1.lib` | Direct2D rendering and effects | engine, app, headless, tests |
+| `dxgi.lib` | DXGI swap chain, HDR output queries | engine, app, headless, tests |
+| `d3dcompiler.lib` | Runtime HLSL compilation (D3DCompile) | engine, app, headless, tests |
+| `dxguid.lib` | DirectX GUIDs (IID_ID2D1Factory, etc.) | engine, app, headless, tests |
+| `windowscodecs.lib` | WIC image loading and PNG / JPEG XR encode | engine, app, headless, tests (and `Rendering/ImageCapture.cpp`) |
+| `mfplat.lib`, `mfreadwrite.lib`, `mfuuid.lib` | Media Foundation video source decoding | engine, app, headless, tests |
+| `mscms.lib` | ICC profile reading (Image Color Management) | engine (and `Rendering/IccProfileParser.cpp`) |
+| `windowsapp.lib` | WinRT umbrella: Windows Graphics Capture interop, DirectWrite for the node-graph canvas | engine, broker; the app through the WinUI defaults |
+| `bcrypt.lib` | MCP session crypto (`Engine/Mcp/McpCrypto.cpp`) | tests, and every binary compiling `McpCrypto.cpp` |
+| `shell32.lib`, `CoreMessaging.lib` | Known folders; the system `DispatcherQueue` `DisplayInformation` needs | app (`App.xaml.cpp`, `MainWindow.xaml.cpp`) |
 
 ---
 

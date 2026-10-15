@@ -77,7 +77,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>d3d11.lib;d2d1.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;windowscodecs.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;dwrite.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;d2d1.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;windowscodecs.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
@@ -97,12 +97,22 @@
   <ItemGroup>
     <ClInclude Include="EngineExport.h" />
     <ClInclude Include="pch_engine.h" />
+    <ClInclude Include="ShaderLabHeadless\HeadlessArgs.h" />
+    <ClInclude Include="ShaderLabHeadless\HeadlessEngine.h" />
+    <ClInclude Include="ShaderLabHeadless\ImageOutput.h" />
+    <ClInclude Include="ShaderLabHeadless\ScriptRunner.h" />
+    <ClInclude Include="ShaderLabHeadless\GpuBench.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch_engine.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="ShaderLabHeadless\Main.cpp" />
+    <ClCompile Include="ShaderLabHeadless\HeadlessArgs.cpp" />
+    <ClCompile Include="ShaderLabHeadless\HeadlessEngine.cpp" />
+    <ClCompile Include="ShaderLabHeadless\ImageOutput.cpp" />
+    <ClCompile Include="ShaderLabHeadless\ScriptRunner.cpp" />
+    <ClCompile Include="ShaderLabHeadless\GpuBench.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="ShaderLabEngine.vcxproj">

@@ -25,7 +25,6 @@ namespace ShaderLab::Controls
 
     private:
         void AppendEntry(const NodeLogEntry& entry);
-        std::wstring FormatEntry(const NodeLogEntry& entry) const;
 
         winrt::Microsoft::UI::Xaml::Window m_window{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::RichTextBlock m_logView{ nullptr };

@@ -4,8 +4,6 @@
 #include "../EngineExport.h"
 #include "../Graph/EffectNode.h"
 
-namespace ShaderLab::Graph { class EffectGraph; }
-
 namespace ShaderLab::Effects
 {
     // Describes a pre-built ShaderLab effect with embedded HLSL.
@@ -21,14 +19,12 @@ namespace ShaderLab::Effects
 
         // Stable identifier and version for upgrade detection.
         std::wstring effectId;          // Stable ID (survives renames)
-        uint32_t effectVersion{ 1 };   // Increment when HLSL or params change.
-        // Scoping note: a saved graph stores the effect HLSL and recompiles
-        // from it. The ~23 effects that #include "shaderlab_colormath.hlsli"
-        // pick up a ColorMath change directly; graphs that carry an inline
-        // copy keep the math they were saved with until upgraded. Bump the
-        // effects whose BEHAVIOUR changes, not all 23 -- an upgrade prompt is
-        // only useful where taking it changes output. When you touch
-        // ColorMath, map the changed function to its call sites and bump those.
+        // Bump when a change should reach saved graphs (they keep their own
+        // HLSL copy); TestEffectVersionGuard flags changes and says how. A
+        // ColorMath change reaches graphs whose HLSL #includes the library;
+        // bump the effects whose output it changes, for graphs holding an
+        // inline copy.
+        uint32_t effectVersion{ 1 };
 
         // Embedded HLSL source — compiled on first use.
         std::string hlslSource;
@@ -43,13 +39,21 @@ namespace ShaderLab::Effects
         std::vector<Graph::AnalysisFieldDescriptor> analysisFields;
         Graph::AnalysisOutputType analysisOutputType{ Graph::AnalysisOutputType::None };
 
-        // Compute shader thread group dimensions.
+        // The evaluator's contract with the effect; see NodeContracts.h. A
+        // D3D11 compute effect's thread-group size is its HLSL [numthreads].
+        Graph::NodeKind nodeKind{ Graph::NodeKind::Shader };
+        Graph::DispatchShape dispatchShape{ Graph::DispatchShape::PerOutputPixel };
+        Graph::OutputExtent outputExtent;
+        Graph::InjectedConstants injectedConstants{ Graph::InjectedConstants::None };
+
+        // A D2D compute shader's thread-group size (user effects only).
         uint32_t threadGroupX{ 8 };
         uint32_t threadGroupY{ 8 };
         uint32_t threadGroupZ{ 1 };
 
         // Hidden default properties (in cbuffer but not shown in Properties panel).
-        // Set on node creation; auto-updated by the evaluator for dynamic values.
+        // Set on node creation. The ones injectedConstants names are written
+        // by the evaluator from then on.
         std::map<std::wstring, Graph::PropertyValue> hiddenDefaults;
         // Trailing inputNames that are lookup tables. See
         // CustomEffectDefinition::lookupInputCount.
@@ -94,9 +98,6 @@ namespace ShaderLab::Effects
         // Creates an output pin so downstream pixel shaders can read the result.
         bool hasImageOutput{ false };
 
-        // Clock nodes are time-based animation sources (special render loop handling).
-        bool isClock{ false };
-
         // File a user effect was loaded from; empty for built-ins.
         std::wstring sourcePath;
         bool IsUserEffect() const { return !sourcePath.empty(); }
@@ -130,8 +131,8 @@ namespace ShaderLab::Effects
         const ShaderLabEffectDescriptor* FindById(std::wstring_view effectId) const;
         const std::vector<ShaderLabEffectDescriptor>& All() const { return m_effects; }
 
-        // Computed library version: sum of all built-in effect versions.
-        // User effects are excluded so the number identifies the build.
+        // Sum of all built-in effect versions (user effects excluded). Any
+        // bump raises it; equal sums do not imply identical catalogs.
         uint32_t LibraryVersion() const
         {
             uint32_t version = 0;
@@ -145,13 +146,6 @@ namespace ShaderLab::Effects
         // Create a fully-configured EffectNode from a descriptor.
         static Graph::EffectNode CreateNode(const ShaderLabEffectDescriptor& desc);
 
-        // Re-derive the runtime flags CreateNode sets from the descriptor but
-        // the JSON format does not carry (today: isClock). EVERY graph load
-        // must call this -- a Clock whose flag is false never advances and
-        // never emits Time / Progress, silently freezing everything bound to
-        // it. Only the GUI's file-open path used to do this.
-        static void RestoreRuntimeFlags(Graph::EffectGraph& graph);
-
         // User effects
         // Register every shader node in each saved graph (*.json) in
         // `directory` as an effect. An optional top-level "category" picks the
@@ -161,6 +155,21 @@ namespace ShaderLab::Effects
         // to the registry and may replace entries in place.
         const UserEffectLoadReport& LoadUserEffects(const std::wstring& directory);
         const UserEffectLoadReport& UserEffectReport() const { return m_userReport; }
+
+        // The descriptor each shader node in one saved graph's JSON would be
+        // registered with, registering nothing. Failures go to `report`.
+        static std::vector<ShaderLabEffectDescriptor> ParseEffectsFromJson(
+            std::wstring_view json, const std::wstring& source, UserEffectLoadReport& report);
+
+        // Registers every shader node in one saved graph's JSON as an effect,
+        // as LoadUserEffects does for each file. `source` names it in errors
+        // and becomes each descriptor's sourcePath. With `compileCheck` an
+        // effect must compile first; an effect blob brings its own bytecode.
+        // Returns the names registered. `accept`, when set, picks which of the
+        // JSON's effects to register. Same startup rule as LoadUserEffects.
+        std::vector<std::wstring> RegisterEffectsFromJson(
+            std::wstring_view json, const std::wstring& source, bool compileCheck, UserEffectLoadReport& report,
+            const std::function<bool(const ShaderLabEffectDescriptor&)>& accept = {});
 
         // %LOCALAPPDATA%\ShaderLab\effects, or empty if it cannot be resolved.
         static std::wstring DefaultUserEffectsDirectory();
@@ -173,28 +182,27 @@ namespace ShaderLab::Effects
         UserEffectLoadReport m_userReport;
     };
 
+    // The C++ hooks a built-in effect carries beyond its HLSL, looked up by
+    // the descriptor id a node's CustomEffectDefinition records. The evaluator
+    // reaches them through this interface rather than the catalog singleton.
+    // Returned pointers stay valid while the provider is unchanged.
+    class SHADERLAB_API IEffectHooks
+    {
+    public:
+        virtual ~IEffectHooks() = default;
+        virtual const ShaderLabEffectDescriptor::DerivedConstantsFn*
+            DerivedConstants(std::wstring_view effectId) const = 0;
+        virtual const ShaderLabEffectDescriptor::ImageOutputSizeFn*
+            ImageOutputSize(std::wstring_view effectId) const = 0;
+    };
+
+    // Hooks from ShaderLabEffects::Instance(), the evaluator's default.
+    SHADERLAB_API const IEffectHooks& BuiltInEffectHooks();
+
     // The conflict policy LoadUserEffects applies; public so tests can call it.
     SHADERLAB_API UserEffectConflict ResolveUserEffectConflict(
         const ShaderLabEffectDescriptor& existing,
         const ShaderLabEffectDescriptor& incoming);
-
-    SHADERLAB_API void RegisterEngineD2DEffects(ID2D1Factory1* factory);
-
-    // Configure the on-disk bytecode cache for this process. Pass an
-    // empty `rootPath` to disable disk persistence (tests, headless
-    // ad-hoc runs). When non-empty, the directory is created if
-    // missing, and a background thread reaps entries older than
-    // `staleThresholdSec` (default 90 days) so the cache doesn't
-    // grow without bound. Pass 0 for staleThresholdSec to skip the
-    // background reap (the user can still trigger it manually via
-    // the status-bar broom button).
-    //
-    // Recommended: pass `%LOCALAPPDATA%\ShaderLab\bytecode\`. The
-    // engine does NOT pick a default automatically -- the host owns
-    // the path policy so headless/test runs can opt out cleanly.
-    SHADERLAB_API void ConfigureBytecodeCache(
-        std::wstring rootPath,
-        uint64_t staleThresholdSec = 90ull * 24 * 60 * 60);
 
     // Shared HLSL color math functions. Shaders get them with
     // #include "shaderlab_colormath.hlsli"; the text has an include guard.

@@ -3,9 +3,14 @@
 #include "pch_engine.h"
 #include "../EngineExport.h"
 #include "../Graph/PropertyValue.h"
+#include "ShaderIncludes.h"
 
 namespace ShaderLab::Effects
 {
+    // D3DCompile flags for every effect shader. Part of the bytecode cache
+    // key (IncludeLibraryHashOf), so changing them invalidates the cache.
+    constexpr UINT cShaderCompileFlags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+
     // Describes a single constant buffer variable discovered via D3DReflect.
     struct ShaderVariable
     {
@@ -44,12 +49,6 @@ namespace ShaderLab::Effects
         uint32_t                          inputCount{ 0 };      // texture inputs
     };
 
-    // Include handler for the engine's embedded headers,
-    // "shaderlab_params.hlsli", "shaderlab_colormath.hlsli" and
-    // "shaderlab_gamut.hlsli". All are optional for a shader. Every D3DCompile of effect HLSL passes this, so
-    // all compile paths resolve the same names. Never null; do not release.
-    SHADERLAB_API ID3DInclude* ShaderLabIncludeHandler();
-
     // HLSL shader compilation and reflection utilities.
     // Wraps D3DCompile and D3DReflect for use by the custom effect system.
     class SHADERLAB_API ShaderCompiler
@@ -71,7 +70,7 @@ namespace ShaderLab::Effects
             const std::string& target = "ps_5_0");
 
         // Compile HLSL source with explicit preprocessor macros. Used
-        // by the GPU-binding feature to inject _SLPARAM_<name>_GPU=0|1
+        // by the GPU-binding feature to inject _SLPARAM_<name>_GPU=0|1|2
         // sentinels per gpuBindable parameter. Includes resolve through
         // ShaderLabIncludeHandler(); other includes are not supported
         // (D3D_COMPILE_STANDARD_FILE_INCLUDE is intentionally bypassed
@@ -103,12 +102,8 @@ namespace ShaderLab::Effects
     //   * float  PropertyValue -> bool cbuffer slot: BOOL(value > 0.5)
     //   * uint/int/bool PropertyValue -> matching slot: direct copy
     //   * float vector PropertyValue -> matching N-component slot: direct copy
-    // and the legacy "memcpy of float bit-pattern produces nonsense uints"
-    // bug class can't recur (CHANGELOG 1.3.9).
-    //
-    // This was previously implemented inline in three places (D3D11 compute
-    // dispatch, CustomPixelShaderEffect, CustomComputeShaderEffect) and only
-    // the D3D11 compute site did the typed conversion. Phase 3 unifies them.
+    // so a float is never memcpy'd into a uint slot as its bit pattern. Every
+    // cbuffer packer (pixel, D2D compute and D3D11 compute) goes through it.
     //
     // Returns true if any bytes were written. `dest` may not be null;
     // `remaining` is the remaining cbuffer bytes from `dest`.

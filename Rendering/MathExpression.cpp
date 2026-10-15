@@ -3,8 +3,7 @@
 // this translation unit (with PCH disabled in the .vcxproj entry).
 #include <string>
 #include <vector>
-#include <unordered_map>
-#include <mutex>
+#include <algorithm>
 
 // Strip down ExprTk to the math-only feature set. The disabled subsystems
 // pull in <regex> and other heavy machinery that have known crash bugs in
@@ -29,26 +28,8 @@ namespace ShaderLab::Rendering
 {
 	namespace
 	{
-		// Simple per-thread cache: parsed exprtk expressions are reusable
-		// across evaluations, but ExprTk's symbol_table binds variables by
-		// address, so we recompile when the variable set changes.
-		struct CompiledKey
-		{
-			std::string utf8;
-			std::vector<std::string> vars;
-			bool operator==(const CompiledKey&) const = default;
-		};
-		struct CompiledKeyHash
-		{
-			size_t operator()(const CompiledKey& k) const noexcept
-			{
-				size_t h = std::hash<std::string>{}(k.utf8);
-				for (const auto& v : k.vars)
-					h ^= std::hash<std::string>{}(v) + 0x9e3779b9 + (h << 6) + (h >> 2);
-				return h;
-			}
-		};
-
+		// ExprTk identifiers and operators are ASCII. A non-ASCII character
+		// becomes '?', which no identifier can contain, so it cannot alias one.
 		std::string Narrow(const std::wstring& w)
 		{
 			std::string out;
@@ -73,8 +54,16 @@ namespace ShaderLab::Rendering
 			return true;
 		}
 
-		// ExprTk expressions bind variables by reference, so we need stable
-		// storage for the current call's variable values.
+		const auto isNonAscii = [](wchar_t c) { return c >= 0x80; };
+		if (std::any_of(expression.begin(), expression.end(), isNonAscii))
+		{
+			if (outError) *outError = L"Parse error: expressions must be ASCII";
+			outResult = 0.0f;
+			return false;
+		}
+
+		// Parsed on every call. ExprTk binds variables by reference, so the
+		// values need stable storage for the duration of the call.
 		std::vector<double> values(varCount);
 		std::vector<std::string> names(varCount);
 		for (size_t i = 0; i < varCount; ++i)
@@ -91,7 +80,14 @@ namespace ShaderLab::Rendering
 		exprtk::expression<double> expr;
 		expr.register_symbol_table(symbols);
 
-		exprtk::parser<double> parser;
+		// Expressions arrive from saved graphs and MCP and run on the render
+		// thread, where a loop could hang it, so loops are refused at parse time.
+		using ParserSettings = exprtk::parser<double>::settings_t;
+		ParserSettings settings;
+		settings.disable_control_structure(ParserSettings::e_ctrl_for_loop)
+			.disable_control_structure(ParserSettings::e_ctrl_while_loop)
+			.disable_control_structure(ParserSettings::e_ctrl_repeat_loop);
+		exprtk::parser<double> parser(settings);
 		std::string utf8 = Narrow(expression);
 		if (!parser.compile(utf8, expr))
 		{

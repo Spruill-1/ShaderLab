@@ -17,38 +17,36 @@ namespace ShaderLab::Effects
     //   - 10-bit 1010102 formats           → HDR10 (PQ / BT.2020)
     //   - float / half formats             → already linear scRGB (no-op)
     // The result is flattened once at load, so downstream consumers see a
-    // single canonical format regardless of source.
+    // single canonical format regardless of source. When any step fails the
+    // load fails: there is no "best effort" encoded bitmap.
     class SHADERLAB_API ImageLoader
     {
     public:
-        ImageLoader();
+        // Does not touch COM; the WIC factory is created on the first load.
+        ImageLoader() = default;
 
-        // Load an image from a file path. Returns a linear scRGB FP16
-        // bitmap, or nullptr on failure.
+        // Load an image from a file path. Returns a linear scRGB FP16 bitmap,
+        // or nullptr with LastError() naming the failed stage and HRESULT.
+        // Must be called outside a BeginDraw on `dc`: the colour-managed
+        // image is flattened through a temporary target.
         winrt::com_ptr<ID2D1Bitmap1> LoadFromFile(
             const std::wstring& filePath,
             ID2D1DeviceContext5* dc);
 
-        // Load from an already-opened IStream. Same contract.
-        winrt::com_ptr<ID2D1Bitmap1> LoadFromStream(
-            IStream* stream,
-            ID2D1DeviceContext5* dc);
+        // Why the last LoadFromFile returned nullptr; empty after a success.
+        const std::wstring& LastError() const { return m_lastError; }
 
         // Every file extension WIC can decode on THIS machine, lowercased,
         // dot-prefixed, sorted and de-duplicated (".avif", ".heic", ".jpg", ...).
-        //
-        // Enumerated from the registered WIC decoders rather than hardcoded:
-        // the codec set is machine state, not a compile-time constant. Windows
-        // ships HEIF/AVIF support as installable extensions and users add RAW
-        // codecs, so any fixed list is wrong on some machines and goes stale on
-        // all of them -- .heic decoded fine but could not be picked, because the
-        // file dialog filter never listed it.
-        //
-        // Falls back to a small built-in list if enumeration fails, so the
-        // picker is never empty.
+        // Read from the registered WIC decoders: codecs arrive as OS
+        // extensions (HEIF, AVIF) and third-party packages (camera RAW), so
+        // the set is machine state. Falls back to the in-box codecs if
+        // enumeration fails, so the picker is never empty.
         static std::vector<std::wstring> SupportedExtensions();
 
     private:
+        bool EnsureFactory();
+
         // Decode one WIC frame into the canonical linear scRGB FP16
         // bitmap (see class comment). Must be called OUTSIDE an active
         // BeginDraw on `dc` — it flattens through a temporary target.
@@ -56,6 +54,9 @@ namespace ShaderLab::Effects
             IWICBitmapFrameDecode* frame,
             ID2D1DeviceContext5* dc);
 
+        winrt::com_ptr<ID2D1Bitmap1> Fail(const wchar_t* stage, HRESULT hr);
+
         winrt::com_ptr<IWICImagingFactory2> m_wicFactory;
+        std::wstring m_lastError;
     };
 }

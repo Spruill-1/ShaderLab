@@ -23,8 +23,8 @@ namespace ShaderLab::Controls
         // closes it with Escape, it stays down for the rest of this burst.
         m_dialog.Closed([this](auto&&, auto&&)
         {
-            if (m_showing && m_busy) m_dismissed = true;
-            m_showing = false;
+            if (m_dialogs.BackgroundShowing() && m_busy) m_dismissed = true;
+            m_dialogs.BackgroundClosed();
         });
     }
 
@@ -56,11 +56,7 @@ namespace ShaderLab::Controls
             m_busy = false;
             m_dismissed = false;
             m_peak = 0;
-            if (m_showing)
-            {
-                m_showing = false;
-                m_dialog.Hide();
-            }
+            m_dialogs.HideBackground();
             return;
         }
         if (!m_busy)
@@ -82,76 +78,6 @@ namespace ShaderLab::Controls
         m_bar.IsIndeterminate(m_peak <= 1);
         if (m_peak > 1) m_bar.Value(static_cast<double>(done) / m_peak);
 
-        if (!m_showing && root && m_otherDialogs == 0)
-        {
-            m_dialog.XamlRoot(root);
-            try
-            {
-                m_showOperation = m_dialog.ShowAsync();
-                m_showing = true;
-            }
-            catch (winrt::hresult_error const&)
-            {
-                // WinUI allows one ContentDialog at a time and another is up.
-                // Intentionally swallowed; the next tick tries again.
-            }
-        }
-    }
-
-    winrt::Windows::Foundation::IAsyncOperation<XC::ContentDialogResult>
-        CompileProgressController::ShowDialogAsync(XC::ContentDialog dialog)
-    {
-        // Keep the compile dialog down until this dialog has closed.
-        struct OtherDialogScope
-        {
-            uint32_t& count;
-            explicit OtherDialogScope(uint32_t& counter) : count(counter) { ++count; }
-            ~OtherDialogScope() { --count; }
-        } scope(m_otherDialogs);
-
-        if (m_showing)
-        {
-            m_showing = false;
-            m_dialog.Hide();
-        }
-
-        auto result = XC::ContentDialogResult::None;
-        try
-        {
-            // The compile dialog closes asynchronously; wait for it before opening another.
-            if (auto closing = std::exchange(m_showOperation, nullptr))
-            {
-                if (closing.Status() == winrt::Windows::Foundation::AsyncStatus::Started)
-                {
-                    m_waitingDialogs.push_back(dialog);
-                    co_await closing;
-                    // HideDialog while waiting removes the entry: do not show at all.
-                    if (!RemoveWaitingDialog(dialog))
-                        co_return XC::ContentDialogResult::None;
-                }
-            }
-            result = co_await dialog.ShowAsync();
-        }
-        catch (winrt::hresult_error const& error)
-        {
-            // Another dialog outside this helper is open. Callers treat None as cancel.
-            RemoveWaitingDialog(dialog);
-            OutputDebugStringW((L"[ShaderLab] ShowDialogAsync: " + std::wstring(error.message()) + L"\n").c_str());
-        }
-        co_return result;
-    }
-
-    void CompileProgressController::HideDialog(XC::ContentDialog const& dialog)
-    {
-        if (!RemoveWaitingDialog(dialog))
-            dialog.Hide();
-    }
-
-    bool CompileProgressController::RemoveWaitingDialog(XC::ContentDialog const& dialog)
-    {
-        auto it = std::find(m_waitingDialogs.begin(), m_waitingDialogs.end(), dialog);
-        if (it == m_waitingDialogs.end()) return false;
-        m_waitingDialogs.erase(it);
-        return true;
+        m_dialogs.TryShowBackground(m_dialog, root);
     }
 }

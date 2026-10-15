@@ -2,6 +2,7 @@
 #include "McpJsonRpc.h"
 #include "McpRouter.h"
 #include "McpToolCatalog.h"
+#include "McpArgs.h"
 #include "../../Version.h"
 
 #include <winrt/Windows.Data.Json.h>
@@ -13,13 +14,10 @@ namespace ShaderLab::Mcp
 
     namespace
     {
-        // The one protocol revision this server implements. 2025-06-18
-        // removed JSON-RPC batching from MCP — this server never accepted
-        // batches, so it is the first revision the implementation is
-        // actually conformant with (the old dispatcher pinned 2024-11-05,
-        // which required batching). Always answered regardless of the
-        // client's requested version; a client that cannot speak it is
-        // expected to disconnect per spec.
+        // The one protocol revision this server implements: 2025-06-18
+        // removed JSON-RPC batching, which this server never accepts. Always
+        // answered regardless of the client's requested version; a client
+        // that cannot speak it is expected to disconnect per spec.
         constexpr const char* kProtocolVersion = "2025-06-18";
 
         std::string WrapResult(const std::string& idStr, const std::string& result)
@@ -115,40 +113,42 @@ namespace ShaderLab::Mcp
                 break;
             case ToolArgMode::PathNumber:
             {
-                if (!args.HasKey(tool->argKey))
-                    return ToolErrorResult(idStr,
-                        "Missing required argument: " + WideToUtf8(tool->argKey));
-                auto num = static_cast<uint32_t>(args.GetNamedNumber(tool->argKey));
-                path = std::vformat(tool->pathTemplate, std::make_wformat_args(num));
+                std::string argError;
+                auto number = RequireUintArg(args, tool->argKey, argError);
+                if (!number)
+                    return ToolErrorResult(idStr, argError);
+                path = std::vformat(tool->pathTemplate, std::make_wformat_args(*number));
                 break;
             }
             case ToolArgMode::PathString:
             {
-                if (!args.HasKey(tool->argKey))
-                    return ToolErrorResult(idStr,
-                        "Missing required argument: " + WideToUtf8(tool->argKey));
-                path = std::wstring(tool->pathTemplate) +
-                       std::wstring(args.GetNamedString(tool->argKey));
+                std::string argError;
+                auto text = RequireStringArg(args, tool->argKey, argError);
+                if (!text)
+                    return ToolErrorResult(idStr, argError);
+                path = std::wstring(tool->pathTemplate) + *text;
                 break;
             }
             case ToolArgMode::NodeLogs:
             {
-                if (!args.HasKey(tool->argKey))
-                    return ToolErrorResult(idStr,
-                        "Missing required argument: " + WideToUtf8(tool->argKey));
-                auto nodeId = static_cast<uint32_t>(args.GetNamedNumber(tool->argKey));
-                uint64_t sinceSeq = 0;
-                if (args.HasKey(L"sinceSeq"))
-                    sinceSeq = static_cast<uint64_t>(args.GetNamedNumber(L"sinceSeq"));
-                path = std::vformat(tool->pathTemplate, std::make_wformat_args(nodeId, sinceSeq));
+                std::string argError;
+                auto nodeId = RequireUintArg(args, tool->argKey, argError);
+                const double since = ReadNumberArg(args, L"sinceSeq", argError).value_or(0.0);
+                if (argError.empty() && (since < 0.0 || std::floor(since) != since))
+                    argError = "sinceSeq must be a non-negative integer";
+                if (!argError.empty())
+                    return ToolErrorResult(idStr, argError);
+                const auto sinceSeq = static_cast<uint64_t>(since);
+                path = std::vformat(tool->pathTemplate, std::make_wformat_args(*nodeId, sinceSeq));
                 break;
             }
             case ToolArgMode::UnwrapField:
             {
-                if (!args.HasKey(tool->argKey))
-                    return ToolErrorResult(idStr,
-                        "Missing required argument: " + WideToUtf8(tool->argKey));
-                body = WideToUtf8(std::wstring(args.GetNamedString(tool->argKey)));
+                std::string argError;
+                auto text = RequireStringArg(args, tool->argKey, argError);
+                if (!text)
+                    return ToolErrorResult(idStr, argError);
+                body = WideToUtf8(*text);
                 break;
             }
             }
@@ -177,11 +177,11 @@ namespace ShaderLab::Mcp
     {
         return {
             { "shaderlab://context", "ShaderLab Context",
-              "System prompt: pipeline format, shader conventions, API reference", L"/context" },
+              "Pipeline format and shader conventions; tools/list describes the API", L"/context" },
             { "shaderlab://graph", "Effect Graph",
               "Full graph state with nodes, edges, properties, custom effect definitions", L"/graph" },
             { "shaderlab://registry/effects", "Built-in Effects",
-              "All 48+ built-in D2D effects with property metadata", L"/registry/effects" },
+              "Every built-in Direct2D effect with its category and input count", L"/registry" },
             { "shaderlab://custom-effects", "Custom Effects",
               "Custom effects in graph with HLSL source and compile status", L"/custom-effects" },
         };
@@ -191,12 +191,6 @@ namespace ShaderLab::Mcp
     {
         if (options.resources.empty())
             options.resources = DefaultResources();
-
-        // The GET / health route was removed with the HTTP transport
-        // (stdio-migration Step 9) — nothing probes it now; the shim owns the
-        // client-facing handshake and callers reach the dispatcher via the
-        // sealed session channel. host kind still rides in initialize's
-        // serverInfo below.
 
         // POST / — the JSON-RPC dispatcher.
         router.AddRoute(L"POST", L"/",
@@ -245,9 +239,8 @@ namespace ShaderLab::Mcp
                 if (!hasId)
                     return Response::None();
 
-                // Guarded params accessor (the old dispatcher's unchecked
-                // GetNamedObject(L"params") threw winrt::hresult_error on
-                // array/absent params and surfaced as a generic 500).
+                // Guarded params accessor: an array or absent params is a
+                // -32602, not an exception.
                 auto getParams = [&](WDJ::JsonObject& out) -> bool {
                     if (!jobj.HasKey(L"params")) return false;
                     auto pv = jobj.GetNamedValue(L"params");

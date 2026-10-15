@@ -10,12 +10,11 @@
 
 namespace ShaderLab
 {
-    // MCP route registry. The embedded Winsock HTTP listener was removed in
-    // stdio-migration Step 9 (point of no return) — the ONLY transport now is
-    // the broker (shim → hub → session over named pipes; McpSessionClient
-    // routes each sealed request through RouteRequest). What remains is the
-    // pure routing surface every transport is written against: AddRoute,
-    // RouteRequest (longest-prefix, owns the query split), HasRoute.
+    // The MCP route registry every transport is written against: AddRoute,
+    // RouteRequest (longest prefix, owns the query split) and HasRoute. The
+    // transport is the broker; McpSessionClient routes each sealed request
+    // through RouteRequest. A handler's exception is answered 500 with its
+    // message.
     class SHADERLAB_API McpRouter
     {
     public:
@@ -29,9 +28,8 @@ namespace ShaderLab
             const std::string& body)>;
 
         // Fired once per top-level dispatcher request (POST /) so a host can
-        // pulse a UI activity indicator. `clientId` identifies the caller —
-        // a session/channel label now that HTTP peer addresses are gone
-        // (formerly `peerAddress`). Must be cheap + thread-safe.
+        // pulse a UI activity indicator. `clientId` labels the caller's
+        // session. Must be cheap and thread-safe.
         using ActivityCallback = std::function<void(
             const std::string& method,
             const std::wstring& path,

@@ -47,7 +47,7 @@ namespace ShaderLab::Effects
     // A regular D2D effect (`ID2D1EffectImpl` + `ID2D1DrawTransform`)
     // that wraps user-authored D3D11 compute shaders. From the
     // graph's perspective it behaves like any other effect: lives in
-    // `EffectGraph::EffectNode::cachedEffect`, takes one image input,
+    // `GraphModel::EffectNode::cachedEffect`, takes one image input,
     // and produces an image output. Internally it dispatches a D3D11
     // compute shader against the input each time the host calls
     // `Dispatch`, populating either:
@@ -56,7 +56,7 @@ namespace ShaderLab::Effects
     //     Luminance Statistics / Channel Statistics / Chromaticity
     //     Statistics / gamut-coverage analysis), readable by
     //     downstream consumers via `IEngineComputeOutput::GetAnalysisSrv`
-    //     for the Phase 8 GPU-binding fast path, or
+    //     (GPU bindings, lane 1), or
     //
     //   * a D3D11-compute-produced output texture wrapped as an
     //     `ID2D1Bitmap1` (for image-producing nodes such as
@@ -66,16 +66,9 @@ namespace ShaderLab::Effects
     // The effect's own D2D output (its pass-through pixel shader) is
     // unused -- downstream nodes wire to `node->cachedOutput`
     // directly. The pass-through exists only so the effect satisfies
-    // D2D's effect-shape contract (one input -> one output).
-    //
-    // Replaces the pre-Phase-8 special-case branch in
-    // `GraphEvaluator::EvaluateNode` for `customEffect.shaderType ==
-    // D3D11ComputeShader` and the parallel `m_d3d11RunnerCache` /
-    // `m_imageComputeCache` maps. After this, `D3D11ComputeShader`
-    // effects route through the same `CreateOrGetEffect` path every
-    // other custom effect does -- the only thing the host has to do
-    // is QI the bridge for `ICustomComputeBridge` and call `Dispatch`
-    // from the deferred-compute pass.
+    // D2D's effect-shape contract (one input -> one output). The
+    // evaluator creates it like any other effect and drives `Dispatch`
+    // from ProcessDeferredCompute.
 
     // {149A1DAA-1CF1-4298-862C-5A7F3C1B4CD1}
     inline constexpr GUID IID_ICustomComputeBridge = {
@@ -135,7 +128,7 @@ namespace ShaderLab::Effects
         // only effects.
         virtual ID2D1Bitmap1* STDMETHODCALLTYPE GetImageOutput() = 0;
 
-        // Phase 8 GPU-binding (consumer side). The evaluator calls
+        // GPU bindings, consumer side. The evaluator calls
         // this for each binding it routes upstream-effect-SRV ->
         // consumer-t-slot before each dispatch. Bindings are cleared
         // automatically at the end of every Dispatch so a stale
@@ -149,8 +142,7 @@ namespace ShaderLab::Effects
 
         // Set the dispatch dimensions for the next call. Defaults to
         // (1,1,1) for analysis-only effects; image-producing per-pixel
-        // effects (e.g. ICtCp Tone Map after migration) call this
-        // before Dispatch with (W/tx, H/ty, 1) where tx,ty are the
+        // effects call this before Dispatch with (W/tx, H/ty, 1) where tx,ty are the
         // shader's [numthreads] dimensions.
         virtual HRESULT STDMETHODCALLTYPE SetDispatchDims(
             UINT32 x, UINT32 y, UINT32 z) = 0;
@@ -163,8 +155,8 @@ namespace ShaderLab::Effects
     //     `node->cachedOutput`).
     //   * `ICustomComputeBridge` -- driver-side interface for the
     //     evaluator's deferred-compute pass.
-    //   * `IEngineComputeOutput` -- consumer-side interface for the
-    //     Phase 8 GPU-binding fast path. Delegates to the runner.
+    //   * `IEngineComputeOutput` / `IEngineComputeTexture` -- the
+    //     consumer-side GPU-binding lanes 1 and 3. Delegate to the runner.
     class CustomComputeBridgeEffect
         : public ID2D1EffectImpl
         , public ID2D1DrawTransform
@@ -183,13 +175,10 @@ namespace ShaderLab::Effects
         // `SetCompiledBytecode` after `CreateEffect`.
         static HRESULT RegisterEffect(ID2D1Factory1* factory);
 
-        // Captured by `CreateFactory` so the evaluator can call
-        // ICustomComputeBridge methods on the just-created instance.
-        // Mirrors the s_lastCreated convention used by
-        // CustomPixelShaderEffect / CustomComputeShaderEffect.
-        // Thread-local so concurrent CreateEffect calls on different
-        // device contexts don't collide.
-        static thread_local CustomComputeBridgeEffect* s_lastCreated;
+        // Creates a bridge effect and returns its impl too, so the evaluator
+        // can drive the dispatch. The impl lives as long as outEffect.
+        static HRESULT Create(ID2D1DeviceContext* dc,
+            winrt::com_ptr<ID2D1Effect>& outEffect, CustomComputeBridgeEffect** outImpl);
 
         // D2D creation callback (invoked by CreateEffect).
         static HRESULT __stdcall CreateFactory(IUnknown** effect);
@@ -254,9 +243,30 @@ namespace ShaderLab::Effects
         // instead of Map() draining the whole GPU pipeline right after the
         // submit. Reset after each Dispatch.
         void SetAsyncReadback(bool async) { m_asyncReadback = async; }
+        // EvaluatorOptions::computeCommandList for this bridge's dispatches.
+        void SetComputeCommandList(bool on) { m_runner.UseImmediateContextForBenchmark(!on); }
         // Newest completed async readback, if any landed since the last call.
         bool PollAnalysisReadback(std::vector<float>& out);
         bool HasPendingReadback() const { return m_runner.HasPendingReadback(); }
+        // The last blocking readback's Map result (the dispatch itself succeeded).
+        HRESULT LastReadbackResult() const { return m_runner.LastReadbackResult(); }
+
+        // The step the last Dispatch failed at, None after a success.
+        enum class DispatchStage
+        {
+            None,
+            Arguments,      // a null context or input
+            Device,         // no D3D11 device behind the context
+            ShaderCreate,   // CreateComputeShader refused the bytecode
+            NoShader,       // no bytecode installed yet
+            InputBounds,    // an input is unbounded, empty or too large
+            InputCopy,      // copying an input to an FP32 texture
+            ImageOutput,    // creating the image-output texture
+            Run,            // the runner's dispatch
+        };
+        DispatchStage LastFailureStage() const { return m_lastFailure; }
+        // "creating the compute shader" and so on; empty for None.
+        static const wchar_t* DescribeStage(DispatchStage stage);
 
         // ---- IEngineComputeOutput ----
         HRESULT STDMETHODCALLTYPE GetAnalysisSrv(
@@ -279,6 +289,11 @@ namespace ShaderLab::Effects
         CustomComputeBridgeEffect() = default;
         ~CustomComputeBridgeEffect() = default;
 
+        // D2D hands back no impl, so CreateFactory leaves the new instance
+        // here for Create. Thread-local: devices create effects on more
+        // than one thread.
+        static thread_local CustomComputeBridgeEffect* s_lastCreated;
+
         LONG m_refCount{ 1 };
 
         // D2D-side state (transform graph, draw info, input rect).
@@ -287,15 +302,7 @@ namespace ShaderLab::Effects
         winrt::com_ptr<ID2D1DrawInfo>        m_drawInfo;
         D2D1_RECT_L                          m_inputRect{};
 
-        // The pass-through pixel shader's GUID. Loaded once by the
-        // first instance to be initialized; subsequent instances
-        // reuse the same shader.
-        static GUID s_passThroughGuid;
-        static bool s_passThroughLoaded;
-
-        // D3D11 compute side. Owned exclusively by this effect; the
-        // pre-Phase-8 `m_d3d11RunnerCache` map on `GraphEvaluator` is
-        // gone -- runners live on the bridges that drive them.
+        // D3D11 compute side, owned by this effect.
         Rendering::D3D11ComputeRunner m_runner;
         std::vector<BYTE>             m_pendingBytecode;
         bool                          m_bytecodeDirty{ false };
@@ -325,14 +332,8 @@ namespace ShaderLab::Effects
         UINT32                          m_imageOutputW{ 0 };
         UINT32                          m_imageOutputH{ 0 };
 
-        // Cached input bitmap. Without this the bridge allocated a
-        // fresh FP32 bitmap (132 MB at 4K!) on every dispatch, which
-        // dominated frame time (~30ms/frame on Intel Arc). Re-created
-        // only when the upstream's dimensions change.
-        // Cached FP32 input bitmaps -- one per input slot (t0..tN-1).
-        // Reused across frames when the input dimensions don't change,
-        // dropped + reallocated when they do. Vector grows lazily as
-        // shaders with more inputs come through.
+        // FP32 copies of the inputs, one per slot (t0..tN-1), reused while
+        // an input's size holds (a 4K FP32 bitmap is 133 MB).
         struct CachedInputBitmap {
             winrt::com_ptr<ID2D1Bitmap1> bitmap;
             UINT32 width{ 0 };
@@ -342,7 +343,7 @@ namespace ShaderLab::Effects
 
         UINT64 m_lastEvaluatedFrame{ 0 };
 
-        // Phase 8 GPU-binding state, cleared at end of each Dispatch.
+        // GPU-binding SRVs for the next Dispatch, cleared at its end.
         std::vector<ID3D11ShaderResourceView*> m_gpuBindingSrvs;
         std::vector<UINT32>                    m_gpuBindingSlots;
 
@@ -351,7 +352,25 @@ namespace ShaderLab::Effects
         UINT32 m_dispatchY{ 1 };
         UINT32 m_dispatchZ{ 1 };
 
-        // Helpers.
+        // Bytecode CreateComputeShader refused, so a node stuck on it fails
+        // fast every frame instead of retrying (and copying its inputs).
+        ShaderId m_failedShaderId{};
+        HRESULT  m_failedShaderHr{ S_OK };
+        bool     m_hasFailedShader{ false };
+        DispatchStage m_lastFailure{ DispatchStage::None };
+
+        // Dispatch steps.
+        HRESULT Fail(DispatchStage stage, HRESULT hr);
+        static HRESULT D3D11DeviceOf(ID2D1DeviceContext5* dc, winrt::com_ptr<ID3D11Device>& device);
+        // Creates (or reuses) the pending shader and hands it to the runner.
+        HRESULT InstallPendingShader(ID3D11Device* device);
+        // The input in `slot` as an FP32 texture: its own surface when it is
+        // already one, else a copy drawn into the slot's cached bitmap.
+        // Needs the context at 96 DPI.
+        HRESULT PrepareInputTexture(ID2D1DeviceContext5* dc, ID2D1Image* image, UINT32 slot,
+                                    winrt::com_ptr<ID3D11Texture2D>& texture);
+        Rendering::D3D11ComputeRunner::Readback ChooseReadback(bool wantCpu) const;
+
         HRESULT EnsurePassThroughShader();
         HRESULT EnsureImageOutputTexture(
             ID3D11Device* device,

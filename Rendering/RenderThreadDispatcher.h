@@ -2,25 +2,25 @@
 
 // RenderThreadDispatcher
 //
-// MPSC closure queue used to marshal work onto the render thread (or, until
-// Phase 7 lands the dedicated worker, onto whichever thread calls Drain()).
+// MPSC closure queue used to marshal work onto the render worker, the thread
+// that calls Drain().
 //
-// Producer model: any thread (UI, MCP HTTP listener, NodeGraphController)
+// Producer model: any thread (UI, MCP session, NodeGraphController)
 // calls DispatchAsync(fn) for fire-and-forget work, or DispatchSync<T>(fn)
 // when it needs the closure's return value (or just to know it's been
 // applied). Closures run on the consumer thread, which is the single writer
-// to EffectGraph -- so closure bodies can call m_graph.X(...) directly.
+// to GraphModel -- so closure bodies can call m_graph.X(...) directly.
 //
-// Consumer model: the render thread (or its eventual replacement) calls
+// Consumer model: the render thread calls
 // Drain() once per loop iteration. Wait() blocks the consumer until at
 // least one closure is enqueued or shutdown is signaled. RegisterConsumer()
 // captures the consumer's std::thread::id so re-entrant DispatchSync calls
 // from inside a closure run inline (avoiding self-deadlock).
 //
-// Headless / synchronous mode (constructor flag): both DispatchAsync and
-// DispatchSync invoke the closure inline on the calling thread. The headless
-// host needs this because there is no separate render thread there; the MCP
-// listener thread is the sole consumer and must run closures synchronously.
+// Synchronous mode (constructor flag): both DispatchAsync and DispatchSync
+// run the closure inline on the calling thread. Only the unit tests use it;
+// the headless host has no dispatcher and runs MCP closures directly on its
+// session thread.
 
 #include <windows.h>
 
@@ -46,8 +46,7 @@ namespace ShaderLab::Rendering
     {
     public:
         // synchronous=true: producer-side calls run the closure inline on the
-        // calling thread. Used by ShaderLabHeadless and the existing 154-test
-        // suite, where there is no separate render thread.
+        // calling thread, for tests with no render thread.
         explicit RenderThreadDispatcher(bool synchronous = false)
             : m_synchronous(synchronous)
         {
@@ -98,7 +97,9 @@ namespace ShaderLab::Rendering
 
         // Enqueue a closure and block the calling thread until it has run.
         // Throws std::runtime_error on timeout or shutdown. Re-throws any
-        // exception the closure produced.
+        // exception the closure produced. A timeout abandons a closure that
+        // has not started (it will never run); one that has started is
+        // waited for, since it may reference the caller's stack.
         template <class F>
         auto DispatchSync(F&& fn,
                           std::chrono::milliseconds timeout = std::chrono::seconds(30))
@@ -120,6 +121,12 @@ namespace ShaderLab::Rendering
             auto prom = std::make_shared<std::promise<R>>();
             auto fut = prom->get_future();
 
+            // Claimed by whichever side moves first: the consumer (to run the
+            // closure) or a timed-out caller (to abandon it). An abandoned
+            // closure never runs, because its [&] captures die with the
+            // caller's frame.
+            auto claim = std::make_shared<std::atomic<SyncClaim>>(SyncClaim::Pending);
+
             // Cancel-aware element: when the dispatcher shuts down (or an
             // adapter switch resets the consumer) the queued item is invoked
             // with cancelled=true so this promise FAILS FAST rather than the
@@ -127,8 +134,11 @@ namespace ShaderLab::Rendering
             // render < DispatchSync < shim < client timeout ladder
             // enforceable (see Engine/Mcp/McpTimeouts.h).
             Item item =
-                [this, prom, fn = std::forward<F>(fn)](bool cancelled) mutable
+                [this, prom, claim, fn = std::forward<F>(fn)](bool cancelled) mutable
                 {
+                    auto expected = SyncClaim::Pending;
+                    if (!claim->compare_exchange_strong(expected, SyncClaim::Running))
+                        return;   // abandoned by a timed-out caller
                     if (cancelled)
                     {
                         try { throw std::runtime_error(
@@ -176,7 +186,14 @@ namespace ShaderLab::Rendering
                 item(true);   // shutting down: fail the promise immediately
 
             if (fut.wait_for(timeout) != std::future_status::ready)
-                throw std::runtime_error("RenderThreadDispatcher::DispatchSync: timed out");
+            {
+                auto expected = SyncClaim::Pending;
+                if (claim->compare_exchange_strong(expected, SyncClaim::Abandoned))
+                    throw std::runtime_error("RenderThreadDispatcher::DispatchSync: timed out");
+                // The closure already started and references this frame, so
+                // wait for it rather than unwind under it.
+                fut.wait();
+            }
 
             if constexpr (std::is_void_v<R>) { fut.get(); return; }
             else                              return fut.get();
@@ -350,6 +367,21 @@ namespace ShaderLab::Rendering
 
         bool IsSynchronous() const { return m_synchronous; }
 
+        // True on the registered consumer thread, and always in synchronous
+        // mode, where every caller runs closures inline.
+        bool IsConsumerThread() const
+        {
+            return m_synchronous ||
+                   m_consumerId.load(std::memory_order_acquire) == std::this_thread::get_id();
+        }
+
+        // False until a consumer registers and again after ResetConsumer:
+        // no thread is draining, so the caller owns what closures would touch.
+        bool HasConsumer() const
+        {
+            return m_consumerId.load(std::memory_order_acquire) != std::thread::id{};
+        }
+
         // Runs on the consumer thread after each queued DispatchSync closure,
         // before its caller is released, so the caller observes whatever the
         // hook publishes. Set it before the consumer starts.
@@ -383,15 +415,11 @@ namespace ShaderLab::Rendering
             return ready;
         }
 
-        bool IsConsumerThread() const
-        {
-            return m_consumerId.load(std::memory_order_acquire) ==
-                   std::this_thread::get_id();
-        }
-
         // Queue element carries a cancel flag: run(false) executes normally,
         // run(true) fails any attached promise (shutdown / consumer reset).
         using Item = std::function<void(bool)>;
+
+        enum class SyncClaim : int { Pending, Running, Abandoned };
 
         const bool m_synchronous;
         mutable std::mutex m_mutex;

@@ -1,6 +1,6 @@
 #pragma once
 
-// Wire frame codec for the MCP broker pipe (stdio-migration Step 4).
+// Wire frame codec for the MCP broker pipe.
 //
 // Layout, little-endian throughout:
 //

@@ -43,13 +43,14 @@ ShaderLab.exe (WinUI 3 host)
   ├── MainWindow (XAML)         — split across .xaml.cpp / .WorkingSpace.cpp / .GraphFileIo.cpp / .RenderTick.cpp / .McpRoutes.cpp
   ├── RenderEngine              — D3D11 + D2D1 device stack, DXGI swap chain, BeginDraw/EndDraw/Present
   ├── Controls/                 — NodeGraphController (canvas), OutputWindow (per-Output OS window),
-  │                               ShaderEditorController, PixelInspectorController, PixelTraceController
+  │                               NodeGraphRenderer, GraphCanvasInputController, PreviewController,
+  │                               PixelTracePanelController, PropertiesPanelController, ...
   └── EffectDesignerWindow      — Modal for creating/editing custom pixel/compute shader effects
 
 ShaderLabEngine.dll (host-agnostic)
-  ├── Graph/                    — EffectGraph, EffectNode, EffectEdge, NodeType, PropertyValue
+  ├── Graph/                    — GraphModel, EffectNode, EffectEdge, NodeType, PropertyValue
   ├── Rendering/
-  │   ├── GraphEvaluator        — Topological walk + per-node D2D effect cache + ProcessDeferredCompute
+  │   ├── GraphEvaluator        — Facade over Evaluator/ (topological walk, per-node NodeRuntime, ProcessDeferredCompute)
   │   ├── DisplayMonitor        — HDR/SDR/WCG detection via WinRT AdvancedColorInfo (event-driven)
   │   ├── D3D11ComputeRunner    — Generic D3D11 compute dispatch (RWStructuredBuffer<float4>),
   │   │                           also implements IEngineComputeOutput (Phase 8 GPU-binding interface)
@@ -67,7 +68,7 @@ ShaderLabEngine.dll (host-agnostic)
   │   ├── IEngineComputeOutput  — COM interface for upstream effects exposing GPU-resident analysis
   │   ├── CustomPixelShaderEffect / CustomComputeShaderEffect — Custom-effect base classes
   │   ├── SourceNodeFactory     — Image / video / Flood / DXGI Desktop Duplication / Windows Graphics Capture
-  │   └── DxgiDuplicationSourceProvider, WindowsGraphicsCaptureSourceProvider, VideoSourceProvider
+  │   └── DxgiDuplicationSourceProvider, WindowsGraphicsCaptureSourceProvider, VideoSourceProvider (+ VideoFrameReader / VideoSeekModel / VideoFrameConverter)
   └── Engine/Mcp/
       ├── McpRouter             — route registry (longest-prefix, query split, HasRoute); HTTP listener deleted in stdio-mig. Step 9 — the broker is the only transport
       ├── McpTypes              — transport-neutral Mcp::Response (+ noReply) + shared JsonEscape/WideToUtf8
@@ -76,7 +77,8 @@ ShaderLabEngine.dll (host-agnostic)
       ├── McpFrame/McpCrypto/McpPeerIdentity/McpChannel — broker plumbing (frame codec, P-256/HKDF/AES-GCM, pairing, per-channel SecureChannel)
       ├── McpSessionClient      — registers a session with the hub; serves sealed requests via the router (headless + GUI)
       ├── McpTimeouts           — the MCP timeout ladder (render < DispatchSync < shim < client), static_assert-ordered
-      └── EngineMcpRoutes       — 25 engine-pure routes + IEngineCommandSink + EngineContext
+      ├── EngineMcpRoutes       — IEngineCommandSink + EngineContext + RegisterEngineRoutes
+      └── Routes/               — the 28 engine routes, one file per concern (+ GraphPatch, RouteSupport)
 
 ShaderLabHeadless.exe (console host, no WinUI dependency)
   └── Main.cpp                  — PNG render / --pixels FP32 readback / --script JSON batch mode
@@ -86,7 +88,7 @@ Render loop: a **render worker `std::jthread`** (MTA) drives graph evaluation at
 
 ### Graph access rule (READ THIS BEFORE TOUCHING `m_graph` FROM UI CODE)
 
-The render worker is the **single writer** of the live `EffectGraph`, and it writes
+The render worker is the **single writer** of the live `GraphModel`, and it writes
 continuously — clock-node `properties[...] =` inserts every tick, plus every MCP
 closure (add/remove/clear/set-property). Getting this wrong is a data race that
 surfaces as an access violation deep inside `std::map`, **not** as a compile error.
@@ -106,19 +108,17 @@ Three access paths, pick deliberately:
 3. **Layout computation** (`RebuildLayout` / `AutoLayout` / `ComputeNodeVisual`)
    → live `m_graph`, but **only on the render thread**; it must see post-mutation
    state immediately, so a snapshot would be a frame stale and miss a just-added
-   node. UI-side callers go through `MainWindow::RunLayoutOnRenderThread`.
+   node. UI-side callers use `NodeGraphController::RequestRelayout` / `RequestAutoLayout`.
 
-Two locks exist, with a strict order. `MainWindow::m_graphMutex` guards the worker's
-own tick/drain — a backstop, not the pattern; new code should use the snapshot
-rather than take it, because the worker holds it for the whole tick (~50 ms on a
-heavy graph) and locking the UI behind that stalls the canvas.
-`NodeGraphController::m_visualsMutex` guards `m_visuals`, which is genuinely written
+`m_graph` has no lock: the render worker is its only thread, and everyone else
+reads the snapshot or dispatches. The one lock is
+`NodeGraphController::m_visualsMutex`, which guards `m_visuals`, genuinely written
 from both threads (`RebuildLayout` on the render thread; `AddNode` / `DeleteSelected`
 / `UpdateDragNodes` on the UI thread) and read by every paint and hit-test.
 
-**Lock order: `m_graphMutex` → `m_visualsMutex`.** The render thread acquires them
-in that order, so UI code must **never** hold `m_visualsMutex` across a
-`DispatchSync` — dispatch the graph write first, release, then lock to update
+**Never hold `m_visualsMutex` across a `DispatchSync`.** A dispatched closure that
+relayouts takes it on the render thread, so waiting on that closure while holding
+it deadlocks — dispatch the graph write first, release, then lock to update
 visuals. Two corollaries, both of which were live bugs: don't hold references into
 `m_visuals` across a dispatch (copy by value — they dangle if the worker rebuilds
 layout while you wait), and don't read `m_visuals` from inside a dispatched closure,
@@ -127,7 +127,7 @@ which runs on the render thread.
 ## Namespace Convention
 
 All code lives under `ShaderLab::` with sub-namespaces matching directories:
-- `ShaderLab::Graph` — data model (EffectGraph, EffectNode, EffectEdge, PropertyValue)
+- `ShaderLab::Graph` — data model (GraphModel, EffectNode, EffectEdge, PropertyValue)
 - `ShaderLab::Rendering` — device stack, swap chain, evaluator, display monitoring, GPU reduction
 - `ShaderLab::Effects` — effect registry, custom effects, shader compilation, image loading
 - `ShaderLab::Controls` — UI controllers (decoupled from XAML views)
@@ -145,6 +145,7 @@ All code lives under `ShaderLab::` with sub-namespaces matching directories:
 - Initialization paths: `winrt::check_hresult()` to throw on failure
 - Render/runtime paths: `SUCCEEDED(hr)` / `FAILED(hr)` checks with early return (no exceptions in hot paths)
 - Graph operations: Return `bool` for success/failure; `nullptr` for not-found
+- Node changes: through the `Graph/GraphEdits.h` setters (`SetNodeProperty`, `SetNodeMedia`, `RenameNode`, `MarkNodeChanged`, ...), which mark the node dirty; never by writing `EffectNode` fields from a host. Only a node still being built, or a white-box test staging engine state, writes fields directly
 - Topological sort: Throws `std::logic_error` on cycle detection
 
 ### Naming
@@ -152,13 +153,13 @@ All code lives under `ShaderLab::` with sub-namespaces matching directories:
 - **Methods**: PascalCase (`AddNode`, `PrepareForRender`, `TopologicalSort`)
 - **Enums**: PascalCase values (`NodeType::BuiltInEffect`, `AnalysisFieldType::Float2`)
 - **Structs**: PascalCase, used for plain data (`EffectNode`, `DisplayCapabilities`, `ShaderVariable`)
-- **Classes**: PascalCase, used for stateful objects with methods (`EffectGraph`, `RenderEngine`, `GraphEvaluator`)
+- **Classes**: PascalCase, used for stateful objects with methods (`GraphModel`, `RenderEngine`, `GraphEvaluator`)
 
 ### File Organization
 - **Header-only**: Small data structs and inline constants (`NodeType.h`, `PropertyValue.h`, `DisplayInfo.h`, `PipelineFormat.h`, `EffectEdge.h`, `EffectNode.h`)
 - **Header + .cpp**: Stateful classes with complex logic
 - **One class per file pair** (matching names)
-- **Anonymous namespaces** for file-local helpers (e.g., JSON serialization helpers in `EffectGraph.cpp`)
+- **Anonymous namespaces** for file-local helpers (e.g., JSON serialization helpers in `GraphModel.cpp`)
 
 ### Property System
 - Node properties stored as `std::map<std::wstring, PropertyValue>` where `PropertyValue = std::variant<float, int32_t, uint32_t, bool, std::wstring, float2, float3, float4, D2D1_MATRIX_5X4_F, std::vector<float>>`
@@ -172,7 +173,7 @@ When creating new D2D effects (the core purpose of this tool):
 2. Register with `ID2D1Factory1::RegisterEffectFromString()` using XML schema + `D2D1_VALUE_TYPE_BINDING` macros
 3. Keep only `InputCount` as a D2D-exposed property; manage shader bytecode and cbuffers host-side
 4. Use `ShaderCompiler` for `D3DCompile` (ps_5_0 / cs_5_0) + `D3DReflect` for cbuffer discovery
-5. Register effects in `Effects::RegisterEngineD2DEffects()` at engine init (called from app + headless + tests)
+5. Register effects in `Engine::RegisterEngineD2DEffects()` (`Engine/EngineBootstrap.h`) at engine init (called from app + headless + tests)
 6. Follow `CustomPixelShaderEffect` / `CustomComputeShaderEffect` as templates
 
 ## Looking at HDR Output (an AI agent cannot, directly)
@@ -219,10 +220,10 @@ Active development centers on **tone-mapping and color-correction effects author
 - **Graph serialization**: `Windows.Data.Json` (zero extra dependencies). GUID fields use `StringFromGUID2`/`CLSIDFromString`.
 - **Effect registry**: Singleton with 40+ built-in D2D effects across 9 categories. Case-insensitive name lookup.
 - **ShaderLab effects library**: 38 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map + Scale), Source / Generator, Composition (Split Comparison, Side by Side), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use; bytecode cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` (decision #58 catalog → see [builtin-catalog.md](../docs/effects/builtin-catalog.md) for the full per-effect type table).
-- **MCP server**: JSON-RPC 2.0 (protocol 2025-06-18, batching rejected) over **stdio via the broker** — the embedded HTTP listener was deleted in stdio-migration Step 9 (decision #71, superseding #31/#58; engine ABI **3**). The router, dispatcher, 39-tool catalog + 25 engine-pure routes live in `Engine/Mcp/` (handlers take `(path, query, body)`); 16 app-side routes stay in `MainWindow.McpRoutes.cpp`. Each host registers as a hub **session** (`McpSessionClient`, GUID-identified); a client's shim (`ShaderLabMcpBroker --stdio`, unpackaged, distributed to `%LOCALAPPDATA%\ShaderLab\bin\`) activates the packaged hub and pins a session with `use_session`. Both hosts register the same engine-side route set through `IEngineCommandSink`: pure mutation closures dispatched via `sink.Dispatch`, with 8 event hooks (`OnNodeAdded`, `OnNodeRemoved`, `OnNodeChanged`, `OnGraphCleared`, `OnGraphLoaded`, `OnGraphStructureChanged`, `OnCustomEffectRecompiled`, `OnDisplayProfileChanged`) the GUI overrides to keep its UI in sync. CI drives `RunTests.ps1` through a shim against a headless `--mcp-session`.
+- **MCP server**: JSON-RPC 2.0 (protocol 2025-06-18, batching rejected) over **stdio via the broker** — the embedded HTTP listener was deleted in stdio-migration Step 9 (decision #71, superseding #31/#58; engine ABI **3**). The router, dispatcher, 47-tool catalog and the 28 engine routes (`Engine/Mcp/Routes/`, one file per concern) live in `Engine/Mcp/` (handlers take `(path, query, body)`); the GUI's 20 own routes are in `MainWindow.McpAppRoutes.cpp` and `Controls/PerfMcpRoutes`, registered through `Controls::McpRouteTable` as UI, render or any-thread routes. Every body goes through `McpJsonWriter.h`; errors are `{error, code}`, a bad argument is a 400 before anything changes, and a later fault is a 500 with its message. Each host registers as a hub **session** (`McpSessionClient`, GUID-identified); a client's shim (`ShaderLabMcpBroker --stdio`, unpackaged, distributed to `%LOCALAPPDATA%\ShaderLab\bin\`) activates the packaged hub and pins a session with `use_session`. Both hosts register the same engine-side route set through `IEngineCommandSink`: pure mutation closures dispatched via `sink.Dispatch`, with 8 event hooks (`OnNodeAdded`, `OnNodeRemoved`, `OnNodeChanged`, `OnGraphCleared`, `OnGraphLoaded`, `OnGraphStructureChanged`, `OnCustomEffectRecompiled`, `OnDisplayProfileChanged`) the GUI overrides to keep its UI in sync. CI drives `RunTests.ps1` through a shim against a headless `--mcp-session`.
 - **Versioning**: `Version.h` defines the app version and the graph format version (read them there rather than quoting numbers here). Both are stored in saved graphs. Forward compatibility check on load. `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` is independent — bumped manually on engine ABI breaks; mismatch between header and DLL aborts startup with a friendly message-box.
 - **Refresh-rate-driven render loop on the worker thread**: the render worker `std::jthread` runs the graph evaluate at the active monitor's refresh rate (clamped to 60–240 Hz). Dirty-gated: skips evaluate when no nodes changed, no output window is open, and `m_forceRender` is false. The UI thread runs a `DispatcherQueueTimer` at the same rate, but its body is just "drain dispatcher + blit offscreen + Present1" — sub-ms cost. The interval is re-applied on every display change so dragging the window across monitors picks up the new rate.
-- **`ProcessDeferredCompute` requires an active D2D draw session**: it calls `dc->DrawImage` internally to pre-render the upstream chain into an FP32 bitmap, and outside `BeginDraw`/`EndDraw` that DrawImage silently no-ops. The GUI's `RenderFrame`, the headless host's `runEval` / `RunRender`, and the test bench all wrap accordingly.
+- **`ProcessDeferredCompute` requires an active D2D draw session**: it calls `dc->DrawImage` internally to pre-render the upstream chain into an FP32 bitmap, and outside `BeginDraw`/`EndDraw` that DrawImage silently no-ops. The GUI's `RenderFrame`, the headless host's `HeadlessEngine::RenderFrame` / `RenderFrameFor` (all through `FrameExecutor::Run`), and the test bench all wrap accordingly.
 - **Ctrl+Enter** compiles shader from the editor TextBox.
 
 ## Adding New Files
@@ -239,7 +240,7 @@ These are critical lessons learned during development. Any AI agent generating o
 
 0a. **Never issue a multi-call D3D11 sequence on the shared immediate context — record on a deferred context and submit once.** `SetMultithreadProtected` makes single calls thread-safe, not sequences, and Direct2D on another thread (same device) can land between a UAV bind and the `Dispatch` that needed it — the dispatch then writes nothing and still returns `S_OK` (~8% of compute re-dispatches, before `D3D11ComputeRunner` moved to a deferred context + one `ExecuteCommandList(list, TRUE)`). Don't reach for `ID2D1Multithread` instead: it works, but it couples compute to Direct2D.
 0b. **A lookup-table input (`lookupInputCount`) is read with `Load` at computed coordinates**, is excluded from the output rect, is demanded whole on every tile, and receives a 1×1 zero placeholder when unwired — never null, since D2D renders nothing for an effect with a null input. Keep a matching `TEXCOORDn` in the signature anyway (positional contract), and keep parentheses out of comments inside the parameter list: the signature guard ends the list at the first `)`.
-0. **`MapOutputRectToInputRects` must answer with the TILE it was asked about, not the whole image.** Direct2D tiles a render once the output is wider than ~2048 px and asks for each tile in turn. Answering "I need the entire input" makes it re-render the whole upstream chain once per tile, which is a cliff rather than a slope: 2048x1280 measured **1.10 ms** and 2100x1280 measured **56.05 ms** -- 1.03x the pixels, 51x the time -- while height changes nothing (1280x2560 is 1.02 ms). With `D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING` declared, output pixel N depends only on input pixel N, so the 1:1 answer is the correct one. Analysis pins (1 x N parameter textures) are not image inputs and keep the whole-rect answer. Behind `Performance::IsSubRectInputDemandEnabled` (default on) if you need to compare. **Corollary for profiling:** a shader that looks catastrophically slow at 4K may not be slow at all -- check the transform's rect mapping before touching its arithmetic. An ablation that removed this tone mapper's entire ICtCp pipeline saved 3%.
+0. **`MapOutputRectToInputRects` must answer with the TILE it was asked about, not the whole image.** Direct2D tiles a render once the output is wider than ~2048 px and asks for each tile in turn. Answering "I need the entire input" makes it re-render the whole upstream chain once per tile, which is a cliff rather than a slope: 2048x1280 measured **1.10 ms** and 2100x1280 measured **56.05 ms** -- 1.03x the pixels, 51x the time -- while height changes nothing (1280x2560 is 1.02 ms). With `D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING` declared, output pixel N depends only on input pixel N, so the 1:1 answer is the correct one. Analysis pins (1 x N parameter textures) are not image inputs and keep the whole-rect answer. Behind `EvaluatorOptions::subRectInputDemand` (default on; `Performance::SetSubRectInputDemandEnabled` sets the process default) if you need to compare. **Corollary for profiling:** a shader that looks catastrophically slow at 4K may not be slow at all -- check the transform's rect mapping before touching its arithmetic. An ablation that removed this tone mapper's entire ICtCp pipeline saved 3%.
 
 1. **Typed cbuffer pack (Phase 3+)**: `uint`, `int`, and `bool` cbuffer slots in HLSL are now packed correctly even when the corresponding `PropertyValue` is stored as `float` (the default for enum-style parameters). The `Effects::PackPropertyToCBuffer` helper reflects each cbuffer variable's `D3D_SHADER_VARIABLE_TYPE` and converts via `static_cast<uint32_t>` / `<int32_t>` / `BOOL` before writing. So you *can* declare `uint Mode` in HLSL and use clean `if (Mode == 1)` comparisons. **Pre-Phase-3 historical convention** (still works, used by all existing ShaderLab effects): declare enums as `float` in HLSL with `> 0.5` / `> 1.5` threshold comparisons. New effects can use either; mixing within one effect is fine.
 2. **HLSL compiler with `D3DCOMPILE_WARNINGS_ARE_ERRORS` optimizes out cbuffer variables** not referenced on ALL code paths. Read all cbuffer vars at top of `main()` before any branches.

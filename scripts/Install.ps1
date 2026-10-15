@@ -86,7 +86,7 @@ if (Test-Path $depsDir) {
 Add-AppxPackage -Path $MsixPath -AllowUnsigned -ForceApplicationShutdown
 Write-Host 'Installed. Launch ShaderLab from the Start menu.' -ForegroundColor Green
 
-# ---- MCP client config (stdio-migration Step 8) -------------------------
+# ---- MCP client config -------------------------------------------------
 # ShaderLab copies its MCP shim to %LOCALAPPDATA%\ShaderLab\bin\ on first
 # launch, and exposes each window as an MCP session via the broker hub. Print
 # a ready-to-paste stdio client config: the shim path is stable + unpackaged

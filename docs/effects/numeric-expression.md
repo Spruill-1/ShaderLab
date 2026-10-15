@@ -2,7 +2,7 @@
 
 A single, expression-driven math node replaces the legacy fixed-op math primitives. Implemented in `Rendering/MathExpression.{h,cpp}` (PCH disabled on the .cpp so the heavy ExprTk template instantiations don't leak into the rest of the engine TU).
 
-- **Dynamic inputs**: starts with one input `A`. Use the **➕ Add Input** button in the Properties panel to add `B`, `C`, … up to `Z` (26-input cap). Each row has an **✕** button to remove just that input.
+- **Dynamic inputs**: starts with one input `A`. Use the **➕ Add Input** button in the Properties panel to add `B`, `C`, … up to `Z` (26-input cap). Each row has an **✕** button to remove just that input. Both are engine edits in `Graph/GraphEdits` (`AddExpressionInput`, `RemoveExpressionInput`, `CanRemoveExpressionInput`), so removing an input also drops any binding to it and the last input cannot go.
 - **Expression**: a `TextBox` at the top of the Properties panel holds the formula. Examples:
   - `A + B * C`
   - `max(A, B, C)`
@@ -21,6 +21,12 @@ A single, expression-driven math node replaces the legacy fixed-op math primitiv
 library to its math-only core; without these flags the MSVC Release optimizer was
 producing a 0xC0000005 in the regex / IO subsystems on first evaluation. Only finite
 scalar expressions are supported — no strings, files, or vector return values.
+
+**Loops are refused.** Expressions come from saved graphs and MCP and are evaluated on
+the render thread, where `while (1) {}` would hang it. The parser is built with the
+`for`, `while` and `repeat` control structures disabled, so an expression using one
+fails to compile and the node reports the parse error like any other (tests
+`LoopRefused_*`). `if` / ternaries and `switch` still work.
 
 
 ---

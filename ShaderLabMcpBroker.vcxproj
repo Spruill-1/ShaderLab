@@ -110,6 +110,9 @@
     <ClInclude Include="Engine\Mcp\McpPeerIdentity.h" />
     <ClInclude Include="Engine\Mcp\McpChannel.h" />
     <ClInclude Include="Engine\Mcp\McpTypes.h" />
+    <ClInclude Include="ShaderLabMcpBroker\BrokerPipeIo.h" />
+    <ClInclude Include="ShaderLabMcpBroker\Hub.h" />
+    <ClInclude Include="ShaderLabMcpBroker\Shim.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch_engine.cpp">
@@ -120,6 +123,9 @@
     <ClCompile Include="Engine\Mcp\McpPeerIdentity.cpp" />
     <ClCompile Include="Engine\Mcp\McpChannel.cpp" />
     <ClCompile Include="ShaderLabMcpBroker\Main.cpp" />
+    <ClCompile Include="ShaderLabMcpBroker\BrokerPipeIo.cpp" />
+    <ClCompile Include="ShaderLabMcpBroker\Hub.cpp" />
+    <ClCompile Include="ShaderLabMcpBroker\Shim.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

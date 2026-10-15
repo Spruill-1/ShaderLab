@@ -25,6 +25,19 @@ D2D evaluates compute effects in **tiles**. Key conventions:
 - **`Output.GetDimensions()`**: Returns the tile size, not the full image.
 - **Constant buffer upload**: Done in `CalculateThreadgroups` (not `PrepareForRender`) for correct per-tile values.
 
+## Statistics reductions
+
+The statistics shaders (Channel, Luminance and Chromaticity Statistics) share
+the multi-group reduction scaffolding from `shaderlab_params.hlsli`:
+`SHADERLAB_PARTIAL_WORD(group, i)` and `SHADERLAB_HISTOGRAM_WORD(group, bin, bins)`
+lay out the scratch buffer, `ShaderLabTreeReduce(tid, threads, combine)` folds
+groupshared accumulators through the shader's own `combine(dst, src)`,
+`ShaderLabStoreHistogram` / `ShaderLabMergeHistograms` move histograms through
+scratch, and `ShaderLabPercentileBin` walks the merged histogram. Each shader
+keeps only its per-pixel accumulate, its `Combine` and its `Result` packing.
+Each macro is a braced block, so its loop variables cannot collide with the
+caller's (fxc scopes a `for` initialiser to the enclosing block).
+
 ## Shader Pattern
 ```hlsl
 cbuffer Constants : register(b0) {

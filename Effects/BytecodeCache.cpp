@@ -1,7 +1,9 @@
 #include "pch_engine.h"
 #include "BytecodeCache.h"
-#include "ShaderLabParamsHlsl.h"
-#include "ShaderLabEffects.h"
+#include "ShaderCompiler.h"
+#include "ShaderIncludes.h"
+#include "ShaderVariants.h"
+#include "../Engine/Utf8.h"
 
 #include <algorithm>
 #include <chrono>
@@ -62,9 +64,9 @@ namespace ShaderLab::Effects
     uint64_t IncludeLibraryHashOf(std::string_view paramsText, std::string_view colorMathText,
                                   std::string_view gamutText)
     {
-        // Cache schema version: bump when the cache layout, key fields or
-        // compile flags change in a way that should invalidate existing
-        // entries (in-memory and on disk). Edits to the embedded includes
+        // Cache schema version: bump when the cache layout or key fields
+        // change in a way that should invalidate existing entries (in-memory
+        // and on disk). Edits to the embedded includes or the compile flags
         // change the hash on their own.
         constexpr uint32_t kCacheSchemaVersion = 5;
         std::string buffer;
@@ -76,6 +78,7 @@ namespace ShaderLab::Effects
             buffer.append(text);
         };
         buffer.append(reinterpret_cast<const char*>(&kCacheSchemaVersion), sizeof(kCacheSchemaVersion));
+        buffer.append(reinterpret_cast<const char*>(&cShaderCompileFlags), sizeof(cShaderCompileFlags));
         appendSized(paramsText);
         appendSized(colorMathText);
         appendSized(gamutText);
@@ -85,10 +88,11 @@ namespace ShaderLab::Effects
     uint64_t IncludeLibraryHash()
     {
         // The includes are compiled into the binary, so hash them once.
-        static const uint64_t sHash = IncludeLibraryHashOf(
-            std::string_view(GetShaderLabParamsHLSL(), GetShaderLabParamsHLSLLength()),
-            GetColorMathHLSL(),
-            GetGamutHLSL());
+        static const uint64_t sHash = []
+        {
+            const auto includes = EmbeddedIncludes();
+            return IncludeLibraryHashOf(includes[0].text, includes[1].text, includes[2].text);
+        }();
         return sHash;
     }
 
@@ -122,26 +126,7 @@ namespace ShaderLab::Effects
 
     std::string CanonicalizeHlslSource(std::wstring_view source)
     {
-        // wide -> UTF-8 first. winrt::to_string requires hstring_view;
-        // do a minimal manual conversion since these are ASCII HLSL
-        // sources in practice. Anything outside ASCII is preserved as
-        // a raw byte sequence using WideCharToMultiByte for safety.
-        std::string utf8;
-        if (!source.empty())
-        {
-            int needed = ::WideCharToMultiByte(
-                CP_UTF8, 0,
-                source.data(), static_cast<int>(source.size()),
-                nullptr, 0, nullptr, nullptr);
-            if (needed > 0)
-            {
-                utf8.resize(static_cast<size_t>(needed));
-                ::WideCharToMultiByte(
-                    CP_UTF8, 0,
-                    source.data(), static_cast<int>(source.size()),
-                    utf8.data(), needed, nullptr, nullptr);
-            }
-        }
+        const std::string utf8 = WideToUtf8(source);
         return CanonicalizeImpl(utf8.data(), utf8.size());
     }
 
@@ -194,11 +179,28 @@ namespace ShaderLab::Effects
         return instance;
     }
 
-    BytecodeCache::BytecodeCache()
+    BytecodeCache::BytecodeCache() = default;
+
+    // Hosts call Shutdown first, so this normally finds no workers. A host
+    // that did not reaches here at process exit, when Windows has already
+    // ended the other threads and the join returns at once.
+    BytecodeCache::~BytecodeCache()
     {
-        // Worker threads: half the cores, clamped to 2..6. Option variants
-        // are precompiled in parallel here; the cap bounds D3DCompile's
-        // memory use and leaves a core for the render thread.
+        Shutdown();
+    }
+
+    size_t BytecodeCache::WorkerCount() const
+    {
+        std::lock_guard<std::mutex> g(m_mutex);
+        return m_workers.size();
+    }
+
+    void BytecodeCache::StartWorkers_NoLock()
+    {
+        if (!m_workers.empty() || m_shutdown.load()) return;
+        // Half the cores, clamped to 2..6. Option variants are precompiled in
+        // parallel here; the cap bounds D3DCompile's memory use and leaves a
+        // core for the render thread.
         const size_t coreCount = (std::max)(std::thread::hardware_concurrency(), 1u);
         const size_t workerCount = (std::min)((std::max)(coreCount / 2, size_t{ 2 }), size_t{ 6 });
         m_workers.reserve(workerCount);
@@ -211,28 +213,35 @@ namespace ShaderLab::Effects
         }
     }
 
-    BytecodeCache::~BytecodeCache()
-    {
-        Shutdown();
-    }
-
     void BytecodeCache::Shutdown()
     {
-        // Idempotent.
         if (m_shutdown.exchange(true)) return;
 
+        std::vector<std::jthread> workers;
         {
             std::lock_guard<std::mutex> g(m_mutex);
-            m_workQueue.clear();  // discard queued-but-not-started work.
+            // A dropped compile job's placeholder would read as compiling forever.
+            // A queued key can also be compiling right now (inline in
+            // GetOrCompile, or on a worker from a duplicate job); DoCompile holds
+            // a reference to that entry with the lock dropped, so it stays and
+            // the compile in flight completes it.
+            for (const PendingWork& work : m_workQueue)
+            {
+                if (work.task) continue;
+                auto it = m_entries.find(work.request.key);
+                if (it != m_entries.end() &&
+                    it->second.status == BytecodeStatus::Pending &&
+                    it->second.compilesInFlight == 0)
+                    m_entries.erase(it);
+            }
+            m_workQueue.clear();
+            workers.swap(m_workers);
         }
+        for (auto& w : workers)
+            w.request_stop();
         m_workCv.notify_all();
         m_readyCv.notify_all();
-        for (auto& w : m_workers)
-        {
-            w.request_stop();
-        }
-        // jthread destructors join on scope exit (or on the next assignment).
-        m_workers.clear();
+        // Each jthread joins as `workers` goes out of scope.
     }
 
     // -----------------------------------------------------------------------
@@ -247,6 +256,7 @@ namespace ShaderLab::Effects
             auto it = m_entries.find(key);
             if (it != m_entries.end())
             {
+                Materialize_NoLock(it->second);
                 r.status       = it->second.status;
                 r.bytecode     = it->second.bytecode;
                 r.errorMessage = it->second.errorMessage;
@@ -256,7 +266,7 @@ namespace ShaderLab::Effects
         }
         // Disk fallback: hydrate the in-memory map if the file exists.
         std::vector<uint8_t> fromDisk;
-        if (TryLoadFromDisk(key, fromDisk))
+        if (TryLoadFromDisk(GetDiskCacheRoot(), key, fromDisk))
         {
             std::lock_guard<std::mutex> g(m_mutex);
             // Re-check after acquiring the lock (another thread may have
@@ -296,6 +306,9 @@ namespace ShaderLab::Effects
 
         {
             std::lock_guard<std::mutex> g(m_mutex);
+            if (m_shutdown.load()) return;
+            if (!request.allowPrebuiltCompile && m_prebuiltSources.contains(request.key.sourceHash))
+                return;
             auto it = m_entries.find(request.key);
             if (it != m_entries.end())
             {
@@ -320,10 +333,32 @@ namespace ShaderLab::Effects
             Entry& e = m_entries[request.key];
             e.status         = BytecodeStatus::Pending;
             e.insertionOrder = m_nextInsertionOrder++;
-            if (urgent) m_workQueue.push_front({ std::move(request) });
-            else        m_workQueue.push_back({ std::move(request) });
+            if (urgent) m_workQueue.push_front({ std::move(request), {} });
+            else        m_workQueue.push_back({ std::move(request), {} });
+            StartWorkers_NoLock();
         }
         m_workCv.notify_one();
+    }
+
+    void BytecodeCache::QueueReapDisk(uint64_t staleThresholdSec)
+    {
+        {
+            std::lock_guard<std::mutex> g(m_mutex);
+            if (m_shutdown.load()) return;
+            m_workQueue.push_back({ {}, [this, staleThresholdSec] {
+                const ReapResult result = ReapDisk(staleThresholdSec);
+                std::lock_guard<std::mutex> resultLock(m_mutex);
+                m_lastReap = result;
+            } });
+            StartWorkers_NoLock();
+        }
+        m_workCv.notify_one();
+    }
+
+    std::optional<BytecodeCache::ReapResult> BytecodeCache::LastReapResult() const
+    {
+        std::lock_guard<std::mutex> g(m_mutex);
+        return m_lastReap;
     }
 
     std::optional<size_t> BytecodeCache::QueuePosition(const BytecodeCompileKey& key) const
@@ -347,6 +382,7 @@ namespace ShaderLab::Effects
             auto it = m_entries.find(request.key);
             if (it != m_entries.end())
             {
+                Materialize_NoLock(it->second);
                 if (it->second.status == BytecodeStatus::Ready)
                 {
                     BytecodeCacheResult r;
@@ -369,11 +405,21 @@ namespace ShaderLab::Effects
             }
         }
 
+        // A build a prebuilt effect's blob lacks is not compiled here; the
+        // evaluator falls back to one the blob has.
+        if (!request.allowPrebuiltCompile && IsPrebuiltSource(request.key.sourceHash))
+        {
+            BytecodeCacheResult refused;
+            refused.status = BytecodeStatus::NotRequested;
+            refused.errorMessage = L"This build is not in the effect's prebuilt blob, and runtime compiles are off.";
+            return refused;
+        }
+
         // Disk fallback BEFORE inline compile -- a previous-session
         // bytecode is much cheaper than re-running D3DCompile.
         {
             std::vector<uint8_t> fromDisk;
-            if (TryLoadFromDisk(request.key, fromDisk))
+            if (TryLoadFromDisk(GetDiskCacheRoot(), request.key, fromDisk))
             {
                 std::lock_guard<std::mutex> g(m_mutex);
                 auto it = m_entries.find(request.key);
@@ -435,6 +481,7 @@ namespace ShaderLab::Effects
         BytecodeCacheMetadata metaCopy;
         BytecodeCompileKey    keyCopy;
         std::vector<uint8_t>  bytecodeForDisk;
+        std::wstring          diskRoot;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
             auto& e = m_entries[request.key];
@@ -456,17 +503,15 @@ namespace ShaderLab::Effects
             metaCopy         = request.metadata;
             if (finalStatus == BytecodeStatus::Ready)
                 bytecodeForDisk = e.bytecode;
+            diskRoot         = m_diskRoot;
             EnforceByteLimit_NoLock();
         }
         m_inlineCompiles.fetch_add(1, std::memory_order_relaxed);
         m_readyCv.notify_all();
 
-        // Persist outside the lock (best-effort; don't block render).
-        if (!bytecodeForDisk.empty() && !m_diskRoot.empty())
-        {
-            std::lock_guard<std::mutex> g(m_mutex);
-            WriteToDisk(keyCopy, metaCopy, bytecodeForDisk);
-        }
+        // Persist without the lock (best-effort).
+        if (!bytecodeForDisk.empty())
+            WriteToDisk(diskRoot, keyCopy, metaCopy, bytecodeForDisk);
 
         BytecodeCacheResult r;
         r.status       = finalStatus;
@@ -477,70 +522,54 @@ namespace ShaderLab::Effects
     }
 
     // -----------------------------------------------------------------------
-    // Eager precompile
-    // -----------------------------------------------------------------------
-
-    void BytecodeCache::PrecompileCommonShapes(
-        const BytecodeCacheMetadata& metadata,
-        const std::string& canonicalHlslSource,
-        const std::string& entryPoint,
-        const std::string& target,
-        const std::vector<std::string>& gpuBindableParamNames)
-    {
-        if (m_shutdown.load()) return;
-
-        const uint64_t srcHash    = HashCanonicalSource(canonicalHlslSource);
-        const uint64_t paramHash  = HashParamSignature(gpuBindableParamNames);
-        const uint64_t includeHash = IncludeLibraryHash();
-        const size_t   paramCount = gpuBindableParamNames.size();
-
-        // Hard cap on bitset width. Today's effects use ~3-5 gpu params
-        // max; complaining loudly here lets us catch a future change
-        // before silent truncation bites.
-        if (paramCount > 32)
-        {
-            // Still proceed with baseline only -- safer than crashing.
-            // Future: widen to uint64_t or dynamic bitset.
-        }
-
-        auto enqueueShape = [&](uint32_t bitset)
-        {
-            BytecodeCompileRequest req;
-            req.key.sourceHash         = srcHash;
-            req.key.paramSignatureHash = paramHash;
-            req.key.includeLibraryHash = includeHash;
-            req.key.macroBitset        = bitset;
-            req.key.entryPoint         = entryPoint;
-            req.key.target             = target;
-            req.metadata               = metadata;
-            req.hlslSource             = canonicalHlslSource;
-            req.gpuBindableParamNames  = gpuBindableParamNames;
-            RequestCompile(std::move(req));
-        };
-
-        // Baseline (all params in cbuffer mode).
-        enqueueShape(0u);
-        // One variant per gpu-bindable param flipped to GPU mode, two bits
-        // per param. A pixel shader takes GPU values as an input image
-        // (mode 2), a compute shader as an SRV (mode 1).
-        const uint32_t gpuMode = (target.rfind("ps", 0) == 0) ? 2u : 1u;
-        const size_t shapeCount = std::min<size_t>(paramCount, 16);
-        for (size_t i = 0; i < shapeCount; ++i)
-            enqueueShape(gpuMode << (2u * static_cast<uint32_t>(i)));
-    }
-
-    // -----------------------------------------------------------------------
     // Invalidate / Clear / Stats
     // -----------------------------------------------------------------------
+
+    void BytecodeCache::AddPrebuilt(const BytecodeCompileKey& key, PrebuiltLoader load)
+    {
+        std::lock_guard<std::mutex> g(m_mutex);
+        m_prebuiltSources.insert(key.sourceHash);
+        auto& entry = m_entries[key];
+        if (entry.compilesInFlight > 0) return;   // a worker is filling it; its result stands
+        if (entry.status == BytecodeStatus::Ready && entry.pinned) return;   // registered already
+        m_currentBytes -= entry.bytecode.size();
+        entry.status = BytecodeStatus::Ready;
+        entry.bytecode.clear();
+        entry.errorMessage.clear();
+        entry.pinned = true;
+        entry.load = std::move(load);
+        entry.insertionOrder = m_nextInsertionOrder++;
+    }
+
+    void BytecodeCache::Materialize_NoLock(Entry& entry)
+    {
+        if (!entry.load) return;
+        entry.bytecode = entry.load();
+        entry.load = nullptr;
+        if (entry.bytecode.empty())
+        {
+            entry.status = BytecodeStatus::Failed;
+            entry.errorMessage = L"A prebuilt build in the effect's blob does not decompress.";
+            return;
+        }
+        m_currentBytes += entry.bytecode.size();
+    }
+
+    bool BytecodeCache::IsPrebuiltSource(uint64_t sourceHash) const
+    {
+        std::lock_guard<std::mutex> g(m_mutex);
+        return m_prebuiltSources.contains(sourceHash);
+    }
 
     void BytecodeCache::Invalidate(const BytecodeCompileKey& key)
     {
         std::lock_guard<std::mutex> g(m_mutex);
         auto it = m_entries.find(key);
         if (it == m_entries.end()) return;
-        if (it->second.status == BytecodeStatus::Pending)
+        if (it->second.status == BytecodeStatus::Pending || it->second.pinned)
         {
-            // Don't yank an in-flight entry out from under a worker.
+            // Don't yank an in-flight entry out from under a worker, or a
+            // prebuilt one that nothing could rebuild.
             return;
         }
         m_currentBytes -= it->second.bytecode.size();
@@ -550,10 +579,11 @@ namespace ShaderLab::Effects
     void BytecodeCache::Clear()
     {
         std::lock_guard<std::mutex> g(m_mutex);
-        // Don't drop Pending entries -- workers may be mid-compile.
+        // Don't drop Pending entries -- workers may be mid-compile -- or
+        // prebuilt ones.
         for (auto it = m_entries.begin(); it != m_entries.end(); )
         {
-            if (it->second.status == BytecodeStatus::Pending)
+            if (it->second.status == BytecodeStatus::Pending || it->second.pinned)
             {
                 ++it;
             }
@@ -566,7 +596,7 @@ namespace ShaderLab::Effects
     }
 
     // -----------------------------------------------------------------------
-    // Disk persistence (Phase 8 p8-cache-disk)
+    // Disk persistence
     // -----------------------------------------------------------------------
     //
     // Layout: <root>\<effectIdSafe>\<version>\<keyHashHex>.cso
@@ -638,18 +668,24 @@ namespace ShaderLab::Effects
 
     void BytecodeCache::SetDiskCacheRoot(std::wstring rootPath)
     {
+        if (!rootPath.empty())
+            EnsureDirectoryRecursive(rootPath);
         std::lock_guard<std::mutex> g(m_mutex);
         m_diskRoot = std::move(rootPath);
-        if (!m_diskRoot.empty())
-            EnsureDirectoryRecursive(m_diskRoot);
+    }
+
+    std::wstring BytecodeCache::GetDiskCacheRoot() const
+    {
+        std::lock_guard<std::mutex> g(m_mutex);
+        return m_diskRoot;
     }
 
     std::wstring BytecodeCache::KeyToDiskPath(
+        const std::wstring& root,
         const BytecodeCompileKey& key,
-        const BytecodeCacheMetadata& meta) const
+        const BytecodeCacheMetadata& meta)
     {
-        // Caller holds m_mutex.
-        if (m_diskRoot.empty()) return {};
+        if (root.empty()) return {};
 
         // Single 64-bit hash of the full key for the filename.
         BytecodeCompileKeyHash hasher;
@@ -658,7 +694,7 @@ namespace ShaderLab::Effects
         std::wstring effectIdSafe = SanitizeForFilesystem(
             meta.effectId.empty() ? L"_unknown" : meta.effectId);
 
-        std::wstring path = m_diskRoot;
+        std::wstring path = root;
         if (!path.empty() && path.back() != L'\\') path.push_back(L'\\');
         path += effectIdSafe;
         path.push_back(L'\\');
@@ -670,8 +706,9 @@ namespace ShaderLab::Effects
     }
 
     bool BytecodeCache::TryLoadFromDisk(
+        const std::wstring& root,
         const BytecodeCompileKey& key,
-        std::vector<uint8_t>& outBytecode) const
+        std::vector<uint8_t>& outBytecode)
     {
         // The on-disk filename is keyed by the FULL hash of all
         // bytecode-determining fields. We don't have effectId/version
@@ -681,12 +718,12 @@ namespace ShaderLab::Effects
         // immediate `<effectIdSafe>/<version>/` children looking for
         // a file named `<keyHashHex>.cso`. With a typical cache of
         // 5-50 effects, that's a fast operation.
-        if (m_diskRoot.empty()) return false;
+        if (root.empty()) return false;
         BytecodeCompileKeyHash hasher;
         std::wstring fname = HexFormat(static_cast<uint64_t>(hasher(key))) + L".cso";
 
         WIN32_FIND_DATAW fdEffect{};
-        std::wstring effectGlob = m_diskRoot;
+        std::wstring effectGlob = root;
         if (!effectGlob.empty() && effectGlob.back() != L'\\') effectGlob.push_back(L'\\');
         effectGlob += L"*";
         HANDLE hEffect = ::FindFirstFileW(effectGlob.c_str(), &fdEffect);
@@ -696,7 +733,7 @@ namespace ShaderLab::Effects
         do {
             if (!(fdEffect.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
             if (fdEffect.cFileName[0] == L'.') continue;
-            std::wstring effectDir = m_diskRoot;
+            std::wstring effectDir = root;
             if (effectDir.back() != L'\\') effectDir.push_back(L'\\');
             effectDir += fdEffect.cFileName;
 
@@ -761,15 +798,13 @@ namespace ShaderLab::Effects
     }
 
     void BytecodeCache::WriteToDisk(
+        const std::wstring& root,
         const BytecodeCompileKey& key,
         const BytecodeCacheMetadata& meta,
         const std::vector<uint8_t>& bytecode)
     {
-        // Caller holds m_mutex (we do file I/O while holding the lock
-        // -- not great but cache-disk writes are ~10 KB and the worker
-        // thread does this off the render path).
-        if (m_diskRoot.empty() || bytecode.empty()) return;
-        std::wstring path = KeyToDiskPath(key, meta);
+        if (root.empty() || bytecode.empty()) return;
+        std::wstring path = KeyToDiskPath(root, key, meta);
         if (path.empty()) return;
 
         // Create parent dir.
@@ -777,8 +812,9 @@ namespace ShaderLab::Effects
         if (slash == std::wstring::npos) return;
         if (!EnsureDirectoryRecursive(path.substr(0, slash))) return;
 
-        // Atomic write: temp file in parent dir + MoveFileEx replace.
-        std::wstring tmp = path + L".tmp";
+        // Atomic write: temp file in parent dir + MoveFileEx replace. The temp
+        // name is per thread: two threads can persist the same key at once.
+        std::wstring tmp = path + L"." + std::to_wstring(::GetCurrentThreadId()) + L".tmp";
         HANDLE hFile = ::CreateFileW(tmp.c_str(), GENERIC_WRITE,
             0, nullptr, CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -915,7 +951,7 @@ namespace ShaderLab::Effects
     {
         while (!stop.stop_requested() && !m_shutdown.load())
         {
-            BytecodeCompileRequest req;
+            PendingWork work;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_workCv.wait(lock, [&] {
@@ -923,9 +959,15 @@ namespace ShaderLab::Effects
                 });
                 if (stop.stop_requested() || m_shutdown.load()) return;
                 if (m_workQueue.empty()) continue;
-                req = std::move(m_workQueue.front().request);
+                work = std::move(m_workQueue.front());
                 m_workQueue.pop_front();
             }
+            if (work.task)
+            {
+                work.task();
+                continue;
+            }
+            const BytecodeCompileRequest& req = work.request;
 
             // Compile outside the queue mutex.
             std::unique_lock<std::mutex> lock(m_mutex);
@@ -943,21 +985,25 @@ namespace ShaderLab::Effects
                 continue;
             }
 
-            DoCompile(req, lock, it->second);
-            EnforceByteLimit_NoLock();
+            // A reference, not the iterator: DoCompile drops the lock, and an
+            // insert meanwhile can rehash, which moves no node but invalidates
+            // iterators.
+            Entry& entry = it->second;
+            DoCompile(req, lock, entry);
             m_workerCompiles.fetch_add(1, std::memory_order_relaxed);
 
-            // Persist to disk on success (best-effort, with the lock
-            // held -- file writes are small and the worker is off the
-            // render thread).
-            if (it->second.status == BytecodeStatus::Ready &&
-                !m_diskRoot.empty())
-            {
-                WriteToDisk(req.key, req.metadata, it->second.bytecode);
-            }
+            // Copy what to persist before the byte limit can evict the entry,
+            // then write without the lock (best-effort).
+            std::vector<uint8_t> bytecodeForDisk;
+            if (entry.status == BytecodeStatus::Ready && !m_diskRoot.empty())
+                bytecodeForDisk = entry.bytecode;
+            const std::wstring diskRoot = m_diskRoot;
+            EnforceByteLimit_NoLock();
 
             lock.unlock();
             m_readyCv.notify_all();
+            if (!bytecodeForDisk.empty())
+                WriteToDisk(diskRoot, req.key, req.metadata, bytecodeForDisk);
         }
     }
 
@@ -966,39 +1012,14 @@ namespace ShaderLab::Effects
         std::unique_lock<std::mutex>& lock,
         Entry& outEntry)
     {
-        // Build the macro list from the param-name vector + bitset.
-        // Strings must outlive D3DCompile, so keep them owned locally.
-        std::vector<std::string> defNames;
-        std::vector<std::string> defValues;
-        defNames.reserve(req.gpuBindableParamNames.size());
-        defValues.reserve(req.gpuBindableParamNames.size());
-        // TWO bits per parameter, not one: the binding mode is 0 (cbuffer),
-        // 1 (StructuredBuffer SRV) or 2 (Texture2D effect input). Mode 2 is
-        // the only GPU-resident route open to a Direct2D PIXEL shader, which
-        // cannot bind an arbitrary SRV. 16 gpu-bindable params per effect fit
-        // in the uint32; beyond that the tail stays cbuffer-bound, which is
-        // always correct if slower.
-        for (size_t i = 0; i < req.gpuBindableParamNames.size() && i < 16; ++i)
-        {
-            const uint32_t mode = (req.key.macroBitset >> (2u * i)) & 3u;
-            defNames.push_back("_SLPARAM_" + req.gpuBindableParamNames[i] + "_GPU");
-            defValues.push_back(mode == 2u ? "2" : (mode == 1u ? "1" : "0"));
-        }
-        // Define both option macros for every specialised parameter, in every
-        // variant: _SLOPT_<name>_MODE (1 = fixed, 0 = cbuffer read) and
-        // _SLOPT_<name> (the fixed option index). See SHADERLAB_OPTION.
-        for (size_t i = 0; i < req.optionParamNames.size() && i < cMaxSpecializedOptions; ++i)
-        {
-            const uint32_t slot = OptionKeySlot(req.key.optionKey, i);
-            defNames.push_back("_SLOPT_" + req.optionParamNames[i] + "_MODE");
-            defValues.push_back(slot ? "1" : "0");
-            defNames.push_back("_SLOPT_" + req.optionParamNames[i]);
-            defValues.push_back(std::to_string(slot ? slot - 1u : 0u));
-        }
+        // ShaderVariants owns the macro spellings. The strings must outlive D3DCompile.
+        std::vector<MacroPair> macroPairs = BuildVariantMacros(
+            req.gpuBindableParamNames, req.key.macroBitset, req.optionParamNames, req.key.optionKey);
+        macroPairs.insert(macroPairs.end(), req.fieldMacros.begin(), req.fieldMacros.end());
         std::vector<ShaderCompiler::MacroDef> macros;
-        macros.reserve(defNames.size());
-        for (size_t i = 0; i < defNames.size(); ++i)
-            macros.push_back({ defNames[i].c_str(), defValues[i].c_str() });
+        macros.reserve(macroPairs.size());
+        for (const auto& [name, value] : macroPairs)
+            macros.push_back({ name.c_str(), value.c_str() });
 
         // Drop the lock around D3DCompile -- it can take 50-300ms in
         // debug. Other readers can still TryGet the (Pending) entry,
@@ -1006,12 +1027,14 @@ namespace ShaderLab::Effects
         std::string hlsl = req.hlslSource;
         std::string entry = req.key.entryPoint;
         std::string target = req.key.target;
+        ++outEntry.compilesInFlight;
         lock.unlock();
 
         ShaderCompileResult result = ShaderCompiler::CompileFromString(
             hlsl, "BytecodeCache", entry, target, macros);
 
         lock.lock();
+        --outEntry.compilesInFlight;
         // Race check: if the entry was wiped or completed under us,
         // discard our result. Specifically, NEVER overwrite a Ready
         // entry with a Failed result (or any worker result with a
@@ -1055,7 +1078,7 @@ namespace ShaderLab::Effects
         victims.reserve(m_entries.size());
         for (auto& [k, e] : m_entries)
         {
-            if (e.status == BytecodeStatus::Pending) continue;
+            if (e.status == BytecodeStatus::Pending || e.pinned) continue;
             victims.push_back({ e.insertionOrder, k });
         }
         std::sort(victims.begin(), victims.end(),

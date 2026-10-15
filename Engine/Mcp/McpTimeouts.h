@@ -1,6 +1,6 @@
 #pragma once
 
-// The one place the MCP timeout ladder lives (stdio-migration Step 7).
+// The one place the MCP timeout ladder lives.
 //
 // Each hop must give the hop below it time to fail on its OWN terms and
 // report a real error, rather than the outer hop timing out first and

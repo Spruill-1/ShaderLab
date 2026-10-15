@@ -82,6 +82,16 @@ namespace ShaderLab::Mcp
             static_cast<unsigned>(SHADERLAB_ENGINE_ABI_VERSION));
     }
 
+    std::wstring ResolvePipeBaseName(std::wstring_view override)
+    {
+        if (!override.empty())
+            return std::wstring(override);
+        wchar_t env[256]{};
+        if (::GetEnvironmentVariableW(L"SHADERLAB_MCP_PIPE", env, ARRAYSIZE(env)) > 0)
+            return env;
+        return DefaultPipeBaseName();
+    }
+
     std::wstring DefaultPipeBaseName()
     {
         std::wstring sid = L"nouser";

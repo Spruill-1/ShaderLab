@@ -1,10 +1,11 @@
 #include "pch_engine.h"
 #include "EffectGraphFile.h"
-#include "../Graph/EffectGraph.h"
+#include "../Graph/GraphModel.h"
+#include "../Engine/Utf8.h"
 
 // miniz: vendored at build time by EnsureMiniz.ps1 -> third_party/miniz.
 // We use only its DEFLATE codec (tdefl_compress_mem_to_heap /
-// tinfl_decompress_mem_to_heap); the surrounding ZIP container is still
+// tinfl_decompress_mem_to_mem); the surrounding ZIP container is still
 // our own minimal writer/reader, which already tracks per-entry
 // compression method, CRC32, and sizes.
 #define MINIZ_NO_ARCHIVE_APIS
@@ -12,13 +13,15 @@
 #define MINIZ_NO_TIME
 #include "miniz.h"
 
-// Minimal ZIP "store" (method=0) reader/writer.
+#include <cwctype>
+
+// Minimal ZIP reader/writer.
 //
 // We only ever read or write archives produced by this code, so the
 // implementation focuses on the small subset of the ZIP spec that
 // matters for our container:
 //
-//   * No compression (method 0).
+//   * Stored (method 0) or DEFLATE (method 8) entries.
 //   * No encryption.
 //   * No multi-disk volumes.
 //   * No ZIP64 extensions; entries are well under 4 GB.
@@ -45,9 +48,11 @@
 //   * Compression uses miniz's tdefl_compress_mem_to_heap with the
 //     default probe count (~zlib level 6). The output is raw DEFLATE
 //     (no zlib header), which is exactly what ZIP method 8 expects.
-//   * Decompression uses miniz's tinfl_decompress_mem_to_heap. The
-//     reader accepts both method 0 (forward-compatible with old
-//     archives) and method 8.
+//   * Decompression uses miniz's tinfl_decompress_mem_to_mem into a
+//     buffer of the entry's declared size. The reader accepts both
+//     method 0 (forward-compatible with old archives) and method 8.
+//   * Archives are untrusted input: media names must be flat file
+//     names, and an entry may not inflate past its declared size.
 //   * miniz is vendored at build time (third_party/miniz, MIT
 //     licensed) by EnsureMiniz.ps1 -- the source is not checked in.
 
@@ -157,38 +162,31 @@ namespace
 	constexpr uint32_t kEocdSig = 0x06054b50;
 	constexpr uint16_t cDosDate1980 = (1 << 9) | (1 << 5) | 1; // 1980-01-01, fixed
 
-	// UTF-16 -> UTF-8 conversion via WideCharToMultiByte (no third-party
-	// dependency). Used for ZIP entry names (which we mark as UTF-8 via
-	// general-purpose bit 11) and for the JSON payload.
-	std::string Utf16ToUtf8(std::wstring_view ws)
+	// A media entry is extracted to extractDir\<name>, so the name must be a
+	// plain file name: no separators, drive or stream colons, dot segments,
+	// control characters, trailing dots or spaces (Windows strips them), or
+	// device names.
+	bool IsFlatMediaFileName(const std::wstring& name)
 	{
-		if (ws.empty()) return {};
-		const int bytes = WideCharToMultiByte(
-			CP_UTF8, 0,
-			ws.data(), static_cast<int>(ws.size()),
-			nullptr, 0, nullptr, nullptr);
-		std::string out(static_cast<size_t>(bytes), '\0');
-		WideCharToMultiByte(
-			CP_UTF8, 0,
-			ws.data(), static_cast<int>(ws.size()),
-			out.data(), bytes, nullptr, nullptr);
-		return out;
+		if (name.empty() || name.size() > 255) return false;
+		for (wchar_t ch : name)
+			if (ch < 0x20 || ch == L'\\' || ch == L'/' || ch == L':' || ch == L'*' || ch == L'?' ||
+				ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|')
+				return false;
+		if (name.back() == L'.' || name.back() == L' ') return false;
+
+		std::wstring stem = name.substr(0, name.find(L'.'));
+		while (!stem.empty() && stem.back() == L' ') stem.pop_back();
+		for (auto& ch : stem) ch = static_cast<wchar_t>(std::towupper(ch));
+		static const std::set<std::wstring> sDeviceNames = {
+			L"CON", L"PRN", L"AUX", L"NUL",
+			L"COM1", L"COM2", L"COM3", L"COM4", L"COM5", L"COM6", L"COM7", L"COM8", L"COM9",
+			L"LPT1", L"LPT2", L"LPT3", L"LPT4", L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9" };
+		return !sDeviceNames.contains(stem);
 	}
 
-	std::wstring Utf8ToUtf16(const char* data, size_t size)
-	{
-		if (size == 0) return {};
-		const int chars = MultiByteToWideChar(
-			CP_UTF8, 0,
-			data, static_cast<int>(size),
-			nullptr, 0);
-		std::wstring out(static_cast<size_t>(chars), L'\0');
-		MultiByteToWideChar(
-			CP_UTF8, 0,
-			data, static_cast<int>(size),
-			out.data(), chars);
-		return out;
-	}
+	// Raw DEFLATE never expands data by more than about 1032:1.
+	constexpr uint64_t cMaxDeflateRatio = 1032;
 
 	bool WriteAll(HANDLE h, const void* data, size_t size)
 	{
@@ -485,7 +483,7 @@ namespace ShaderLab::Rendering
 		SaveStats localStats;
 		SaveStats& result = stats ? *stats : localStats;
 		result = {};
-		const std::string jsonUtf8 = Utf16ToUtf8(graphJson);
+		const std::string jsonUtf8 = WideToUtf8(graphJson);
 		const std::vector<uint8_t> jsonBytes(jsonUtf8.begin(), jsonUtf8.end());
 
 		// Steps: check each media file, write or copy each one, graph.json, done.
@@ -510,7 +508,7 @@ namespace ShaderLab::Rendering
 			++step;
 			const std::wstring fileName = std::filesystem::path(media[i].sourcePath).filename().wstring();
 			if (!report(L"Checking " + fileName)) return false;
-			const std::string entryName = Utf16ToUtf8(media[i].zipEntryName);
+			const std::string entryName = WideToUtf8(media[i].zipEntryName);
 			auto match = std::find_if(existing.begin(), existing.end(),
 				[&](const EntryRecord& entry) { return entry.name == entryName; });
 			if (match == existing.end()) continue;
@@ -582,7 +580,7 @@ namespace ShaderLab::Rendering
 				{
 					std::vector<uint8_t> data;
 					if (!report(L"Writing " + fileName) || !ReadWholeFile(media[i].sourcePath, data)
-						|| !writer.AddBytes(Utf16ToUtf8(media[i].zipEntryName), data))
+						|| !writer.AddBytes(WideToUtf8(media[i].zipEntryName), data))
 						return false;
 				}
 			}
@@ -632,6 +630,9 @@ namespace ShaderLab::Rendering
 		if (!::GetFileSizeEx(file.get(), &size) || size.QuadPart < (LONGLONG)sizeof(EndOfCentralDirectory))
 			return std::nullopt;
 
+		// One ReadFile call takes a DWORD length.
+		if (static_cast<ULONGLONG>(size.QuadPart) > MAXDWORD)
+			return std::nullopt;
 		std::vector<uint8_t> buf(static_cast<size_t>(size.QuadPart));
 		DWORD read = 0;
 		if (!::ReadFile(file.get(), buf.data(), static_cast<DWORD>(buf.size()), &read, nullptr)
@@ -697,22 +698,18 @@ namespace ShaderLab::Rendering
 					buf.data() + e.dataOff + e.size);
 				return out;
 			}
-			// Method 8: raw DEFLATE. miniz's tinfl_decompress_mem_to_heap
-			// is the symmetric inverse of tdefl_compress_mem_to_heap that
-			// we used on save -- no zlib header, no checksum trailer.
-			size_t outSize = 0;
-			void* inflated = tinfl_decompress_mem_to_heap(
-				buf.data() + e.dataOff, e.size, &outSize, 0);
-			if (!inflated) return out;
-			if (e.uncompressedSize != 0 && outSize != e.uncompressedSize)
-			{
-				mz_free(inflated);
+			// Method 8: raw DEFLATE, the inverse of tdefl_compress_mem_to_heap
+			// on save -- no zlib header, no checksum trailer. Inflate into
+			// exactly the declared size, so a payload that would grow past it
+			// is refused instead of allocated.
+			if (e.uncompressedSize == 0) return out;
+			if (e.uncompressedSize > static_cast<uint64_t>(e.size) * cMaxDeflateRatio)
 				return out;
-			}
-			out.assign(
-				static_cast<const uint8_t*>(inflated),
-				static_cast<const uint8_t*>(inflated) + outSize);
-			mz_free(inflated);
+			out.resize(e.uncompressedSize);
+			const size_t outSize = tinfl_decompress_mem_to_mem(
+				out.data(), out.size(), buf.data() + e.dataOff, e.size, 0);
+			if (outSize != out.size())
+				out.clear();
 			return out;
 		};
 
@@ -723,8 +720,7 @@ namespace ShaderLab::Rendering
 			if (e.name != "graph.json") continue;
 			auto bytes = inflateEntry(e);
 			if (bytes.empty() && e.uncompressedSize > 0) return std::nullopt;
-			graphJson = Utf8ToUtf16(
-				reinterpret_cast<const char*>(bytes.data()), bytes.size());
+			graphJson = Utf8ToWide(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
 		}
 		if (!graphJson.has_value())
 			return std::nullopt;
@@ -792,9 +788,10 @@ namespace ShaderLab::Rendering
 			if (!e.name.starts_with("media/")) continue;
 			if (e.name.size() <= 6 || e.name.back() == '/') continue; // skip the dir marker
 
-			const std::wstring nameW = Utf8ToUtf16(e.name.c_str(), e.name.size());
+			const std::wstring nameW = Utf8ToWide(std::string_view(e.name.c_str(), e.name.size()));
 			// strip the "media/" prefix (6 chars) for the on-disk name
 			const std::wstring fileName = nameW.substr(6);
+			if (!IsFlatMediaFileName(fileName)) return std::nullopt;
 
 			++step;
 			if (!report(fileName)) return std::nullopt;
@@ -814,7 +811,7 @@ namespace ShaderLab::Rendering
 			if (!ok) return std::nullopt;
 
 			// mediaMap key uses the canonical "media://<name>" token
-			// that the saver wrote into shaderPath. Loader rewrites
+			// that the saver wrote into mediaPath. Loader rewrites
 			// any node whose path matches to outPath.
 			result.mediaMap[L"media://" + fileName] = outPath;
 		}
@@ -870,38 +867,35 @@ namespace ShaderLab::Rendering
 		if (bytes.size() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
 			start = 3;
 		LoadResult result;
-		result.graphJson = Utf8ToUtf16(reinterpret_cast<const char*>(bytes.data()) + start, bytes.size() - start);
+		result.graphJson = Utf8ToWide(std::string_view(reinterpret_cast<const char*>(bytes.data()) + start, bytes.size() - start));
 		return result;
 	}
 
-	void EffectGraphFile::ResolveMediaTokens(Graph::EffectGraph& graph,
+	void EffectGraphFile::ResolveMediaTokens(Graph::GraphModel& graph,
 		const std::map<std::wstring, std::wstring>& mediaMap)
 	{
 		if (mediaMap.empty()) return;
-		for (auto& node : const_cast<std::vector<Graph::EffectNode>&>(graph.Nodes()))
+		for (auto& node : graph.MutableNodes())
 		{
-			if (node.type != Graph::NodeType::Source || !node.shaderPath.has_value()) continue;
-			auto it = mediaMap.find(*node.shaderPath);
+			if (node.type != Graph::NodeType::Source || !node.mediaPath.has_value()) continue;
+			auto it = mediaMap.find(*node.mediaPath);
 			if (it == mediaMap.end()) continue;
-			node.shaderPath = it->second;
-			auto propertyIt = node.properties.find(L"shaderPath");
-			if (propertyIt != node.properties.end())
-				propertyIt->second = it->second;
+			node.mediaPath = it->second;
 		}
 	}
 
-	std::wstring EffectGraphFile::SerializeForSave(Graph::EffectGraph graph, bool embedMedia,
+	std::wstring EffectGraphFile::SerializeForSave(Graph::GraphModel graph, bool embedMedia,
 		std::vector<MediaEntry>& media)
 	{
 		if (!embedMedia)
 			return std::wstring(graph.ToJson());
 
 		std::set<std::wstring> usedNames;
-		for (auto& node : const_cast<std::vector<Graph::EffectNode>&>(graph.Nodes()))
+		for (auto& node : graph.MutableNodes())
 		{
 			if (node.type != Graph::NodeType::Source) continue;
-			if (!node.shaderPath.has_value()) continue;
-			const std::wstring path = node.shaderPath.value();
+			if (!node.mediaPath.has_value()) continue;
+			const std::wstring path = node.mediaPath.value();
 			if (path.empty() || path.starts_with(L"media://")) continue;
 			// Skip missing files rather than failing the whole save.
 			std::error_code ec;
@@ -925,10 +919,7 @@ namespace ShaderLab::Rendering
 			media.push_back(std::move(entry));
 
 			const std::wstring token = L"media://" + name;
-			node.shaderPath = token;
-			auto propertyIt = node.properties.find(L"shaderPath");
-			if (propertyIt != node.properties.end())
-				propertyIt->second = token;
+			node.mediaPath = token;
 		}
 		return std::wstring(graph.ToJson());
 	}
@@ -936,7 +927,7 @@ namespace ShaderLab::Rendering
 	bool EffectGraphFile::SaveJson(const std::wstring& path, const std::wstring& graphJson,
 		uint64_t* bytesWritten)
 	{
-		const std::string utf8 = Utf16ToUtf8(graphJson);
+		const std::string utf8 = WideToUtf8(graphJson);
 		const std::wstring tempPath = path + L".saving";
 		{
 			winrt::file_handle file{ ::CreateFileW(tempPath.c_str(), GENERIC_WRITE, 0, nullptr,
@@ -963,3 +954,108 @@ namespace ShaderLab::Rendering
 	}
 }
 
+namespace ShaderLab::Rendering
+{
+	namespace
+	{
+		uint64_t ToTicks(const FILETIME& time)
+		{
+			return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+		}
+
+		// When a media folder was last known alive: its heartbeat, else the
+		// folder's write time (folders from builds without heartbeats).
+		uint64_t LastTouched(const std::filesystem::path& dir)
+		{
+			FILETIME time{};
+			const std::wstring beat = (dir / L".heartbeat").wstring();
+			HANDLE file = ::CreateFileW(beat.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+				nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_HIDDEN, nullptr);
+			if (file != INVALID_HANDLE_VALUE)
+			{
+				::GetFileTime(file, nullptr, nullptr, &time);
+				::CloseHandle(file);
+				return ToTicks(time);
+			}
+			WIN32_FILE_ATTRIBUTE_DATA attributes{};
+			if (::GetFileAttributesExW(dir.c_str(), GetFileExInfoStandard, &attributes))
+				return ToTicks(attributes.ftLastWriteTime);
+			return 0;
+		}
+	}
+
+	std::wstring TempDirectory()
+	{
+		wchar_t buffer[MAX_PATH + 1]{};
+		const DWORD length = ::GetTempPathW(MAX_PATH + 1, buffer);
+		return (length == 0 || length > MAX_PATH) ? std::wstring{} : std::wstring(buffer, length);
+	}
+
+	bool TouchMediaHeartbeat(const std::wstring& dir)
+	{
+		std::error_code ec;
+		if (!std::filesystem::exists(dir, ec)) return false;
+		FILETIME now{};
+		::GetSystemTimeAsFileTime(&now);
+		const std::wstring path = dir + L"\\.heartbeat";
+		HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+		if (file == INVALID_HANDLE_VALUE) return false;
+		DWORD written = 0;
+		const BOOL ok = ::WriteFile(file, &now, sizeof(now), &written, nullptr);
+		::CloseHandle(file);
+		return ok && written == sizeof(now);
+	}
+
+	std::vector<StaleMediaDir> FindStaleMediaDirs(const std::wstring& tempRoot, uint64_t staleSec, bool countBytes)
+	{
+		std::vector<StaleMediaDir> stale;
+		if (tempRoot.empty()) return stale;
+		FILETIME nowTime{};
+		::GetSystemTimeAsFileTime(&nowTime);
+		const uint64_t now = ToTicks(nowTime);
+		const uint64_t staleTicks = staleSec * 10'000'000ULL;
+
+		std::error_code ec;
+		for (const auto& entry : std::filesystem::directory_iterator(tempRoot, ec))
+		{
+			if (!entry.is_directory(ec)) continue;
+			if (!entry.path().filename().wstring().starts_with(L"ShaderLab-")) continue;
+			const uint64_t touched = LastTouched(entry.path());
+			// A time in the future (clock change) counts as fresh.
+			if (touched != 0 && (now <= touched || now - touched <= staleTicks)) continue;
+
+			StaleMediaDir dir{ entry.path().wstring() };
+			if (countBytes)
+			{
+				std::error_code sizeEc;
+				for (auto it = std::filesystem::recursive_directory_iterator(entry.path(), sizeEc);
+					 it != std::filesystem::recursive_directory_iterator(); it.increment(sizeEc))
+				{
+					if (sizeEc) break;
+					if (it->is_regular_file(sizeEc))
+						dir.bytes += static_cast<uint64_t>(it->file_size(sizeEc));
+				}
+			}
+			stale.push_back(std::move(dir));
+		}
+		return stale;
+	}
+
+	ReapMediaResult ReapMediaDirs(const std::vector<StaleMediaDir>& dirs)
+	{
+		ReapMediaResult result;
+		for (const auto& dir : dirs)
+		{
+			std::error_code ec;
+			std::filesystem::remove_all(dir.path, ec);
+			if (ec)
+			{
+				result.failures.emplace_back(dir.path, ec.message());
+				continue;
+			}
+			++result.deleted;
+			result.bytesFreed += dir.bytes;
+		}
+		return result;
+	}
+}

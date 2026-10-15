@@ -1,5 +1,6 @@
 #include "pch_engine.h"
 #include "McpRouter.h"
+#include "McpJsonWriter.h"
 
 #include <format>
 
@@ -71,24 +72,29 @@ namespace ShaderLab
             }
             catch (const std::exception& ex)
             {
-                resp = { 500, std::string(R"({"error":")") + ex.what() + R"("})" };
+                resp = Mcp::ErrorResponse(500, ex.what());
+            }
+            catch (const winrt::hresult_error& ex)
+            {
+                resp = Mcp::ErrorResponse(500, std::format("{} (0x{:08X})",
+                    winrt::to_string(ex.message()), static_cast<uint32_t>(ex.code().value)));
             }
             catch (...)
             {
-                // winrt::hresult_error / SEH translations. A handler must
-                // never let these escape onto a transport thread.
-                resp = { 500, R"({"error":"Unhandled non-standard exception in route handler"})" };
+                // SEH translations and anything else: a handler must never
+                // let an exception escape onto a transport thread.
+                resp = Mcp::ErrorResponse(500, "Unhandled non-standard exception in route handler");
             }
         }
         else
         {
-            resp = { 404, R"({"error":"Not found"})" };
+            resp = Mcp::ErrorResponse(404, "Not found");
         }
 
         // Activity ping for the host's UI indicator — once per top-level
         // dispatcher request (POST /), not per internal sub-route the
-        // dispatcher itself routes. clientId is a generic label now that
-        // there is no HTTP peer address.
+        // dispatcher itself routes. clientId is a generic label: the broker
+        // pipe carries no peer address.
         if (method == L"POST" && matchPath == L"/")
         {
             ActivityCallback cb;

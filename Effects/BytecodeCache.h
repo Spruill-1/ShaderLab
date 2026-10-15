@@ -7,54 +7,48 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
-// BytecodeCache (Phase 8 GPU-binding work)
-// =========================================
+// BytecodeCache
+// =============
 //
-// Compile-once, reuse-everywhere bytecode store.
-//
-// Motivation
-// ----------
-// Phase 8 introduces gpuBindable parameters that switch a shader between
-// "cbuffer" and "GPU-bound" mode at compile time via the
-// `_SLPARAM_<name>_GPU=0|1` macros injected by the host. With N gpuBindable
-// params per effect we want N+1 variants ready to swap in at zero render-
-// thread cost: a baseline (all params in cbuffer mode) and one variant per
-// param flipped to GPU mode (Phase 8 supports at most one binding active
-// per consumer at a time, so we don't need 2^N).
-//
-// The user's stated goal: "when a user first inserts an effect into the
-// graph, why don't we just compile/cache all of the options then and
-// there?". The cache provides the substrate for that: enqueue compiles
-// off the render thread, hand out finished bytecode synchronously.
+// Compile-once, reuse-everywhere bytecode store. It stores and compiles
+// requests; ShaderVariants decides what a variant is (MakeVariantRequest,
+// BuildVariantMacros, PrecompileBindingShapes). A gpuBindable parameter
+// switches its shader between cbuffer and GPU-bound builds at compile time
+// through the `_SLPARAM_<name>_GPU=0|1|2` macros, so one effect has several
+// variants; compiling them on the worker threads keeps that cost off the
+// render thread.
 //
 // Identity model
 // --------------
-// The compile-key contains everything that influences the resulting
+// The compile key contains everything that influences the resulting
 // bytecode -- canonical source hash, entry point, target, ordered
 // gpu-param signature hash, embedded-include-library hash, macro bitset.
-// Effect ID / version are stored as *metadata only* so the disk-cache
-// layer (`p8-cache-disk`) has stable layout names; identical source
-// across two renamed effects shares one cache entry.
+// Effect ID / version are metadata only, which give the disk layer stable
+// directory names; identical source across two renamed effects shares one
+// cache entry.
 //
-// Diagnostics survive
-// -------------------
-// Lookups return a `BytecodeCacheResult` that carries a status + bytecode
-// + error message. Existing call sites that previously consumed
-// `ShaderCompileResult::ErrorMessage()` keep working: they just adapt the
-// field name. Failed entries cache their diagnostics so a deterministic
+// Diagnostics
+// -----------
+// Lookups return a `BytecodeCacheResult` carrying a status, bytecode and
+// error message. Failed entries keep their diagnostics so a deterministic
 // compile error doesn't recompile every frame.
 //
 // Threading
 // ---------
-// 2 worker `std::jthread`s drain a FIFO queue. The render thread can call
-// `GetOrCompile` which:
+// Worker `std::jthread`s (half the cores, clamped to 2..6) drain a FIFO
+// queue. They start with the first queued job, not at construction, and
+// `Shutdown` joins them; hosts call it through Engine::ShutdownEngineServices
+// before the engine DLL unloads. The render thread can call `GetOrCompile`
+// which:
 //   1. returns immediately if the entry is `Ready`;
 //   2. waits up to `timeoutMs` for an in-flight worker to finish;
 //   3. falls back to inline compile on the calling thread.
@@ -64,8 +58,8 @@
 // Bounded memory
 // --------------
 // Total `Ready` + `Failed` bytecode bytes are capped (default 256 MB).
-// `Pending` entries are never evicted. Eviction is naive LRU on insertion
-// order -- good enough until disk persistence lands.
+// `Pending` entries are never evicted. Eviction is LRU on insertion order;
+// an evicted entry is reloaded from the disk layer when one is configured.
 
 namespace ShaderLab::Effects
 {
@@ -134,6 +128,14 @@ namespace ShaderLab::Effects
         std::string             hlslSource;            // canonical UTF-8 (LF line endings).
         std::vector<std::string> gpuBindableParamNames; // index i -> bits [2i, 2i+1] of macroBitset.
         std::vector<std::string> optionParamNames;      // index i -> bits [8i, 8i+7] of optionKey.
+        // SL_FIELD_<name> = <Result index> per analysis field (AnalysisFieldMacros);
+        // folded into key.paramSignatureHash.
+        std::vector<std::pair<std::string, std::string>> fieldMacros;
+        // A source registered prebuilt (AddPrebuilt) is compiled only when
+        // this is set: the evaluator sets it when its host allows runtime
+        // compiles. Otherwise a build the blob lacks is refused, and the
+        // evaluator falls back to one it has.
+        bool allowPrebuiltCompile{ false };
     };
 
     // Option specialisation limits: an option key holds eight 8-bit slots.
@@ -167,11 +169,15 @@ namespace ShaderLab::Effects
     SHADERLAB_API std::string CanonicalizeHlslSource(std::wstring_view source);
     SHADERLAB_API std::string CanonicalizeHlslSource(std::string_view source);
 
-    // The cache itself. Single global instance.
+    // The cache itself. The engine uses the process instance; tests may
+    // build their own.
     class SHADERLAB_API BytecodeCache
     {
     public:
         static BytecodeCache& Instance();
+
+        BytecodeCache();
+        ~BytecodeCache();
 
         BytecodeCache(const BytecodeCache&) = delete;
         BytecodeCache& operator=(const BytecodeCache&) = delete;
@@ -190,7 +196,7 @@ namespace ShaderLab::Effects
         // disabled and the cache is purely in-memory. Path is created
         // recursively if missing.
         void SetDiskCacheRoot(std::wstring rootPath);
-        const std::wstring& GetDiskCacheRoot() const { return m_diskRoot; }
+        std::wstring GetDiskCacheRoot() const;
 
         // Idempotent enqueue. If status is already Pending or Ready,
         // no-op. If status is Failed, no-op (caller must explicitly
@@ -215,28 +221,35 @@ namespace ShaderLab::Effects
         // entry produced by an inline compile.
         BytecodeCacheResult GetOrCompile(BytecodeCompileRequest request, uint32_t timeoutMs = 50);
 
-        // Eager precompile of N+1 variants (baseline + one per gpu-bindable
-        // param). Call from UI/MCP insertion paths. Idempotent. Variants
-        // already Pending or Ready are skipped.
-        void PrecompileCommonShapes(
-            const BytecodeCacheMetadata& metadata,
-            const std::string& canonicalHlslSource,
-            const std::string& entryPoint,
-            const std::string& target,
-            const std::vector<std::string>& gpuBindableParamNames);
+        // Produces a prebuilt build's bytecode, decompressing it from its
+        // blob; empty when it cannot.
+        using PrebuiltLoader = std::function<std::vector<uint8_t>()>;
 
-        // Mark a key as needing recompile. Used by the editor when the
-        // user fixes a previously-failed shader and Ctrl+Enters. Removes
-        // the entry; next request recompiles.
+        // Adds a build made ahead of time (an effect blob) as a Ready entry
+        // that is never evicted, cleared or invalidated, and records its
+        // source as prebuilt (see allowPrebuiltCompile). `load` runs the
+        // first time the entry is read, so a build nobody asks for never
+        // takes memory.
+        void AddPrebuilt(const BytecodeCompileKey& key, PrebuiltLoader load);
+        bool IsPrebuiltSource(uint64_t sourceHash) const;
+
+        // Drops the entry so the next request recompiles (the editor's
+        // Ctrl+Enter after fixing a failed shader).
         void Invalidate(const BytecodeCompileKey& key);
 
-        // Reaper hooks (Phase 8 cache disk + reaper work).
+        // Drops every in-memory entry except Pending ones (a worker may be
+        // mid-compile).
         void Clear();
 
         // Reap stale on-disk entries. Files not modified within
         // `staleThresholdSec` are deleted. Returns counts.
         struct ReapResult { size_t filesDeleted; size_t bytesFreed; size_t errors; };
         ReapResult ReapDisk(uint64_t staleThresholdSec);
+
+        // ReapDisk as a job on the worker queue, behind any queued compiles.
+        // Its counts land in LastReapResult. Dropped if Shutdown comes first.
+        void QueueReapDisk(uint64_t staleThresholdSec);
+        std::optional<ReapResult> LastReapResult() const;
 
         // Delete everything under the disk cache root. In-memory
         // entries are preserved (next render still works without
@@ -256,15 +269,16 @@ namespace ShaderLab::Effects
         };
         Stats GetStats() const;
 
-        // Explicit shutdown. Waits for worker threads to drain (with
-        // bounded timeout) and stops accepting new work. Safe to call
-        // from a destructor as a fallback, but the engine should call
-        // it explicitly on close.
+        // Stops accepting queued work, discards what is queued and joins the
+        // workers (a compile in flight finishes first). Idempotent. Lookups
+        // and GetOrCompile keep working afterwards, compiling inline.
         void Shutdown();
 
+        // Worker threads running now: 0 until the first queued job and after
+        // Shutdown.
+        size_t WorkerCount() const;
+
     private:
-        BytecodeCache();
-        ~BytecodeCache();
 
         struct Entry
         {
@@ -272,14 +286,23 @@ namespace ShaderLab::Effects
             std::vector<uint8_t> bytecode;
             std::wstring         errorMessage;
             uint64_t             insertionOrder{ 0 };  // for naive LRU eviction.
+            // DoCompile calls holding a reference to this entry with the lock
+            // dropped. Nothing may erase the entry while it is non-zero.
+            uint32_t             compilesInFlight{ 0 };
+            bool                 pinned{ false };   // AddPrebuilt
+            PrebuiltLoader       load;              // until the first read
         };
 
-        // Compile request payload kept on the queue. The key is a copy
-        // so we don't need to stabilize the entry pointer across the
-        // workers and the entry map.
+        // Runs a prebuilt entry's loader on its first read. Caller holds m_mutex.
+        void Materialize_NoLock(Entry& entry);
+
+        // A queued job: a compile request, or a maintenance task when
+        // `task` is set. The key is a copy so the entry pointer need not be
+        // stable across the workers and the entry map.
         struct PendingWork
         {
             BytecodeCompileRequest request;
+            std::function<void()>  task;
         };
 
         // Run a D3DCompile in-place and mutate the entry. Caller holds
@@ -292,6 +315,8 @@ namespace ShaderLab::Effects
             Entry& outEntry);
 
         void WorkerLoop(std::stop_token stop);
+        // Starts the workers if none are running. Caller holds m_mutex.
+        void StartWorkers_NoLock();
 
         // Evict oldest Ready/Failed entries until total bytecode bytes
         // fits under m_maxBytes. Caller holds m_mutex. Pending entries
@@ -305,21 +330,27 @@ namespace ShaderLab::Effects
         std::deque<PendingWork>                                                          m_workQueue;
         std::vector<std::jthread>                                                        m_workers;
         std::atomic<bool>                                                                m_shutdown{ false };
+        std::unordered_set<uint64_t>                                                     m_prebuiltSources;   // guarded by m_mutex
         uint64_t                                                                         m_nextInsertionOrder{ 1 };
         size_t                                                                           m_currentBytes{ 0 };
 
         // Tunables.
         size_t       m_maxBytes{ 256ull * 1024 * 1024 };  // 256 MB.
-        std::wstring m_diskRoot;                          // empty = disabled.
+        std::wstring m_diskRoot;                          // empty = disabled; guarded by m_mutex.
+        std::optional<ReapResult> m_lastReap;             // guarded by m_mutex.
 
-        // Disk helpers.
-        std::wstring KeyToDiskPath(
+        // Disk helpers. They take the root as a snapshot taken under m_mutex
+        // and do their file I/O without holding it.
+        static std::wstring KeyToDiskPath(
+            const std::wstring& root,
             const BytecodeCompileKey& key,
-            const BytecodeCacheMetadata& meta) const;
-        bool TryLoadFromDisk(
+            const BytecodeCacheMetadata& meta);
+        static bool TryLoadFromDisk(
+            const std::wstring& root,
             const BytecodeCompileKey& key,
-            std::vector<uint8_t>& outBytecode) const;
-        void WriteToDisk(
+            std::vector<uint8_t>& outBytecode);
+        static void WriteToDisk(
+            const std::wstring& root,
             const BytecodeCompileKey& key,
             const BytecodeCacheMetadata& meta,
             const std::vector<uint8_t>& bytecode);

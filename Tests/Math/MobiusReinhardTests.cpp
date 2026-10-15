@@ -1,17 +1,14 @@
 #include "pch_engine.h"
 #include "../ShaderTestBench.h"
-#include "../TestCommon.h"
+#include "../TestSupport.h"
 
 #include <cstdio>
 
 namespace ShaderLab::Tests
 {
     // Tests for the anchored Möbius / Reinhard helpers used by the ICtCp
-    // tone-mapping suite. These are the helpers that have historically
-    // produced the most painful bugs (CHANGELOG 1.3.8: anchor wrong;
-    // peakIn/peakOut inverted at call site; out-of-domain asymptote
-    // walk producing 1.4M nits) — exactly the algebraic-correctness class
-    // this whole test bench exists to lock down.
+    // tone-mapping suite: the anchor, the peakIn/peakOut order at the call
+    // site, and the asymptote outside the domain are each pinned here.
     void TestMobiusReinhard(ShaderTestBench& bench)
     {
         std::printf("\n=== Math: Mobius / Reinhard ===\n");
@@ -160,5 +157,13 @@ namespace ShaderLab::Tests
             TEST("IToNits(NitsToI(x)) ~= x over [0, 4000] nits (max err < 1.0)",
                 !r.empty() && r[0].x < 1.0f);
         }
+    }
+}
+
+namespace ShaderLab::Tests
+{
+    namespace
+    {
+        SL_REGISTER_TEST(TestMobiusReinhard, Tag::Gpu | Tag::Math, [] { TestMobiusReinhard(Bench()); });
     }
 }

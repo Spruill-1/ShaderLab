@@ -1,30 +1,17 @@
 #pragma once
 
-// Engine-side MCP JSON-RPC dispatcher (stdio-migration Step 3).
+// The MCP JSON-RPC dispatcher (initialize, tools/list, tools/call,
+// resources, ping) on a host's router; RegisterJsonRpcEndpoint is the whole
+// integration, and both hosts use it.
 //
-// Moved out of MainWindow.McpRoutes.cpp so BOTH hosts serve the MCP
-// protocol surface (initialize / tools/list / tools/call / resources /
-// ping) over whatever transport fronts the router — the legacy HTTP
-// listener today, the stdio session client from Step 6 on. The GUI's
-// former inline dispatcher is deleted; RegisterJsonRpcEndpoint on the
-// host's router is the whole integration.
-//
-// stdio-conformance rules enforced here (all were violated by the old
-// GUI dispatcher; invisible over HTTP, fatal over a line-framed stream):
-//   * Every response is ONE JSON message with no embedded newlines.
-//   * Notifications (requests with an ABSENT id — that is the detection,
-//     not a "notifications/" name prefix) produce Response::None(): the
-//     HTTP transport sends 202-empty, the stdio transport emits zero
-//     bytes.
-//   * `id: null` never appears on an error path when the request carried
-//     an id — a null id matches no pending request on a multiplexed
-//     stream and hangs the client until its own timeout. The one
-//     remaining null is the unparseable-JSON case, where no id is
-//     recoverable (the Step 5 shim owns that failure class).
-//   * protocolVersion is pinned to 2025-06-18, the revision that REMOVED
-//     JSON-RPC batching — this server never supported batching, and the
-//     previously-pinned 2024-11-05 required it. Batch (array) requests
-//     get an explicit -32600.
+// Rules for a line-framed stream:
+//   * Every response is one JSON message with no embedded newline.
+//   * A request with no id is a notification and gets Response::None():
+//     zero bytes. The absent id is the test, not a "notifications/" prefix.
+//   * An error answers with the request's id; only unparseable JSON, where
+//     no id can be read, answers with null.
+//   * protocolVersion is 2025-06-18, which removed JSON-RPC batching; a
+//     batch (array) request gets -32600.
 
 #include "pch_engine.h"
 #include "../../EngineExport.h"

@@ -3,10 +3,10 @@
 // IEngineComputeOutput — engine-internal COM interface exposed by
 // effects whose analysis output is GPU-resident in a structured buffer.
 //
-// Phase 8 GPU-binding architecture: when a compute analysis effect's
-// output field feeds a downstream effect's parameter via the property-
-// binding system, we want to route GPU→GPU instead of round-tripping
-// through Map(). The evaluator detects this routing by QI'ing the
+// When a compute analysis effect's output field feeds a downstream effect's
+// parameter through a property binding, the value can travel GPU to GPU
+// instead of round-tripping through Map() (lane 1 in
+// docs/architecture/d2d-d3d11-hybrid-compute.md). The evaluator detects this routing by QI'ing the
 // upstream effect for this interface; effects that implement it expose
 // the SRV of their structured-buffer output, and the evaluator binds
 // it directly to the downstream effect's t-slot for the appropriate
@@ -19,10 +19,10 @@
 // the COM boundary would only invite drift. This interface is narrow
 // on purpose: just the runtime resource handles, in stable POD shape.
 //
-// Implementations: the D2D effect wrapper for the D3D11-compute path
-// (Phase 8 -- still in progress as of this edit). Pixel-shader effects
-// and the D2D-tiled compute path do NOT implement this interface --
-// neither produces a structured-buffer SRV the evaluator could bind.
+// Implementations: CustomComputeBridgeEffect (the D3D11-compute path) and
+// its D3D11ComputeRunner. Pixel-shader effects and the D2D-tiled compute
+// path do not implement it -- neither produces a structured-buffer SRV. A
+// pixel-shader consumer reads the values through IEngineComputeTexture.
 
 #include "../EngineExport.h"
 

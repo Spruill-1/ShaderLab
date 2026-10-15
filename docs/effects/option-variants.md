@@ -88,9 +88,14 @@ Rules:
 The cache key carries the option values (`BytecodeCompileKey::optionKey`,
 8 bits per parameter: 0 generic, *v*+1 option *v*) alongside the GPU-binding
 modes, and the option names join the parameter signature hash, so variants of
-different definitions can never collide. Engine side: `Effects/ShaderVariants.h`,
-`Rendering/GraphEvaluator.cpp` (`QueueOptionVariants`, `PollVariantCompiles`,
-`ApplyCustomEffect`), `Effects/BytecodeCache.cpp` (`DoCompile`).
+different definitions can never collide. `Effects/ShaderVariants.h` owns all of
+it: `MakeVariantRequest` builds every request (so a key the evaluator asks for and
+one queued elsewhere always match), `BuildVariantMacros` spells the macros, and
+`PrecompileBindingShapes` warms the GPU-binding shapes of an effect with no
+options; `BytecodeCache` only stores and compiles. The evaluator side is
+`Rendering/Evaluator/VariantSelector.cpp` (`Select`, `QueueOptionVariants`,
+`Poll`, `CompileBaseline`), called from `ApplyCustomEffect`
+(`CustomEffectNode.cpp`) and `DispatchViaBridge` (`ComputeScheduler.cpp`).
 
 ## Why not a constants table?
 

@@ -17,16 +17,7 @@ namespace ShaderLab::Mcp
     {
         std::wstring ResolvePipePath(const std::wstring& base)
         {
-            std::wstring name = base;
-            if (name.empty())
-            {
-                wchar_t env[256]{};
-                if (GetEnvironmentVariableW(L"SHADERLAB_MCP_PIPE", env, ARRAYSIZE(env)) > 0)
-                    name = env;
-                else
-                    name = DefaultPipeBaseName();   // shared source of truth
-            }
-            return L"\\\\.\\pipe\\" + name;
+            return L"\\\\.\\pipe\\" + ResolvePipeBaseName(base);
         }
 
         // Blocking write of a whole buffer to a byte-mode pipe.
@@ -68,6 +59,10 @@ namespace ShaderLab::Mcp
         McpRouter&           router;
         SessionClientOptions opts;
         std::atomic<bool>    stop{ false };
+        HANDLE               stopEvent{ nullptr };   // manual reset; set by Stop()
+
+        mutable std::mutex   statusMutex;
+        SessionStatus        status;
 
         // `pipe` and `runnerThread` are guarded by ioMutex.
         //
@@ -95,10 +90,19 @@ namespace ShaderLab::Mcp
         {
             SecureChannel sc;
             uint64_t      sendSeq{ 1 };  // handshake was seq 0
+            uint64_t      recvSeq{ 0 };  // highest data seq opened; older ones are replays
         };
         std::unordered_map<uint32_t, Channel> channels;
 
-        Impl(McpRouter& r, SessionClientOptions o) : router(r), opts(std::move(o)) {}
+        Impl(McpRouter& r, SessionClientOptions o)
+            : router(r), opts(std::move(o)), stopEvent(::CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
+        ~Impl() { if (stopEvent) ::CloseHandle(stopEvent); }
+
+        void SetStatus(SessionState state, std::wstring detail = {})
+        {
+            std::lock_guard lock(statusMutex);
+            status = { state, std::move(detail) };
+        }
 
         // One connect → register → serve cycle. Returns when the pipe
         // dies or Stop() fires.
@@ -107,11 +111,15 @@ namespace ShaderLab::Mcp
             channels.clear();
             const std::wstring path = ResolvePipePath(opts.pipeBaseName);
 
+            SetStatus(SessionState::Connecting);
             HANDLE h = CreateFileW(path.c_str(),
                 FILE_READ_DATA | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
                 0, nullptr, OPEN_EXISTING, 0, nullptr);
             if (h == INVALID_HANDLE_VALUE)
+            {
+                SetStatus(SessionState::NoHub, std::format(L"no hub on {} (Win32 error {})", path, ::GetLastError()));
                 return;
+            }
             {
                 // Publish under the lock, and bail if Stop() fired while we
                 // were connecting -- otherwise this handle is one Stop() never
@@ -135,6 +143,8 @@ namespace ShaderLab::Mcp
             // without these checks the handshake ran to completion against a
             // cancelled pipe before anyone noticed the toggle.
             bool ok = self && hub && !stop.load();
+            if (!self || !hub)
+                SetStatus(SessionState::Refused, L"could not verify the hub's process identity");
             if (ok)
             {
                 auto myBuild = WideToUtf8(LocalBuildId());
@@ -153,22 +163,31 @@ namespace ShaderLab::Mcp
                 {
                     auto obj = ParseControl(ack);
                     auto hubBuild = obj ? std::wstring(obj->GetNamedString(L"buildId", L"")) : L"";
-                    ok = obj && WideToUtf8(obj->GetNamedString(L"op", L"")) == "hello-ack"
-                        && EvaluatePairing(*self, *hub, LocalBuildId(), hubBuild) == PairingVerdict::Accept;
+                    const bool acked = obj && WideToUtf8(obj->GetNamedString(L"op", L"")) == "hello-ack";
+                    const auto verdict = EvaluatePairing(*self, *hub, LocalBuildId(), hubBuild);
+                    ok = acked && verdict == PairingVerdict::Accept;
+                    if (!acked)
+                        SetStatus(SessionState::Refused, L"the hub did not acknowledge the session");
+                    else if (!ok)
+                        SetStatus(SessionState::Refused, std::format(
+                            L"the hub is a different ShaderLab build or package (pairing verdict {})",
+                            static_cast<int>(verdict)));
                 }
                 else ok = false;
             }
 
             if (ok)
             {
+                SetStatus(SessionState::Registered);
                 for (;;)
                 {
                     if (stop.load()) break;
                     Frame f;
                     if (!ReadFrameBlocking(h, acc, f))
                         break;
-                    HandleFrame(h, outSeq, f);
+                    HandleFrame(h, f);
                 }
+                SetStatus(SessionState::Connecting, L"the connection to the hub closed");
             }
 
             // This thread owns the close -- see the ioMutex note above.
@@ -182,7 +201,7 @@ namespace ShaderLab::Mcp
                 CloseHandle(cur);
         }
 
-        void HandleFrame(HANDLE h, uint64_t& outSeq, const Frame& f)
+        void HandleFrame(HANDLE h, const Frame& f)
         {
             if (f.header.channelId == 0)
             {
@@ -211,9 +230,14 @@ namespace ShaderLab::Mcp
             if (it == channels.end() || !it->second.sc.Ready())
                 return;   // data before handshake; drop
 
+            // The shim numbers each channel's requests upward from 1, so a seq
+            // at or below the last one opened is a replay.
+            if (f.header.seq <= it->second.recvSeq)
+                return;
             auto plain = it->second.sc.Open(cid, f.header.seq, f.body);
             if (!plain)
                 return;   // tamper / desync: drop the frame
+            it->second.recvSeq = f.header.seq;
 
             std::string requestJson(plain->begin(), plain->end());
             Response resp = router.RouteRequest(L"POST", L"/", requestJson);
@@ -294,10 +318,15 @@ namespace ShaderLab::Mcp
             m_impl->ServeOnce();
             if (m_impl->stop.load())
                 break;
-            // Reconnect with capped exponential backoff after a drop.
-            Sleep(backoffMs);
+            // Reconnect with capped exponential backoff after a drop; Stop()
+            // ends the wait.
+            if (m_impl->stopEvent)
+                ::WaitForSingleObject(m_impl->stopEvent, backoffMs);
+            else
+                ::Sleep(backoffMs);
             backoffMs = std::min<uint32_t>(backoffMs * 2, 4000);
         }
+        m_impl->SetStatus(SessionState::Stopped);
 
         // Retire the thread handle before returning: once we are gone a
         // late Stop() must not hand a dead thread to CancelSynchronousIo.
@@ -314,6 +343,8 @@ namespace ShaderLab::Mcp
     void McpSessionClient::Stop()
     {
         m_impl->stop.store(true);
+        if (m_impl->stopEvent)
+            ::SetEvent(m_impl->stopEvent);
 
         // Unblock the session thread's pending SYNCHRONOUS pipe I/O. The pipe
         // is opened without FILE_FLAG_OVERLAPPED, so CancelIo / CancelIoEx do
@@ -329,5 +360,11 @@ namespace ShaderLab::Mcp
         std::lock_guard lock(m_impl->ioMutex);
         if (m_impl->runnerThread)
             CancelSynchronousIo(m_impl->runnerThread);
+    }
+
+    SessionStatus McpSessionClient::Status() const
+    {
+        std::lock_guard lock(m_impl->statusMutex);
+        return m_impl->status;
     }
 }

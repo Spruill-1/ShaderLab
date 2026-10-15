@@ -15,8 +15,8 @@ The deep reference is [`docs/`](docs/README.md); this file is the part you need
   relevant file under `docs/`, adds a `CHANGELOG.md` entry, and — for a choice whose
   *why* isn't obvious from the code — a row in [`docs/history/decision-log.md`](docs/history/decision-log.md).
   Root `README.md` stays slim (install + build + pointer to `docs/`).
-- **Don't widen `MainWindow`.** It is already ~10k LOC across six files with ~89
-  member fields. New UI behavior belongs in a `Controls/` controller; new
+- **Don't widen `MainWindow`.** It is still ~5.4k LOC across eight files with ~87
+  member fields, after the 2026-10 controller extractions. New UI behavior belongs in a `Controls/` controller; new
   host-agnostic behavior belongs in the engine.
 
 ## Build, test, run
@@ -65,7 +65,7 @@ deploy, no registration, and gives FP32 readback via `--pixels`.
 
 ## The graph-access rule (read before touching `m_graph` from UI code)
 
-The render worker is the **single writer** of the live `EffectGraph` and writes
+The render worker is the **single writer** of the live `GraphModel` and writes
 continuously — clock-node property inserts every tick, plus every MCP mutation.
 Getting this wrong is a data race that surfaces as an access violation deep inside
 `std::map`, **not** a compile error. Two such crashes shipped before the rule was
@@ -78,10 +78,13 @@ written down; both were `node->properties.find()` from the UI thread during pain
    `m_graph` from a pointer or interaction handler.
 3. **Layout computation** (`RebuildLayout` / `AutoLayout` / `ComputeNodeVisual`) →
    live `m_graph`, **render thread only** (it must see post-mutation state).
-   UI callers go through `MainWindow::RunLayoutOnRenderThread`.
+   UI callers use `NodeGraphController::RequestRelayout` / `RequestAutoLayout`,
+   which dispatch; the canvas's own commands relayout inside their closures.
 
-**Lock order: `m_graphMutex` → `m_visualsMutex`.** Never hold `m_visualsMutex` across
-a `DispatchSync`; don't hold references into `m_visuals` across a dispatch (copy by
+`m_graph` itself has no lock: only the render worker touches it.
+`NodeGraphController::m_visualsMutex` is the one lock here. Never hold it across
+a `DispatchSync` (a dispatched relayout takes it on the render thread, so that
+deadlocks); don't hold references into `m_visuals` across a dispatch (copy by
 value — they dangle if the worker rebuilds layout); don't read `m_visuals` inside a
 dispatched closure (it runs on the render thread). Full contract:
 [`docs/architecture/threading-model.md`](docs/architecture/threading-model.md).
@@ -100,10 +103,11 @@ The ones that bite most often:
   `GraphEvaluator::Evaluate` must run **outside** one: the D2D Histogram and
   custom-analysis readbacks open their *own* `BeginDraw`, and nesting that fails
   with `D2DERR_WRONG_STATE` (`0x88990001`). Any post-dispatch `Evaluate` sweep that
-  must happen inside the session runs under `SetDeferredComputeFrozen(true)` so it
-  cannot re-queue a compute node (the Histogram defers its read to the next frame).
-  `MainWindow::RenderFrameToOffscreen`, headless `runEval`, and headless `RunRender`
-  all use this exact shape — copy it, don't improvise. History worth knowing:
+  must happen inside the session runs as `Evaluate(EvalMode::Frozen)` so it cannot
+  re-queue a compute node (the Histogram defers its read to the next frame).
+  `Rendering::FrameExecutor::Run` owns this shape, and every host and test renders
+  through it (`MainWindow::RenderFrameToOffscreen`, `HeadlessEngine`) — call it,
+  don't re-sequence the passes yourself. History worth knowing:
   `Evaluate` used to pre-render compute inputs too (`PreRenderInputBitmap`, deleted
   2026-09-25), and getting the split wrong looked like a property-plumbing bug —
   correct on the first frame, then black or **stale** after the first `set-property`.
@@ -140,13 +144,15 @@ The ones that bite most often:
   PQ helpers in `Effects/ColorMath.cpp`.
 
 **MCP-specific:** untyped (`{}`-schema) tool args arrive from Claude Code as JSON
-**strings** — `"203"`, `"true"`. `EngineMcpRoutes.cpp` coerces them to the parameter's
-real type in both `/graph/set-property` and `/graph/apply`. Keep that coercion when
-touching those paths; without it bindings break, shaders read 0, and clocks freeze.
+**strings** — `"203"`, `"true"`. `Graph::WriteProperty` (`Graph/PropertyWrite.cpp`)
+coerces them to the parameter's real type, and both `/graph/set-property`
+(`Engine/Mcp/Routes/PropertyRoutes.cpp`) and `/graph/apply` (`Routes/GraphPatch.cpp`)
+write through it. Keep it that way when touching those paths; without the coercion
+bindings break, shaders read 0, and clocks freeze.
 Diagnostic tell: `graph_get_node` printing `"203"` (quoted = string, broken) vs
 `203.000000`.
-Adding a tool also requires bumping the exact count asserted by `Rpc_CatalogCount`
-in `Tests/TestRunner.cpp`, and `Tests/RunTests.ps1` **clears the graph**, so don't
+Adding a tool also requires bumping `cExpectedToolCount` (`Rpc_CatalogCount`) in
+`Tests/Mcp/McpRouterTests.cpp`, and `Tests/RunTests.ps1` **clears the graph**, so don't
 run it against a session whose graph you still need.
 
 ## Looking at HDR output (you cannot, directly)
@@ -183,12 +189,14 @@ golden-image comparison, and feeding back in as an Image source.
 
 ## Layout
 
-Four projects around one host-agnostic engine:
+Five projects around one host-agnostic engine:
 
 - `ShaderLabEngine.dll` — `Graph/` (model + `GraphUiSnapshot`), `Rendering/`
   (evaluator, `D3D11ComputeRunner`, `DisplayMonitor`, ICC, capture), `Effects/`
   (built-in effect library with embedded HLSL, registry, compiler, sources),
-  `Engine/Mcp/` (router, JSON-RPC, tool catalog, engine-pure routes, broker crypto).
+  `Engine/Mcp/` (router, JSON-RPC, tool catalog, engine-pure routes, broker crypto),
+  `Engine/Api/` (EffectGraph, the public COM API for other D3D11 programs: see
+  [`docs/architecture/effectgraph-api.md`](docs/architecture/effectgraph-api.md)).
   `SHADERLAB_ENGINE_ABI_VERSION` in `EngineExport.h` is bumped **manually** on ABI
   breaks; a mismatch aborts host startup.
 - `ShaderLab.exe` — WinUI 3 packaged app: XAML, `Controls/` controllers,
@@ -198,6 +206,8 @@ Four projects around one host-agnostic engine:
 - `ShaderLabMcpBroker.exe` — MCP transport. `--hub` is a blind relay (sealed bodies);
   `--stdio` is the client shim. Does **not** link the engine.
 - `ShaderLabTests.exe` — standalone runner, no WinUI, WARP-capable.
+- `EffectGraphCompile.exe` — builds an effect blob from an Effect Designer `.json` at a
+  consuming project's build (`build/EffectGraph.targets` runs it).
 
 Pipeline is **always scRGB FP16 linear light** (1.0 = 80 nits), no format switching,
 no built-in tone-mapping pass — tone mappers are composed as graph effects (the ICtCp
@@ -219,6 +229,16 @@ D2D effects hand-roll `IUnknown` refcounting on a `LONG m_refCount`. Init paths 
 
 New files go in the matching directory **and** into both `ShaderLab.vcxproj` (or the
 right project) and `.vcxproj.filters`.
+
+**Change a node through a setter, not its fields.** `Graph/GraphEdits.h` has one per
+kind of change (`SetNodeProperty`, `SetNodeMedia`, `RenameNode`, `SetNodePosition` /
+`MoveNodes`, `MarkNodeChanged`, `RetryNode`, `ResetNodeOutput`, `ReplaceCustomEffect`,
+`SetBindingComponent`), each in a node form and a (graph, id) form, and each marks the
+node dirty exactly when the change affects what it renders. Untyped values (MCP,
+scripts) go through `Graph::WriteProperty`. Building a fresh node before `AddNode` may
+set fields directly (`Effects::CreateCustomEffectNode`, `EffectRegistry::CreateOutputNode`
+and `Graph::NewInstanceOf` cover the common shapes), and a white-box test may stage
+engine-owned state (`dirty`, `needed`, `runtimeError`, `cachedOutput`, `clockTime`).
 
 **Don't add a bare `catch (...) {}`.** Record the failure somewhere a caller can see
 it (`LastError()`, `runtimeError`, an MCP status field), or — when swallowing really is

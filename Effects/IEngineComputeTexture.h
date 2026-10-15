@@ -7,12 +7,11 @@
 //
 //   1. StructuredBuffer SRV  (IEngineComputeOutput::GetAnalysisSrv)
 //        For a COMPUTE consumer. Bound straight to a t-slot; the cheapest
-//        lane, and the one the Phase 8 GPU bindings already use.
+//        lane.
 //   2. CPU values            (EffectNode::analysisOutput.fields)
 //        For anything CPU-side: a Numeric Expression, the properties panel,
-//        an MCP read. Costs a Map() that waits on the GPU -- measured at
-//        ~10 ms of stall per frame at 5 Mpx, because it destroys CPU/GPU
-//        overlap rather than merely copying nine floats.
+//        an MCP read. Costs a Map() that waits on the GPU, which destroys
+//        CPU/GPU overlap rather than merely copying a few floats.
 //   3. A 1-row RGBA32F TEXTURE  (this interface)
 //        For a PIXEL-shader consumer. Direct2D will not let a custom pixel
 //        shader bind an arbitrary SRV -- it maps a transform's INPUTS to

@@ -1,6 +1,5 @@
 #include "pch_engine.h"
 #include "CustomPixelShaderEffect.h"
-#include "Performance.h"
 
 namespace ShaderLab::Effects
 {
@@ -20,125 +19,6 @@ namespace ShaderLab::Effects
     }
 
     // -----------------------------------------------------------------------
-    // Property bindings table (used by D2D effect registration)
-    // -----------------------------------------------------------------------
-
-    // Custom property index (only InputCount is exposed to D2D).
-    // Shader bytecode and constant buffer are managed internally
-    // via direct pointer access from GraphEvaluator.
-    enum : UINT32
-    {
-        PROP_INPUT_COUNT = 0,
-    };
-
-    // -----------------------------------------------------------------------
-    // Registration
-    // -----------------------------------------------------------------------
-
-    HRESULT CustomPixelShaderEffect::RegisterEffect(ID2D1Factory1* factory)
-    {
-        // Default registration with 1 input (used as fallback).
-        return RegisterWithInputCount(factory, CLSID_CustomPixelShader, 1);
-    }
-
-    HRESULT CustomPixelShaderEffect::RegisterWithInputCount(
-        ID2D1Factory1* factory, REFCLSID clsid, UINT32 inputCount)
-    {
-        if (!factory || inputCount == 0 || inputCount > 8)
-            return E_INVALIDARG;
-
-        // Build XML with the exact number of fixed inputs.
-        std::wstring xml =
-            L"<?xml version='1.0'?>\r\n"
-            L"<Effect>\r\n"
-            L"  <Property name='DisplayName' type='string' value='Custom Pixel Shader'/>\r\n"
-            L"  <Property name='Author'      type='string' value='ShaderLab'/>\r\n"
-            L"  <Property name='Category'    type='string' value='Custom'/>\r\n"
-            L"  <Property name='Description' type='string' value='Runs a user-supplied pixel shader.'/>\r\n"
-            L"  <Inputs>\r\n";
-        for (UINT32 i = 0; i < inputCount; ++i)
-            xml += std::format(L"    <Input name='I{}'/>\r\n", i);
-        xml += L"  </Inputs>\r\n"
-               L"</Effect>\r\n";
-
-        return factory->RegisterEffectFromString(
-            clsid,
-            xml.c_str(),
-            nullptr,
-            0,
-            &CustomPixelShaderEffect::CreateFactory);
-    }
-
-    HRESULT CustomPixelShaderEffect::UnregisterEffect(ID2D1Factory1* factory)
-    {
-        if (!factory)
-            return E_INVALIDARG;
-        return factory->UnregisterEffect(CLSID_CustomPixelShader);
-    }
-
-    // Thread-local for capturing the last-created impl pointer.
-    thread_local CustomPixelShaderEffect* CustomPixelShaderEffect::s_lastCreated = nullptr;
-    thread_local UINT32 CustomPixelShaderEffect::s_pendingInputCount = 0;
-
-    HRESULT __stdcall CustomPixelShaderEffect::CreateFactory(IUnknown** effect)
-    {
-        auto* impl = new (std::nothrow) CustomPixelShaderEffect();
-        *effect = static_cast<ID2D1EffectImpl*>(impl);
-        s_lastCreated = impl;
-        return *effect ? S_OK : E_OUTOFMEMORY;
-    }
-
-    CustomPixelShaderEffect::CustomPixelShaderEffect()
-    {
-        // Use the pending input count set before CreateEffect, so that
-        // Initialize → SetSingleTransformNode sees the correct value
-        // from GetInputCount() immediately.
-        if (s_pendingInputCount > 0)
-            m_inputCount = s_pendingInputCount;
-    }
-
-    // -----------------------------------------------------------------------
-    // IUnknown
-    // -----------------------------------------------------------------------
-
-    IFACEMETHODIMP CustomPixelShaderEffect::QueryInterface(REFIID riid, void** ppv)
-    {
-        if (!ppv)
-            return E_POINTER;
-
-        *ppv = nullptr;
-
-        if (riid == __uuidof(ID2D1EffectImpl))
-            *ppv = static_cast<ID2D1EffectImpl*>(this);
-        else if (riid == __uuidof(ID2D1DrawTransform))
-            *ppv = static_cast<ID2D1DrawTransform*>(this);
-        else if (riid == __uuidof(ID2D1Transform))
-            *ppv = static_cast<ID2D1Transform*>(this);
-        else if (riid == __uuidof(ID2D1TransformNode))
-            *ppv = static_cast<ID2D1TransformNode*>(this);
-        else if (riid == __uuidof(IUnknown))
-            *ppv = static_cast<ID2D1EffectImpl*>(this);
-        else
-            return E_NOINTERFACE;
-
-        AddRef();
-        return S_OK;
-    }
-
-    IFACEMETHODIMP_(ULONG) CustomPixelShaderEffect::AddRef()
-    {
-        return InterlockedIncrement(&m_refCount);
-    }
-
-    IFACEMETHODIMP_(ULONG) CustomPixelShaderEffect::Release()
-    {
-        ULONG count = InterlockedDecrement(&m_refCount);
-        if (count == 0)
-            delete this;
-        return count;
-    }
-
-    // -----------------------------------------------------------------------
     // ID2D1EffectImpl
     // -----------------------------------------------------------------------
 
@@ -147,10 +27,7 @@ namespace ShaderLab::Effects
         ID2D1TransformGraph* transformGraph)
     {
         m_effectContext.copy_from(effectContext);
-        m_transformGraph.copy_from(transformGraph);
-
-        // Set ourselves as the single transform node in the graph.
-        return transformGraph->SetSingleTransformNode(static_cast<ID2D1DrawTransform*>(this));
+        return AttachToGraph(transformGraph);
     }
 
     IFACEMETHODIMP CustomPixelShaderEffect::PrepareForRender(D2D1_CHANGE_TYPE /*changeType*/)
@@ -176,12 +53,6 @@ namespace ShaderLab::Effects
         }
 
         return S_OK;
-    }
-
-    IFACEMETHODIMP CustomPixelShaderEffect::SetGraph(ID2D1TransformGraph* transformGraph)
-    {
-        m_transformGraph.copy_from(transformGraph);
-        return transformGraph->SetSingleTransformNode(static_cast<ID2D1DrawTransform*>(this));
     }
 
     // -----------------------------------------------------------------------
@@ -289,7 +160,7 @@ namespace ShaderLab::Effects
         //
         // Analysis pins (>= ImageInputCount) are 1 x N parameter textures and
         // say nothing about geometry; they keep the old answer.
-        if (!::ShaderLab::Performance::IsSubRectInputDemandEnabled())
+        if (!m_subRectInputDemand)
             return MapOutputRectToInputRectsWholeInput(
                 outputRect, inputRects, inputRectCount);
 
@@ -306,29 +177,15 @@ namespace ShaderLab::Effects
         return S_OK;
     }
 
-    // The behaviour that shipped, kept reachable as a kill switch. See
-    // Performance::IsSubRectInputDemandEnabled for why it is no longer the
-    // default and what it costs (53 ms -> 2.6 ms at 2880x1800).
+    // Whole-input demand, the subRectInputDemand = false kill switch (see
+    // EvaluatorOptions::subRectInputDemand for what it costs).
     IFACEMETHODIMP CustomPixelShaderEffect::MapOutputRectToInputRectsWholeInput(
         const D2D1_RECT_L* /*outputRect*/,
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const
     {
-        // Always return the FULL output rect as the input demand, ignoring
-        // the queried sub-rect. This is the safe-with-TRIVIAL_SAMPLING
-        // baseline: it ensures the intermediate textures match the full
-        // effect output rect so TEXCOORD maps 1:1 with GetDimensions()-
-        // normalized math, and so thumbnail / sub-rect previews show the
-        // *whole* effect output rather than just the queried region.
-        //
-        // An earlier attempt at honoring the queried sub-rect to enable
-        // D2Ds lazy-eval propagation (for preview-resolution scaling and
-        // per-input-rect routing) caused the symptom that thumbnail-
-        // sized preview panes rendered only a small sub-rect of the
-        // chain into the upper-left of the canvas. Reverted; preview-
-        // resolution scaling is shipped as the explicit Scale catalog
-        // node instead, which constrains the source-side rect rather
-        // than relying on leaf-side sub-rect demand propagation.
+        // Demand the full output rect from every input, ignoring the queried
+        // sub-rect, so each intermediate matches the whole effect output.
         for (UINT32 i = 0; i < inputRectCount; ++i)
         {
             inputRects[i] = m_lastOutputRect;
@@ -347,66 +204,8 @@ namespace ShaderLab::Effects
     }
 
     // -----------------------------------------------------------------------
-    // ID2D1TransformNode
-    // -----------------------------------------------------------------------
-
-    IFACEMETHODIMP_(UINT32) CustomPixelShaderEffect::GetInputCount() const
-    {
-        return m_inputCount;
-    }
-
-    // -----------------------------------------------------------------------
-    // Custom property accessors
-    // -----------------------------------------------------------------------
-
-    HRESULT CustomPixelShaderEffect::SetInputCount(UINT32 count)
-    {
-        if (count == m_inputCount)
-            return S_OK;
-
-        m_inputCount = count;
-
-        // Update the D2D transform graph to reflect the new input count.
-        if (m_transformGraph)
-        {
-            return m_transformGraph->SetSingleTransformNode(
-                static_cast<ID2D1DrawTransform*>(this));
-        }
-        return S_OK;
-    }
-
-    UINT32 CustomPixelShaderEffect::GetInputCountProp() const
-    {
-        return m_inputCount;
-    }
-
-    // -----------------------------------------------------------------------
     // Host-facing API (outside D2D property system)
     // -----------------------------------------------------------------------
-
-    HRESULT CustomPixelShaderEffect::LoadShaderBytecode(ID3DBlob* bytecode)
-    {
-        if (!bytecode)
-            return E_INVALIDARG;
-        return LoadShaderBytecode(
-            static_cast<const BYTE*>(bytecode->GetBufferPointer()),
-            static_cast<UINT32>(bytecode->GetBufferSize()));
-    }
-
-    HRESULT CustomPixelShaderEffect::LoadShaderBytecode(const BYTE* data, UINT32 dataSize)
-    {
-        if (!data || dataSize == 0)
-            return E_INVALIDARG;
-        m_shaderBytecode.assign(data, data + dataSize);
-        m_shaderDirty = true;
-        return S_OK;
-    }
-
-    void CustomPixelShaderEffect::SetConstantBufferData(const BYTE* data, UINT32 dataSize)
-    {
-        m_constantBuffer.assign(data, data + dataSize);
-        m_cbDirty = true;
-    }
 
     HRESULT CustomPixelShaderEffect::ForceLoadShader()
     {
@@ -438,37 +237,5 @@ namespace ShaderLab::Effects
         return m_drawInfo->SetPixelShaderConstantBuffer(
             m_constantBuffer.data(),
             static_cast<UINT32>(m_constantBuffer.size()));
-    }
-
-    // -----------------------------------------------------------------------
-    // Convenience: pack PropertyValue map into constant buffer
-    // -----------------------------------------------------------------------
-
-    void CustomPixelShaderEffect::PackConstantBuffer(
-        const std::map<std::wstring, Graph::PropertyValue>& properties,
-        const std::vector<ShaderVariable>& variables,
-        uint32_t cbSizeBytes)
-    {
-        // Allocate and zero the constant buffer.
-        m_constantBuffer.resize(cbSizeBytes, 0);
-
-        for (const auto& var : variables)
-        {
-            auto it = properties.find(var.name);
-            if (it == properties.end())
-                continue;
-            if (var.offset >= cbSizeBytes)
-                continue;
-
-            BYTE* dest = m_constantBuffer.data() + var.offset;
-            uint32_t remaining = cbSizeBytes - var.offset;
-
-            // Typed pack: converts float -> uint/int/bool and respects
-            // the declared HLSL cbuffer slot type. See
-            // ShaderCompiler.cpp::PackPropertyToCBuffer (Phase 3).
-            PackPropertyToCBuffer(dest, remaining, var.type, var.columns, it->second);
-        }
-
-        m_cbDirty = true;
     }
 }

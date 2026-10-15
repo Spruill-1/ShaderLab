@@ -1,7 +1,6 @@
 #pragma once
 
-// Peer identity + binary-pairing policy for the MCP broker pipe
-// (stdio-migration Step 4).
+// Peer identity + binary-pairing policy for the MCP broker pipe.
 //
 // The one enforced boundary: verify the peer PROCESS, not its claims,
 // and keep it version-tolerant.
@@ -61,10 +60,13 @@ namespace ShaderLab::Mcp
     SHADERLAB_API std::wstring LocalBuildId();
 
     // The default broker pipe base name, per-user isolated by SID:
-    // "ShaderLab.mcp.v1.<user-SID>". THE single source of truth so the hub,
-    // the shim, and every session client agree on where to meet when no
-    // --pipe / SHADERLAB_MCP_PIPE override is given (stdio-migration Step 6/7).
+    // "ShaderLab.mcp.v1.<user-SID>". The hub, the shim and every session
+    // client meet here when no --pipe / SHADERLAB_MCP_PIPE override is given.
     SHADERLAB_API std::wstring DefaultPipeBaseName();
+
+    // The pipe base name to use: `override` when given (a --pipe argument),
+    // else SHADERLAB_MCP_PIPE, else DefaultPipeBaseName().
+    SHADERLAB_API std::wstring ResolvePipeBaseName(std::wstring_view override);
 
     enum class PairingVerdict : uint8_t
     {

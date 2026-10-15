@@ -1,6 +1,6 @@
 #include "pch_engine.h"
 #include "../ShaderTestBench.h"
-#include "../TestCommon.h"
+#include "../TestSupport.h"
 #include "Effects/ColorMathCpu.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Rendering/VideoExport.h"
@@ -9,11 +9,10 @@
 
 namespace ShaderLab::Tests
 {
-    void TestGamut(ShaderTestBench& bench)
+    void TestSrgbTransfer(ShaderTestBench& bench)
     {
-        std::printf("\n=== Math: Gamut & Encodings ===\n");
+        std::printf("\n=== Math: sRGB transfer ===\n");
 
-        // ---- sRGB <-> linear (piecewise gamma) ----------------------------
         {
             // Linear 1.0 -> sRGB 1.0 anchor.
             auto r = bench.Run(R"(
@@ -73,8 +72,12 @@ namespace ShaderLab::Tests
             TEST("LinearToSRGB(SRGBToLinear(x)) ~= x on 6-color suite",
                 !r.empty() && r[0].x < 1e-5f);
         }
+    }
 
-        // ---- xyY <-> XYZ --------------------------------------------------
+    void TestXyYConversions(ShaderTestBench& bench)
+    {
+        std::printf("\n=== Math: xyY and XYZ ===\n");
+
         {
             // xyYToXYZ at D65 anchor: x=0.3127, y=0.3290, Y=1.0 -> standard
             // D65 XYZ (0.95047, 1.0, 1.08883). The codebase's D65 white
@@ -129,8 +132,12 @@ namespace ShaderLab::Tests
                 && Near(r[0].x, 0.3127f, 1e-4f)
                 && Near(r[0].y, 0.3290f, 1e-4f));
         }
+    }
 
-        // ---- PointInTriangle (gamut tests) --------------------------------
+    void TestPointInTriangle(ShaderTestBench& bench)
+    {
+        std::printf("\n=== Math: PointInTriangle ===\n");
+
         // D65 (0.3127, 0.3290) is inside the Rec.709 triangle.
         {
             auto r = bench.Run(R"(
@@ -159,8 +166,12 @@ namespace ShaderLab::Tests
             TEST("PointInTriangle: Rec.709 R primary is on/inside Rec.709 boundary",
                 !r.empty() && Near(r[0].x, 1.0f, 1e-6f));
         }
+    }
 
-        // ---- OKLab ---------------------------------------------------------
+    void TestOklab(ShaderTestBench& bench)
+    {
+        std::printf("\n=== Math: OKLab ===\n");
+
         // OKLab(white) should land on (1, 0, 0): lightness 1, neutral chroma.
         {
             auto r = bench.Run(R"(
@@ -183,12 +194,16 @@ namespace ShaderLab::Tests
                 && Near(r[0].y, 0.0f, 1e-5f)
                 && Near(r[0].z, 0.0f, 1e-5f));
         }
+    }
 
-        // ---- ScRGBToLab anchor --------------------------------------------
-        // CIE Lab(scRGB white) should be approximately (100, 0, 0)
-        // assuming Y_n=1.0 and the scRGB pipeline treats 1.0 as the white
-        // point. (Tolerance loose because the codebase's D65_XYZ
-        // constants don't match the matrix's white point exactly.)
+    // CIE Lab(scRGB white) should be approximately (100, 0, 0)
+    // assuming Y_n=1.0 and the scRGB pipeline treats 1.0 as the white
+    // point. (Tolerance loose because the codebase's D65_XYZ
+    // constants don't match the matrix's white point exactly.)
+    void TestScRgbToLabAnchor(ShaderTestBench& bench)
+    {
+        std::printf("\n=== Math: ScRGBToLab anchor ===\n");
+
         {
             auto r = bench.Run(R"(
                 Result[0] = float4(ScRGBToLab(float3(1, 1, 1)), 0);
@@ -199,11 +214,15 @@ namespace ShaderLab::Tests
                 && Near(r[0].y, 0.0f,   1.0f)
                 && Near(r[0].z, 0.0f,   1.0f));
         }
+    }
 
-        // ---- SoftCompressDistance (gamut soft roll-off) -------------------
-        // Contract tests: these hold for any hardness p >= 1 of the ACES
-        // power curve (p=1 is exactly Reinhard). threshold=0.75,
-        // limit=1.5, power=1.2 (the ACES RGC default) unless stated.
+    // Contract tests: these hold for any hardness p >= 1 of the ACES
+    // power curve (p=1 is exactly Reinhard). threshold=0.75,
+    // limit=1.5, power=1.2 (the ACES RGC default) unless stated.
+    void TestSoftCompressDistance(ShaderTestBench& bench)
+    {
+        std::printf("\n=== Math: SoftCompressDistance ===\n");
+
         {
             // Identity zone: d <= threshold returns d exactly.
             auto r = bench.Run(R"(
@@ -283,8 +302,12 @@ namespace ShaderLab::Tests
                 && Near(r[0].x, 0.90f, 1e-3f)
                 && r[0].y > r[0].x + 0.01f);
         }
+    }
 
-        // ---- 8-bit dither / quantize (screenshot output path) --------------
+    void TestDitherQuantize(ShaderTestBench& bench)
+    {
+        std::printf("\n=== Math: 8-bit dither and quantize ===\n");
+
         {
             // Zero strength must land exactly on the 8-bit grid.
             auto r = bench.Run(R"(
@@ -636,5 +659,19 @@ namespace ShaderLab::Tests
                 && Near(r[0].x, 200.75f, 0.05f)
                 && Near(r[0].y, 254.7083f, 0.05f));
         }
+    }
+}
+
+namespace ShaderLab::Tests
+{
+    namespace
+    {
+        SL_REGISTER_TEST(TestSrgbTransfer, Tag::Gpu | Tag::Math, [] { TestSrgbTransfer(Bench()); });
+        SL_REGISTER_TEST(TestXyYConversions, Tag::Gpu | Tag::Math, [] { TestXyYConversions(Bench()); });
+        SL_REGISTER_TEST(TestPointInTriangle, Tag::Gpu | Tag::Math, [] { TestPointInTriangle(Bench()); });
+        SL_REGISTER_TEST(TestOklab, Tag::Gpu | Tag::Math, [] { TestOklab(Bench()); });
+        SL_REGISTER_TEST(TestScRgbToLabAnchor, Tag::Gpu | Tag::Math, [] { TestScRgbToLabAnchor(Bench()); });
+        SL_REGISTER_TEST(TestSoftCompressDistance, Tag::Gpu | Tag::Math, [] { TestSoftCompressDistance(Bench()); });
+        SL_REGISTER_TEST(TestDitherQuantize, Tag::Gpu | Tag::Math, [] { TestDitherQuantize(Bench()); });
     }
 }

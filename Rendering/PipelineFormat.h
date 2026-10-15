@@ -1,13 +1,12 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "DisplayInfo.h"
 
 namespace ShaderLab::Rendering
 {
-    // Identifies a pipeline-wide pixel format + color space combination.
-    // Everything that touches pixels — swap chain, render targets, tone mapper,
-    // pixel inspector — reads from the active PipelineFormat.
+    // Pixel format + color space of the swap chain and render targets. The
+    // pipeline is always scRGB FP16 (FormatScRgbFP16); the struct exists so
+    // consumers read one description instead of repeating the DXGI values.
     struct PipelineFormat
     {
         DXGI_FORMAT             dxgiFormat{ DXGI_FORMAT_R16G16B16A16_FLOAT };
@@ -23,29 +22,14 @@ namespace ShaderLab::Rendering
         // True if the format can represent values outside [0,1] (HDR headroom).
         bool isFloatingPoint{ true };
 
-        // Bytes per pixel (useful for buffer allocation).
-        uint32_t BytesPerPixel() const
-        {
-            switch (dxgiFormat)
-            {
-            case DXGI_FORMAT_B8G8R8A8_UNORM:      return 4;
-            case DXGI_FORMAT_R10G10B10A2_UNORM:    return 4;
-            case DXGI_FORMAT_R16G16B16A16_FLOAT:   return 8;
-            case DXGI_FORMAT_R32G32B32A32_FLOAT:   return 16;
-            default:                               return 0;
-            }
-        }
-
         bool operator==(const PipelineFormat& other) const
         {
             return dxgiFormat == other.dxgiFormat && colorSpace == other.colorSpace;
         }
     };
 
-    // ----- Predefined pipeline formats -----
-
-    // scRGB FP16 — default. Linear, full HDR range, negative values allowed.
-    // Ideal for HDR compositing and effect authoring.
+    // scRGB FP16: linear, full HDR range, negative values allowed. On SDR
+    // displays DWM composes it through Advanced Color.
     inline const PipelineFormat FormatScRgbFP16{
         .dxgiFormat    = DXGI_FORMAT_R16G16B16A16_FLOAT,
         .colorSpace    = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
@@ -54,52 +38,4 @@ namespace ShaderLab::Rendering
         .isLinear       = true,
         .isFloatingPoint = true,
     };
-
-    // sRGB 8-bit — standard SDR. Gamma 2.2, [0–255] per channel.
-    inline const PipelineFormat FormatSrgb8{
-        .dxgiFormat    = DXGI_FORMAT_B8G8R8A8_UNORM,
-        .colorSpace    = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
-        .name          = L"sRGB 8-bit",
-        .bitsPerChannel = 8,
-        .isLinear       = false,
-        .isFloatingPoint = false,
-    };
-
-    // HDR10 — PQ transfer, BT.2020 primaries, 10-bit.
-    // Used when targeting HDR10 displays or PQ-encoded content.
-    inline const PipelineFormat FormatHdr10{
-        .dxgiFormat    = DXGI_FORMAT_R10G10B10A2_UNORM,
-        .colorSpace    = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
-        .name          = L"HDR10",
-        .bitsPerChannel = 10,
-        .isLinear       = false,
-        .isFloatingPoint = false,
-    };
-
-    // Linear FP32 — maximum precision. 32-bit float per channel, linear.
-    // For precision-critical work (deep compositing, scientific visualization).
-    inline const PipelineFormat FormatLinearFP32{
-        .dxgiFormat    = DXGI_FORMAT_R32G32B32A32_FLOAT,
-        .colorSpace    = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
-        .name          = L"Linear FP32",
-        .bitsPerChannel = 32,
-        .isLinear       = true,
-        .isFloatingPoint = true,
-    };
-
-    // All available formats in display order (for UI combo boxes, etc.).
-    inline const PipelineFormat AllFormats[] = {
-        FormatScRgbFP16,
-        FormatSrgb8,
-        FormatHdr10,
-        FormatLinearFP32,
-    };
-
-    // Returns the pipeline format. Always scRGB FP16 — the app is designed
-    // for HDR/ACM workflows where scRGB swap chains are handled correctly
-    // by Windows Desktop Window Manager, even on SDR displays via ACM.
-    inline PipelineFormat RecommendedFormat(const DisplayCapabilities& /*caps*/)
-    {
-        return FormatScRgbFP16;
-    }
 }
