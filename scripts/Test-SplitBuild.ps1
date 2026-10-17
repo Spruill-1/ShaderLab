@@ -5,8 +5,9 @@
 
 .DESCRIPTION
     Copies what ShaderLab keeps (everything but EffectGraph: the engine folders
-    less scripts/ShaderLabOwnedFiles.txt, the engine's projects, bindings,
-    packaging, the tests) into -WorkDir, links packages\ and third_party\ in,
+    and EffectGraph's tests less scripts/ShaderLabOwnedFiles.txt, the engine's
+    projects, bindings and packaging; plus the copies in scripts/SharedFiles.txt)
+    into -WorkDir, links packages\ and third_party\ in,
     extracts the EffectGraph.Engine package, and builds the GUI, headless and
     broker with EffectGraphEnginePackageDir set. Then renders a fixture with
     that headless and with this repository's, and fails unless the PNGs match.
@@ -34,15 +35,21 @@ if (-not $Package -or -not (Test-Path $Package)) { throw 'No EffectGraph.Engine 
 $engineDirs = 'Graph', 'Rendering', 'Effects', 'Engine', 'BuiltInEffects', 'EffectGraphDll', 'EffectGraphCompile'
 $engineFiles = 'pch_engine.h', 'pch_engine.cpp', 'ShaderLabEngine.vcxproj', 'ShaderLabEngine.vcxproj.filters',
     'EffectGraph.vcxproj', 'EffectGraph.vcxproj.filters', 'EffectGraphCompile.vcxproj', 'EffectGraphCompile.vcxproj.filters',
-    'BuiltInEffects.vcxproj', 'BuiltInEffects.vcxproj.filters', 'TestEffectPlugin.vcxproj', 'TestEffectPlugin.vcxproj.filters',
+    'BuiltInEffects.vcxproj', 'BuiltInEffects.vcxproj.filters', 'EffectGraphTests.vcxproj', 'EffectGraphTests.vcxproj.filters',
     'build/EffectGraph.targets', 'build/EffectGraphBuiltIns.targets'
 $engineTrees = 'bindings/', 'packaging/', 'Tests/', 'third_party/'
-$owned = Get-Content (Join-Path $PSScriptRoot 'ShaderLabOwnedFiles.txt') |
-    Where-Object { $_ -and -not $_.StartsWith('#') } | ForEach-Object { $_.Trim() -replace '\*\*', '*' }
+function Read-Globs([string]$name)
+{
+    Get-Content (Join-Path $PSScriptRoot $name) |
+        Where-Object { $_ -and -not $_.StartsWith('#') } | ForEach-Object { $_.Trim() -replace '\*\*', '*' }
+}
+$owned = Read-Globs 'ShaderLabOwnedFiles.txt'
+$shared = Read-Globs 'SharedFiles.txt'
 
 function Test-ShaderLabFile([string]$relative)
 {
     if ($owned | Where-Object { $relative -like $_ }) { return $true }
+    if ($shared | Where-Object { $relative -like $_ }) { return $true }
     if ($relative -in $engineFiles) { return $false }
     if ($engineTrees | Where-Object { $relative.StartsWith($_) }) { return $false }
     return $relative.Split('/')[0] -notin $engineDirs
@@ -62,8 +69,6 @@ Write-Host "ShaderLab's files: $($files.Count)"
 # Restored packages and the submodules, as a clone would have them.
 cmd /c mklink /J "$(Join-Path $WorkDir 'packages')" "$(Join-Path $root 'packages')" | Out-Null
 cmd /c mklink /J "$(Join-Path $WorkDir 'third_party')" "$(Join-Path $root 'third_party')" | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $WorkDir 'Tests') | Out-Null
-Copy-Item -Recurse (Join-Path $root 'Tests\fixtures') (Join-Path $WorkDir 'Tests\fixtures')
 
 # ---- The package, where packages.config would restore it.
 $packageDir = Join-Path $WorkDir "EffectGraphPackages\$([IO.Path]::GetFileNameWithoutExtension($Package))"

@@ -3,7 +3,6 @@
 
 #include "../../Graph/GraphModel.h"
 #include "../../Graph/GraphEdits.h"
-#include "../../Graph/ParameterVisibility.h"
 #include "../../Graph/ValueFormat.h"
 #include "../../Effects/EffectUpgrade.h"
 #include "../../Effects/NodeCatalog.h"
@@ -12,8 +11,8 @@
 
 #include <cstdio>
 
-// The graph edits, visibility rule and value formatting the Properties panel
-// uses, tested without a window.
+// The graph edits and value formatting the Properties panel uses, tested
+// without a window.
 namespace ShaderLab::Tests
 {
     namespace
@@ -23,47 +22,6 @@ namespace ShaderLab::Tests
             const auto* desc = Effects::ShaderLabEffects::Instance().FindByName(name);
             return desc ? Effects::ShaderLabEffects::CreateNode(*desc) : Graph::EffectNode{};
         }
-    }
-
-    SL_TEST_CASE(TestParameterVisibility, Tag::Fast)
-    {
-        printf("\n=== Parameter Visibility ===\n");
-        std::map<std::wstring, Graph::PropertyValue> props{
-            { L"Mode", 2u }, { L"Gain", 0.5f }, { L"On", true }, { L"Name", std::wstring(L"x") } };
-
-        TEST("VisibleWhen_EmptyIsVisible", Graph::EvaluateVisibleWhen(L"", props));
-        TEST("VisibleWhen_EqualHolds", Graph::EvaluateVisibleWhen(L"Mode == 2", props));
-        TEST("VisibleWhen_EqualFails", !Graph::EvaluateVisibleWhen(L"Mode == 1", props));
-        TEST("VisibleWhen_NotEqual", Graph::EvaluateVisibleWhen(L"Mode != 1", props));
-        TEST("VisibleWhen_LessEqual", Graph::EvaluateVisibleWhen(L"Gain <= 0.5", props));
-        TEST("VisibleWhen_Greater", !Graph::EvaluateVisibleWhen(L"Gain > 0.5", props));
-        TEST("VisibleWhen_BoolAsNumber", Graph::EvaluateVisibleWhen(L"On == 1", props));
-        TEST("VisibleWhen_NoSpaces", Graph::EvaluateVisibleWhen(L"Mode>=2", props));
-        TEST("VisibleWhen_TrailingTextIgnored", Graph::EvaluateVisibleWhen(L"Mode == 2abc", props));
-        TEST("VisibleWhen_BadNumberFailsOpen", Graph::EvaluateVisibleWhen(L"Mode == abc", props));
-        TEST("VisibleWhen_OutOfRangeFailsOpen", Graph::EvaluateVisibleWhen(L"Mode == 1e99", props));
-        TEST("VisibleWhen_NoOperatorFailsOpen", Graph::EvaluateVisibleWhen(L"Mode", props));
-        TEST("VisibleWhen_MissingParamFailsOpen", Graph::EvaluateVisibleWhen(L"Other == 7", props));
-        TEST("VisibleWhen_StringParamFailsOpen", Graph::EvaluateVisibleWhen(L"Name == 7", props));
-
-        Graph::EffectNode plain;
-        ShaderLab::Graph::SetNodeProperty(plain, L"Anything", 1.0f);
-        TEST("Shown_NoCustomEffectShowsAll", Graph::IsParameterShown(plain, L"Anything"));
-
-        Graph::EffectNode custom;
-        custom.customEffect.emplace();
-        Graph::ParameterDefinition mode;
-        mode.name = L"Mode";
-        Graph::ParameterDefinition gain;
-        gain.name = L"Gain";
-        gain.visibleWhen = L"Mode == 1";
-        custom.customEffect->parameters = { mode, gain };
-        custom.properties = { { L"Mode", 2u }, { L"Gain", 0.5f }, { L"Hidden", 1.0f } };
-        TEST("Shown_DeclaredParam", Graph::IsParameterShown(custom, L"Mode"));
-        TEST("Shown_UndeclaredHidden", !Graph::IsParameterShown(custom, L"Hidden"));
-        TEST("Shown_ConditionFalseHidden", !Graph::IsParameterShown(custom, L"Gain"));
-        ShaderLab::Graph::SetNodeProperty(custom, L"Mode", 1u);
-        TEST("Shown_ConditionTrueShown", Graph::IsParameterShown(custom, L"Gain"));
     }
 
     SL_TEST_CASE(TestValueFormat, Tag::Fast)

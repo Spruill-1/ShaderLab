@@ -1,0 +1,11 @@
+# Files EffectGraph owns that ShaderLab keeps its own copy of at the repo
+# split: the test runner (ShaderLabTests builds it too), the test plugin its
+# discovery test loads, and the fixtures. One glob per line, relative to the
+# repo root. scripts/Test-SplitBuild.ps1 copies them into its ShaderLab tree.
+Tests/TestRunner.cpp
+Tests/TestSupport.*
+Tests/TestCommon.h
+Tests/ShaderTestBench.*
+Tests/TestPlugin/**
+Tests/fixtures/**
+TestEffectPlugin.vcxproj*

@@ -66,8 +66,8 @@ DEFLATE (`tdefl_compress_mem_to_heap`, `tinfl_decompress_mem_to_heap`,
 
 ### Built-in effect headers
 
-`ShaderLab`, `ShaderLabHeadless` and `ShaderLabTests` import
-`build\EffectGraphBuiltIns.targets`, which runs `EffectGraphCompile --builtins`
+`ShaderLab`, `ShaderLabHeadless`, `ShaderLabTests` and `EffectGraphTests` import
+`build\EffectGraphBuiltIns.targets` (the first three through `build\EffectGraphEngine.targets`), which runs `EffectGraphCompile --builtins`
 before C++ compiles. It writes a header per built-in shader effect, with every
 build compiled in, to `<Platform>\<Configuration>\EffectGraphBuiltIns\`, and keeps
 the compiled builds in its `cache` folder: about 5 s the first time, under 1 s
@@ -105,7 +105,8 @@ bite when building ARM64 natively on an ARM64 machine, and both fail in misleadi
    - `x64\Debug\ShaderLabEngine\ShaderLabEngine.lib` (linked into every program)
    - `x64\Debug\EffectGraph\EffectGraph.dll` + `EffectGraph.lib` + `include\` (for outside programs)
    - `x64\Debug\ShaderLab\ShaderLab.exe`
-   - `x64\Debug\ShaderLabTests\ShaderLabTests.exe`
+   - `x64\Debug\EffectGraphTests\EffectGraphTests.exe` (the engine's tests)
+   - `x64\Debug\ShaderLabTests\ShaderLabTests.exe` (ShaderLab's tests)
    - `x64\Debug\ShaderLabHeadless\ShaderLabHeadless.exe`
    - `x64\Debug\ShaderLabMcpBroker\ShaderLabMcpBroker.exe` (also copied into the app layout + MSIX payload as the `Hub` application)
 

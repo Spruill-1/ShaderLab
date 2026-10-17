@@ -2,8 +2,6 @@
 #include "../TestSupport.h"
 #include "Engine/Api/EffectGraph.h"
 #include "Engine/Api/EffectGraphInternal.h"
-#include "Mcp/EngineMcpRoutes.h"
-#include "Mcp/McpRouter.h"
 #include "Engine/Utf8.h"
 
 #include <cmath>
@@ -366,58 +364,6 @@ namespace
         auto oldTarget = MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
                                      nullptr, 0);
         TEST("Move_OldDeviceTargetRefused", context->RealizeTo(matrix.get(), oldTarget.get()) == E_INVALIDARG);
-    }
-
-    // An MCP route that replaces the graph does it through the context, so
-    // node interfaces held from before see their node as removed.
-    SL_TEST_CASE(TestEffectGraphReplacedOverMcp, Tag::Gpu | Tag::Mcp)
-    {
-        printf("\n=== EffectGraph: a graph replaced over MCP ===\n");
-        struct ContextSink : ShaderLab::Mcp::IEngineCommandSink
-        {
-            IEffectGraphContextInternal* context{ nullptr };
-            ShaderLab::Mcp::Response Dispatch(
-                std::function<ShaderLab::Mcp::Response(ShaderLab::Mcp::EngineContext&)> closure) override
-            {
-                ShaderLab::Mcp::EngineContext engineContext(*context);
-                return closure(engineContext);
-            }
-        };
-        auto context = MakeContext();
-        auto internal = context.as<IEffectGraphContextInternal>();
-        ContextSink sink;
-        sink.context = internal.get();
-        ShaderLab::McpRouter router;
-        ShaderLab::Mcp::RegisterEngineRoutes(router, sink);
-
-        auto texels = GreyTexels(1.0f, 3.0f);
-        auto texture = MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE, texels.data(), cWidth * 8);
-        winrt::com_ptr<IEffectGraphNode> input, stats;
-        winrt::check_hresult(context->CreateTextureInput(texture.get(), EFFECTGRAPH_INPUT_ENCODING_SCRGB_LINEAR, input.put()));
-        winrt::check_hresult(context->CreateEffect(L"Luminance Statistics", stats.put()));
-        stats->SetInput(0, input.get());
-        TEST("Replace_RendersBefore", SUCCEEDED(context->Realize(stats.get(), nullptr)) &&
-             std::abs(FieldOf(stats.get(), L"Max") - 240.0f) < 0.05f);
-
-        const auto cleared = router.RouteRequest(L"POST", L"/graph/clear", "");
-        wchar_t error[64];
-        TEST("Replace_ClearSucceeds", cleared.statusCode == 200 && internal->Model().Nodes().empty());
-        TEST("Replace_ClearRemovesNodes", stats->GetError(error, 64) == EFFECTGRAPH_E_NODE_REMOVED &&
-             context->Realize(stats.get(), nullptr) == EFFECTGRAPH_E_NODE_REMOVED);
-        TEST("Replace_ClearRemovesInputs",
-             input.as<IEffectGraphInput>()->SetTexture(texture.get(), EFFECTGRAPH_INPUT_ENCODING_SCRGB_LINEAR) ==
-                 EFFECTGRAPH_E_NODE_REMOVED);
-
-        // A node the next graph gives the same id is not the old interface's.
-        winrt::com_ptr<IEffectGraphNode> fresh;
-        winrt::check_hresult(context->CreateEffect(L"Luminance Statistics", fresh.put()));
-        const std::string graphJson = ShaderLab::WideToUtf8(std::wstring(internal->Model().ToJson()));
-        const auto loaded = router.RouteRequest(L"POST", L"/graph/load", graphJson);
-        TEST("Replace_LoadSucceeds", loaded.statusCode == 200 && internal->Model().Nodes().size() == 1);
-        TEST("Replace_LoadRemovesNodes", fresh->GetError(error, 64) == EFFECTGRAPH_E_NODE_REMOVED);
-        winrt::com_ptr<IEffectGraphNode> found;
-        TEST("Replace_LoadedNodeFound", internal->NodeFor(internal->Model().Nodes()[0].id, found.put()) == S_OK &&
-             found && found.get() != fresh.get());
     }
 
     // A D3D11 device on 11on12 over WARP, whose D3D12 device can be removed on

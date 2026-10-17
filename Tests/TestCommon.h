@@ -156,6 +156,23 @@ namespace ShaderLab::Tests
     };
 }
 
+namespace ShaderLab::Tests
+{
+    // Start-up a runner's host adds (ShaderLab registers its support library):
+    // each runs once, after COM, Media Foundation and the engine start, before
+    // the device is created.
+    inline std::vector<void (*)()>& TestSetups()
+    {
+        static std::vector<void (*)()> setups;
+        return setups;
+    }
+
+    struct TestSetupRegistration
+    {
+        explicit TestSetupRegistration(void (*setup)()) { TestSetups().push_back(setup); }
+    };
+}
+
 #define SL_TEST_CONCAT_INNER(a, b) a##b
 #define SL_TEST_CONCAT(a, b) SL_TEST_CONCAT_INNER(a, b)
 
@@ -170,6 +187,12 @@ namespace ShaderLab::Tests
 #define SL_REGISTER_TEST(name, tags, run)                                               \
     static const ::ShaderLab::Tests::TestRegistration SL_TEST_CONCAT(s_register_, name){ \
         #name, (tags), (run), __FILE__, __LINE__ }
+
+// Registers start-up for the runner:  SL_TEST_SETUP(RegisterMine) { ... }
+#define SL_TEST_SETUP(name)                                                              \
+    static void name();                                                                  \
+    static const ::ShaderLab::Tests::TestSetupRegistration SL_TEST_CONCAT(s_setup_, name){ &name }; \
+    static void name()
 
 #define TEST(name, ...) ::ShaderLab::Tests::ReportResult((name), static_cast<bool>(__VA_ARGS__), __FILE__, __LINE__)
 #define TEST_EQ(name, actual, expected) ::ShaderLab::Tests::ReportEqual((name), (actual), (expected), __FILE__, __LINE__)

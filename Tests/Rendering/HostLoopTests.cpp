@@ -2,8 +2,8 @@
 #include "../TestSupport.h"
 #include "Graph/GraphModel.h"
 #include "Rendering/FramePacer.h"
-#include "Rendering/GpuTimer.h"
 #include "Rendering/GraphEvaluator.h"
+#include "Rendering/PreviewViewState.h"
 #include "Rendering/RenderThreadDispatcher.h"
 
 #include <atomic>
@@ -14,11 +14,14 @@
 #include <thread>
 #include <vector>
 
-// The render loop pieces hosts share: the frame pacer and the render-thread
-// dispatcher.
+// ShaderLab's render loop pieces: the frame pacer, the render-thread
+// dispatcher and the preview's view state.
 namespace
 {
     using namespace ShaderLab::Tests;
+    namespace Rendering = ShaderLab::Rendering;
+
+    bool Near(float a, float b, float tolerance = 1e-4f) { return std::abs(a - b) <= tolerance; }
 
     SL_TEST_CASE(TestFramePacer, Tag::Fast | Tag::Timing)
     {
@@ -140,40 +143,6 @@ namespace
             printf("  [info] paced loop, 10 ms work: %.1f Hz over %d frames\n", hz, frames);
             TIMING_TEST("Paced worker loop runs at 60 +- 2 Hz", hz >= 58.0 && hz <= 62.0);
         }
-    }
-
-    // A span closed without being opened in the same frame must not report:
-    // its begin query would hold a timestamp from an earlier frame.
-    SL_TEST_CASE(TestGpuTimerUnopenedSpan, Tag::Gpu)
-    {
-        using ShaderLab::Rendering::GpuSpan;
-        ShaderLab::Rendering::GpuTimer timer;
-        TEST("GpuTimer_Initializes", timer.Initialize(g_d3dDevice.get()));
-        timer.SetEnabled(true);
-
-        timer.BeginFrame();
-        timer.Begin(GpuSpan::Evaluate);
-        timer.End(GpuSpan::Evaluate);
-        timer.EndFrame();
-        timer.CollectBlocking();
-        const double opened = timer.SpanMs(GpuSpan::Evaluate);
-
-        // Cycle the ring back to the first slot, then close Evaluate unopened.
-        for (uint32_t frame = 1; frame < ShaderLab::Rendering::GpuTimer::kLatency; ++frame)
-        {
-            timer.BeginFrame();
-            timer.EndFrame();
-            timer.CollectBlocking();
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        timer.BeginFrame();
-        timer.Begin(GpuSpan::Frame);
-        timer.End(GpuSpan::Evaluate);
-        timer.End(GpuSpan::Frame);
-        timer.EndFrame();
-        TEST("GpuTimer_FrameResolves", timer.CollectBlocking());
-        TEST("GpuTimer_UnopenedSpanKeepsLastValue", timer.SpanMs(GpuSpan::Evaluate) == opened);
-        timer.Shutdown();
     }
 
     SL_TEST_CASE(TestRenderThreadDispatcher, Tag::Fast)
@@ -503,5 +472,53 @@ namespace
             TEST("DispatchSync timeout throws", timedOut);
             TEST("DispatchSync timeout leaves the closure unexecuted", !bodyRan->load());
         }
+    }
+
+    SL_TEST_CASE(TestPreviewViewState, Tag::Fast)
+    {
+        printf("\n=== Preview view state ===\n");
+        using Rendering::PreviewView;
+
+        const auto fit = Rendering::FitPreviewView({ 0, 0, 200, 100 }, 400, 400);
+        TEST("Fit_Centred", fit && Near(fit->zoom, 1.9f) && Near(fit->panX, 10.0f) && Near(fit->panY, 105.0f));
+        TEST("Fit_EmptyImageWaits", !Rendering::FitPreviewView({ 0, 0, 0, 0 }, 400, 400));
+        TEST("Fit_NoViewportWaits", !Rendering::FitPreviewView({ 0, 0, 10, 10 }, 0, 400));
+        const auto unbounded = Rendering::FitPreviewView({ -1e7f, -1e7f, 1e7f, 1e7f }, 400, 400);
+        TEST("Fit_UnboundedIsIdentity", unbounded && *unbounded == PreviewView{});
+        const auto offset = Rendering::FitPreviewView({ 50, 50, 250, 150 }, 400, 400);
+        TEST("Fit_HonoursOrigin", offset && Near(offset->panX, 10.0f - 50.0f * 1.9f));
+
+        const auto zoomed = Rendering::ZoomPreviewAbout({ 1.0f, 0.0f, 0.0f }, 100.0f, 50.0f, 2.0f);
+        TEST("Zoom_KeepsPointFixed", Near(zoomed.zoom, 2.0f) && Near(zoomed.panX, -100.0f) && Near(zoomed.panY, -50.0f));
+        TEST("Zoom_Clamped", Near(Rendering::ZoomPreviewAbout({ 90.0f, 0, 0 }, 0, 0, 2.0f).zoom, 100.0f));
+
+        Rendering::PreviewViewState state;
+        state.SetViewport(400, 400);
+        state.SelectNode(5);
+        TEST("State_NewNodeFits", state.FitPending() && state.AutoFit() && state.NodeId() == 5);
+        const auto frame = state.Frame();
+        TEST("State_FitApplies", state.FitTo(frame, { 0, 0, 200, 100 }) && !state.FitPending() &&
+             Near(state.View().zoom, 1.9f));
+
+        // An edit while a frame renders beats the fit computed from that frame.
+        const auto stale = state.Frame();
+        state.SetView({ 3.0f, 1.0f, 2.0f });
+        TEST("State_EditEndsAutoFit", !state.AutoFit());
+        TEST("State_StaleFitDropped", !state.FitTo(stale, { 0, 0, 10, 10 }) && Near(state.View().zoom, 3.0f));
+
+        // Each node keeps its own view.
+        state.SelectNode(6);
+        TEST("State_OtherNodeFits", state.FitPending() && state.AutoFit());
+        state.SelectNode(5);
+        TEST("State_ViewRemembered", state.View() == (PreviewView{ 3.0f, 1.0f, 2.0f }) && !state.FitPending());
+
+        state.SetSelectedNode(9);
+        TEST("State_SelectionInFrame", state.Frame().selectedNodeId == 9);
+        state.RequestFit(/*keepFitted=*/false);
+        TEST("State_OneShotFit", state.FitPending() && !state.AutoFit());
+        state.Reset();
+        TEST("State_ResetForgets", state.NodeId() == 0 && state.FitPending());
+        state.SelectNode(5);
+        TEST("State_ResetForgetsViews", state.AutoFit());
     }
 }

@@ -101,78 +101,37 @@
     <ClInclude Include="Tests\ShaderTestBench.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="pch_engine.cpp">
+    <ClCompile Include="pch_host.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Tests\TestRunner.cpp" />
     <ClCompile Include="Tests\TestSupport.cpp" />
-    <ClCompile Include="Tests\FixtureManifestTests.cpp" />
     <ClCompile Include="Tests\ShaderTestBench.cpp" />
-    <ClCompile Include="Tests\Effects\BytecodeCacheTests.cpp" />
-    <ClCompile Include="Tests\Effects\EffectCatalogTests.cpp" />
-    <ClCompile Include="Tests\Effects\ShaderCompilerTests.cpp" />
-    <ClCompile Include="Tests\Effects\HlslScaffoldTests.cpp" />
-    <ClCompile Include="Tests\Effects\StatisticsTests.cpp" />
-    <ClCompile Include="Tests\Effects\ToneMapReferenceTests.cpp" />
-    <ClCompile Include="Tests\Effects\UserEffectLibraryTests.cpp" />
-    <ClCompile Include="Tests\Effects\VariantTests.cpp" />
-    <ClCompile Include="Tests\Graph\GraphContractTests.cpp" />
-    <ClCompile Include="Tests\Graph\GraphEditsTests.cpp" />
+    <ClCompile Include="Tests\ShaderLabTestSetup.cpp" />
     <ClCompile Include="Tests\Graph\GraphLayoutTests.cpp" />
-    <ClCompile Include="Tests\Graph\GraphModelTests.cpp" />
-    <ClCompile Include="Tests\Graph\GraphPolicyTests.cpp" />
-    <ClCompile Include="Tests\Math\ColorMatrixTests.cpp" />
-    <ClCompile Include="Tests\Math\DeltaETests.cpp" />
-    <ClCompile Include="Tests\Math\GamutTests.cpp" />
-    <ClCompile Include="Tests\Math\MobiusReinhardTests.cpp" />
-    <ClCompile Include="Tests\Math\TransferFunctionTests.cpp" />
+    <ClCompile Include="Tests\Graph\GraphUiTests.cpp" />
+    <ClCompile Include="Tests\Hosts\BrokerShimTests.cpp" />
+    <ClCompile Include="Tests\Hosts\EffectPluginDiscoveryTests.cpp" />
+    <ClCompile Include="Tests\Hosts\HeadlessArgsTests.cpp" />
+    <ClCompile Include="Tests\Mcp\McpEffectGraphTests.cpp" />
+    <ClCompile Include="Tests\Mcp\McpHelperTests.cpp" />
     <ClCompile Include="Tests\Mcp\McpRouteTests.cpp" />
     <ClCompile Include="Tests\Mcp\McpRouterTests.cpp" />
     <ClCompile Include="Tests\Mcp\McpTransportTests.cpp" />
-    <ClCompile Include="Tests\Hosts\BrokerShimTests.cpp" />
-    <ClCompile Include="Tests\Hosts\HeadlessArgsTests.cpp" />
+    <ClCompile Include="Tests\Persistence\PackageTests.cpp" />
+    <ClCompile Include="Tests\Rendering\ExpressionTests.cpp" />
+    <ClCompile Include="Tests\Rendering\HostLoopTests.cpp" />
+    <ClCompile Include="Tests\Video\VideoExportTests.cpp" />
+    <ClCompile Include="Tests\Video\VideoPlaybackTests.cpp" />
     <ClCompile Include="ShaderLabHeadless\HeadlessArgs.cpp" />
     <ClCompile Include="ShaderLabMcpBroker\BrokerPipeIo.cpp" />
     <ClCompile Include="ShaderLabMcpBroker\Shim.cpp" />
-    <ClCompile Include="Tests\Persistence\PackageTests.cpp" />
-    <ClCompile Include="Tests\Api\EffectGraphApiTests.cpp" />
-    <ClCompile Include="Tests\Api\EffectGraphPluginTests.cpp" />
-    <ClCompile Include="Tests\Api\EffectGraphDllTests.cpp" />
-    <ClCompile Include="Tests\Effects\BuiltInEffectTests.cpp" />
-    <ClCompile Include="Tests\Effects\EffectBlobTests.cpp" />
-    <ClCompile Include="Tests\Rendering\ComputeTests.cpp" />
-    <ClCompile Include="Tests\Rendering\EvaluatorTests.cpp" />
-    <ClCompile Include="Tests\Rendering\GpuBindingTests.cpp" />
-    <ClCompile Include="Tests\Rendering\HostLoopTests.cpp" />
-    <ClCompile Include="Tests\Rendering\ReadbackTests.cpp" />
-    <ClCompile Include="Tests\Rendering\PixelTraceTests.cpp" />
-    <ClCompile Include="Tests\Sources\ImageLoaderTests.cpp" />
-    <ClCompile Include="Tests\Sources\SourceProviderTests.cpp" />
-    <ClCompile Include="Tests\Video\VideoPlaybackTests.cpp" />
-    <ClCompile Include="Tests\Video\VideoSourceTests.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <!-- Built first for TestEffectGraphDll, which loads it; not linked. -->
-    <ProjectReference Include="EffectGraph.vcxproj">
-      <Project>{61D99F51-6BAE-4AC0-A59B-40B84A8C71DF}</Project>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-      <LinkLibraryDependencies>false</LinkLibraryDependencies>
-    </ProjectReference>
-    <!-- Built first and copied to Effects\, where the tests load it. -->
     <ProjectReference Include="TestEffectPlugin.vcxproj">
       <Project>{9B2E4F17-3C6A-4D85-B1E2-7A0C5D9F6E48}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <LinkLibraryDependencies>false</LinkLibraryDependencies>
-    </ProjectReference>
-    <ProjectReference Include="BuiltInEffects.vcxproj">
-      <Project>{463424C5-37AA-4129-ABAB-1CD7F3BF2215}</Project>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-      <LinkLibraryDependencies>true</LinkLibraryDependencies>
-    </ProjectReference>
-    <ProjectReference Include="ShaderLabEngine.vcxproj">
-      <Project>{A7A1E0F1-665C-4D06-9AC7-6D6B6A0D0F01}</Project>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-      <LinkLibraryDependencies>true</LinkLibraryDependencies>
     </ProjectReference>
     <ProjectReference Include="ShaderLabSupport.vcxproj">
       <Project>{3C5E8A21-7B4D-4F6A-9E12-5D8C0B7A4E63}</Project>
@@ -181,7 +140,7 @@
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <Import Project="build\EffectGraphBuiltIns.targets" />
+  <Import Project="build\EffectGraphEngine.targets" />
   <Target Name="CopyTestEffectPlugin" AfterTargets="Build">
     <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\TestEffectPlugin\TestEffectPlugin.dll"
           DestinationFolder="$(OutDir)Effects" SkipUnchangedFiles="true" />

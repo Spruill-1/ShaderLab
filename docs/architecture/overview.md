@@ -21,8 +21,8 @@ graph TB
         SUP[Support/: ExprTk, .effectgraph files]
     end
 
-    subgraph Tests["ShaderLabTests.exe"]
-        TR[TestRunner main + self-registering cases<br/>Graph / Effects / Rendering / Sources / Video / Mcp / Math]
+    subgraph Tests["EffectGraphTests.exe / ShaderLabTests.exe"]
+        TR[One TestRunner, self-registering cases<br/>engine: Graph / Effects / Rendering / Sources / Video / Api / Math<br/>ShaderLab: Mcp / Hosts / expressions / host loop / playback]
     end
 
     subgraph Headless["ShaderLabHeadless.exe"]

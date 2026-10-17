@@ -3,7 +3,6 @@
 #include "../TestSupport.h"
 #include "Effects/ColorMathCpu.h"
 #include "Effects/ShaderLabEffects.h"
-#include "Rendering/VideoExport.h"
 
 #include <cstdio>
 
@@ -439,42 +438,6 @@ namespace ShaderLab::Tests
                 TEST(std::format("CubeBoundaryRadius >= every coarse sample found inside, {} "
                                  "(the gamut early-out depends on this)", gamutNames[gi]).c_str(),
                     !r.empty() && r[0].x == 0.0f);
-            }
-
-            // Video export conversion (Rendering/VideoExport.cpp) against
-            // values any Y'CbCr table gives. BT.709 limited 8-bit: red is
-            // (63, 102, 240), white (235, 128, 128), black (16, 128, 128).
-            // BT.2020 PQ limited 10-bit: black 64, a 100-nit neutral
-            // floor(64 + 876 * PQ(100) + 0.5) = floor(64 + 876*0.5080784 + 0.5)
-            // = 509, 10000 nits 940; neutrals carry chroma 512.
-            {
-                auto r = bench.Run(R"(
-                    float3 red  = VideoEncodeSdr(float3(1, 0, 0));
-                    float3 wht  = VideoEncodeSdr(float3(1, 1, 1));
-                    float3 blk  = VideoEncodeSdr(float3(0, 0, 0));
-                    Result[0] = float4(VideoLumaCode(red, 1), VideoChromaCode(VideoChromaDiff(red, 1), 1), 0);
-                    Result[1] = float4(VideoLumaCode(wht, 1), VideoChromaCode(VideoChromaDiff(wht, 1), 1), 0);
-                    Result[2] = float4(VideoLumaCode(blk, 1), VideoChromaCode(VideoChromaDiff(blk, 1), 1), 0);
-                    float3 h100 = VideoEncodeHdr10(float3(1.25, 1.25, 1.25));
-                    float3 hMax = VideoEncodeHdr10(float3(125, 125, 125));
-                    float3 hBlk = VideoEncodeHdr10(float3(0, 0, 0));
-                    Result[3] = float4(VideoLumaCode(h100, 0), VideoChromaCode(VideoChromaDiff(h100, 0), 0), 0);
-                    Result[4] = float4(VideoLumaCode(hMax, 0), VideoLumaCode(hBlk, 0), VideoChromaCode(VideoChromaDiff(hBlk, 0), 0));
-                    Result[5] = float4(VideoContentNits(float3(1.25, 1.25, 1.25)), VideoContentNits(float3(500, 0, 0)),
-                                       VideoContentNits(float3(-1, -1, -1)), 0);
-                )", 6, ShaderLab::Rendering::VideoConvertHelpersHLSL());
-                const bool ok = r.size() >= 6;
-                TEST("Video SDR: BT.709 red encodes to (63, 102, 240)",
-                    ok && r[0].x == 63.0f && r[0].y == 102.0f && r[0].z == 240.0f);
-                TEST("Video SDR: white (235,128,128), black (16,128,128)",
-                    ok && r[1].x == 235.0f && r[1].y == 128.0f && r[1].z == 128.0f
-                       && r[2].x == 16.0f && r[2].y == 128.0f && r[2].z == 128.0f);
-                TEST("Video HDR10: 100-nit neutral is Y 509, chroma 512",
-                    ok && r[3].x == 509.0f && r[3].y == 512.0f && r[3].z == 512.0f);
-                TEST("Video HDR10: 10000 nits is Y 940, black Y 64 / chroma 512",
-                    ok && r[4].x == 940.0f && r[4].y == 64.0f && r[4].z == 512.0f && r[4].w == 512.0f);
-                TEST("Video content light: 100-nit neutral reads 100, clamps at 10000 and 0",
-                    ok && Near(r[5].x, 100.0f, 0.05f) && r[5].y == 10000.0f && r[5].z == 0.0f);
             }
 
             // Dither must be a function of the PIXEL, not of the exact float

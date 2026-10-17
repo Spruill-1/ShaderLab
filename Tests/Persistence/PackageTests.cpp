@@ -346,4 +346,45 @@ namespace
 
         fs::remove_all(dir, ec);   // best-effort cleanup
     }
+    // Stale media folders: a fresh heartbeat keeps a folder, an old one does not.
+    SL_TEST_CASE(TestStaleMediaDirs, Tag::Fast)
+    {
+        printf("\n=== Stale media folders ===\n");
+        namespace fs = std::filesystem;
+        const fs::path root = fs::temp_directory_path() / std::format(L"ShaderLabReapTest-{}", ::GetCurrentProcessId());
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        const fs::path fresh = root / L"ShaderLab-fresh";
+        const fs::path old = root / L"ShaderLab-old";
+        const fs::path other = root / L"NotShaderLab";
+        fs::create_directories(fresh);
+        fs::create_directories(old);
+        fs::create_directories(other);
+        ShaderLab::Support::TouchMediaHeartbeat(fresh.wstring());
+        ShaderLab::Support::TouchMediaHeartbeat(old.wstring());
+        std::ofstream(old / L"clip.mp4", std::ios::binary) << "0123456789";
+
+        // Age the old folder's heartbeat by an hour.
+        FILETIME now{};
+        ::GetSystemTimeAsFileTime(&now);
+        ULARGE_INTEGER aged{};
+        aged.LowPart = now.dwLowDateTime;
+        aged.HighPart = now.dwHighDateTime;
+        aged.QuadPart -= 3600ull * 10'000'000ull;
+        const FILETIME agedTime{ aged.LowPart, aged.HighPart };
+        HANDLE beat = ::CreateFileW((old / L".heartbeat").c_str(), FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_HIDDEN, nullptr);
+        if (beat != INVALID_HANDLE_VALUE)
+        {
+            ::SetFileTime(beat, nullptr, nullptr, &agedTime);
+            ::CloseHandle(beat);
+        }
+
+        const auto stale = ShaderLab::Support::FindStaleMediaDirs(root.wstring() + L"\\", ShaderLab::Support::cStaleMediaDirSec, true);
+        TEST("StaleMedia_OnlyTheOldFolder", stale.size() == 1 && fs::path(stale[0].path).filename() == L"ShaderLab-old");
+        TEST("StaleMedia_CountsBytes", !stale.empty() && stale[0].bytes >= 10);
+        const auto reaped = ShaderLab::Support::ReapMediaDirs(stale);
+        TEST("StaleMedia_Reaped", reaped.deleted == 1 && !fs::exists(old) && fs::exists(fresh) && fs::exists(other));
+        fs::remove_all(root, ec);
+    }
 }

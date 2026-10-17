@@ -6,6 +6,7 @@
   </Configurations>
   <Project Path="ShaderLabEngine.vcxproj" Id="a7a1e0f1-665c-4d06-9ac7-6d6b6a0d0f01" />
   <Project Path="ShaderLabSupport.vcxproj" Id="3c5e8a21-7b4d-4f6a-9e12-5d8c0b7a4e63" />
+  <Project Path="EffectGraphTests.vcxproj" Id="e7f3a2c5-8d41-4b6e-9a07-3c5d1f2b8e94" />
   <Project Path="ShaderLabTests.vcxproj" Id="c1d2e3f4-1122-4b33-9c44-556677889900" />
   <Project Path="ShaderLabHeadless.vcxproj" Id="d2e3f4a5-2233-4c44-ad55-667788990011" />
   <Project Path="BuiltInEffects.vcxproj" Id="463424c5-37aa-4129-abab-1cd7f3bf2215" />

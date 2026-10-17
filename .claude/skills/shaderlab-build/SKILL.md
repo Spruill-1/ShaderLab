@@ -54,7 +54,9 @@ the packaged app and is much slower.
 ```pwsh
 $plat = 'x64'   # or 'ARM64'
 
-# Tests only (pulls in the engine). The usual inner loop.
+# Tests only. The usual inner loop: EffectGraphTests for the engine,
+# ShaderLabTests for MCP, the hosts and ShaderLab's own pieces.
+& $msb EffectGraphTests.vcxproj  /p:Configuration=Debug /p:Platform=$plat /m /v:m /nologo
 & $msb ShaderLabTests.vcxproj    /p:Configuration=Debug /p:Platform=$plat /m /v:m /nologo
 
 # Headless host (engine + console host, no WinUI).
@@ -78,14 +80,19 @@ Get-Process ShaderLab, ShaderLabMcpBroker -ErrorAction SilentlyContinue | Stop-P
 ## Tests
 
 ```pwsh
+& ".\$plat\Debug\EffectGraphTests\EffectGraphTests.exe" --adapter warp
 & ".\$plat\Debug\ShaderLabTests\ShaderLabTests.exe" --adapter warp
 ```
 
-Ends with `ALL <n> TESTS PASSED`; exit code is the failure count. `--adapter warp`
-uses the software rasterizer — no GPU dependency, and what CI runs. Covers the graph
-model, evaluator, bindings, bytecode cache, `GraphUiSnapshot`, dispatcher, MCP router
-+ JSON-RPC contracts, broker frame codec / crypto / peer identity, GPU-binding
-matrices, and the HLSL math bench.
+Each ends with `ALL <n> TESTS PASSED`; exit code is the failure count. `--adapter warp`
+uses the software rasterizer — no GPU dependency, and what CI runs.
+`EffectGraphTests` covers the engine: graph model, evaluator, bindings, bytecode
+cache, effects, sources, video sources, the public and plugin APIs, GPU-binding
+matrices and the HLSL math bench. `ShaderLabTests` covers what ShaderLab adds:
+MCP router + JSON-RPC contracts, broker frame codec / crypto / peer identity, the
+headless and shim argument handling, `.effectgraph` files, Numeric Expression
+evaluation (ExprTk), `GraphUiSnapshot`, layout, the frame pacer and dispatcher,
+video export and the real-time playback harnesses.
 
 Cases register themselves (`SL_TEST_CASE` in `Tests/TestCommon.h`), so a subset is a
 flag away: `--tag fast` (no device), `--tag video`, `--tag mcp`, `--tag math`,

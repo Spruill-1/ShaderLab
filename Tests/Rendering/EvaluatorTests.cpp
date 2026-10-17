@@ -10,7 +10,6 @@
 #include "../../Graph/GraphModel.h"
 #include "../../Rendering/DisplayProfile.h"
 #include "../../Rendering/MathExpression.h"
-#include "../../Support/ExprTkEvaluator.h"
 #include "../../Rendering/WorkingSpaceSync.h"
 #include "Graph/GraphEdits.h"
 
@@ -159,22 +158,6 @@ namespace ShaderLab::Tests
             TEST("ParameterNode_RandomInUnitRange", first >= 0.0f && first < 1.0f && other >= 0.0f && other < 1.0f);
             TEST("ParameterNode_RandomFollowsSeed", first != other);
 
-            auto expression = ParameterNode(NodeKind::Expression, { { L"Result", AnalysisFieldType::Float } });
-            expression.customEffect->parameters = {
-                ParameterDefinition{ L"Expression", L"string", std::wstring(L"") },
-                ParameterDefinition{ L"A", L"float", 0.0f },
-                ParameterDefinition{ L"B", L"float", 0.0f },
-            };
-            expression.properties = { { L"Expression", std::wstring(L"A * 2 + B") }, { L"A", 3.0f }, { L"B", 1.0f } };
-            TEST("ParameterNode_ExpressionEvaluates",
-                 FieldValue(ParameterNodeFields(expression), L"Result") == 7.0f && expression.runtimeError.empty());
-            ShaderLab::Graph::SetNodeProperty(expression, L"Expression", std::wstring(L"A * ("));
-            ParameterNodeFields(expression);
-            TEST("ParameterNode_ExpressionErrorReported", !expression.runtimeError.empty());
-            ShaderLab::Graph::SetNodeProperty(expression, L"Expression", std::wstring(L"A \u00D7 2"));
-            ParameterNodeFields(expression);
-            TEST("ParameterNode_ExpressionRejectsNonAscii",
-                 expression.runtimeError.find(L"ASCII") != std::wstring::npos);
 
             namespace Numerics = winrt::Windows::Foundation::Numerics;
             auto constant = ParameterNode(NodeKind::ConstantParameter, {
@@ -237,23 +220,25 @@ namespace ShaderLab::Tests
              FAILED(handler->Open(D3D_INCLUDE_LOCAL, "missing.hlsli", nullptr, &data, &bytes)));
     }
 
-    // The engine has no expression language of its own: the runner registered
-    // ExprTk, and without a registration every expression fails with a reason.
+    // The engine has no expression language of its own: a host registers one,
+    // and without it every expression fails with a reason.
     SL_TEST_CASE(TestMathExpressionHook, Tag::Fast)
     {
         printf("\n=== Numeric Expression evaluator hook ===\n");
         const wchar_t* names[] = { L"A", L"B" };
         const float values[] = { 3.0f, 4.0f };
-        float result = 0.0f;
+        float result = 1.0f;
         std::wstring error;
-        TEST("MathHook_Registered", Rendering::EvaluateMathExpression(L"sqrt(A*A + B*B)", names, values, 2, result, &error) &&
-             result == 5.0f);
+        TEST("MathHook_UnsetFails", !Rendering::EvaluateMathExpression(L"A + B", names, values, 2, result, &error) &&
+             result == 0.0f && !error.empty());
 
-        Rendering::SetMathExpressionEvaluator(nullptr);
-        result = 1.0f;
-        error.clear();
+        Rendering::SetMathExpressionEvaluator([](const std::wstring& expression, const wchar_t* const*, const float* inputs,
+                                                 size_t count, float& out, std::wstring*) {
+            out = expression == L"A + B" && count == 2 ? inputs[0] + inputs[1] : 0.0f;
+            return true;
+        });
         const bool evaluated = Rendering::EvaluateMathExpression(L"A + B", names, values, 2, result, &error);
-        Rendering::SetMathExpressionEvaluator(&Support::EvaluateWithExprTk);
-        TEST("MathHook_UnsetFails", !evaluated && result == 0.0f && !error.empty());
+        Rendering::SetMathExpressionEvaluator(nullptr);
+        TEST("MathHook_RegisteredIsUsed", evaluated && result == 7.0f);
     }
 }

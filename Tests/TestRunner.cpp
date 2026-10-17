@@ -4,19 +4,20 @@
 #include "EffectGraphBuiltIns.h"
 #include "Rendering/DeviceStack.h"
 #include "Engine/EngineBootstrap.h"
-#include "Support/ShaderLabSupport.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <string>
 #include <vector>
 
-// ShaderLab test runner: runs every case registered with SL_TEST_CASE or
-// SL_REGISTER_TEST (Tests/TestCommon.h) on one shared device.
+// Test runner: runs every case registered with SL_TEST_CASE or
+// SL_REGISTER_TEST (Tests/TestCommon.h) on one shared device, after any
+// SL_TEST_SETUP start-up. EffectGraphTests and ShaderLabTests both build it.
 //
-//   ShaderLabTests.exe [--adapter warp|default] [--tag <tag>[,<tag>...]]
-//                      [--filter <text>] [--list] [--require-fixtures]
+//   <runner>.exe [--adapter warp|default] [--tag <tag>[,<tag>...]]
+//                [--filter <text>] [--list] [--require-fixtures]
 //
 // Exit code = number of failures (0 = all passed).
 
@@ -45,11 +46,19 @@ namespace
         std::string error;
     };
 
+    // The executable's name, for messages.
+    std::string RunnerName()
+    {
+        wchar_t path[MAX_PATH]{};
+        ::GetModuleFileNameW(nullptr, path, MAX_PATH);
+        return std::filesystem::path(path).stem().string();
+    }
+
     void PrintUsage()
     {
-        std::printf("Usage: ShaderLabTests.exe [--adapter warp|default] [--tag <tag>[,<tag>...]]\n"
-                    "                          [--filter <text>] [--list] [--require-fixtures]\n"
-                    "Tags:");
+        std::printf("Usage: %s.exe [--adapter warp|default] [--tag <tag>[,<tag>...]]\n"
+                    "         [--filter <text>] [--list] [--require-fixtures]\n"
+                    "Tags:", RunnerName().c_str());
         for (const auto& entry : cTagNames) std::printf(" %s", entry.name);
         std::printf("\nA manual case runs only when --filter matches it.\n");
     }
@@ -243,7 +252,7 @@ int main(int argc, char* argv[])
     const RunnerOptions options = ParseArgs(argc, argv);
     if (!options.error.empty())
     {
-        std::printf("ShaderLabTests: %s\n", options.error.c_str());
+        std::printf("%s: %s\n", RunnerName().c_str(), options.error.c_str());
         PrintUsage();
         return 1;
     }
@@ -262,7 +271,7 @@ int main(int argc, char* argv[])
     }
     if (cases.empty())
     {
-        std::printf("ShaderLabTests: no test case matches\n");
+        std::printf("%s: no test case matches\n", RunnerName().c_str());
         return 1;
     }
 
@@ -273,9 +282,10 @@ int main(int argc, char* argv[])
     {
         ~EngineServicesScope() { ShaderLab::Engine::ShutdownEngineServices(); }
     } engineServices;
-    ShaderLab::Support::RegisterShaderLabSupport();
+    for (const auto setup : TestSetups())
+        setup();
 
-    std::printf("ShaderLab Test Runner\n");
+    std::printf("%s\n", RunnerName().c_str());
     std::printf("=====================\n");
     if (!CreateTestDevice(options.warp))
         return 1;

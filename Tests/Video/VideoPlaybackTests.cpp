@@ -29,7 +29,7 @@
 #include <vector>
 
 // Real-time harnesses for Clock-driven video playback and render-loop pacing,
-// plus the video provider's playback controls, seeks and decoder surface pool.
+// plus the video provider's playback controls and seeks.
 // The harnesses report an [info] table every run; their targets are asserted
 // while the matching cEnforce flag is set and timing assertions are on (see
 // TIMING_TEST). SHADERLAB_VIDEO_MATRIX=full runs every clip against every
@@ -767,151 +767,6 @@ namespace ShaderLab::Tests
             std::printf("  [info] Close with a full queue: %.1f ms\n", closeSeconds * 1000.0);
             TEST("VideoControl_CloseWithFullQueue", closeSeconds < 1.0 && idle.UploadedFrameTime() == -1.0);
         }
-    }
-
-    // Decoder surface pool probe: how many hardware-decoded samples a caller
-    // can hold before ReadSample blocks waiting for a surface to come back.
-    // Each read runs on a helper thread with a timeout; on a stall the held
-    // samples are released, which lets the blocked read return.
-    namespace
-    {
-        struct SurfacePoolProbe
-        {
-            int held{ 0 };          // samples held when the next read stalled
-            bool stalled{ false };
-            bool hardware{ false }; // every sample was a DXGI surface
-            std::string error;
-        };
-
-        SurfacePoolProbe ProbeSurfacePool(const std::wstring& path, ID3D11Device* device, UINT extraOutputSamples)
-        {
-            SurfacePoolProbe probe;
-            UINT resetToken = 0;
-            winrt::com_ptr<IMFDXGIDeviceManager> manager;
-            if (FAILED(MFCreateDXGIDeviceManager(&resetToken, manager.put())) ||
-                FAILED(manager->ResetDevice(device, resetToken)))
-            {
-                probe.error = "DXGI device manager";
-                return probe;
-            }
-            winrt::com_ptr<IMFAttributes> attributes;
-            MFCreateAttributes(attributes.put(), 2);
-            attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-            attributes->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, manager.get());
-            winrt::com_ptr<IMFSourceReader> reader;
-            if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), attributes.get(), reader.put())))
-            {
-                probe.error = "source reader";
-                return probe;
-            }
-            const DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
-            reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
-            reader->SetStreamSelection(stream, TRUE);
-            winrt::com_ptr<IMFMediaType> outputType;
-            MFCreateMediaType(outputType.put());
-            outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-            outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-            if (FAILED(reader->SetCurrentMediaType(stream, nullptr, outputType.get())))
-            {
-                probe.error = "NV12 output";
-                return probe;
-            }
-            if (extraOutputSamples > 0)
-            {
-                winrt::com_ptr<IMFSourceReaderEx> readerEx;
-                winrt::com_ptr<IMFTransform> decoder;
-                winrt::com_ptr<IMFAttributes> outputAttributes;
-                GUID category{};
-                if (!reader.try_as(readerEx) ||
-                    FAILED(readerEx->GetTransformForStream(stream, 0, &category, decoder.put())) ||
-                    FAILED(decoder->GetOutputStreamAttributes(0, outputAttributes.put())) ||
-                    FAILED(outputAttributes->SetUINT32(MF_SA_MINIMUM_OUTPUT_SAMPLE_COUNT, extraOutputSamples)))
-                {
-                    probe.error = "MF_SA_MINIMUM_OUTPUT_SAMPLE_COUNT not settable";
-                    return probe;
-                }
-            }
-
-            constexpr int cMaxHeld = 64;
-            probe.hardware = true;
-            std::vector<winrt::com_ptr<IMFSample>> held;
-            for (int i = 0; i < cMaxHeld; ++i)
-            {
-                winrt::com_ptr<IMFSample> sample;
-                HRESULT readResult = E_FAIL;
-                DWORD flags = 0;
-                std::mutex mutex;
-                std::condition_variable doneSignal;
-                bool done = false;
-                std::thread readThread([&]
-                {
-                    DWORD actualStream = 0;
-                    LONGLONG timestamp = 0;
-                    winrt::com_ptr<IMFSample> result;
-                    const HRESULT hr = reader->ReadSample(stream, 0, &actualStream, &flags, &timestamp, result.put());
-                    std::lock_guard lock(mutex);
-                    readResult = hr;
-                    sample = std::move(result);
-                    done = true;
-                    doneSignal.notify_one();
-                });
-                bool finished;
-                {
-                    std::unique_lock lock(mutex);
-                    finished = doneSignal.wait_for(lock, std::chrono::seconds(2), [&] { return done; });
-                }
-                if (!finished)
-                {
-                    probe.stalled = true;
-                    probe.held = static_cast<int>(held.size());
-                    held.clear();
-                    readThread.join();
-                    return probe;
-                }
-                readThread.join();
-                if (FAILED(readResult) || (flags & MF_SOURCE_READERF_ENDOFSTREAM) || !sample) break;
-                winrt::com_ptr<IMFMediaBuffer> buffer;
-                winrt::com_ptr<IMFDXGIBuffer> dxgiBuffer;
-                if (FAILED(sample->GetBufferByIndex(0, buffer.put())) || !buffer.try_as(dxgiBuffer))
-                    probe.hardware = false;
-                held.push_back(std::move(sample));
-            }
-            probe.held = static_cast<int>(held.size());
-            return probe;
-        }
-    }
-
-    void TestVideoDecoderSurfacePool(ID3D11Device* device)
-    {
-        std::printf("\n=== Video decoder surface pool ===\n");
-        bool anyRan = false;
-        int smallestPool = 1000;
-        for (const wchar_t* clip : { L"video_index_h264_180p60.mp4", L"video_index_h264_720p60.mp4",
-                                     L"video_sdr_h264_30f.mp4", L"video_hdr10_hevc_30f.mp4" })
-        {
-            const std::wstring path = FindFixture(clip);
-            if (path.empty()) continue;
-            for (UINT extra : { 0u, 8u })
-            {
-                const auto probe = ProbeSurfacePool(path, device, extra);
-                if (!probe.error.empty())
-                {
-                    std::printf("  [info] %-28ls extra %u: %s\n", clip, extra, probe.error.c_str());
-                    continue;
-                }
-                anyRan = true;
-                if (probe.stalled) smallestPool = (std::min)(smallestPool, probe.held);
-                std::printf("  [info] %-28ls MF_SA_MINIMUM_OUTPUT_SAMPLE_COUNT %u: %s after holding %d samples (%s)\n",
-                    clip, extra, probe.stalled ? "ReadSample stalls" : "no stall", probe.held,
-                    probe.hardware ? "DXGI surfaces" : "not all DXGI surfaces");
-            }
-        }
-        TEST("VideoSurfacePool_ProbeRan", anyRan);
-        // The provider holds its queue plus the frame being converted.
-        std::printf("  [info] provider holds at most %zu samples; smallest pool measured %d\n",
-            Effects::VideoSourceProvider::DecodeAheadFrames() + 1, smallestPool);
-        TEST("VideoSurfacePool_QueueFitsPool",
-             static_cast<int>(Effects::VideoSourceProvider::DecodeAheadFrames()) + 1 < smallestPool);
     }
 
     // Render worker pacing: the throttled loop waits on
@@ -2141,8 +1996,6 @@ namespace ShaderLab::Tests
 {
     namespace
     {
-        SL_REGISTER_TEST(TestVideoDecoderSurfacePool, Tag::Gpu | Tag::Video,
-            [] { TestVideoDecoderSurfacePool(g_d3dDevice.get()); });
         SL_REGISTER_TEST(TestVideoPlaybackControl, Tag::Gpu | Tag::Video | Tag::Timing,
             [] { TestVideoPlaybackControl(g_dc.get(), g_d3dDevice.get(), g_d3dContext.get()); });
         SL_REGISTER_TEST(TestVideoSeekWhilePlaying, Tag::Gpu | Tag::Video | Tag::Timing,

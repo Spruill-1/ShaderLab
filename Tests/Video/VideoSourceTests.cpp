@@ -3,7 +3,6 @@
 #include "Graph/ClockModel.h"
 #include "Graph/GraphModel.h"
 #include "Rendering/GraphEvaluator.h"
-#include "Rendering/VideoExport.h"
 #include "Graph/GraphEdits.h"
 
 #include <atomic>
@@ -15,98 +14,10 @@
 #include <thread>
 #include <vector>
 
-// Video sources and video export helpers.
+// Video sources.
 namespace
 {
     using namespace ShaderLab::Tests;
-
-    // Video export's pure helpers: Clock time at a frame, the export duration,
-    // codec resolution and the ffmpeg arguments.
-    SL_TEST_CASE(TestVideoExportHelpers, Tag::Fast | Tag::Video)
-    {
-        printf("\n=== Video export helpers ===\n");
-        auto& registry = ShaderLab::Effects::ShaderLabEffects::Instance();
-        auto* clockDesc = registry.FindByName(L"Clock");
-        if (!clockDesc) { TEST("VideoExport_ClockDescriptor", false); return; }
-
-        ShaderLab::Graph::GraphModel g;
-        auto cid = g.AddNode(ShaderLab::Effects::ShaderLabEffects::CreateNode(*clockDesc));
-        auto setP = [&](const wchar_t* k, float v) { ShaderLab::Graph::SetNodeProperty(*g.FindNode(cid), k, v); };
-        auto timeAt = [&](double t) { ShaderLab::Graph::SetClocksToTime(g, t); return g.FindNode(cid)->clockTime; };
-
-        // Defaults: Start 0, Stop 10, Speed 1, Loop on.
-        TEST("VideoExport_ClockLoopWraps", std::abs(timeAt(12.5) - 2.5) < 1e-9);
-        setP(L"Loop", 0.0f);
-        TEST("VideoExport_ClockNoLoopClamps", std::abs(timeAt(12.0) - 10.0) < 1e-9);
-        setP(L"Loop", 1.0f); setP(L"Speed", 2.0f);
-        TEST("VideoExport_ClockSpeedScales", std::abs(timeAt(3.0) - 6.0) < 1e-9 && std::abs(timeAt(6.0) - 2.0) < 1e-9);
-        TEST("VideoExport_LongestClockUsesSpeed", std::abs(ShaderLab::Graph::LongestClockDuration(g) - 5.0) < 1e-9);
-        setP(L"Speed", -1.0f);
-        TEST("VideoExport_ClockNegativeSpeedLoops", std::abs(timeAt(2.5) - 7.5) < 1e-9);
-
-        // A graph loaded from JSON has working Clocks,
-        // with no post-load call: a Clock is one by its saved node kind.
-        auto loaded = ShaderLab::Graph::GraphModel::FromJson(g.ToJson());
-        bool clockFlagged = false;
-        for (const auto& n : loaded.Nodes()) if (n.IsClock()) clockFlagged = true;
-        TEST("VideoExport_LoadedClockIsClock", clockFlagged);
-        TEST("VideoExport_LoadedClockSteps", ShaderLab::Graph::SetClocksToTime(loaded, 1.0) == 1);
-
-        std::wstring err;
-        auto path = ShaderLab::Rendering::FindFfmpeg(L"C:\\definitely\\not\\here\\ffmpeg.exe", err);
-        TEST("VideoExport_MissingFfmpegFailsWithInstructions",
-             path.empty() && err.find(L"not found") != std::wstring::npos && err.find(L"PATH") != std::wstring::npos);
-
-        // The ffmpeg command line is a pure function of the request.
-        using namespace ShaderLab::Rendering;
-        auto contains = [](const std::wstring& haystack, const wchar_t* needle) { return haystack.find(needle) != std::wstring::npos; };
-        VideoExportRequest hdrRequest;
-        hdrRequest.outputPath = L"C:\\out dir\\clip.mp4";
-        hdrRequest.fps = 60.0;
-        std::wstring codecError;
-        const VideoCodec hdrCodec = ResolveVideoCodec(hdrRequest, codecError);
-        TEST("VideoExport_HdrDefaultsToHevc",
-             hdrCodec == VideoCodec::Hevc && codecError.empty() && std::wstring(EncoderName(hdrCodec)) == L"libx265");
-        FfmpegEncodeSettings hdrSettings;
-        hdrSettings.codec = hdrCodec;
-        hdrSettings.width = 1920;
-        hdrSettings.height = 1080;
-        hdrSettings.mastering = DefaultMasteringDisplay();
-        hdrSettings.maxCll = 1000;
-        hdrSettings.maxFall = 400;
-        const std::wstring hdrArgs = BuildFfmpegArgs(hdrRequest, hdrSettings);
-        TEST("VideoExport_ArgsRawInput", contains(hdrArgs, L"-pix_fmt p010le -video_size 1920x1080 -framerate 60 "));
-        TEST("VideoExport_ArgsHdr10Metadata", contains(hdrArgs,
-            L"master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50):max-cll=1000,400"));
-        TEST("VideoExport_ArgsHevcMp4", contains(hdrArgs, L"-crf 18 ") && contains(hdrArgs, L"-tag:v hvc1 ") &&
-             hdrArgs.ends_with(L"\"C:\\out dir\\clip.mp4\""));
-        hdrSettings.mastering.reset();
-        TEST("VideoExport_ArgsNoMetadataWhenNone", !contains(BuildFfmpegArgs(hdrRequest, hdrSettings), L"master-display"));
-
-        VideoExportRequest sdrRequest;
-        sdrRequest.format = VideoFormat::Sdr;
-        sdrRequest.outputPath = L"clip.mkv";
-        sdrRequest.fps = 30000.0 / 1001.0;
-        FfmpegEncodeSettings sdrSettings;
-        sdrSettings.codec = ResolveVideoCodec(sdrRequest, codecError);
-        sdrSettings.width = 640;
-        sdrSettings.height = 360;
-        const std::wstring sdrArgs = BuildFfmpegArgs(sdrRequest, sdrSettings);
-        TEST("VideoExport_SdrDefaultsToH264", sdrSettings.codec == VideoCodec::H264 && codecError.empty());
-        TEST("VideoExport_ArgsSdr", contains(sdrArgs, L"-pix_fmt nv12 ") && contains(sdrArgs, L"-framerate 30000/1001 ") &&
-             contains(sdrArgs, L"-c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p ") && !contains(sdrArgs, L"hvc1"));
-
-        VideoExportRequest refused = hdrRequest;
-        refused.codec = VideoCodec::H264;
-        std::wstring refusedError;
-        ResolveVideoCodec(refused, refusedError);
-        TEST("VideoExport_Hdr10RefusesH264", contains(refusedError, L"HDR10 needs HEVC or AV1"));
-        refused.codec = VideoCodec::Av1;
-        refused.lossless = true;
-        refusedError.clear();
-        ResolveVideoCodec(refused, refusedError);
-        TEST("VideoExport_Av1RefusesLossless", contains(refusedError, L"not supported with AV1"));
-    }
 
     // Video source: a frame-accurate seek, no re-seek once satisfied, and the
     // zero-copy (hardware decode) upload producing exactly what the CPU Lock2D
@@ -451,5 +362,159 @@ namespace
              !factory.HasVideoProvider(videoId));
         factory.ReleaseCache();
         factory.SetOwnerThread({});
+    }
+}
+
+namespace ShaderLab::Tests
+{
+    // Decoder surface pool probe: how many hardware-decoded samples a caller
+    // can hold before ReadSample blocks waiting for a surface to come back.
+    // Each read runs on a helper thread with a timeout; on a stall the held
+    // samples are released, which lets the blocked read return.
+    namespace
+    {
+        struct SurfacePoolProbe
+        {
+            int held{ 0 };          // samples held when the next read stalled
+            bool stalled{ false };
+            bool hardware{ false }; // every sample was a DXGI surface
+            std::string error;
+        };
+
+        SurfacePoolProbe ProbeSurfacePool(const std::wstring& path, ID3D11Device* device, UINT extraOutputSamples)
+        {
+            SurfacePoolProbe probe;
+            UINT resetToken = 0;
+            winrt::com_ptr<IMFDXGIDeviceManager> manager;
+            if (FAILED(MFCreateDXGIDeviceManager(&resetToken, manager.put())) ||
+                FAILED(manager->ResetDevice(device, resetToken)))
+            {
+                probe.error = "DXGI device manager";
+                return probe;
+            }
+            winrt::com_ptr<IMFAttributes> attributes;
+            MFCreateAttributes(attributes.put(), 2);
+            attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+            attributes->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, manager.get());
+            winrt::com_ptr<IMFSourceReader> reader;
+            if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), attributes.get(), reader.put())))
+            {
+                probe.error = "source reader";
+                return probe;
+            }
+            const DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
+            reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+            reader->SetStreamSelection(stream, TRUE);
+            winrt::com_ptr<IMFMediaType> outputType;
+            MFCreateMediaType(outputType.put());
+            outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+            outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+            if (FAILED(reader->SetCurrentMediaType(stream, nullptr, outputType.get())))
+            {
+                probe.error = "NV12 output";
+                return probe;
+            }
+            if (extraOutputSamples > 0)
+            {
+                winrt::com_ptr<IMFSourceReaderEx> readerEx;
+                winrt::com_ptr<IMFTransform> decoder;
+                winrt::com_ptr<IMFAttributes> outputAttributes;
+                GUID category{};
+                if (!reader.try_as(readerEx) ||
+                    FAILED(readerEx->GetTransformForStream(stream, 0, &category, decoder.put())) ||
+                    FAILED(decoder->GetOutputStreamAttributes(0, outputAttributes.put())) ||
+                    FAILED(outputAttributes->SetUINT32(MF_SA_MINIMUM_OUTPUT_SAMPLE_COUNT, extraOutputSamples)))
+                {
+                    probe.error = "MF_SA_MINIMUM_OUTPUT_SAMPLE_COUNT not settable";
+                    return probe;
+                }
+            }
+
+            constexpr int cMaxHeld = 64;
+            probe.hardware = true;
+            std::vector<winrt::com_ptr<IMFSample>> held;
+            for (int i = 0; i < cMaxHeld; ++i)
+            {
+                winrt::com_ptr<IMFSample> sample;
+                HRESULT readResult = E_FAIL;
+                DWORD flags = 0;
+                std::mutex mutex;
+                std::condition_variable doneSignal;
+                bool done = false;
+                std::thread readThread([&]
+                {
+                    DWORD actualStream = 0;
+                    LONGLONG timestamp = 0;
+                    winrt::com_ptr<IMFSample> result;
+                    const HRESULT hr = reader->ReadSample(stream, 0, &actualStream, &flags, &timestamp, result.put());
+                    std::lock_guard lock(mutex);
+                    readResult = hr;
+                    sample = std::move(result);
+                    done = true;
+                    doneSignal.notify_one();
+                });
+                bool finished;
+                {
+                    std::unique_lock lock(mutex);
+                    finished = doneSignal.wait_for(lock, std::chrono::seconds(2), [&] { return done; });
+                }
+                if (!finished)
+                {
+                    probe.stalled = true;
+                    probe.held = static_cast<int>(held.size());
+                    held.clear();
+                    readThread.join();
+                    return probe;
+                }
+                readThread.join();
+                if (FAILED(readResult) || (flags & MF_SOURCE_READERF_ENDOFSTREAM) || !sample) break;
+                winrt::com_ptr<IMFMediaBuffer> buffer;
+                winrt::com_ptr<IMFDXGIBuffer> dxgiBuffer;
+                if (FAILED(sample->GetBufferByIndex(0, buffer.put())) || !buffer.try_as(dxgiBuffer))
+                    probe.hardware = false;
+                held.push_back(std::move(sample));
+            }
+            probe.held = static_cast<int>(held.size());
+            return probe;
+        }
+    }
+
+    void TestVideoDecoderSurfacePool(ID3D11Device* device)
+    {
+        std::printf("\n=== Video decoder surface pool ===\n");
+        bool anyRan = false;
+        int smallestPool = 1000;
+        for (const wchar_t* clip : { L"video_index_h264_180p60.mp4", L"video_index_h264_720p60.mp4",
+                                     L"video_sdr_h264_30f.mp4", L"video_hdr10_hevc_30f.mp4" })
+        {
+            const std::wstring path = FindFixture(clip);
+            if (path.empty()) continue;
+            for (UINT extra : { 0u, 8u })
+            {
+                const auto probe = ProbeSurfacePool(path, device, extra);
+                if (!probe.error.empty())
+                {
+                    std::printf("  [info] %-28ls extra %u: %s\n", clip, extra, probe.error.c_str());
+                    continue;
+                }
+                anyRan = true;
+                if (probe.stalled) smallestPool = (std::min)(smallestPool, probe.held);
+                std::printf("  [info] %-28ls MF_SA_MINIMUM_OUTPUT_SAMPLE_COUNT %u: %s after holding %d samples (%s)\n",
+                    clip, extra, probe.stalled ? "ReadSample stalls" : "no stall", probe.held,
+                    probe.hardware ? "DXGI surfaces" : "not all DXGI surfaces");
+            }
+        }
+        TEST("VideoSurfacePool_ProbeRan", anyRan);
+        // The provider holds its queue plus the frame being converted.
+        std::printf("  [info] provider holds at most %zu samples; smallest pool measured %d\n",
+            Effects::VideoSourceProvider::DecodeAheadFrames() + 1, smallestPool);
+        TEST("VideoSurfacePool_QueueFitsPool",
+             static_cast<int>(Effects::VideoSourceProvider::DecodeAheadFrames()) + 1 < smallestPool);
+    }
+
+    namespace
+    {
+        SL_REGISTER_TEST(TestVideoDecoderSurfacePool, Tag::Gpu | Tag::Video,
+            [] { TestVideoDecoderSurfacePool(g_d3dDevice.get()); });
     }
 }

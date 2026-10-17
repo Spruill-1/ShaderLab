@@ -67,15 +67,14 @@ jobs:
       - name: Run unit tests
         shell: pwsh
         run: |
-          $exe = "$env:GITHUB_WORKSPACE\${{ env.Platform }}\${{ env.Configuration }}\ShaderLabTests\ShaderLabTests.exe"
-          if (-not (Test-Path $exe)) {
-            Write-Error "Test runner not found at $exe"
-            exit 1
-          }
-          & $exe --adapter warp
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "ShaderLabTests reported $LASTEXITCODE failure(s)"
-            exit $LASTEXITCODE
+          foreach ($runner in 'EffectGraphTests', 'ShaderLabTests') {
+            $exe = "$env:GITHUB_WORKSPACE\${{ env.Platform }}\${{ env.Configuration }}\$runner\$runner.exe"
+            if (-not (Test-Path $exe)) { Write-Error "Test runner not found at $exe"; exit 1 }
+            & $exe --adapter warp
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "$runner reported $LASTEXITCODE failure(s)"
+              exit $LASTEXITCODE
+            }
           }
 
       # Broker smoke (stdio-migration Step 5): election, framing, idle
@@ -181,11 +180,14 @@ jobs:
       - name: Run unit tests
         shell: pwsh
         run: |
-          $exe = "$env:GITHUB_WORKSPACE\x64\Debug\ShaderLabTests\ShaderLabTests.exe"
-          & $exe --adapter warp
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "ShaderLabTests reported $LASTEXITCODE failure(s)"
-            exit $LASTEXITCODE
+          foreach ($runner in 'EffectGraphTests', 'ShaderLabTests') {
+            $exe = "$env:GITHUB_WORKSPACE\x64\Debug\$runner\$runner.exe"
+            if (-not (Test-Path $exe)) { Write-Error "Test runner not found at $exe"; exit 1 }
+            & $exe --adapter warp
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "$runner reported $LASTEXITCODE failure(s)"
+              exit $LASTEXITCODE
+            }
           }
 
       - name: Run headless smoke
@@ -246,7 +248,8 @@ jobs:
       - name: Build (Debug | ARM64)
         shell: pwsh
         run: |
-          foreach ($proj in 'ShaderLabTests.vcxproj',
+          foreach ($proj in 'EffectGraphTests.vcxproj',
+                            'ShaderLabTests.vcxproj',
                             'ShaderLabHeadless.vcxproj',
                             'ShaderLabMcpBroker.vcxproj') {
             & $env:MSBUILD_ARM64 $proj /p:Configuration=Debug /p:Platform=ARM64 /m /nologo /v:minimal
@@ -256,12 +259,14 @@ jobs:
       - name: Run unit tests
         shell: pwsh
         run: |
-          $exe = "$env:GITHUB_WORKSPACE\ARM64\Debug\ShaderLabTests\ShaderLabTests.exe"
-          if (-not (Test-Path $exe)) { Write-Error "Test runner not found at $exe"; exit 1 }
-          & $exe --adapter warp
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "ShaderLabTests reported $LASTEXITCODE failure(s)"
-            exit $LASTEXITCODE
+          foreach ($runner in 'EffectGraphTests', 'ShaderLabTests') {
+            $exe = "$env:GITHUB_WORKSPACE\ARM64\Debug\$runner\$runner.exe"
+            if (-not (Test-Path $exe)) { Write-Error "Test runner not found at $exe"; exit 1 }
+            & $exe --adapter warp
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "$runner reported $LASTEXITCODE failure(s)"
+              exit $LASTEXITCODE
+            }
           }
 
       - name: Headless smoke

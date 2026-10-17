@@ -1,10 +1,10 @@
-# Fails when EffectGraph code includes a file ShaderLab owns
-# (scripts/ShaderLabOwnedFiles.txt). Until the repos split, the engine and
+# Fails when EffectGraph code, its tests included, includes a file ShaderLab
+# owns (scripts/ShaderLabOwnedFiles.txt). Until the repos split, the engine and
 # ShaderLab share folders, so nothing else stops the dependency coming back.
 param([string]$Root = (Split-Path $PSScriptRoot))
 $ErrorActionPreference = 'Stop'
 
-$engineDirs = 'Graph', 'Rendering', 'Effects', 'Engine', 'BuiltInEffects', 'EffectGraphDll', 'EffectGraphCompile'
+$engineDirs = 'Graph', 'Rendering', 'Effects', 'Engine', 'BuiltInEffects', 'EffectGraphDll', 'EffectGraphCompile', 'Tests'
 $patterns = Get-Content (Join-Path $PSScriptRoot 'ShaderLabOwnedFiles.txt') |
     Where-Object { $_ -and -not $_.StartsWith('#') } | ForEach-Object { $_.Trim() }
 

@@ -35,8 +35,10 @@ $msb = "$vs\MSBuild\Current\Bin\MSBuild.exe"           # x64 host
 # On an ARM64 HOST, use the arm64-native binary instead -- see the trap below:
 # $msb = "$vs\MSBuild\Current\Bin\arm64\MSBuild.exe"
 
+& $msb EffectGraphTests.vcxproj /p:Configuration=Debug /p:Platform=x64 /m /v:m /nologo
 & $msb ShaderLabTests.vcxproj /p:Configuration=Debug /p:Platform=x64 /m /v:m /nologo
-& '.\x64\Debug\ShaderLabTests\ShaderLabTests.exe' --adapter warp  # ends "ALL <n> TESTS PASSED"
+& '.\x64\Debug\EffectGraphTests\EffectGraphTests.exe' --adapter warp  # ends "ALL <n> TESTS PASSED"
+& '.\x64\Debug\ShaderLabTests\ShaderLabTests.exe' --adapter warp
 ```
 
 > **Trap — building ARM64 *on* an ARM64 host needs the arm64 MSBuild.**
@@ -58,7 +60,7 @@ Fastest inner loops, cheapest first:
 
 | Loop | Command |
 |---|---|
-| Pure math / shader-bench | build + run `ShaderLabTests.exe --adapter warp` (no GPU, no UI) |
+| Pure math / shader-bench | build + run `EffectGraphTests.exe --adapter warp` (no GPU, no UI) |
 | Headless render / pixel probe | `ARM64\Debug\ShaderLabHeadless\ShaderLabHeadless.exe --graph Tests\fixtures\test_cli_basic.json --node <id> --output out.png --adapter warp` |
 | Batch parameter sweep | same exe with `--script <in.json> --script-output <out.json>` |
 | Full app + MCP | see the **shaderlab-run** skill — packaged deploy has real gotchas |
@@ -226,7 +228,10 @@ Projects around one host-agnostic engine library:
   script batch, MCP session.
 - `ShaderLabMcpBroker.exe` — MCP transport. `--hub` is a blind relay (sealed bodies);
   `--stdio` is the client shim. Does **not** link the engine.
-- `ShaderLabTests.exe` — standalone runner, no WinUI, WARP-capable.
+- `EffectGraphTests.exe` / `ShaderLabTests.exe` — the engine's tests and ShaderLab's,
+  one runner (`Tests/TestRunner.cpp`), no WinUI, WARP-capable. An engine test must not
+  use ShaderLab code (the boundary check covers `Tests/` too); a case that needs
+  MCP, the support library or a host piece goes in a ShaderLab test file.
 - `EffectGraphCompile.exe` — builds an effect blob from an Effect Designer `.json` at a
   consuming project's build (`build/EffectGraph.targets` runs it), and with `--builtins`
   writes a header per built-in shader effect from `BuiltInEffects.lib`

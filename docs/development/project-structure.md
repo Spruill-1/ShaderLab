@@ -11,7 +11,8 @@ ShaderLab/
 ├── EffectGraphCompile.vcxproj      # Effect blob / header generator (out-of-tree effects; --builtins)
 ├── TestEffectPlugin.vcxproj        # Effect plugin the tests load (Tests/TestPlugin): built like a real one, links no engine
 ├── pch_host.cpp                    # ShaderLab's own /Yc source for pch_engine.h (headless, support library, broker)
-├── ShaderLabTests.vcxproj          # Standalone console test runner project
+├── EffectGraphTests.vcxproj        # The engine's tests (no ShaderLab code)
+├── ShaderLabTests.vcxproj          # ShaderLab's tests (MCP, hosts, support library), same runner
 ├── ShaderLabHeadless.vcxproj       # Console host project (no WinUI dependency)
 ├── ShaderLabMcpBroker.vcxproj      # MCP broker (hub + stdio shim); no engine link
 ├── *.vcxproj.filters              # Solution Explorer folders, one per project, mirroring the directories
@@ -65,9 +66,11 @@ ShaderLab/
 │   │   ├── FileRoutes.cpp          # clear, load, load-file, save-file
 │   │   └── DisplayRoutes.cpp       # /display/info, profiles, profile, profile/clear
 │
-├── Tests/                          # ShaderLabTests + smoke scripts
-│   ├── TestRunner.cpp              # main(): device bring-up, --adapter / --tag / --filter / --list /
-│   │                               # --require-fixtures, runs the registry, prints the summary
+├── Tests/                          # EffectGraphTests + ShaderLabTests sources, smoke scripts
+│   │                               # (which cases are ShaderLab's: scripts/ShaderLabOwnedFiles.txt)
+│   ├── TestRunner.cpp              # main() for both runners: device bring-up, --adapter / --tag / --filter /
+│   │                               # --list / --require-fixtures, SL_TEST_SETUP start-up, the registry, the summary
+│   ├── ShaderLabTestSetup.cpp      # ShaderLabTests only: registers the support library (ExprTk)
 │   ├── TestCommon.h                # TEST() / TEST_EQ() / TIMING_TEST() (failures print case + file:line),
 │   │                               # skip counter, and the registry: SL_TEST_CASE(name, tags) defines and
 │   │                               # registers a case, SL_REGISTER_TEST wraps an existing function.
@@ -78,22 +81,23 @@ ShaderLab/
 │   │                               # SkipMissingFixture, ScopedTempDir, frame and pattern-source helpers
 │   ├── ShaderTestBench.h / .cpp    # D3D11 compute test harness for HLSL math (Bench())
 │   ├── FixtureManifestTests.cpp    # fixtures/manifest.json: committed fixtures present, clip SHA-256s match
-│   ├── Graph/                      # Graph model, frame semantics, serialization, bindings, snapshot,
-│   │                               # node contracts, single-owner policies
+│   ├── Graph/                      # Graph model, frame semantics, serialization, bindings, node contracts,
+│   │                               # single-owner policies; ShaderLab: GraphUiTests (snapshot, visibility), layout
 │   ├── Effects/                    # Effect catalog, statistics, shader compiler + includes,
 │   │                               # bytecode cache, variants, user effects (tagged last), and the
 │   │                               # ICtCp Tone Map's FP32 output vs a CPU port (GPU-bound and cbuffer)
 │   ├── Rendering/                  # Compute through the evaluator, GPU bindings and readback policy,
-│   │                               # evaluator helpers, pixel readback + ICC, frame pacer + dispatcher
+│   │                               # evaluator helpers, pixel readback + ICC, GPU timer; ShaderLab:
+│   │                               # ExpressionTests (ExprTk), HostLoopTests (pacer, dispatcher, preview view)
 │   ├── Sources/                    # Image loader, source colour contract, video colour / conversion
-│   ├── Video/                      # Video sources and export helpers; VideoPlaybackTests.cpp holds the
-│   │                               # real-time harnesses (playback rate, render-loop pacing, controls,
-│   │                               # seeks, past-the-end black, surface pool, tick work; [info] tables;
-│   │                               # SHADERLAB_VIDEO_MATRIX=full runs every clip x tick rate)
+│   ├── Video/                      # Video sources and the decoder surface pool; ShaderLab: VideoExportTests,
+│   │                               # and VideoPlaybackTests.cpp's real-time harnesses (playback rate,
+│   │                               # render-loop pacing, controls, seeks, past-the-end black, tick work;
+│   │                               # [info] tables; SHADERLAB_VIDEO_MATRIX=full runs every clip x tick rate)
 │   ├── Persistence/                # .effectgraph packages
-│   ├── Mcp/                        # Router, JSON-RPC, engine routes, session client, frame / crypto /
-│   │                               # peer identity / channel
-│   ├── Hosts/                      # Headless argument parsing, the broker shim's JSON-RPC handling
+│   ├── Mcp/                        # Router, JSON-RPC, engine routes (also driving an EffectGraph context),
+│   │                               # argument readers, session client, frame / crypto / peer identity / channel
+│   ├── Hosts/                      # Headless argument parsing, effect plugin discovery, the broker shim's JSON-RPC handling
 │   │                               # (compiles ShaderLabHeadless/HeadlessArgs.cpp and the broker's
 │   │                               # BrokerPipeIo.cpp / Shim.cpp into the test exe)
 │   ├── Math/                       # HLSL math on the bench (tagged math)
@@ -104,7 +108,7 @@ ShaderLab/
 │   │   └── GamutTests.cpp             # sRGB, xyY, PointInTriangle, OKLab, soft compress, dither
 │   ├── RunVideoExport.ps1          # headless --video vs a spec-derived CPU reference (needs ffmpeg; SKIPs without)
 │   ├── RunTests.ps1                # 40-test MCP integration suite (shim-driven; pins a running session, GUI-only tests self-skip on headless)
-│   ├── RunMathTests.ps1            # Builds (vswhere) and runs ShaderLabTests.exe --tag math on WARP
+│   ├── RunMathTests.ps1            # Builds (vswhere) and runs both runners --tag math on WARP
 │   ├── RunHeadlessSmoke.ps1        # CI smoke (PNG + FP32 pixels + script batch)
 │   ├── RunBrokerSmoke.ps1          # CI smoke: hub election, shim protocol, idle exit
 │   └── fixtures/                      # manifest.json (every fixture: committed or generated, clip hashes),
