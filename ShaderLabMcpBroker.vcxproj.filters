@@ -1,10 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
-    <Filter Include="Engine">
-      <UniqueIdentifier>{FACF334D-3860-519A-BD34-AC8B92EEAE93}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Engine\Mcp">
+    <Filter Include="Mcp">
       <UniqueIdentifier>{1C729112-C2FE-5DB5-8847-A17E18C238BF}</UniqueIdentifier>
     </Filter>
     <Filter Include="ShaderLabMcpBroker">
@@ -12,22 +9,21 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="EngineExport.h" />
     <ClInclude Include="pch_engine.h" />
-    <ClInclude Include="Engine\Mcp\McpFrame.h">
-      <Filter>Engine\Mcp</Filter>
+    <ClInclude Include="Mcp\McpFrame.h">
+      <Filter>Mcp</Filter>
     </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpCrypto.h">
-      <Filter>Engine\Mcp</Filter>
+    <ClInclude Include="Mcp\McpCrypto.h">
+      <Filter>Mcp</Filter>
     </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpPeerIdentity.h">
-      <Filter>Engine\Mcp</Filter>
+    <ClInclude Include="Mcp\McpPeerIdentity.h">
+      <Filter>Mcp</Filter>
     </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpChannel.h">
-      <Filter>Engine\Mcp</Filter>
+    <ClInclude Include="Mcp\McpChannel.h">
+      <Filter>Mcp</Filter>
     </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpTypes.h">
-      <Filter>Engine\Mcp</Filter>
+    <ClInclude Include="Mcp\McpTypes.h">
+      <Filter>Mcp</Filter>
     </ClInclude>
     <ClInclude Include="ShaderLabMcpBroker\BrokerPipeIo.h">
       <Filter>ShaderLabMcpBroker</Filter>
@@ -40,18 +36,18 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="pch_engine.cpp" />
-    <ClCompile Include="Engine\Mcp\McpFrame.cpp">
-      <Filter>Engine\Mcp</Filter>
+    <ClCompile Include="pch_host.cpp" />
+    <ClCompile Include="Mcp\McpFrame.cpp">
+      <Filter>Mcp</Filter>
     </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpCrypto.cpp">
-      <Filter>Engine\Mcp</Filter>
+    <ClCompile Include="Mcp\McpCrypto.cpp">
+      <Filter>Mcp</Filter>
     </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpPeerIdentity.cpp">
-      <Filter>Engine\Mcp</Filter>
+    <ClCompile Include="Mcp\McpPeerIdentity.cpp">
+      <Filter>Mcp</Filter>
     </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpChannel.cpp">
-      <Filter>Engine\Mcp</Filter>
+    <ClCompile Include="Mcp\McpChannel.cpp">
+      <Filter>Mcp</Filter>
     </ClCompile>
     <ClCompile Include="ShaderLabMcpBroker\Main.cpp">
       <Filter>ShaderLabMcpBroker</Filter>

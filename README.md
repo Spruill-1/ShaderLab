@@ -74,7 +74,7 @@ Core capabilities:
 - **Analysis viewers** (Luminance / Channel / Chromaticity Statistics, CIE Histogram + Plot, Gamut Coverage, Luminance Heatmap, etc.) — all share the same compute-bridge architecture and route their outputs as SRVs to downstream consumers when possible.
 - **Tone-mapping suite** (D2D `HDR Tone Map`, ICtCp Tone Map, ICtCp Inverse Tone Map, ICtCp Gamut Map, etc.) operating in scRGB FP16 with PQ / HLG / sRGB transfer functions.
 - **HDR / WCG aware** — event-driven display tracking (WinRT `AdvancedColorInfoChanged`: HDR toggles, the Windows SDR-brightness slider, monitor moves), ICC profile parsing, monitor primaries piped into Custom-gamut analysis effects via the Working Space node.
-- **MCP integration** (stdio, via a broker: shim → hub → per-window sessions) + **headless host** for AI-agent and CI use; the MCP route layer lives in `ShaderLabEngine.dll` so headless and GUI hosts share the route implementations.
+- **MCP integration** (stdio, via a broker: shim → hub → per-window sessions) + **headless host** for AI-agent and CI use; the MCP route layer lives in the engine library so headless and GUI hosts share the route implementations.
 
 Build: Visual Studio 2022 17.8+, Windows 10 SDK 10.0.26100+, C++/WinRT only (no C#). Runtime: Windows 11 22H2 (10.0.22621)+.
 
@@ -82,4 +82,4 @@ Build: Visual Studio 2022 17.8+, Windows 10 SDK 10.0.26100+, C++/WinRT only (no 
 
 ## License & Contact
 
-See [LICENSE](LICENSE) for the project license and the GitHub repository for issues / PRs.
+ShaderLab is MIT ([LICENSE](LICENSE)). The EffectGraph engine and its packages are MIT-0 ([LICENSE-EffectGraph](LICENSE-EffectGraph) lists what that covers). Third-party code in ShaderLab's programs: [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt). Issues and PRs on the GitHub repository.

@@ -1,8 +1,8 @@
 #pragma once
 
-// The shared device, the per-case evaluator and the helpers that several
-// test files use. main() fills the device and resets the evaluator before
-// each registered case.
+// The shared device, the per-case EffectGraph context and the helpers that
+// several test files use. main() creates the device, and a fresh context on it
+// for each registered case.
 
 #include "pch_engine.h"
 #include "TestCommon.h"
@@ -11,6 +11,7 @@
 #include "Rendering/FrameExecutor.h"
 #include "Effects/SourceNodeFactory.h"
 #include "Effects/ShaderLabEffects.h"
+#include "Engine/Api/EffectGraphInternal.h"
 
 #include <filesystem>
 #include <string>
@@ -19,19 +20,30 @@ namespace ShaderLab::Tests
 {
     class ShaderTestBench;
 
-    // The device every case renders on.
+    // The D3D11 device every case renders on.
     extern winrt::com_ptr<ID3D11Device5> g_d3dDevice;
     extern winrt::com_ptr<ID3D11DeviceContext4> g_d3dContext;
+    // The running case's context's D2D factory and device context.
     extern winrt::com_ptr<ID2D1Factory7> g_d2dFactory;
     extern winrt::com_ptr<ID2D1DeviceContext5> g_dc;
     extern bool g_useWarp;
 
-    // The evaluator of the running case, created fresh for each one, so no
-    // case inherits another's effect cache, pinned options or readback
-    // interest. A node's cachedOutput is valid only while it lives.
+    // The EffectGraph context of the running case, created fresh for each one
+    // on the shared device, as a host owns one: g_dc and g_d2dFactory are its,
+    // and CaseEvaluator() is its evaluator. So every case renders on a
+    // context's D2D device, with the effects a context registers, and no case
+    // inherits another's effect cache, pinned options, readback interest or
+    // D2D resources. A node's cachedOutput is valid only while the case runs.
+    IEffectGraphContextInternal& CaseContext();
     Rendering::GraphEvaluator& CaseEvaluator();
+    // A fresh evaluator for the rest of the case, used in place of the
+    // context's, on the same device context.
     void ResetCaseEvaluator();
-    void ReleaseCaseEvaluator();
+    void BeginCaseContext();
+    void EndCaseContext();
+
+    // A new EffectGraph context on the shared device, as a host would own.
+    winrt::com_ptr<IEffectGraphContextInternal> CreateTestContext();
 
     // The HLSL math bench on the shared device, initialized on first use.
     ShaderTestBench& Bench();

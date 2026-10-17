@@ -3,6 +3,7 @@
 #include "ShaderCompiler.h"
 #include "ShaderVariants.h"
 #include "BytecodeCache.h"
+#include "BuiltInEffects.h"
 #include "../Engine/Utf8.h"
 #include "../Graph/GraphModel.h"
 
@@ -63,12 +64,14 @@ namespace ShaderLab::Effects
 
         ShaderLabEffectDescriptor DescriptorFromNode(const Graph::EffectNode& node,
                                                      const std::wstring& category,
+                                                     const std::wstring& subcategory,
                                                      const fs::path& file)
         {
             const auto& def = *node.customEffect;
             ShaderLabEffectDescriptor descriptor;
             descriptor.name = node.name;
             descriptor.category = category;
+            descriptor.subcategory = subcategory;
             descriptor.shaderType = def.shaderType;
             descriptor.effectId = def.shaderLabEffectId.empty() ? node.name : def.shaderLabEffectId;
             descriptor.effectVersion = (std::max)(def.shaderLabEffectVersion, 1u);
@@ -175,7 +178,7 @@ namespace ShaderLab::Effects
         auto fail = [&](const std::wstring& why) { report.errors.push_back(label + L": " + why); };
 
         Graph::GraphModel graph;
-        std::wstring category = L"User";
+        std::wstring category = L"User", subcategory;
         try
         {
             const winrt::hstring text(json);
@@ -186,28 +189,33 @@ namespace ShaderLab::Effects
                 std::wstring fileCategory(root.GetNamedString(L"category"));
                 if (!fileCategory.empty()) category = fileCategory;
             }
+            if (root.HasKey(L"subcategory"))
+                subcategory = root.GetNamedString(L"subcategory");
         }
         catch (winrt::hresult_error const& error) { fail(L"not a ShaderLab graph (" + std::wstring(error.message()) + L")"); return descriptors; }
         catch (std::exception const& error)       { fail(Widen(error.what())); return descriptors; }
 
         for (const auto& node : graph.Nodes())
             if (node.customEffect.has_value())   // not sources, D2D built-ins, outputs
-                descriptors.push_back(DescriptorFromNode(node, category, fs::path(source)));
+                descriptors.push_back(DescriptorFromNode(node, category, subcategory, fs::path(source)));
         if (descriptors.empty()) fail(L"contains no shader nodes");
         return descriptors;
     }
 
     std::vector<std::wstring> ShaderLabEffects::RegisterEffectsFromJson(
         std::wstring_view json, const std::wstring& source, bool compileCheck, UserEffectLoadReport& report,
-        const std::function<bool(const ShaderLabEffectDescriptor&)>& accept)
+        const std::function<bool(const ShaderLabEffectDescriptor&)>& accept,
+        const std::function<void(ShaderLabEffectDescriptor&)>& adopt)
     {
         std::vector<std::wstring> registered;
+        bool addedBuiltIn = false;
         const std::wstring label = fs::path(source).filename().wstring();
         auto fail = [&](const std::wstring& why) { report.errors.push_back(label + L": " + why); };
 
         for (auto& incoming : ParseEffectsFromJson(json, source, report))
         {
             if (accept && !accept(incoming)) continue;
+            if (adopt) adopt(incoming);
             std::wstring compileError;
             if (compileCheck && !CompilesLikeTheEvaluator(CreateNode(incoming), compileError))
             {
@@ -227,6 +235,13 @@ namespace ShaderLab::Effects
                 });
             if (existing != m_effects.end())
             {
+                // Two modules of one program including the same header.
+                if (!existing->IsUserEffect() && !incoming.IsUserEffect() &&
+                    existing->effectId == incoming.effectId && existing->effectVersion == incoming.effectVersion)
+                {
+                    registered.push_back(incoming.name);
+                    continue;
+                }
                 if (ResolveUserEffectConflict(*existing, incoming) == UserEffectConflict::Reject)
                 {
                     if (!existing->IsUserEffect())
@@ -245,7 +260,15 @@ namespace ShaderLab::Effects
             }
             report.loaded.push_back(incoming.name);
             registered.push_back(incoming.name);
+            addedBuiltIn |= !incoming.IsUserEffect();
             m_effects.push_back(std::move(incoming));
+        }
+        // Built-ins keep the engine's order wherever they were registered
+        // from; user effects follow in the order they arrived.
+        if (addedBuiltIn)
+        {
+            std::ranges::stable_sort(m_effects, {}, [](const ShaderLabEffectDescriptor& effect)
+                { return effect.IsUserEffect() ? SIZE_MAX : BuiltInEffectOrder(effect.effectId); });
         }
         return registered;
     }

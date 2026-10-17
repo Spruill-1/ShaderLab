@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "PropertyValue.h"
 
 #include <string_view>
@@ -75,12 +74,12 @@ namespace ShaderLab::Graph
         return (static_cast<uint32_t>(set) & static_cast<uint32_t>(flag)) != 0;
     }
 
-    SHADERLAB_API const wchar_t* NodeKindTag(NodeKind kind);
-    SHADERLAB_API std::optional<NodeKind> NodeKindFromTag(std::wstring_view tag);
-    SHADERLAB_API const wchar_t* DispatchShapeTag(DispatchShape shape);
-    SHADERLAB_API std::optional<DispatchShape> DispatchShapeFromTag(std::wstring_view tag);
-    SHADERLAB_API std::vector<std::wstring> InjectedConstantTags(InjectedConstants set);
-    SHADERLAB_API std::optional<InjectedConstants> InjectedConstantFromTag(std::wstring_view tag);
+    const wchar_t* NodeKindTag(NodeKind kind);
+    std::optional<NodeKind> NodeKindFromTag(std::wstring_view tag);
+    const wchar_t* DispatchShapeTag(DispatchShape shape);
+    std::optional<DispatchShape> DispatchShapeFromTag(std::wstring_view tag);
+    std::vector<std::wstring> InjectedConstantTags(InjectedConstants set);
+    std::optional<InjectedConstants> InjectedConstantFromTag(std::wstring_view tag);
 
     // True when the evaluator publishes the node's analysis fields itself
     // instead of running a shader.
@@ -95,17 +94,17 @@ namespace ShaderLab::Graph
     // and DiagramSize / OutputSize, the output extent and injected values
     // from the property names. `properties` is the node's (parameters and
     // hidden values).
-    SHADERLAB_API NodeKind DeriveNodeKind(const CustomEffectDefinition& def);
-    SHADERLAB_API DispatchShape DeriveDispatchShape(const CustomEffectDefinition& def);
-    SHADERLAB_API OutputExtent DeriveOutputExtent(const CustomEffectDefinition& def,
+    NodeKind DeriveNodeKind(const CustomEffectDefinition& def);
+    DispatchShape DeriveDispatchShape(const CustomEffectDefinition& def);
+    OutputExtent DeriveOutputExtent(const CustomEffectDefinition& def,
         const std::map<std::wstring, PropertyValue>& properties);
-    SHADERLAB_API InjectedConstants DeriveInjectedConstants(
+    InjectedConstants DeriveInjectedConstants(
         const std::map<std::wstring, PropertyValue>& properties);
 
     // Sets all four on a definition built outside the effect catalog (the
     // Effect Designer, a blank custom node, an MCP recompile of an authored
     // effect). Pass the node's own property map, hidden values included: a
     // map of parameter defaults alone loses InputMask / OutputW / OutputH.
-    SHADERLAB_API void DeriveContracts(CustomEffectDefinition& def,
+    void DeriveContracts(CustomEffectDefinition& def,
         const std::map<std::wstring, PropertyValue>& properties);
 }

@@ -4,7 +4,7 @@
 // framed overlapped pipe I/O, channel-0 control messages, and the client side
 // of connecting to a hub.
 
-#include "../Engine/Mcp/McpFrame.h"
+#include "../Mcp/McpFrame.h"
 
 #include <winrt/Windows.Data.Json.h>
 

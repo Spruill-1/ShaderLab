@@ -2,7 +2,7 @@
 
 #include "pch.h"
 #include "OutputSinkRenderState.h"
-#include "../Rendering/PipelineFormat.h"
+#include "Rendering/PipelineFormat.h"
 
 namespace ShaderLab::Controls
 {

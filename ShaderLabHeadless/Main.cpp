@@ -5,20 +5,25 @@
 // describes the modes.
 
 #include "pch_engine.h"
-#include "EngineExport.h"
+#include "Version.h"
+// Every built-in shader effect, registered at startup.
+#include "EffectGraphBuiltIns.h"
 #include "HeadlessArgs.h"
 #include "HeadlessEngine.h"
 #include "ImageOutput.h"
 #include "ScriptRunner.h"
 
-#include "../Effects/BytecodeCache.h"
-#include "../Effects/ShaderLabEffects.h"
-#include "../Engine/EngineBootstrap.h"
-#include "../Engine/Mcp/McpJsonRpc.h"
-#include "../Engine/Mcp/McpRouter.h"
-#include "../Engine/Mcp/McpSessionClient.h"
-#include "../Rendering/PixelReadback.h"
+#include "Effects/BytecodeCache.h"
+#include "Effects/ShaderLabEffects.h"
+#include "Engine/Api/EffectGraphVersion.h"
+#include "Engine/EngineBootstrap.h"
+#include "../Mcp/McpJsonRpc.h"
+#include "../Mcp/McpRouter.h"
+#include "../Mcp/McpSessionClient.h"
+#include "Rendering/PixelReadback.h"
 #include "../Rendering/VideoExport.h"
+#include "../Support/ShaderLabSupport.h"
+#include "../Support/EffectPlugins.h"
 
 #include <shlobj.h>
 #include <KnownFolders.h>
@@ -333,12 +338,21 @@ namespace
         return ExitCode::Ok;
     }
 
-    // Registers --effects-dir libraries before any graph loads, so a graph
-    // holding an older copy sees it as upgradable and add-node finds it.
+    // Registers --effects-dir libraries (effect .json files and plugin DLLs)
+    // before any graph loads, so a graph holding an older copy sees it as
+    // upgradable and add-node finds it.
     void RegisterUserEffects(const Args& args)
     {
         for (const auto& dir : args.effectsDirs)
         {
+            for (const auto& load : ShaderLab::Support::LoadEffectPluginsIn(dir))
+            {
+                if (SUCCEEDED(load.result))
+                    std::fwprintf(stderr, L"Effect plugin: %ls\n", load.path.c_str());
+                else
+                    std::fwprintf(stderr, L"[ShaderLab] effect plugin not loaded: %ls (0x%08X)\n", load.path.c_str(),
+                                  static_cast<unsigned>(load.result));
+            }
             auto& library = ShaderLab::Effects::ShaderLabEffects::Instance();
             const size_t loadedBefore = library.UserEffectReport().loaded.size();
             const size_t errorsBefore = library.UserEffectReport().errors.size();
@@ -358,8 +372,7 @@ int wmain(int argc, wchar_t* argv[])
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
-    std::wprintf(L"ShaderLabHeadless (engine ABI %u)\n",
-        static_cast<unsigned>(::ShaderLab_GetAbiVersion()));
+    std::wprintf(L"ShaderLabHeadless %ls (EffectGraph %hs)\n", ShaderLab::VersionString, EFFECTGRAPH_VERSION_STRING);
 
     Args args;
     const ParseResult parsed = ParseArgs(argc, argv, args);
@@ -376,19 +389,17 @@ int wmain(int argc, wchar_t* argv[])
     for (const auto& warning : parsed.warnings)
         std::fwprintf(stderr, L"WARNING: %ls\n", warning.c_str());
 
-    if (::ShaderLab_GetAbiVersion() != SHADERLAB_ENGINE_ABI_VERSION)
-    {
-        std::wprintf(L"FATAL: engine ABI mismatch (header %u, DLL %u)\n",
-            static_cast<unsigned>(SHADERLAB_ENGINE_ABI_VERSION),
-            static_cast<unsigned>(::ShaderLab_GetAbiVersion()));
-        return ToInt(ExitCode::AbiMismatch);
-    }
     // Joins the engine's worker threads on every return path below.
     struct EngineServicesScope
     {
         ~EngineServicesScope() { ShaderLab::Engine::ShutdownEngineServices(); }
     } engineServices;
 
+    ShaderLab::Support::RegisterShaderLabSupport();
+    for (const auto& load : ShaderLab::Support::LoadEffectPlugins())
+        if (FAILED(load.result))
+            std::fwprintf(stderr, L"[ShaderLab] effect plugin not loaded: %ls (0x%08X)\n", load.path.c_str(),
+                          static_cast<unsigned>(load.result));
     RegisterUserEffects(args);
 
     if (parsed.mode == Mode::ShaderCache)

@@ -1,6 +1,6 @@
 #include "pch_engine.h"
 #include "GraphModel.h"
-#include "../Version.h"
+#include "../Engine/Api/EffectGraphVersion.h"
 
 #include <winrt/Windows.Data.Json.h>
 
@@ -1388,8 +1388,9 @@ namespace ShaderLab::Graph
         WDJ::JsonObject root;
 
         // Version metadata
-        root.SetNamedValue(L"formatVersion", WDJ::JsonValue::CreateNumberValue(::ShaderLab::GraphFormatVersion));
-        root.SetNamedValue(L"appVersion", WDJ::JsonValue::CreateStringValue(::ShaderLab::VersionString));
+        root.SetNamedValue(L"formatVersion", WDJ::JsonValue::CreateNumberValue(cGraphFormatVersion));
+        root.SetNamedValue(L"effectGraphVersion",
+            WDJ::JsonValue::CreateStringValue(winrt::to_hstring(EFFECTGRAPH_VERSION_STRING)));
 
         // Nodes
         WDJ::JsonArray nodesArr;
@@ -1417,15 +1418,19 @@ namespace ShaderLab::Graph
         if (root.HasKey(L"formatVersion"))
         {
             uint32_t fileVersion = static_cast<uint32_t>(root.GetNamedNumber(L"formatVersion"));
-            if (fileVersion > ::ShaderLab::GraphFormatVersion)
+            if (fileVersion > cGraphFormatVersion)
             {
-                std::wstring appVer;
-                if (root.HasKey(L"appVersion"))
-                    appVer = std::wstring(root.GetNamedString(L"appVersion"));
+                // Graphs saved before EffectGraph had its own version carry ShaderLab's.
+                std::wstring savedBy;
+                if (root.HasKey(L"effectGraphVersion"))
+                    savedBy = L"EffectGraph " + std::wstring(root.GetNamedString(L"effectGraphVersion"));
+                else if (root.HasKey(L"appVersion"))
+                    savedBy = L"ShaderLab " + std::wstring(root.GetNamedString(L"appVersion"));
                 throw std::runtime_error(
-                    "This graph was saved with a newer version of ShaderLab"
-                    + (appVer.empty() ? std::string{} : " (v" + std::string(appVer.begin(), appVer.end()) + ")")
-                    + ". Please update ShaderLab to open it.");
+                    "This graph uses format " + std::to_string(fileVersion) + ", newer than this EffectGraph "
+                    EFFECTGRAPH_VERSION_STRING " reads (" + std::to_string(cGraphFormatVersion) + ")"
+                    + (savedBy.empty() ? std::string{} : "; it was saved by " + winrt::to_string(savedBy))
+                    + ". Update to open it.");
             }
         }
 

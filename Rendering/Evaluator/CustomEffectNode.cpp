@@ -207,14 +207,7 @@ namespace ShaderLab::Rendering::Evaluator
             !def.analysisFields.empty() &&
             node.cachedOutput &&
             !m_pass.justCreated.contains(node.id))
-        {
-            // A frozen pass runs inside the host's draw session, where the
-            // readback's own BeginDraw would nest.
-            if (m_frozen)
-                node.dirty = true;
-            else
-                ReadCustomAnalysisOutput(dc, node);
-        }
+            ReadCustomAnalysisOutput(dc, node);
     }
 
     bool EvaluatorCore::InjectHostDimensions(EffectNode& node, PropertyMap& effectiveProps,

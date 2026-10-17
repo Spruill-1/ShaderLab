@@ -2,6 +2,7 @@
 
 #include "MainWindow.g.h"
 #include "Rendering/RenderEngine.h"
+#include "Engine/Api/EffectGraphInternal.h"
 #include "Rendering/DisplayMonitor.h"
 #include "Rendering/GraphEvaluator.h"
 #include "Graph/GraphModel.h"
@@ -21,9 +22,9 @@
 #include "Controls/LogWindow.h"
 #include "Controls/NodeLog.h"
 #include "EffectDesignerWindow.xaml.h"
-#include "Engine/Mcp/McpRouter.h"
-#include "Engine/Mcp/EngineMcpRoutes.h"
-#include "Engine/Mcp/McpSessionClient.h"
+#include "Mcp/McpRouter.h"
+#include "Mcp/EngineMcpRoutes.h"
+#include "Mcp/McpSessionClient.h"
 #include "Rendering/RenderThreadDispatcher.h"
 #include "Rendering/PreviewRenderStats.h"
 #include "Rendering/FrameTimings.h"
@@ -98,27 +99,21 @@ namespace winrt::ShaderLab::implementation
     private:
         HWND GetWindowHandle();
         void InitializeRendering();
-        // A GPU switch: stop the worker, save the graph and view, drop the
-        // device, rebuild it, restore, restart.
+        // A GPU switch: stop the worker, drop the window's device resources,
+        // move the context (graph and all) onto the new device, restart.
         void SwitchAdapter(::ShaderLab::Rendering::DevicePreference pref, LUID adapterLuid);
-        struct SavedView
-        {
-            uint32_t previewNodeId{ 0 };
-            uint32_t selectedNodeId{ 0 };
-            ::ShaderLab::Rendering::PreviewView preview;
-            D2D1_POINT_2F canvasPan{};
-            float canvasZoom{ 1.0f };
-        };
+        // Brings the device back after it was removed, or retries after a
+        // switch that left no device: SwitchAdapter on the same preference.
+        void RecoverDevice();
         void StartRenderWorker();
         void StopRenderWorker();
         void TearDownDeviceResources();
         std::optional<std::wstring> RebuildDeviceResources(::ShaderLab::Rendering::DevicePreference pref, LUID adapterLuid);
-        void RestoreGraph(const winrt::hstring& graphJson, const SavedView& view);
         void ReloadSourcesAfterSwitch();
         // Opens a window for every Output node; a failure goes to the node's log.
         void ReopenOutputWindows();
         void OnPreviewPanelLoaded();
-        void RegisterCustomEffects();
+        static std::wstring BytecodeCacheRoot();
         void UpdateStatusBar();
         void PopulatePreviewNodeSelector();
         void UpdateOutdatedEffectsButton();
@@ -209,14 +204,14 @@ namespace winrt::ShaderLab::implementation
         // The one of those an MCP /graph/load-file extracted; deleted when the graph is next replaced.
         std::wstring m_mcpMediaDir;
 
-        // Heartbeat: every Rendering::cMediaHeartbeatIntervalSec we touch a
+        // Heartbeat: every Support::cMediaHeartbeatIntervalSec we touch a
         // sentinel file inside each extracted dir so a future instance can
         // tell our dirs from orphans left behind by a crash.
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer m_heartbeatTimer{ nullptr };
         void StartHeartbeatTimer();
         void TouchHeartbeats();
         // Prompts once at startup to delete stale ShaderLab-* media dirs
-        // (Rendering::FindStaleMediaDirs).
+        // (Support::FindStaleMediaDirs).
         winrt::fire_and_forget ReapStaleMediaDirsAsync();
         void PopulateAddNodeFlyout();
         void OnAddEffectNode(const ::ShaderLab::Effects::EffectDescriptor& desc);
@@ -259,7 +254,6 @@ namespace winrt::ShaderLab::implementation
         // Device stack.
         ::ShaderLab::Rendering::RenderEngine       m_renderEngine;
         ::ShaderLab::Rendering::DisplayMonitor     m_displayMonitor;
-        ::ShaderLab::Rendering::GraphEvaluator     m_graphEvaluator;
 
         // Keeps the Windows.System.DispatcherQueue we create for the UI
         // thread alive (WinUI 3 threads only run the Microsoft.UI variant;
@@ -336,11 +330,16 @@ namespace winrt::ShaderLab::implementation
         winrt::com_ptr<ID2D1Device6>           m_uiD2dDevice;
         winrt::com_ptr<ID2D1DeviceContext5>    m_uiD2dContext;
 
-        // Effect graph. Render worker only, with no lock: other threads
-        // dispatch writes to it and read the published GraphUiSnapshot
-        // (threading-model.md).
-        ::ShaderLab::Graph::GraphModel         m_graph;
-        ::ShaderLab::Effects::SourceNodeFactory m_sourceFactory;
+        // The EffectGraph context: the graph, its evaluator and sources, and
+        // the D2D device everything draws with. Created by the first
+        // InitializeRendering and kept for the window's life; an adapter
+        // switch moves it onto the new device. Render worker only, with no
+        // lock: other threads dispatch writes to it and read the published
+        // GraphUiSnapshot (threading-model.md).
+        winrt::com_ptr<IEffectGraphContextInternal> m_context;
+        ::ShaderLab::Graph::GraphModel& Model() { return m_context->Model(); }
+        ::ShaderLab::Rendering::GraphEvaluator& Evaluator() { return m_context->Evaluator(); }
+        ::ShaderLab::Effects::SourceNodeFactory& Sources() { return m_context->Sources(); }
 
         // Controllers.
         ::ShaderLab::Controls::NodeGraphController       m_nodeGraphController;
@@ -398,7 +397,6 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Rendering::PreviewRenderStats m_previewRenderStats;
 
         HWND m_hwnd{ nullptr };
-        bool m_customEffectsRegistered{ false };
         std::atomic<bool> m_isShuttingDown{ false };
         std::atomic<bool> m_renderShouldStop{ false };
 
@@ -433,7 +431,7 @@ namespace winrt::ShaderLab::implementation
         // one has been published) or in the live graph (fallback during
         // pre-first-render startup). Used by UI code paths that need to read
         // runtime state -- runtimeError, analysisOutput -- which are written
-        // by the evaluator and would race on direct m_graph reads once the
+        // by the evaluator and would race on direct live-graph reads once the
         // render thread spawns. Note: this returns a pointer into the
         // snapshot which is owned by a shared_ptr; the caller should keep
         // the snapshot alive (e.g., via a local copy) for the duration of
@@ -506,6 +504,13 @@ namespace winrt::ShaderLab::implementation
         // GuiEngineCommandSink::Dispatch returns 503 during the window so a
         // request never marshals into a joined worker / dead D2D context.
         std::atomic<bool> m_adapterSwitchInProgress{ false };
+        // The removed reason once the render worker or the UI's present sees
+        // the device go; the next UI tick recovers (RecoverDevice).
+        std::atomic<HRESULT> m_deviceLost{ S_OK };
+        // No device came up: nothing renders, MCP engine calls answer 503,
+        // and the UI tick retries at m_nextDeviceRetry.
+        std::atomic<bool> m_deviceUnavailable{ false };
+        std::chrono::steady_clock::time_point m_nextDeviceRetry{};
         // MCP starts with the window unless switched off.
         bool m_autoStartMcp{ true };
         ::ShaderLab::Rendering::DevicePreference m_devicePref{ ::ShaderLab::Rendering::DevicePreference::Default };

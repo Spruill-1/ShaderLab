@@ -8,7 +8,6 @@
 // compute statistics, write to a binary blob, etc).
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Graph/GraphModel.h"
 
 #include <cstdint>
@@ -54,7 +53,7 @@ namespace ShaderLab::Rendering
     // (x, y) and (w, h) are in image-local pixel coordinates; the
     // request is clipped to the image's bounds (via GetImageLocalBounds
     // on the DC) before the readback.
-    SHADERLAB_API ReadPixelRegionResult ReadPixelRegion(
+    ReadPixelRegionResult ReadPixelRegion(
         const Graph::GraphModel& graph,
         uint32_t nodeId,
         int32_t x, int32_t y, uint32_t w, uint32_t h,

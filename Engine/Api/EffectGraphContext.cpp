@@ -2,13 +2,13 @@
 #include "EffectGraphImpl.h"
 #include "../EngineBootstrap.h"
 #include "../../Graph/GraphEdits.h"
+#include "../../Effects/BuiltInEffects.h"
 #include "../../Effects/EffectBlob.h"
 #include "../../Effects/EffectRegistry.h"
 #include "../../Effects/NodeCatalog.h"
 #include "../../Effects/ShaderLabEffects.h"
 #include "../../Effects/SourceTextureUtil.h"
 #include "../../Rendering/D2DHelpers.h"
-#include "../../Rendering/EffectGraphFile.h"
 #include "../../Rendering/SourceRuntime.h"
 #include "../../Rendering/DisplayProfile.h"
 #include "../../Rendering/WorkingSpaceSync.h"
@@ -54,11 +54,6 @@ namespace ShaderLab::Api
         // Node objects hold a reference to the context, so none is left here.
         m_graph.ClearCachedOutputs();
         m_evaluator.ReleaseCache();
-        if (!m_extractDir.empty())
-        {
-            std::error_code ec;
-            std::filesystem::remove_all(m_extractDir, ec);   // best effort: a temp folder
-        }
     }
 
     HRESULT Context::Initialize(ID3D11Device* device, const EFFECTGRAPH_CONTEXT_DESC* desc)
@@ -73,6 +68,12 @@ namespace ShaderLab::Api
         m_devices.d2dFactory->QueryInterface(IID_PPV_ARGS(factory.put()));
         if (HRESULT hr = Engine::RegisterEngineD2DEffects(factory.get()); FAILED(hr)) return hr;
 
+        // Compute results stay on the GPU unless something needs them on the
+        // CPU: GetValues reads its node's buffer itself, and a binding the
+        // GPU cannot serve still reads back.
+        auto options = m_evaluator.Options();
+        options.skipUnneededCpuReadback = true;
+
         if (desc)
         {
             if (desc->shaderCacheDirectory && *desc->shaderCacheDirectory)
@@ -83,12 +84,9 @@ namespace ShaderLab::Api
             if (desc->flags & EFFECTGRAPH_CONTEXT_FLAGS_ASYNC_COMPILE)
                 m_evaluator.SetAsyncCompile(true);
             if (desc->flags & EFFECTGRAPH_CONTEXT_FLAGS_ALLOW_RUNTIME_COMPILE)
-            {
-                auto options = m_evaluator.Options();
                 options.compilePrebuiltEffects = true;
-                m_evaluator.SetOptions(options);
-            }
         }
+        m_evaluator.SetOptions(options);
         return S_OK;
     }
 
@@ -96,7 +94,7 @@ namespace ShaderLab::Api
 
     void Context::ForgetNodeObject(uint32_t nodeId, const NodeBase* object)
     {
-        // After LoadGraph the id may belong to another node's object.
+        // After ReplaceGraph the id may belong to another node's object.
         if (auto it = m_nodeObjects.find(nodeId); it != m_nodeObjects.end() && it->second == object)
             m_nodeObjects.erase(it);
     }
@@ -110,7 +108,7 @@ namespace ShaderLab::Api
             return EFFECTGRAPH_E_WRONG_CONTEXT;
         const NodeBase* object = identity->Object();
         if (object->Owner() != this) return EFFECTGRAPH_E_WRONG_CONTEXT;
-        // Gone from the graph, or from a graph LoadGraph replaced.
+        // Gone from the graph, or from a graph ReplaceGraph replaced.
         const auto it = m_nodeObjects.find(object->Id());
         if (!m_graph.FindNode(object->Id()) || it == m_nodeObjects.end() || it->second != object)
             return EFFECTGRAPH_E_NODE_REMOVED;
@@ -174,7 +172,9 @@ namespace ShaderLab::Api
         if (!name || !node) return E_INVALIDARG;
         *node = nullptr;
         auto created = Effects::CreateNodeByName(name, {}, m_graph);
-        if (!created.node) return EFFECTGRAPH_E_UNKNOWN_EFFECT;
+        if (!created.node)
+            return Effects::MissingBuiltInMessage(name).empty() ? EFFECTGRAPH_E_UNKNOWN_EFFECT
+                                                                : EFFECTGRAPH_E_EFFECT_NOT_INCLUDED;
         const bool prepare = created.needsPrepare;
         HRESULT hr = AddNodeAndWrap(std::move(*created.node), node);
         if (SUCCEEDED(hr) && prepare)
@@ -183,6 +183,17 @@ namespace ShaderLab::Api
                 m_sources.PrepareSourceNode(*added, m_dc.get(), m_devices.d3dDevice.get(), m_devices.d3dContext.get());
         }
         return hr;
+    }
+
+    STDMETHODIMP Context::CreateEffectById(REFCLSID effectId, IEffectGraphNode** node)
+    {
+        if (!node) return E_INVALIDARG;
+        *node = nullptr;
+        for (const auto& descriptor : Effects::ShaderLabEffects::Instance().All())
+            if (!descriptor.hlslSource.empty() && Effects::EffectClsid(descriptor.effectId) == effectId)
+                return CreateEffect(descriptor.name.c_str(), node);
+        return Effects::MissingBuiltInMessage(effectId).empty() ? EFFECTGRAPH_E_UNKNOWN_EFFECT
+                                                                : EFFECTGRAPH_E_EFFECT_NOT_INCLUDED;
     }
 
     STDMETHODIMP Context::CreateD2DEffect(REFCLSID effectId, IEffectGraphNode** node)
@@ -230,6 +241,7 @@ namespace ShaderLab::Api
             return EFFECTGRAPH_E_UNSUPPORTED_FORMAT;
 
         InputSource wrapped;
+        wrapped.fromTexture = true;
         wrapped.texture.copy_from(texture);
         wrapped.bitmap = bitmap;
         if (encoding == EFFECTGRAPH_INPUT_ENCODING_HDR10)
@@ -281,7 +293,7 @@ namespace ShaderLab::Api
     HRESULT Context::SetInputTexture(uint32_t nodeId, ID3D11Texture2D* texture, EFFECTGRAPH_INPUT_ENCODING encoding)
     {
         auto it = m_inputs.find(nodeId);
-        if (it == m_inputs.end() || !it->second.texture) return E_NOT_VALID_STATE;
+        if (it == m_inputs.end() || !it->second.fromTexture) return E_NOT_VALID_STATE;
         InputSource source;
         if (HRESULT hr = WrapTexture(texture, encoding, source); FAILED(hr)) return hr;
         it->second = std::move(source);
@@ -292,7 +304,7 @@ namespace ShaderLab::Api
     HRESULT Context::SetInputImage(uint32_t nodeId, ID2D1Image* image)
     {
         auto it = m_inputs.find(nodeId);
-        if (it == m_inputs.end() || it->second.texture) return E_NOT_VALID_STATE;
+        if (it == m_inputs.end() || it->second.fromTexture) return E_NOT_VALID_STATE;
         if (!image) return E_INVALIDARG;
         it->second.output.copy_from(image);
         Graph::MarkNodeChanged(m_graph, nodeId);
@@ -305,56 +317,27 @@ namespace ShaderLab::Api
         if (HRESULT hr = IdOf(node, id); FAILED(hr)) return hr;
         m_graph.RemoveNode(id);
         m_inputs.erase(id);
+        m_uploadedValues.erase(id);
         m_evaluator.InvalidateNode(m_graph, id);
         m_sources.PruneOrphans(m_graph.Nodes());
         return S_OK;
     }
 
-    STDMETHODIMP Context::LoadGraph(PCWSTR path)
+    STDMETHODIMP_(void) Context::ReplaceGraph(Graph::GraphModel&& graph)
     {
-        if (!path) return E_INVALIDARG;
-        std::wstring error;
-        auto loaded = Rendering::EffectGraphFile::LoadAny(path, Rendering::TempDirectory(), error);
-        if (!loaded) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-        Graph::GraphModel graph;
-        try
-        {
-            graph = Graph::GraphModel::FromJson(winrt::hstring(loaded->graphJson));
-        }
-        catch (...)
-        {
-            std::error_code ec;
-            std::filesystem::remove_all(loaded->extractDir, ec);   // best effort: a temp folder
-            return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
-        }
-        Rendering::EffectGraphFile::ResolveMediaTokens(graph, loaded->mediaMap);
-
-        // Everything from before goes: nodes, inputs, cached effects, media.
+        m_uploadedValues.clear();
         m_graph.ClearCachedOutputs();
         m_evaluator.ReleaseCache();
         m_inputs.clear();
         m_nodeObjects.clear();
         ++m_epoch;
         m_graph = std::move(graph);
+        m_graph.MarkAllDirty();
+        // Close the old graph's providers before a host deletes its media.
         m_sources.PruneOrphans(m_graph.Nodes());
-        if (!m_extractDir.empty())
-        {
-            std::error_code ec;
-            std::filesystem::remove_all(m_extractDir, ec);   // best effort: a temp folder
-        }
-        m_extractDir = loaded->extractDir;
+        m_sources.ForgetVideoSettleTimeouts();
         Rendering::PrepareSources(m_graph, m_sources,
             { m_dc.get(), m_devices.d3dDevice.get(), m_devices.d3dContext.get() }, Rendering::SourceScope::All);
-        return S_OK;
-    }
-
-    STDMETHODIMP Context::FindNode(PCWSTR name, IEffectGraphNode** node)
-    {
-        if (!name || !node) return E_INVALIDARG;
-        *node = nullptr;
-        for (const auto& candidate : m_graph.Nodes())
-            if (candidate.name == name) return NodeFor(candidate.id, node);
-        return S_FALSE;
     }
 
     // ---- Evaluating
@@ -382,9 +365,14 @@ namespace ShaderLab::Api
             Rendering::SettleVideoSources(m_graph, m_sources, m_evaluator, m_dc.get());
     }
 
+    HRESULT Context::DeviceRemovedReason() const
+    {
+        return m_devices.d3dDevice ? m_devices.d3dDevice->GetDeviceRemovedReason() : S_OK;
+    }
+
     HRESULT Context::EvaluateFor(uint32_t nodeId, ID2D1Image* target, std::function<void(ID2D1DeviceContext5*)> draw)
     {
-        if (m_inDraw) return D2DERR_WRONG_STATE;
+        if (HRESULT removed = DeviceRemovedReason(); FAILED(removed)) return removed;
         SyncFrameInputs();
         Rendering::FrameRequest request;
         request.demand = Rendering::FrameDemand::Roots;
@@ -392,6 +380,9 @@ namespace ShaderLab::Api
         request.target = target;
         request.draw = std::move(draw);
         const auto result = Rendering::FrameExecutor::Run(m_graph, m_evaluator, m_dc.get(), request);
+        // A device removed during the frame fails EndDraw with
+        // D2DERR_RECREATE_TARGET and nodes with odd errors; say why instead.
+        if (HRESULT removed = DeviceRemovedReason(); FAILED(removed)) return removed;
         if (FAILED(result.endDraw)) return result.endDraw;
 
         const auto* node = m_graph.FindNode(nodeId);
@@ -454,30 +445,6 @@ namespace ShaderLab::Api
         return hr;
     }
 
-    STDMETHODIMP Context::Draw(ID2D1Image* target, EFFECTGRAPH_DRAW_CALLBACK callback, void* callbackContext)
-    {
-        if (!callback) return E_INVALIDARG;
-        if (m_inDraw) return D2DERR_WRONG_STATE;
-        winrt::com_ptr<ID2D1Image> previousTarget;
-        m_dc->GetTarget(previousTarget.put());
-        D2D1_MATRIX_3X2_F previousTransform{};
-        m_dc->GetTransform(&previousTransform);
-        float dpiX = 96.0f, dpiY = 96.0f;
-        m_dc->GetDpi(&dpiX, &dpiY);
-
-        if (target) m_dc->SetTarget(target);
-        m_inDraw = true;
-        m_dc->BeginDraw();
-        callback(m_dc.get(), callbackContext);
-        const HRESULT hr = m_dc->EndDraw();
-        m_inDraw = false;
-
-        m_dc->SetTarget(previousTarget.get());
-        m_dc->SetTransform(previousTransform);
-        m_dc->SetDpi(dpiX, dpiY);
-        return hr;
-    }
-
     STDMETHODIMP_(void) Context::GetD3DDevice(ID3D11Device** device)
     {
         if (!device) return;
@@ -485,23 +452,218 @@ namespace ShaderLab::Api
         (*device)->AddRef();
     }
 
-    STDMETHODIMP_(void) Context::GetD2DDeviceContext(ID2D1DeviceContext5** deviceContext)
+    STDMETHODIMP_(void) Context::GetD2DDevice(ID2D1Device** device)
     {
-        if (!deviceContext) return;
-        m_dc.copy_to(deviceContext);
+        if (!device) return;
+        m_devices.d2dDevice.as<ID2D1Device>().copy_to(device);
+    }
+
+    // ---- Analysis values
+
+    namespace
+    {
+        bool IsComputeAnalysis(const Graph::EffectNode& node)
+        {
+            return node.customEffect.has_value() &&
+                   node.customEffect->shaderType == Graph::CustomShaderType::D3D11ComputeShader &&
+                   !node.customEffect->analysisFields.empty();
+        }
+
+        winrt::com_ptr<ID3D11Buffer> BufferOf(ID3D11ShaderResourceView* view)
+        {
+            winrt::com_ptr<ID3D11Resource> resource;
+            view->GetResource(resource.put());
+            return resource.as<ID3D11Buffer>();
+        }
+    }
+
+    HRESULT Context::ReadValuesBuffer(ID3D11Buffer* buffer, const std::vector<Graph::AnalysisFieldDescriptor>& layout,
+                                      std::vector<Graph::AnalysisFieldValue>& values)
+    {
+        // Copied to a staging buffer and mapped: this waits for the work that
+        // writes it, which is what asking for CPU values means.
+        D3D11_BUFFER_DESC desc{};
+        buffer->GetDesc(&desc);
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.MiscFlags = 0;
+        desc.StructureByteStride = 0;
+        winrt::com_ptr<ID3D11Buffer> staging;
+        if (HRESULT hr = m_devices.d3dDevice->CreateBuffer(&desc, nullptr, staging.put()); FAILED(hr)) return hr;
+        m_devices.d3dContext->CopyResource(staging.get(), buffer);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (HRESULT hr = m_devices.d3dContext->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped); FAILED(hr)) return hr;
+        values = Graph::UnpackAnalysisFields(layout, static_cast<const float*>(mapped.pData), desc.ByteWidth / sizeof(float));
+        m_devices.d3dContext->Unmap(staging.get(), 0);
+        return S_OK;
+    }
+
+    HRESULT Context::ValuesOf(uint32_t nodeId, std::vector<Graph::AnalysisFieldValue>& values)
+    {
+        if (HRESULT hr = EvaluateNode(nodeId); FAILED(hr)) return hr;
+        const auto* node = m_graph.FindNode(nodeId);
+        if (!node) return EFFECTGRAPH_E_NODE_REMOVED;
+        if (IsComputeAnalysis(*node))
+            if (auto view = m_evaluator.AnalysisBuffer(nodeId))
+                return ReadValuesBuffer(BufferOf(view.get()).get(), node->customEffect->analysisFields, values);
+        values = node->analysisOutput.fields;
+        return S_OK;
+    }
+
+    HRESULT Context::Upload(uint32_t nodeId, const std::vector<Graph::AnalysisFieldValue>& fields)
+    {
+        const auto float4s = Graph::PackAnalysisFields(fields);
+        const UINT elements = static_cast<UINT>(float4s.size() / 4);
+        auto& uploaded = m_uploadedValues[nodeId];
+        if (!uploaded.buffer || uploaded.elements != elements)
+        {
+            D3D11_BUFFER_DESC desc{};
+            desc.ByteWidth = elements * 16;
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+            desc.StructureByteStride = 16;
+            uploaded = {};
+            if (HRESULT hr = m_devices.d3dDevice->CreateBuffer(&desc, nullptr, uploaded.buffer.put()); FAILED(hr)) return hr;
+            D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};
+            viewDesc.Format = DXGI_FORMAT_UNKNOWN;
+            viewDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+            viewDesc.Buffer.NumElements = elements;
+            if (HRESULT hr = m_devices.d3dDevice->CreateShaderResourceView(uploaded.buffer.get(), &viewDesc, uploaded.view.put());
+                FAILED(hr))
+            {
+                uploaded = {};
+                return hr;
+            }
+            uploaded.elements = elements;
+        }
+        m_devices.d3dContext->UpdateSubresource(uploaded.buffer.get(), 0, nullptr, float4s.data(), 0, 0);
+        return S_OK;
+    }
+
+    HRESULT Context::ValuesBufferOf(uint32_t nodeId, IEffectGraphValuesBuffer** buffer)
+    {
+        if (HRESULT hr = EvaluateNode(nodeId); FAILED(hr)) return hr;
+        const auto* node = m_graph.FindNode(nodeId);
+        if (!node) return EFFECTGRAPH_E_NODE_REMOVED;
+        if (IsComputeAnalysis(*node))
+        {
+            if (auto view = m_evaluator.AnalysisBuffer(nodeId))
+            {
+                winrt::make<ValuesBuffer>(this, nodeId, node->customEffect->analysisFields, BufferOf(view.get()), view)
+                    .as<IEffectGraphValuesBuffer>().copy_to(buffer);
+                return S_OK;
+            }
+        }
+        if (node->analysisOutput.fields.empty()) return S_FALSE;
+        if (HRESULT hr = Upload(nodeId, node->analysisOutput.fields); FAILED(hr)) return hr;
+        const auto& uploaded = m_uploadedValues[nodeId];
+        winrt::make<ValuesBuffer>(this, nodeId, Graph::AnalysisLayoutOf(node->analysisOutput.fields), uploaded.buffer, uploaded.view)
+            .as<IEffectGraphValuesBuffer>().copy_to(buffer);
+        return S_OK;
+    }
+
+    HRESULT Context::WriteValues(uint32_t nodeId, uint64_t epoch, UINT32 field, const float* floats, UINT32 count)
+    {
+        auto* node = epoch == m_epoch ? m_graph.FindNode(nodeId) : nullptr;
+        if (!node) return EFFECTGRAPH_E_NODE_REMOVED;
+        const bool compute = IsComputeAnalysis(*node);
+
+        // The node's values on the CPU, which bindings served as constants
+        // read: a compute node's come from its buffer when none were read back.
+        std::vector<Graph::AnalysisFieldValue> values = node->analysisOutput.fields;
+        if (compute && values.size() != node->customEffect->analysisFields.size())
+        {
+            auto view = m_evaluator.AnalysisBuffer(nodeId);
+            if (!view) return E_NOT_VALID_STATE;
+            if (HRESULT hr = ReadValuesBuffer(BufferOf(view.get()).get(), node->customEffect->analysisFields, values); FAILED(hr))
+                return hr;
+        }
+        if (field >= values.size()) return E_INVALIDARG;
+        auto& value = values[field];
+        const uint32_t componentCount = Graph::AnalysisFieldComponentCount(value.type);
+        const uint32_t arrayLength = Graph::AnalysisFieldArrayLength(value);
+        const uint32_t expected = Graph::AnalysisFieldIsArray(value.type)
+            ? (value.type == Graph::AnalysisFieldType::FloatArray ? arrayLength : arrayLength * componentCount)
+            : componentCount;
+        if (count != expected) return E_INVALIDARG;
+        if (Graph::AnalysisFieldIsArray(value.type)) value.arrayData.assign(floats, floats + count);
+        else std::copy(floats, floats + count, value.components.begin());
+
+        // The GPU copy: a compute node's results buffer in place, or the upload.
+        if (compute)
+        {
+            const auto row = Graph::PackAnalysisFields({ value });
+            const auto layout = Graph::AnalysisLayoutOf(values);
+            uint32_t start = 0;
+            for (UINT32 i = 0; i < field; ++i) start += layout[i].pixelCount();
+            if (HRESULT hr = m_evaluator.WriteAnalysis(nodeId, start, row.data(), static_cast<uint32_t>(row.size() / 4)); FAILED(hr))
+                return hr;
+        }
+        else if (m_uploadedValues.contains(nodeId))
+        {
+            if (HRESULT hr = Upload(nodeId, values); FAILED(hr)) return hr;
+        }
+        node->analysisOutput.fields = std::move(values);
+
+        // Whatever reads the node's values is evaluated again; the node is
+        // not, which would write its own values back.
+        for (auto& consumer : m_graph.MutableNodes())
+        {
+            bool reads = false;
+            Graph::ForEachBindingSource(consumer, [&](uint32_t source) { reads |= source == nodeId; });
+            if (reads) Graph::MarkNodeChanged(consumer);
+        }
+        return S_OK;
     }
 
     // ---- IEffectGraphContextInternal
 
     STDMETHODIMP_(Rendering::FrameResult) Context::RunFrame(const Rendering::FrameRequest& request)
     {
+        if (HRESULT removed = DeviceRemovedReason(); FAILED(removed))
+        {
+            Rendering::FrameResult skipped;
+            skipped.deviceRemoved = removed;
+            return skipped;
+        }
         SyncFrameInputs();
-        return Rendering::FrameExecutor::Run(m_graph, m_evaluator, m_dc.get(), request);
+        auto result = Rendering::FrameExecutor::Run(m_graph, m_evaluator, m_dc.get(), request);
+        result.deviceRemoved = DeviceRemovedReason();
+        return result;
     }
 
-    STDMETHODIMP Context::MoveToDevice(ID3D11Device*)
+    STDMETHODIMP Context::MoveToDevice(ID3D11Device* device)
     {
-        return E_NOTIMPL;   // Phase 6: the GUI's adapter switch moves here
+        if (!device) return E_INVALIDARG;
+        if (!(device->GetCreationFlags() & D3D11_CREATE_DEVICE_BGRA_SUPPORT))
+            return EFFECTGRAPH_E_UNSUPPORTED_DEVICE;
+
+        // The new stack first, so a failure leaves the context on its old device.
+        Rendering::DeviceStack devices;
+        winrt::com_ptr<ID2D1DeviceContext5> dc;
+        if (HRESULT hr = Rendering::CreateDeviceStackOn(device, devices); FAILED(hr)) return hr;
+        if (HRESULT hr = devices.CreateDeviceContext(dc); FAILED(hr)) return hr;
+        winrt::com_ptr<ID2D1Factory1> factory;
+        devices.d2dFactory->QueryInterface(IID_PPV_ARGS(factory.put()));
+        if (HRESULT hr = Engine::RegisterEngineD2DEffects(factory.get()); FAILED(hr)) return hr;
+
+        // Everything the old device made goes; every node is left dirty, so
+        // sources reopen and effects rebuild on the next frame.
+        m_evaluator.ReleaseCache(m_graph);
+        m_sources.ReleaseCache();
+        m_metadataEffects.clear();
+        m_uploadedValues.clear();
+        for (auto& [id, input] : m_inputs)
+        {
+            const bool fromTexture = input.fromTexture;
+            input = {};
+            input.fromTexture = fromTexture;
+        }
+        m_dc = std::move(dc);
+        m_devices = std::move(devices);
+        return S_OK;
     }
 }
 
@@ -551,6 +713,20 @@ EFFECTGRAPH_API HRESULT WINAPI EffectGraphRegisterEffects(const EFFECTGRAPH_EFFE
         if (source->builds[i].data)
             parts.records.emplace_back(static_cast<const uint8_t*>(source->builds[i].data), source->builds[i].size);
     return ResultOf(ShaderLab::Effects::RegisterEffectBlobParts(parts));
+}
+
+EFFECTGRAPH_API HRESULT WINAPI EffectGraphAddEffects(const EFFECTGRAPH_EFFECT_SOURCE* source)
+{
+    if (!source || !source->description || (source->buildCount && !source->builds)) return E_INVALIDARG;
+    ShaderLab::Effects::EffectBlobParts parts;
+    parts.format = source->format;
+    parts.contractHash = source->contractHash;
+    parts.description = { static_cast<const uint8_t*>(source->description), source->descriptionSize };
+    for (UINT32 i = 0; i < source->buildCount; ++i)
+        if (source->builds[i].data)
+            parts.records.emplace_back(static_cast<const uint8_t*>(source->builds[i].data), source->builds[i].size);
+    ShaderLab::Effects::QueueEffectBlobParts(std::move(parts));
+    return S_OK;
 }
 
 EFFECTGRAPH_API HRESULT WINAPI EffectGraphRegisterEffect(const void* data, UINT32 size)

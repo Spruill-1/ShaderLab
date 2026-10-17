@@ -24,7 +24,6 @@
 // path do not implement it -- neither produces a structured-buffer SRV. A
 // pixel-shader consumer reads the values through IEngineComputeTexture.
 
-#include "../EngineExport.h"
 
 struct ID3D11ShaderResourceView;
 

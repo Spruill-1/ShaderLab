@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../../EngineExport.h"
 #include "EffectGraph.h"
 
 namespace ShaderLab::Graph { class GraphModel; }
@@ -18,13 +17,10 @@ namespace ShaderLab::Rendering
 // The context as ShaderLab's own hosts and tests see it: the C++ objects behind
 // the public interfaces, for what the public API leaves out on purpose (canvas
 // layout, the UI snapshot, Effect Designer compiles, perf counters, MCP).
-// Reached with QueryInterface from IEffectGraphContext; only code built with
-// this engine may use it.
-//
-// Its IID changes with every SHADERLAB_ENGINE_ABI_VERSION, so a host built
-// against another engine gets E_NOINTERFACE rather than a mismatched layout.
-static_assert(SHADERLAB_ENGINE_ABI_VERSION == 7,
-    "New engine ABI version: give IEffectGraphContextInternal a new IID and update this check.");
+// Reached with QueryInterface from IEffectGraphContext, by programs that link
+// the engine library (ShaderLab's hosts and tests) and only on contexts they
+// created themselves. It is not part of EffectGraph.dll's contract: the DLL's
+// users never see this header, and its layout follows the engine's sources.
 
 MIDL_INTERFACE("684bd71b-4d22-4ce7-b0d9-a5bf835e25c3")
 IEffectGraphContextInternal : public IEffectGraphContext
@@ -35,6 +31,9 @@ IEffectGraphContextInternal : public IEffectGraphContext
     STDMETHOD_(ShaderLab::Rendering::GraphEvaluator&, Evaluator)() PURE;
     STDMETHOD_(ShaderLab::Effects::SourceNodeFactory&, Sources)() PURE;
     STDMETHOD_(const ShaderLab::Rendering::DeviceStack&, Devices)() PURE;
+    // The context's own D2D device context, without a reference added. Only
+    // ShaderLab's hosts draw on it, never while an evaluation is running.
+    STDMETHOD_(ID2D1DeviceContext5*, DeviceContext)() PURE;
 
     // The graph id behind a node interface; 0 when it was removed or belongs
     // to another context.
@@ -53,8 +52,10 @@ IEffectGraphContextInternal : public IEffectGraphContext
     // monitor or pinned profile. The context uses the defaults until set.
     STDMETHOD_(void, SetDisplayProfile)(const ShaderLab::Rendering::DisplayProfile& profile) PURE;
 
-    // Moves the context onto another device: an adapter switch or a removed
-    // device. The graph is kept, effects and shaders are rebuilt and sources
-    // reopened; node interfaces stay valid. Images from Realize do not.
-    STDMETHOD(MoveToDevice)(ID3D11Device* device) PURE;
+    // Replaces the whole graph: a host's File > Open or clear, or MCP's
+    // /graph/load. Everything from the old graph goes (cached effects, input
+    // images), node interfaces from before see their node as removed, and
+    // the new graph's sources are opened. Media a host extracted for `graph`
+    // stays the host's to delete.
+    STDMETHOD_(void, ReplaceGraph)(ShaderLab::Graph::GraphModel&& graph) PURE;
 };

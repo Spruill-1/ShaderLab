@@ -546,7 +546,6 @@ namespace ShaderLab::Effects
         m_videoPastEnd.clear();
         m_dxgiCaptureCache.clear();
         m_wgcCaptureCache.clear();
-        m_pendingWgcItems.clear();
         m_captureRetryAt.clear();
         m_videoSettleTimeouts.clear();
     }

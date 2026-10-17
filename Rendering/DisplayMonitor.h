@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "DisplayInfo.h"
 #include "DisplayProfile.h"
 
@@ -30,7 +29,7 @@ namespace ShaderLab::Rendering
     //   - The change callback is invoked WITHOUT internal locks held; it
     //     receives the LIVE caps even while a simulated profile is active
     //     (subscribers should re-read ActiveProfile()).
-    class SHADERLAB_API DisplayMonitor
+    class DisplayMonitor
     {
     public:
         DisplayMonitor() = default;

@@ -1,12 +1,13 @@
 #include "pch_engine.h"
 #include "../TestSupport.h"
-#include "Engine/Mcp/EngineMcpRoutes.h"
-#include "Engine/Mcp/McpJsonRpc.h"
-#include "Engine/Mcp/McpRouter.h"
-#include "Engine/Mcp/McpToolCatalog.h"
+#include "Mcp/EngineMcpRoutes.h"
+#include "Mcp/McpJsonRpc.h"
+#include "Mcp/McpRouter.h"
+#include "Mcp/McpToolCatalog.h"
 #include "Engine/Utf8.h"
 #include "Graph/GraphModel.h"
 #include "Rendering/GraphEvaluator.h"
+#include "Support/PackageRoutes.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -155,26 +156,26 @@ namespace
     }
 
     // /graph/apply with per-node properties, run through the real engine routes
-    // on a graph-only sink (no device, so sources are not prepared).
+    // on a bare context.
     SL_TEST_CASE(TestGraphApplyProperties, Tag::Fast | Tag::Mcp)
     {
         printf("\n=== /graph/apply properties ===\n");
 
         struct GraphOnlySink : ShaderLab::Mcp::IEngineCommandSink
         {
-            ShaderLab::Graph::GraphModel* graph{ nullptr };
+            IEffectGraphContextInternal* context{ nullptr };
             ShaderLab::Mcp::Response Dispatch(
                 std::function<ShaderLab::Mcp::Response(ShaderLab::Mcp::EngineContext&)> closure) override
             {
-                ShaderLab::Mcp::EngineContext context;
-                context.graph = graph;
-                return closure(context);
+                ShaderLab::Mcp::EngineContext engineContext(*context);
+                return closure(engineContext);
             }
         };
 
-        ShaderLab::Graph::GraphModel graph;
+        auto context = CreateTestContext();
+        auto& graph = context->Model();
         GraphOnlySink sink;
-        sink.graph = &graph;
+        sink.context = context.get();
         ShaderLab::McpRouter router;
         ShaderLab::Mcp::RegisterEngineRoutes(router, sink);
 
@@ -265,17 +266,14 @@ namespace
         // Deletes the previous media directory on each change, as the hosts do.
         struct FileSink : ShaderLab::Mcp::IEngineCommandSink
         {
-            ShaderLab::Graph::GraphModel* graph{ nullptr };
-            ShaderLab::Rendering::GraphEvaluator* evaluator{ nullptr };
+            IEffectGraphContextInternal* context{ nullptr };
             std::wstring mediaDir;
             int loads{ 0 };
             ShaderLab::Mcp::Response Dispatch(
                 std::function<ShaderLab::Mcp::Response(ShaderLab::Mcp::EngineContext&)> closure) override
             {
-                ShaderLab::Mcp::EngineContext context;
-                context.graph = graph;
-                context.evaluator = evaluator;
-                return closure(context);
+                ShaderLab::Mcp::EngineContext engineContext(*context);
+                return closure(engineContext);
             }
             void OnGraphLoaded() override { ++loads; }
             void OnGraphMediaDirChanged(const std::wstring& extractDir) override
@@ -286,13 +284,13 @@ namespace
             }
         };
 
-        ShaderLab::Graph::GraphModel graph;
-        ShaderLab::Rendering::GraphEvaluator evaluator;
+        auto context = CreateTestContext();
+        auto& graph = context->Model();
         FileSink sink;
-        sink.graph = &graph;
-        sink.evaluator = &evaluator;
+        sink.context = context.get();
         ShaderLab::McpRouter router;
         ShaderLab::Mcp::RegisterEngineRoutes(router, sink);
+        ShaderLab::Support::RegisterPackageRoutes(router, sink);
 
         const fs::path dir = fs::temp_directory_path() / std::format(L"ShaderLabFileRouteTest-{}", ::GetCurrentProcessId());
         std::error_code ec;

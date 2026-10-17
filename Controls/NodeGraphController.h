@@ -3,7 +3,7 @@
 #include "pch.h"
 #include "NodeLayout.h"
 #include "NodeGraphRenderer.h"
-#include "../Graph/GraphModel.h"
+#include "Graph/GraphModel.h"
 #include "../Graph/GraphUiSnapshot.h"
 #include "../Rendering/RenderThreadDispatcher.h"
 

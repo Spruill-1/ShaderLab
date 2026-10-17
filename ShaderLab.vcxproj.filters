@@ -181,9 +181,13 @@
     <None Include=".github\workflows\ci.yml" />
     <None Include=".github\workflows\release.yml" />
     <None Include=".gitignore" />
+    <None Include="LICENSE" />
+    <None Include="THIRD-PARTY-NOTICES.txt" />
     <None Include="packages.config" />
     <None Include=".gitmodules" />
     <None Include="scripts\Install.ps1" />
+    <None Include="scripts\Check-EngineBoundary.ps1" />
+    <None Include="scripts\ShaderLabOwnedFiles.txt" />
     <None Include="ShaderLab.vcxproj.filters" />
   </ItemGroup>
   <ItemGroup>

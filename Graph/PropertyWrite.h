@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "EffectNode.h"
 
 // Writing a property value that arrives untyped -- from MCP, a script, or any
@@ -23,14 +22,14 @@ namespace ShaderLab::Graph
     // or pauses a clock (SetClockPlaying). `mediaPath`, or its saved name
     // `shaderPath`, sets EffectNode::mediaPath instead of a property. The
     // node is marked dirty.
-    SHADERLAB_API std::wstring WriteProperty(EffectNode& node, const std::wstring& key, const UntypedValue& value);
+    std::wstring WriteProperty(EffectNode& node, const std::wstring& key, const UntypedValue& value);
 
     // What a string means as a boolean: true/false, 1/0, on/off, yes/no, in
     // any case. nullopt for anything else, so a typo is an error rather than
     // a silent false.
-    SHADERLAB_API std::optional<bool> ParseBool(std::wstring_view text);
+    std::optional<bool> ParseBool(std::wstring_view text);
 
     // The whole of `text`, surrounding spaces aside, as a finite number;
     // nullopt for anything else ("12abc", "", "nan").
-    SHADERLAB_API std::optional<double> ParseNumber(std::wstring_view text);
+    std::optional<double> ParseNumber(std::wstring_view text);
 }

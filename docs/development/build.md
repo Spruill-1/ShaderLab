@@ -31,17 +31,23 @@ missing-header errors.
 
 | Path | Upstream | Pin | License | Used by |
 |---|---|---|---|---|
-| `third_party/exprtk` | [ArashPartow/exprtk](https://github.com/ArashPartow/exprtk) | commit `1e4a80b` | MIT | `Rendering/MathExpression.cpp` — Numeric Expression node |
-| `third_party/miniz` | [richgel999/miniz](https://github.com/richgel999/miniz) | tag `3.1.2` | MIT | `Rendering/EffectGraphFile.cpp` — `.effectgraph` ZIP DEFLATE |
+| `third_party/exprtk` | [ArashPartow/exprtk](https://github.com/ArashPartow/exprtk) | commit `1e4a80b` | MIT | `Support/ExprTkEvaluator.cpp` — Numeric Expression node |
+| `third_party/miniz` | [richgel999/miniz](https://github.com/richgel999/miniz) | tag `3.1.2` | MIT | `Support/EffectGraphFile.cpp` — `.effectgraph` ZIP DEFLATE |
+
+Both build only into `ShaderLabSupport.lib`, which ShaderLab's programs link
+and EffectGraph does not (decision #224): the engine library, `EffectGraph.dll`
+and `EffectGraphCompile` contain no third-party source, so EffectGraph can be
+MIT-0 (`LICENSE-EffectGraph`) while the ShaderLab programs carry these two
+MIT notices (`THIRD-PARTY-NOTICES.txt`, also packaged into the MSIX). The
+`VerifySubmodules` check lives in `ShaderLabSupport.vcxproj` with them.
 
 `third_party/miniz_export.h` is a **3-line in-tree shim**, not part of the
 submodule. Upstream's `miniz.h` includes `miniz_export.h`, which their
 CMake generates via `generate_export_header()`; miniz's own amalgamation
 step substitutes an empty `#define MINIZ_EXPORT` instead. We do the same,
 so consuming the submodule doesn't drag a CMake toolchain into an
-otherwise MSBuild-only repo. miniz links statically into
-`ShaderLabEngine.dll` and its symbols are never re-exported, so the empty
-macro is correct.
+otherwise MSBuild-only repo. miniz links statically into the support
+library and its symbols are never exported, so the empty macro is correct.
 
 Only three of miniz's split sources are compiled — `miniz.c`,
 `miniz_tdef.c`, `miniz_tinfl.c`. `miniz_zip.c` is deliberately omitted:
@@ -57,6 +63,21 @@ DEFLATE (`tdefl_compress_mem_to_heap`, `tinfl_decompress_mem_to_heap`,
 4. Build configurations:
    - `Debug | x64`, `Release | x64`
    - `Debug | ARM64`, `Release | ARM64`
+
+### Built-in effect headers
+
+`ShaderLab`, `ShaderLabHeadless` and `ShaderLabTests` import
+`build\EffectGraphBuiltIns.targets`, which runs `EffectGraphCompile --builtins`
+before C++ compiles. It writes a header per built-in shader effect, with every
+build compiled in, to `<Platform>\<Configuration>\EffectGraphBuiltIns\`, and keeps
+the compiled builds in its `cache` folder: about 5 s the first time, under 1 s
+after, and only when the tool, the engine or the `BuiltInEffects` library
+changed. The headers are the same on every platform, so when the machine cannot
+run the target platform's tool (ARM64 built on an x64 machine, as CI does) the
+x64 tool is built and used instead, which builds the x64 engine too. A built-in
+is edited in `BuiltInEffects\BuiltInEffectTable.cpp`; a new one also needs its
+name and id in `Effects\BuiltInEffects.cpp`, in the same order, or the generator
+stops with an error.
 
 ### Building ARM64 *on* an ARM64 host
 
@@ -81,7 +102,8 @@ bite when building ARM64 natively on an ARM64 machine, and both fail in misleadi
   Using the ARM64 MSBuild yields `VCToolArchitecture=NativeARM64` and the whole
   solution builds clean.
 5. Outputs (per arch):
-   - `x64\Debug\ShaderLabEngine\ShaderLabEngine.dll`
+   - `x64\Debug\ShaderLabEngine\ShaderLabEngine.lib` (linked into every program)
+   - `x64\Debug\EffectGraph\EffectGraph.dll` + `EffectGraph.lib` + `include\` (for outside programs)
    - `x64\Debug\ShaderLab\ShaderLab.exe`
    - `x64\Debug\ShaderLabTests\ShaderLabTests.exe`
    - `x64\Debug\ShaderLabHeadless\ShaderLabHeadless.exe`
@@ -117,7 +139,7 @@ Linked through each project's `AdditionalDependencies`, except where a source fi
 | `mfplat.lib`, `mfreadwrite.lib`, `mfuuid.lib` | Media Foundation video source decoding | engine, app, headless, tests |
 | `mscms.lib` | ICC profile reading (Image Color Management) | engine (and `Rendering/IccProfileParser.cpp`) |
 | `windowsapp.lib` | WinRT umbrella: Windows Graphics Capture interop, DirectWrite for the node-graph canvas | engine, broker; the app through the WinUI defaults |
-| `bcrypt.lib` | MCP session crypto (`Engine/Mcp/McpCrypto.cpp`) | tests, and every binary compiling `McpCrypto.cpp` |
+| `bcrypt.lib` | MCP session crypto (`Mcp/McpCrypto.cpp`) | tests, and every binary compiling `McpCrypto.cpp` |
 | `shell32.lib`, `CoreMessaging.lib` | Known folders; the system `DispatcherQueue` `DisplayInformation` needs | app (`App.xaml.cpp`, `MainWindow.xaml.cpp`) |
 
 ---

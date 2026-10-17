@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "EffectNode.h"
 #include "EffectEdge.h"
 
@@ -9,6 +8,10 @@
 
 namespace ShaderLab::Graph
 {
+    // Saved graphs' format. Increment when the JSON changes in a way an older
+    // engine cannot safely load; a newer format is refused on load.
+    constexpr uint32_t cGraphFormatVersion = 2;
+
     // The two ways one node depends on another: an image edge into one of its
     // input pins, or a property binding that reads one of its analysis fields.
     enum class DependencyKind : uint8_t
@@ -20,7 +23,7 @@ namespace ShaderLab::Graph
 
     // DAG-based effect graph.
     // Owns nodes and edges; provides topological ordering and JSON round-trip.
-    class SHADERLAB_API GraphModel
+    class GraphModel
     {
     public:
         GraphModel() = default;

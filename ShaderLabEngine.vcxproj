@@ -20,7 +20,7 @@
     <ProjectConfiguration Include="Release|ARM64"><Configuration>Release</Configuration><Platform>ARM64</Platform></ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
-    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset Condition="'$(VisualStudioVersion)' &gt;= '18.0'">v145</PlatformToolset>
     <PlatformToolset Condition="'$(VisualStudioVersion)' &lt; '18.0'">v143</PlatformToolset>
@@ -28,7 +28,7 @@
     <LinkIncremental>true</LinkIncremental>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
-    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset Condition="'$(VisualStudioVersion)' &gt;= '18.0'">v145</PlatformToolset>
     <PlatformToolset Condition="'$(VisualStudioVersion)' &lt; '18.0'">v143</PlatformToolset>
@@ -36,7 +36,7 @@
     <LinkIncremental>true</LinkIncremental>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
-    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset Condition="'$(VisualStudioVersion)' &gt;= '18.0'">v145</PlatformToolset>
     <PlatformToolset Condition="'$(VisualStudioVersion)' &lt; '18.0'">v143</PlatformToolset>
@@ -45,13 +45,18 @@
     <LinkIncremental>false</LinkIncremental>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
-    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset Condition="'$(VisualStudioVersion)' &gt;= '18.0'">v145</PlatformToolset>
     <PlatformToolset Condition="'$(VisualStudioVersion)' &lt; '18.0'">v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <!-- The EffectGraph.Engine package's build (packaging/Pack.ps1): no /GL, since
+       an LTCG library links only with the exact compiler that built it. -->
+  <PropertyGroup Condition="'$(EffectGraphPackageBuild)' == 'true'">
+    <WholeProgramOptimization>false</WholeProgramOptimization>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings" />
@@ -63,11 +68,19 @@
     <OutDir>$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\</OutDir>
     <IntDir>$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\obj\</IntDir>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(EffectGraphPackageBuild)' == 'true'">
+    <OutDir>$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine.Package\</OutDir>
+    <IntDir>$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine.Package\obj\</IntDir>
+  </PropertyGroup>
+  <!-- Debug information inside the objects, so a consumer's linker finds it. -->
+  <ItemDefinitionGroup Condition="'$(EffectGraphPackageBuild)' == 'true'">
+    <ClCompile>
+      <DebugInformationFormat>OldStyle</DebugInformationFormat>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <!-- third_party\ itself is on the path so miniz.h's #include "miniz_export.h"
-           resolves to our in-tree shim (the real one is CMake-generated upstream). -->
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)third_party;$(ProjectDir)third_party\exprtk;$(ProjectDir)third_party\miniz;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch_engine.h</PrecompiledHeaderFile>
       <PrecompiledHeaderOutputFile>$(IntDir)pch_engine.pch</PrecompiledHeaderOutputFile>
@@ -79,50 +92,27 @@
       <TreatSpecificWarningsAsErrors>4715;%(TreatSpecificWarningsAsErrors)</TreatSpecificWarningsAsErrors>
       <AdditionalOptions>%(AdditionalOptions) /bigobj /utf-8</AdditionalOptions>
     </ClCompile>
-    <Link>
-      <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;d2d1.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;windowscodecs.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;mscms.lib;windowsapp.lib;Cabinet.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <ImportLibrary>$(OutDir)$(TargetName).lib</ImportLibrary>
-    </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
     <ClCompile>
-      <PreprocessorDefinitions>SHADERLAB_ENGINE_EXPORTS;WIN32;_WINDOWS;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;WIN32;_WINDOWS;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
-      <PreprocessorDefinitions>SHADERLAB_ENGINE_EXPORTS;WIN32;_WINDOWS;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;WIN32;_WINDOWS;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
-    <Link>
-      <EnableCOMDATFolding>true</EnableCOMDATFolding>
-      <OptimizeReferences>true</OptimizeReferences>
-    </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="EngineExport.h" />
-    <ClInclude Include="Version.h" />
+    <ClInclude Include="Graph\VideoSourceStatus.h" />
     <ClInclude Include="pch_engine.h" />
-    <ClInclude Include="Engine\Mcp\McpRouter.h" />
-    <ClInclude Include="Engine\Mcp\McpTypes.h" />
-    <ClInclude Include="Engine\Mcp\McpArgs.h" />
-    <ClInclude Include="Engine\Mcp\McpSerialize.h" />
-    <ClInclude Include="Engine\Mcp\McpJsonRpc.h" />
-    <ClInclude Include="Engine\Mcp\McpToolCatalog.h" />
-    <ClInclude Include="Engine\Mcp\McpFrame.h" />
-    <ClInclude Include="Engine\Mcp\McpCrypto.h" />
-    <ClInclude Include="Engine\Mcp\McpPeerIdentity.h" />
-    <ClInclude Include="Engine\Mcp\McpChannel.h" />
-    <ClInclude Include="Engine\Mcp\McpSessionClient.h" />
     <ClInclude Include="Engine\Api\EffectGraph.h" />
     <ClInclude Include="Engine\Api\EffectGraphInternal.h" />
     <ClInclude Include="Engine\Api\EffectGraphImpl.h" />
+    <ClInclude Include="Engine\Api\EffectGraphPlugin.h" />
+    <ClInclude Include="Engine\Api\EffectGraphVersion.h" />
     <ClInclude Include="Engine\EngineBootstrap.h" />
     <ClInclude Include="Engine\Utf8.h" />
-    <ClInclude Include="Engine\Mcp\EngineMcpRoutes.h" />
-    <ClInclude Include="Engine\Mcp\McpJsonWriter.h" />
-    <ClInclude Include="Engine\Mcp\Routes\RouteSupport.h" />
-    <ClInclude Include="Engine\Mcp\Routes\GraphPatch.h" />
     <ClInclude Include="Graph\EffectEdge.h" />
     <ClInclude Include="Graph\GraphModel.h" />
     <ClInclude Include="Graph\ClockModel.h" />
@@ -130,11 +120,8 @@
     <ClInclude Include="Graph\NodeContracts.h" />
     <ClInclude Include="Graph\SourceKind.h" />
     <ClInclude Include="Graph\ParameterModel.h" />
-    <ClInclude Include="Graph\ParameterVisibility.h" />
     <ClInclude Include="Graph\ValueFormat.h" />
-    <ClInclude Include="Graph\GraphLayout.h" />
     <ClInclude Include="Graph\GraphEdits.h" />
-    <ClInclude Include="Graph\GraphUiSnapshot.h" />
     <ClInclude Include="Graph\EffectNode.h" />
     <ClInclude Include="Graph\NodeType.h" />
     <ClInclude Include="Graph\PropertyValue.h" />
@@ -142,9 +129,7 @@
     <ClInclude Include="Rendering\DisplayInfo.h" />
     <ClInclude Include="Rendering\DisplayMonitor.h" />
     <ClInclude Include="Rendering\DisplayProfile.h" />
-    <ClInclude Include="Rendering\EffectGraphFile.h" />
     <ClInclude Include="Rendering\GraphEvaluator.h" />
-    <ClInclude Include="Rendering\FfmpegProcess.h" />
     <ClInclude Include="Rendering\D2DHelpers.h" />
     <ClInclude Include="Rendering\Evaluator\BindingResolver.h" />
     <ClInclude Include="Rendering\Evaluator\ComputeDispatch.h" />
@@ -162,9 +147,6 @@
     <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\MathExpression.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
-    <ClInclude Include="Rendering\FramePacer.h" />
-    <ClInclude Include="Rendering\PreviewRenderStats.h" />
-    <ClInclude Include="Rendering\RenderThreadDispatcher.h" />
     <ClInclude Include="Rendering\CaptureNode.h" />
     <ClInclude Include="Rendering\ImageCapture.h" />
     <ClInclude Include="Effects\ShaderLabParamsHlsl.h" />
@@ -173,8 +155,6 @@
     <ClInclude Include="Rendering\WorkingSpaceSync.h" />
     <ClInclude Include="Rendering\PixelReadback.h" />
     <ClInclude Include="Rendering\PixelTrace.h" />
-    <ClInclude Include="Rendering\PreviewViewState.h" />
-    <ClInclude Include="Rendering\VideoExport.h" />
     <ClInclude Include="Effects\Performance.h" />
     <ClInclude Include="Effects\BytecodeCache.h" />
     <ClInclude Include="Effects\ShaderVariants.h" />
@@ -183,7 +163,9 @@
     <ClInclude Include="Effects\CustomEffectBase.h" />
     <ClInclude Include="Effects\CustomComputeShaderEffect.h" />
     <ClInclude Include="Effects\CustomPixelShaderEffect.h" />
+    <ClInclude Include="Effects\BuiltInEffects.h" />
     <ClInclude Include="Effects\EffectBlob.h" />
+    <ClInclude Include="Effects\GamutLutGeometry.h" />
     <ClInclude Include="Effects\EffectRegistry.h" />
     <ClInclude Include="Effects\ImageLoader.h" />
     <ClInclude Include="Effects\PropertyMetadata.h" />
@@ -206,22 +188,17 @@
     <ClCompile Include="pch_engine.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="EngineExport.cpp" />
     <ClCompile Include="Graph\GraphModel.cpp" />
     <ClCompile Include="Graph\ClockModel.cpp" />
     <ClCompile Include="Graph\PropertyWrite.cpp" />
     <ClCompile Include="Graph\NodeContracts.cpp" />
     <ClCompile Include="Graph\SourceKind.cpp" />
     <ClCompile Include="Graph\ParameterModel.cpp" />
-    <ClCompile Include="Graph\ParameterVisibility.cpp" />
     <ClCompile Include="Graph\ValueFormat.cpp" />
-    <ClCompile Include="Graph\GraphLayout.cpp" />
     <ClCompile Include="Graph\GraphEdits.cpp" />
-    <ClCompile Include="Graph\GraphUiSnapshot.cpp" />
     <ClCompile Include="Rendering\D3D11ComputeRunner.cpp" />
     <ClCompile Include="Rendering\DisplayMonitor.cpp" />
     <ClCompile Include="Rendering\GraphEvaluator.cpp" />
-    <ClCompile Include="Rendering\FfmpegProcess.cpp" />
     <ClCompile Include="Rendering\Evaluator\AnalysisReadback.cpp" />
     <ClCompile Include="Rendering\Evaluator\BindingResolver.cpp" />
     <ClCompile Include="Rendering\Evaluator\CachePolicy.cpp" />
@@ -243,13 +220,7 @@
     <ClCompile Include="Rendering\WorkingSpaceSync.cpp" />
     <ClCompile Include="Rendering\PixelReadback.cpp" />
     <ClCompile Include="Rendering\PixelTrace.cpp" />
-    <ClCompile Include="Rendering\PreviewViewState.cpp" />
-    <ClCompile Include="Rendering\VideoExport.cpp" />
-    <ClCompile Include="Rendering\EffectGraphFile.cpp" />
-    <ClCompile Include="Rendering\MathExpression.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
-    </ClCompile>
+    <ClCompile Include="Rendering\MathExpression.cpp" />
     <ClCompile Include="Effects\ColorMath.cpp" />
     <ClCompile Include="Effects\Performance.cpp" />
     <ClCompile Include="Effects\BytecodeCache.cpp" />
@@ -259,6 +230,8 @@
     <ClCompile Include="Effects\CustomEffectBase.cpp" />
     <ClCompile Include="Effects\CustomComputeShaderEffect.cpp" />
     <ClCompile Include="Effects\CustomPixelShaderEffect.cpp" />
+    <ClCompile Include="Effects\BuiltInEffectHooks.cpp" />
+    <ClCompile Include="Effects\BuiltInEffects.cpp" />
     <ClCompile Include="Effects\EffectBlob.cpp" />
     <ClCompile Include="Effects\EffectRegistry.cpp" />
     <ClCompile Include="Effects\ImageLoader.cpp" />
@@ -277,49 +250,10 @@
     <ClCompile Include="Effects\VideoFrameReader.cpp" />
     <ClCompile Include="Effects\VideoSeekModel.cpp" />
     <ClCompile Include="Effects\VideoSourceProvider.cpp" />
-    <ClCompile Include="Engine\Mcp\McpRouter.cpp" />
-    <ClCompile Include="Engine\Mcp\McpSerialize.cpp" />
     <ClCompile Include="Engine\Api\EffectGraphContext.cpp" />
     <ClCompile Include="Engine\Api\EffectGraphNode.cpp" />
+    <ClCompile Include="Engine\Api\EffectGraphPlugin.cpp" />
     <ClCompile Include="Engine\EngineBootstrap.cpp" />
-    <ClCompile Include="Engine\Mcp\EngineMcpRoutes.cpp" />
-    <ClCompile Include="Engine\Mcp\Routes\RouteSupport.cpp" />
-    <ClCompile Include="Engine\Mcp\Routes\CatalogRoutes.cpp" />
-    <ClCompile Include="Engine\Mcp\Routes\GraphRoutes.cpp" />
-    <ClCompile Include="Engine\Mcp\Routes\GraphPatch.cpp" />
-    <ClCompile Include="Engine\Mcp\Routes\PropertyRoutes.cpp" />
-    <ClCompile Include="Engine\Mcp\Routes\EffectRoutes.cpp" />
-    <ClCompile Include="Engine\Mcp\Routes\ReadbackRoutes.cpp" />
-    <ClCompile Include="Engine\Mcp\Routes\FileRoutes.cpp" />
-    <ClCompile Include="Engine\Mcp\Routes\DisplayRoutes.cpp" />
-    <ClCompile Include="Engine\Mcp\Routes\VideoRoutes.cpp" />
-    <ClCompile Include="Engine\Mcp\McpJsonRpc.cpp" />
-    <ClCompile Include="Engine\Mcp\McpToolCatalog.cpp" />
-    <ClCompile Include="Engine\Mcp\McpFrame.cpp" />
-    <ClCompile Include="Engine\Mcp\McpCrypto.cpp" />
-    <ClCompile Include="Engine\Mcp\McpPeerIdentity.cpp" />
-    <ClCompile Include="Engine\Mcp\McpChannel.cpp" />
-    <ClCompile Include="Engine\Mcp\McpSessionClient.cpp" />
-    <!-- miniz (submodule, tag 3.1.2). The upstream git tree ships split sources;
-         only these three are needed for the .effectgraph DEFLATE path
-         (mz_free, tdefl_compress_mem_to_heap, tinfl_decompress_mem_to_heap).
-         miniz_zip.c is deliberately omitted: EffectGraphFile.cpp writes the
-         ZIP container itself and only uses raw DEFLATE. -->
-    <ClCompile Include="third_party\miniz\miniz.c">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <CompileAs>CompileAsC</CompileAs>
-      <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
-    </ClCompile>
-    <ClCompile Include="third_party\miniz\miniz_tdef.c">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <CompileAs>CompileAsC</CompileAs>
-      <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
-    </ClCompile>
-    <ClCompile Include="third_party\miniz\miniz_tinfl.c">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <CompileAs>CompileAsC</CompileAs>
-      <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
-    </ClCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
@@ -334,15 +268,5 @@
     <Error Condition="!Exists('packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets'))" />
     <Error Condition="!Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props'))" />
     <Error Condition="!Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets'))" />
-  </Target>
-
-  <!-- exprtk and miniz are git submodules under third_party\. If the working
-       copy was cloned without them, fail with an actionable message instead of
-       a wall of missing-header errors. -->
-  <Target Name="VerifySubmodules" BeforeTargets="PrepareForBuild">
-    <Error Condition="!Exists('$(ProjectDir)third_party\exprtk\exprtk.hpp')"
-           Text="Missing third_party\exprtk\exprtk.hpp. The exprtk and miniz dependencies are git submodules. Run: git submodule update --init --recursive" />
-    <Error Condition="!Exists('$(ProjectDir)third_party\miniz\miniz.c')"
-           Text="Missing third_party\miniz\miniz.c. The exprtk and miniz dependencies are git submodules. Run: git submodule update --init --recursive" />
   </Target>
 </Project>

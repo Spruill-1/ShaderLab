@@ -8,13 +8,17 @@ graph TB
         RE[RenderEngine<br/>SwapChainPanel binding]
     end
 
-    subgraph Engine["ShaderLabEngine.dll"]
+    subgraph Engine["ShaderLabEngine.lib (static)"]
         EG[Graph/*]
         EV[GraphEvaluator]
         FX[EffectRegistry / ShaderLabEffects / SourceNodeFactory]
         IO[ImageLoader / VideoSourceProvider / capture providers / ShaderCompiler]
         MON[DisplayMonitor / ICC]
-        MCP[Engine/Mcp: McpRouter + Routes/]
+    end
+
+    subgraph Support["ShaderLabSupport.lib (static, ShaderLab only)"]
+        MCP[Mcp/: McpRouter + Routes/]
+        SUP[Support/: ExprTk, .effectgraph files]
     end
 
     subgraph Tests["ShaderLabTests.exe"]

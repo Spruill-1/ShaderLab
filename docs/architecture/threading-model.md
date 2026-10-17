@@ -37,7 +37,7 @@ flowchart LR
 
     subgraph MCP["MCP (broker session client thread)"]
         Server["McpSessionClient<br/>(sealed shim → hub → session)"]
-        Routes["McpRouter → Engine/Mcp/Routes<br/>+ the GUI's own routes"]
+        Routes["McpRouter → Mcp/Routes<br/>+ the GUI's own routes"]
     end
 
     DispatchTimer --> XAML
@@ -97,7 +97,7 @@ sequenceDiagram
     loop @ FramePacer deadline (monitor refresh, 60-240 Hz)
         W->>Disp: WaitUntil(deadline), then Drain() any queued closures
         W->>W: AdvanceClocks, ResolveSourceBindings, TickAndUploadVideos,<br/>PropagateDirtyDownstream
-        W->>W: RenderFrameToOffscreen(dt):<br/>PrepareSources, pick idx = published ^ 1<br/>FrameExecutor::Run (Evaluate → BeginDraw →<br/>ProcessDeferredCompute → frozen sweep → draw → EndDraw)
+        W->>W: RenderFrameToOffscreen(dt):<br/>PrepareSources, pick idx = published ^ 1<br/>FrameExecutor::Run (Evaluate → ProcessDeferredCompute →<br/>frozen sweep → BeginDraw, draw, EndDraw)
         W->>Off: publishedIdx.store(idx)
         W->>Off: publishedVersion.fetch_add(1)
         W->>W: RenderOutputSinks()<br/>(per-sink double-buffer + bufferGen)
@@ -113,7 +113,7 @@ frame.
 Every host renders a frame through `Rendering::FrameExecutor::Run` (decision
 #133): the GUI worker's `RenderFrameToOffscreen` (with a draw callback for the
 preview), headless `HeadlessEngine::RenderFrame` / `RenderFrameFor`, `ExportVideo`, and the tests. It
-owns the ordering in the [draw-session contract](d2d-d3d11-hybrid-compute.md#known-limitations)
+owns the ordering, and when draw sessions open, described in [hybrid compute](d2d-d3d11-hybrid-compute.md#known-limitations)
 so no host copies it. The graph semantics it relies on live in `Graph/`:
 
 | Concern | Owner | Rule |
@@ -126,7 +126,7 @@ so no host copies it. The graph semantics it relies on live in `Graph/`:
 | Sources | `Rendering/SourceRuntime` | `PrepareSources` (all, or dirty-or-video each frame; a failure lands on `runtimeError`) and `SettleVideoSources` for hosts with no render loop. |
 
 The GUI-thread / render-thread split is unchanged: all of this runs on the
-render worker, which is the only thread that touches `m_graph`, so the graph
+render worker, which is the only thread that touches the live graph, so the graph
 has no lock (decision #207). No UI code reads the live graph: the Properties
 panel's 4 Hz bound-value refresh reads `GraphUiSnapshot::hasDirtyNodes` and the selected node's bindings from the
 snapshot.
@@ -307,7 +307,7 @@ sequenceDiagram
 
 Anything XAML-touching (panel rebuild, selector populate) stays on the UI
 thread after the dispatcher returns and reads the `GraphUiSnapshot`. Anything
-touching `m_graph`, layout, or D3D11/D2D goes inside the closure, including
+touching the live graph, layout, or D3D11/D2D goes inside the closure, including
 source preparation, which uses the render D2D context. After every queued
 `DispatchSync` closure the dispatcher runs an after-sync hook
 (`SetAfterSyncClosure`) that republishes the snapshot before the caller is
@@ -326,7 +326,7 @@ stateDiagram-v2
     Running --> Running: Drain → eval → publish<br/>(per tick)
     Running --> Paused: SwitchAdapter starts
     Paused --> Stopped: SwitchAdapter sets<br/>m_renderShouldStop<br/>+ joins worker
-    Stopped --> Running: SwitchAdapter recreates<br/>engine + respawns jthread
+    Stopped --> Running: SwitchAdapter recreates the device,<br/>moves the context + respawns jthread
     Running --> Stopping: MainWindow dtor sets<br/>m_isShuttingDown<br/>+ m_renderShouldStop
     Stopping --> [*]: dispatcher.Shutdown()<br/>worker.join()<br/>release D2D/D3D
 ```
@@ -359,12 +359,13 @@ SwapChainPanel-bound swap chain.
 |---|---|---|
 | `m_d3dDevice`, `m_d3dContext` | `RenderEngine` | D3D11 immediate context with `ID3D10Multithread::SetMultithreadProtected(TRUE)`. Both threads call into it. Protection makes each *call* atomic, not a *sequence*: any multi-call GPU operation (bind shader/SRVs/UAVs, then `Dispatch`) must be recorded on its own deferred context and submitted with one `ExecuteCommandList(…, TRUE)`, or another thread's D2D work can land between the calls and the dispatch runs unbound. `D3D11ComputeRunner` and `VideoFrameConverter` both do this; each lost ~2–8% of dispatches, silently, before they did. |
 | `VideoSourceProvider` frame queue | Decode thread fills, render thread takes | One mutex per provider guards the queue, the seek request, a seek generation number and the `VideoSeekModel` keyframe map; a frame decoded for an older seek is discarded. `Close()` releases the queued decoder samples before joining the decode thread, since a `ReadSample` waiting for a free decoder surface returns only when one is released. See [video playback](../ui-ux/animation-system.md#video-playback). |
-| Multi-threaded D2D device | `RenderEngine` | Single device, two contexts. |
-| `m_d2dDeviceContext` | UI thread | Editor canvas, blit-to-swap-chain, file-save capture. |
-| `m_renderD2dContext` | Render thread | `BeginDraw` → graph eval → `EndDraw` per tick. |
+| Multi-threaded D2D device | The EffectGraph context (`MainWindow::m_context`) | Built on `RenderEngine`'s D3D11 device by the context, which an adapter switch moves (`MoveToDevice`, decision #215). One device, three contexts, so images interop. |
+| `m_d2dDeviceContext` | UI thread | `RenderEngine`'s, on the context's D2D device: the preview swap chain's back-buffer target. |
+| `m_uiD2dContext` | UI thread | Editor canvas, blit-to-swap-chain, output-window blits, graph capture. |
+| `m_renderD2dContext` | Render thread | The context's own device context: graph eval per tick, with a draw session only for the preview's draw (and any step that draws). |
 | `m_swapChain` | Bound to UI's `SwapChainPanel`. UI thread Presents. |
 | `m_offscreenTextures[2]` + `m_offscreenRenderTargets[2]` | Render thread writes; UI thread reads via `m_offscreenSourceBitmapUi[2]` (UI-context wrappers). |
-| `m_graph` | Logical single writer/reader on render thread. UI mutations route through `RenderThreadDispatcher::DispatchSync` (worker drains the queue between iterations, so a closure runs while the worker is implicitly paused). |
+| The live graph (`Model()`, the context's `GraphModel`) | Logical single writer/reader on render thread. UI mutations route through `RenderThreadDispatcher::DispatchSync` (worker drains the queue between iterations, so a closure runs while the worker is implicitly paused). |
 | `m_outputWindows` (XAML) | UI thread only. The worker never iterates it: its evaluation roots for output windows come from the open (`!closed`) entries of `m_outputSinks`. |
 | `m_outputSinks` (`OutputSinkRenderState`) | shared_ptr<>; UI thread mutates the vector under `m_outputSinksMutex`; render thread snapshots and reads. Every path that clears `m_outputWindows` (graph load, graph clear, adapter switch) clears the sinks too. |
 | `SourceNodeFactory` (video / capture providers) | Render thread only, including `RegisterGraphicsCaptureItem` (the WGC picker dispatches it). The render worker names itself the owner (`SetOwnerThread`) while it runs, and debug builds assert every call comes from the owner; with the worker stopped (startup, adapter switch) the UI thread may call it. The UI reads video playback state (position, duration, size, frame rate, loop, uploads) from `GraphUiSnapshot::videoSources`, a value copy taken when the snapshot is published. `VideoProviderForRenderThread` is for render-thread callers and tests. A capture node is re-pointed at its provider's current image every tick; while the capture is lost it has no output (`Capture lost, retrying: <reason>`), so the graph downstream of it pauses until the tick's once-a-second reopen succeeds. |
@@ -399,7 +400,7 @@ caller, and the two threads deadlock.
 ## MCP routes
 
 `MainWindow::GuiEngineCommandSink::Dispatch` (the engine sink the GUI host
-provides to the routes under `Engine/Mcp/Routes/`) marshals the closure to the
+provides to the routes under `Mcp/Routes/`) marshals the closure to the
 render thread. Mutating routes (`/graph/add-node`, `/graph/set-property`, …)
 and readback routes (`/render/capture-node`, `/render/pixel-region`) all run on
 the worker. Engine context (`graph`, `dc`, `d3dDevice`, etc.) points at
@@ -442,9 +443,9 @@ on a size change, without locking on the read path.
 
 ## Pixel trace + capture (P13)
 
-Pixel inspection / pixel trace / per-node capture all walk `m_graph` and
+Pixel inspection / pixel trace / per-node capture all walk the live graph and
 read pixel values from `cachedOutput` via `DrawImage` to a 1×1 staging
-texture. They're routed through the render dispatcher so `m_graph` is stable
+texture. They're routed through the render dispatcher so the live graph is stable
 for the duration of the readback.
 
 ## What stays on UI thread

@@ -31,7 +31,6 @@
 // this interface: it lives on EffectNode::analysisOutput.fields, and the
 // evaluator has the node in hand.
 
-#include "../EngineExport.h"
 
 struct ID3D11ShaderResourceView;
 struct ID3D11Texture2D;

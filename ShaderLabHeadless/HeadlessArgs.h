@@ -4,7 +4,7 @@
 // process exit codes. Parsing is pure (no device, no printing) so the tests
 // can drive it.
 
-#include "../Rendering/DisplayProfile.h"
+#include "Rendering/DisplayProfile.h"
 
 #include <cstdint>
 #include <optional>
@@ -20,7 +20,7 @@ namespace ShaderLab::Headless
     {
         Ok            = 0,
         Usage         = 1,   // bad or missing argument
-        AbiMismatch   = 2,   // ShaderLabEngine.dll does not match these headers
+        // 2 is retired: it reported an engine DLL from another build.
         Device        = 3,   // D3D11 / D2D device, effect registration, %LOCALAPPDATA%
         InputRead     = 4,   // --graph or --script file unreadable
         InputParse    = 5,   // --graph or --script file is not valid

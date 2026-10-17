@@ -12,7 +12,6 @@
 // CPU-readable BGRA8 bitmap, and WIC-encode to PNG.
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 
 #include <cstdint>
 #include <vector>
@@ -52,7 +51,7 @@ namespace ShaderLab::Rendering
     //
     // `maxDim` clamps the longer edge of the output to bound encoder cost
     // for very large images. Defaults to 2048.
-    SHADERLAB_API CaptureNodeResult CaptureNodeAsPng(
+    CaptureNodeResult CaptureNodeAsPng(
         Graph::GraphModel& graph,
         uint32_t nodeId,
         ID2D1DeviceContext* dc,

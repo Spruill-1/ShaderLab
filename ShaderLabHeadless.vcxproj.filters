@@ -6,7 +6,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="EngineExport.h" />
     <ClInclude Include="pch_engine.h" />
     <ClInclude Include="ShaderLabHeadless\HeadlessArgs.h">
       <Filter>ShaderLabHeadless</Filter>
@@ -25,7 +24,7 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="pch_engine.cpp" />
+    <ClCompile Include="pch_host.cpp" />
     <ClCompile Include="ShaderLabHeadless\Main.cpp">
       <Filter>ShaderLabHeadless</Filter>
     </ClCompile>

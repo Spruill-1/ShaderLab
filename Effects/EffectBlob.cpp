@@ -1,6 +1,7 @@
 #include "pch_engine.h"
 #include "EffectBlob.h"
 #include "BytecodeCache.h"
+#include "BuiltInEffects.h"
 #include "ShaderLabEffects.h"
 #include "ShaderVariants.h"
 #include "../Engine/Utf8.h"
@@ -255,9 +256,18 @@ namespace ShaderLab::Effects
                     return Unpack(packed, size);
                 });
             }
+            // A built-in's blob makes it built-in: no source file, and its C++ hooks.
+            auto adopt = [](ShaderLabEffectDescriptor& d)
+            {
+                const auto* info = FindBuiltInEffect(d.effectId);
+                if (!info || !info->shader || info->effectId != d.effectId || info->name != d.name) return;
+                d.sourcePath.clear();
+                AttachBuiltInHooks(d);
+            };
             result.effects = ShaderLabEffects::Instance().RegisterEffectsFromJson(
                 json, cBlobSource, /*compileCheck*/ false, report,
-                [&](const ShaderLabEffectDescriptor& d) { return std::ranges::find(includedNames, d.name) != includedNames.end(); });
+                [&](const ShaderLabEffectDescriptor& d) { return std::ranges::find(includedNames, d.name) != includedNames.end(); },
+                adopt);
             if (result.effects.empty())
             {
                 result.status = EffectBlobStatus::NotRegistered;
@@ -304,15 +314,16 @@ namespace ShaderLab::Effects
         }
 
         // A private cache: the engine's own compile path, without touching the
-        // process cache or its disk layer.
+        // process cache. Its disk layer is the caller's folder, when given.
         BytecodeCache cache;
+        if (!options.cacheDirectory.empty()) cache.SetDiskCacheRoot(options.cacheDirectory);
         std::vector<std::pair<EffectBlobBuildInfo, BytecodeCompileRequest>> pending;
         std::vector<bool> parameterUsed(options.gpuBoundParameters.size(), false);
         for (const auto& descriptor : descriptors)
         {
             const auto node = ShaderLabEffects::CreateNode(descriptor);
             const auto& def = *node.customEffect;
-            EffectBlobEffectInfo effect{ descriptor.name };
+            EffectBlobEffectInfo effect{ descriptor.name, descriptor.effectId };
 
             // The listed parameters this effect can serve on the GPU.
             const auto gpuNames = GpuBindableNames(def);
@@ -431,7 +442,8 @@ namespace ShaderLab::Effects
         return std::move(writer.Result());
     }
 
-    std::string GenerateEffectHeader(const EffectBlobBuild& build, const std::string& symbol, const std::wstring& sourceName)
+    std::string GenerateEffectHeader(const EffectBlobBuild& build, const std::string& symbol, const std::wstring& sourceName,
+                                     const EffectHeaderOptions& options)
     {
         auto bytes = [](std::string& out, std::span<const uint8_t> data)
         {
@@ -478,7 +490,11 @@ namespace ShaderLab::Effects
             for (const auto& layout : effect.gpuLayouts)
                 out += "//   " + LayoutMacro(effect.name, layout) + "\n";
         }
-        out += "//\n// Register with EffectGraphRegisterEffects(&" + symbol + ").\n";
+        if (options.registerAtStartup)
+            out += "//\n// Registers itself when the program starts; define\n"
+                   "// EFFECTGRAPH_NO_STARTUP_REGISTRATION to call EffectGraphRegisterEffects(&" + symbol + ") instead.\n";
+        else
+            out += "//\n// Register with EffectGraphRegisterEffects(&" + symbol + ").\n";
         out += "#pragma once\n#include \"EffectGraph.h\"\n\n";
 
         out += "inline constexpr unsigned char " + symbol + "_Description[] = {\n";
@@ -502,6 +518,23 @@ namespace ShaderLab::Effects
         out += std::format("    {}, 0x{:016x}ull,\n", cEffectBlobFormat, IncludeLibraryHash());
         out += "    " + symbol + "_Description, sizeof(" + symbol + "_Description),\n";
         out += "    " + symbol + "_Builds, sizeof(" + symbol + "_Builds) / sizeof(" + symbol + "_Builds[0]) - 1,\n};\n";
+
+        // Each effect's class id, for CreateEffectById.
+        out += "\n";
+        for (const auto& effect : build.effects)
+        {
+            const GUID id = EffectClsid(effect.effectId);
+            out += std::format("inline constexpr GUID {} = {{ 0x{:08x}, 0x{:04x}, 0x{:04x}, "
+                               "{{ 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x} }} }};\n",
+                               EffectClsidName(effect.name), id.Data1, id.Data2, id.Data3,
+                               id.Data4[0], id.Data4[1], id.Data4[2], id.Data4[3],
+                               id.Data4[4], id.Data4[5], id.Data4[6], id.Data4[7]);
+        }
+        if (options.registerAtStartup)
+        {
+            out += "\n#ifndef EFFECTGRAPH_NO_STARTUP_REGISTRATION\n"
+                   "inline const HRESULT " + symbol + "_Added = EffectGraphAddEffects(&" + symbol + ");\n#endif\n";
+        }
         return out;
     }
 
@@ -546,5 +579,74 @@ namespace ShaderLab::Effects
     EffectBlobRegistration RegisterEffectBlobParts(const EffectBlobParts& parts)
     {
         return Register(parts, nullptr);
+    }
+
+    namespace
+    {
+        struct BlobQueue
+        {
+            std::mutex mutex;
+            std::vector<EffectBlobParts> parts;
+            std::vector<std::wstring> errors;
+            std::atomic<size_t> drained{ 0 };
+            std::atomic<size_t> queued{ 0 };
+            std::recursive_mutex drainMutex;
+        };
+
+        BlobQueue& Queue()
+        {
+            static BlobQueue sQueue;
+            return sQueue;
+        }
+
+        thread_local bool tDraining = false;
+    }
+
+    void QueueEffectBlobParts(EffectBlobParts parts)
+    {
+        auto& queue = Queue();
+        std::scoped_lock lock(queue.mutex);
+        queue.parts.push_back(std::move(parts));
+        queue.queued.store(queue.parts.size(), std::memory_order_release);
+    }
+
+    void DrainQueuedEffectBlobs()
+    {
+        auto& queue = Queue();
+        // Registering reaches the registry, which calls back here.
+        if (tDraining) return;
+        if (queue.queued.load(std::memory_order_acquire) == queue.drained) return;
+        std::scoped_lock drainLock(queue.drainMutex);
+        struct Draining
+        {
+            Draining() { tDraining = true; }
+            ~Draining() { tDraining = false; }
+        } draining;
+        for (;;)
+        {
+            EffectBlobParts next;
+            {
+                std::scoped_lock lock(queue.mutex);
+                if (queue.drained == queue.parts.size()) break;
+                next = queue.parts[queue.drained++];
+            }
+            const auto registration = Register(next, nullptr);
+            {
+                std::scoped_lock lock(queue.mutex);
+                if (registration.status != EffectBlobStatus::Registered || !registration.error.empty())
+                {
+                    queue.errors.push_back(registration.error.empty() ? L"an effect header registered nothing"
+                                                                      : registration.error);
+                    std::fwprintf(stderr, L"[ShaderLab] effect header: %ls\n", queue.errors.back().c_str());
+                }
+            }
+        }
+    }
+
+    std::vector<std::wstring> QueuedEffectBlobErrors()
+    {
+        auto& queue = Queue();
+        std::scoped_lock lock(queue.mutex);
+        return queue.errors;
     }
 }

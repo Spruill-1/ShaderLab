@@ -62,14 +62,10 @@ namespace
 
             PrepareSourcesAndEvaluate(g, sf);
             g_dc->SetTarget(nullptr);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
             // Run twice so the first-frame just-created delay clears.
             PrepareSourcesAndEvaluate(g, sf);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
 
             // TargetPeakNits is the tone mapper's first gpu-bindable parameter.
             const auto targetPeakIndex = [&]
@@ -118,13 +114,9 @@ namespace
             CaseEvaluator().ReleaseCache();
             PrepareSourcesAndEvaluate(g, sf);
             g_dc->SetTarget(nullptr);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
             PrepareSourcesAndEvaluate(g, sf);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
 
             auto* n = g.FindNode(ictcpId);
             TEST("GpuBinding_ICtCpHasOutput_FlagOff", n && n->cachedOutput != nullptr);
@@ -146,13 +138,9 @@ namespace
             CaseEvaluator().ReleaseCache();
             PrepareSourcesAndEvaluate(g, sf);
             g_dc->SetTarget(nullptr);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
             PrepareSourcesAndEvaluate(g, sf);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
 
             auto* n = g.FindNode(ictcpId);
             TEST("GpuBinding_ICtCpHasOutput_FlagOnNoBinding", n && n->cachedOutput != nullptr);
@@ -598,13 +586,9 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION,
             // Two-pass: first creates effects, second produces output.
             PrepareSourcesAndEvaluate(g, sf);
             g_dc->SetTarget(nullptr);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
             PrepareSourcesAndEvaluate(g, sf);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
 
             uint64_t afterSkip = ShaderLab::Performance::SkippedCpuReadbacks();
             TEST("SkipReadback_CounterIncrementsWhenSkipping",
@@ -633,13 +617,9 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION,
 
             PrepareSourcesAndEvaluate(g, sf);
             g_dc->SetTarget(nullptr);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
             PrepareSourcesAndEvaluate(g, sf);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
 
             const float mean = AnalysisField(g.FindNode(statsId), L"Mean");
             TEST("SkipReadback_HostHintForcesReadback", mean > 0.0f);
@@ -660,13 +640,9 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION,
 
             PrepareSourcesAndEvaluate(g, sf);
             g_dc->SetTarget(nullptr);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
             PrepareSourcesAndEvaluate(g, sf);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
 
             const float mean = AnalysisField(g.FindNode(statsId), L"Mean");
             TEST("SkipReadback_FlagOffAlwaysReadsBack", mean > 0.0f);
@@ -694,21 +670,15 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION,
             // First eval pair (fresh hint -> read).
             PrepareSourcesAndEvaluate(g, sf);
             g_dc->SetTarget(nullptr);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
             PrepareSourcesAndEvaluate(g, sf);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
 
             uint64_t beforeSkipped = ShaderLab::Performance::SkippedCpuReadbacks();
             for (int i = 0; i < 4; ++i)
             {
                 PrepareSourcesAndEvaluate(g, sf);
-                g_dc->BeginDraw();
                 CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-                g_dc->EndDraw();
             }
             uint64_t afterSkipped = ShaderLab::Performance::SkippedCpuReadbacks();
             TEST("SkipReadback_HintThrottleSkipsRepeatFrames",
@@ -722,9 +692,7 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION,
             if (statsNode)
                 statsNode->analysisOutput.fields.clear();
             PrepareSourcesAndEvaluate(g, sf);
-            g_dc->BeginDraw();
             CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-            g_dc->EndDraw();
             bool refreshed = statsNode &&
                 statsNode->analysisOutput.type == ShaderLab::Graph::AnalysisOutputType::Typed &&
                 !statsNode->analysisOutput.fields.empty();

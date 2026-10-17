@@ -1,9 +1,9 @@
 #include "pch_engine.h"
 #include "Shim.h"
 
-#include "../Engine/Mcp/McpTimeouts.h"
-#include "../Engine/Mcp/McpTypes.h"
-#include "../Version.h"
+#include "../Mcp/McpTimeouts.h"
+#include "../Mcp/McpTypes.h"
+#include "Version.h"
 
 #include <fcntl.h>
 #include <io.h>

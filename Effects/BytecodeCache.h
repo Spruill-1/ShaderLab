@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "ShaderCompiler.h"
 
 #include <atomic>
@@ -150,28 +149,28 @@ namespace ShaderLab::Effects
 
     // Helpers (also exposed so call sites can hash without going through
     // the cache, e.g. to compute a key for `TryGet`).
-    SHADERLAB_API uint64_t FNV1a64(const void* data, size_t size);
-    SHADERLAB_API uint64_t HashCanonicalSource(std::string_view canonical);
-    SHADERLAB_API uint64_t HashParamSignature(const std::vector<std::string>& orderedNames);
+    uint64_t FNV1a64(const void* data, size_t size);
+    uint64_t HashCanonicalSource(std::string_view canonical);
+    uint64_t HashParamSignature(const std::vector<std::string>& orderedNames);
     // Hashes the gpu-bindable and specialised option names together.
     // With no options this equals HashParamSignature(gpuNames).
-    SHADERLAB_API uint64_t HashParamSignature(const std::vector<std::string>& gpuNames,
+    uint64_t HashParamSignature(const std::vector<std::string>& gpuNames,
                                               const std::vector<std::string>& optionNames);
     // Covers the three engine headers and the cache schema.
-    SHADERLAB_API uint64_t IncludeLibraryHash();
-    SHADERLAB_API uint64_t IncludeLibraryHashOf(std::string_view paramsText, std::string_view colorMathText,
+    uint64_t IncludeLibraryHash();
+    uint64_t IncludeLibraryHashOf(std::string_view paramsText, std::string_view colorMathText,
                                                 std::string_view gamutText);
 
     // Centralized source canonicalization. Every call site that hashes
     // source MUST go through this so a render-time hash matches the
     // precompile-time hash even if the call site stored the source as
     // wstring vs string with different line-endings.
-    SHADERLAB_API std::string CanonicalizeHlslSource(std::wstring_view source);
-    SHADERLAB_API std::string CanonicalizeHlslSource(std::string_view source);
+    std::string CanonicalizeHlslSource(std::wstring_view source);
+    std::string CanonicalizeHlslSource(std::string_view source);
 
     // The cache itself. The engine uses the process instance; tests may
     // build their own.
-    class SHADERLAB_API BytecodeCache
+    class BytecodeCache
     {
     public:
         static BytecodeCache& Instance();

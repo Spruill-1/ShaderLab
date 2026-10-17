@@ -69,6 +69,8 @@ namespace ShaderLab::Rendering::Evaluator
         void ClearCpuAnalysisInterest();
         void RequestFreshCpuReadback(uint32_t nodeId) { m_nodes[nodeId].freshReadbackRequested = true; }
         uint32_t AppliedGpuBits(uint32_t nodeId) const;
+        winrt::com_ptr<ID3D11ShaderResourceView> AnalysisBuffer(uint32_t nodeId) const;
+        HRESULT WriteAnalysis(uint32_t nodeId, uint32_t firstElement, const float* float4s, uint32_t elementCount);
 
     private:
         // ---- per-node state ----------------------------------------------

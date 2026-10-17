@@ -1,6 +1,6 @@
 # ShaderLab Built-in Effects
 
-ShaderLab ships with **38 built-in ShaderLab effects** implemented in `Effects/ShaderLabEffects.h/.cpp`, on top of the **40+ wrapped built-in D2D effects** in `Effects/EffectRegistry.cpp`. Each ShaderLab effect has its HLSL embedded as a string constant, compiled at first use via `ShaderCompiler` (and cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` so subsequent sessions reuse the bytecode), and shares a common color math library (BT.709 / BT.2020 / DCI-P3 matrices, PQ / HLG transfer functions, CIE xy conversions, ICtCp). Every effect is versioned with `effectId` and `effectVersion` so saved graphs can be upgraded in place — see [Effect Versioning System](effect-versioning.md).
+ShaderLab ships with **38 built-in ShaderLab effects**, on top of the **40+ wrapped built-in D2D effects** in `Effects/EffectRegistry.cpp`. The 30 shader effects are written in `BuiltInEffects/BuiltInEffectTable.cpp` and reach a program as generated headers with their bytecode prebuilt ([Built-in effects](../architecture/effectgraph-api.md#built-in-effects)); the 8 without a shader (parameters, Clock, Numeric Expression, Random, Working Space) are in `Effects/ShaderLabEffects.cpp`. The shader effects share a common color math library (BT.709 / BT.2020 / DCI-P3 matrices, PQ / HLG transfer functions, CIE xy conversions, ICtCp). Every effect is versioned with `effectId` and `effectVersion` so saved graphs can be upgraded in place — see [Effect Versioning System](effect-versioning.md).
 
 The **Type** column below uses these abbreviations:
 

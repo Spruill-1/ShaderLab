@@ -24,7 +24,6 @@
 // Host-agnostic. Headless exposes it as --video and registers the
 // /render/video route (Mcp::RegisterVideoExportRoute); the GUI does not.
 
-#include "../EngineExport.h"
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -94,26 +93,26 @@ namespace ShaderLab::Rendering
 
     // Resolve ffmpeg: an explicit path must exist; otherwise search PATH.
     // Returns empty and fills `error` with instructions when neither works.
-    SHADERLAB_API std::wstring FindFfmpeg(const std::wstring& explicitPath, std::wstring& error);
+    std::wstring FindFfmpeg(const std::wstring& explicitPath, std::wstring& error);
 
     // The conversion math as HLSL functions (VideoEncodeHdr10 / VideoEncodeSdr
     // / VideoChromaHdr10 / VideoChromaSdr), without the kernel -- exposed so
     // the shader test bench can check them against reference values.
-    SHADERLAB_API const std::string& VideoConvertHelpersHLSL();
+    const std::string& VideoConvertHelpersHLSL();
 
     // Sets request.format, codec and mastering from their --video / MCP
     // spellings (hdr10|sdr, hevc|h265|av1|h264|avc, p3-1000|working-space|none;
     // empty picks the default). False, with `error` naming the valid values,
     // for anything else.
-    SHADERLAB_API bool ParseVideoOptions(const std::wstring& format, const std::wstring& codec,
+    bool ParseVideoOptions(const std::wstring& format, const std::wstring& codec,
                                          const std::wstring& mastering, VideoExportRequest& request,
                                          std::wstring& error);
 
     // The codec an export encodes with: Default is HEVC for HDR10 and H.264
     // for SDR. `error` says why the request's combination is refused.
-    SHADERLAB_API VideoCodec ResolveVideoCodec(const VideoExportRequest& request, std::wstring& error);
+    VideoCodec ResolveVideoCodec(const VideoExportRequest& request, std::wstring& error);
     // ffmpeg's encoder for a codec: libx265, libsvtav1 or libx264.
-    SHADERLAB_API const wchar_t* EncoderName(VideoCodec codec);
+    const wchar_t* EncoderName(VideoCodec codec);
 
     // An HDR10 mastering display: CIE xy primaries and white point, and its
     // luminance range in nits.
@@ -140,10 +139,10 @@ namespace ShaderLab::Rendering
 
     // ffmpeg's arguments, without the executable, for encoding raw p010le /
     // nv12 frames from stdin into request.outputPath.
-    SHADERLAB_API std::wstring BuildFfmpegArgs(const VideoExportRequest& request,
+    std::wstring BuildFfmpegArgs(const VideoExportRequest& request,
                                                const FfmpegEncodeSettings& settings);
 
-    SHADERLAB_API VideoExportResult ExportVideo(
+    VideoExportResult ExportVideo(
         const VideoExportRequest& request,
         Graph::GraphModel& graph,
         GraphEvaluator& evaluator,

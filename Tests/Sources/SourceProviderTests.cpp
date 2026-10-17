@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <windows.graphics.capture.interop.h>
 
 // The source side: the colour contract every provider meets (linear scRGB),
 // the image loader's error channel, the image cache's file stamp, the video
@@ -270,6 +271,43 @@ namespace ShaderLab::Tests
             factory.ReleaseCache();
             TEST("SourceSettle_TimeoutsBelongToTheFactory",
                  remembered && forgotten && !factory.VideoSettleTimedOut(3, L"C:\\clip.mp4", 1.5));
+        }
+
+        // The window or monitor picked for a capture is not a device resource:
+        // releasing the device's objects keeps it, and the capture reopens.
+        SL_TEST_CASE(TestCaptureItemSurvivesRelease, Tag::Gpu)
+        {
+            std::printf("\n=== A picked capture item survives a device release ===\n");
+            winrt::Windows::Graphics::Capture::GraphicsCaptureItem item{ nullptr };
+            try
+            {
+                auto interop = winrt::get_activation_factory<winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
+                                                             IGraphicsCaptureItemInterop>();
+                HMONITOR monitor = ::MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+                winrt::check_hresult(interop->CreateForMonitor(monitor,
+                    winrt::guid_of<winrt::Windows::Graphics::Capture::IGraphicsCaptureItem>(), winrt::put_abi(item)));
+            }
+            catch (const winrt::hresult_error&)
+            {
+                item = nullptr;   // no capture here (session 0, CI): reported as a skip below
+            }
+            if (!item)
+            {
+                SkipMissingFixture(L"a capture item for the primary monitor (no desktop session)");
+                return;
+            }
+
+            Graph::GraphModel graph;
+            SourceNodeFactory factory;
+            const uint32_t id = graph.AddNode(SourceNodeFactory::CreateWindowsGraphicsCaptureSourceNode());
+            factory.RegisterGraphicsCaptureItem(id, item);
+            const std::wstring notPicked = L"Choose a window or monitor for this Windows Graphics Capture source.";
+            factory.PrepareSourceNode(*graph.FindNode(id), g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+            const bool openedBefore = graph.FindNode(id)->runtimeError != notPicked;
+            factory.ReleaseCache();
+            factory.PrepareSourceNode(*graph.FindNode(id), g_dc.get(), g_d3dDevice.get(), g_d3dContext.get());
+            TEST("Capture_PickedBefore", openedBefore);
+            TEST("Capture_StillPickedAfterRelease", graph.FindNode(id)->runtimeError != notPicked);
         }
 
         SL_TEST_CASE(TestVideoColor, Tag::Fast | Tag::Video)

@@ -25,10 +25,10 @@
 //  * Snapshot nodes/edges are value copies of GraphModel state at the
 //    moment Build was called.
 
-#include "../EngineExport.h"
-#include "GraphModel.h"
-#include "EffectEdge.h"
-#include "EffectNode.h"
+#include "Graph/GraphModel.h"
+#include "Graph/EffectEdge.h"
+#include "Graph/EffectNode.h"
+#include "Graph/VideoSourceStatus.h"
 
 #include <cstdint>
 #include <memory>
@@ -37,21 +37,6 @@
 
 namespace ShaderLab::Graph
 {
-    // Playback state of one video source, copied from its provider on the
-    // render thread so the UI never touches a live provider.
-    struct VideoSourceStatus
-    {
-        std::uint32_t nodeId{ 0 };
-        bool open{ false };
-        bool loop{ false };
-        std::uint32_t width{ 0 };
-        std::uint32_t height{ 0 };
-        double frameRate{ 0.0 };
-        double duration{ 0.0 };
-        double position{ 0.0 };
-        std::uint64_t uploads{ 0 };
-    };
-
     struct GraphUiSnapshot
     {
         // Bumps every time a graph mutation is applied on the render thread
@@ -106,7 +91,7 @@ namespace ShaderLab::Graph
 
     // Build an immutable snapshot from the live graph. Caller must already
     // be on the render thread (the single writer of `graph`).
-    SHADERLAB_API std::shared_ptr<const GraphUiSnapshot> BuildGraphUiSnapshot(
+    std::shared_ptr<const GraphUiSnapshot> BuildGraphUiSnapshot(
         const GraphModel& graph,
         std::uint32_t previewNodeId,
         std::uint64_t graphGeneration,

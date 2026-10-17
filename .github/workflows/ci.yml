@@ -32,6 +32,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Engine boundary
+        shell: pwsh
+        run: ./scripts/Check-EngineBoundary.ps1
+
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 

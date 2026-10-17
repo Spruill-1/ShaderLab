@@ -1,7 +1,7 @@
 #pragma once
 
 #include "pch.h"
-#include "../Rendering/PixelTrace.h"
+#include "Rendering/PixelTrace.h"
 #include "../Rendering/PreviewViewState.h"
 
 namespace ShaderLab::Controls

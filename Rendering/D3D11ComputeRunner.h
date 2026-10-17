@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Effects/IEngineComputeOutput.h"
 #include "../Effects/IEngineComputeTexture.h"
 
@@ -24,7 +23,7 @@ namespace ShaderLab::Rendering
     // The COM implementation is no-op-refcounted: the runner is an interior
     // object of the bridge effect that holds it by value, valid while that
     // effect lives.
-    class SHADERLAB_API D3D11ComputeRunner
+    class D3D11ComputeRunner
         : public Effects::IEngineComputeOutput
         , public Effects::IEngineComputeTexture
     {
@@ -276,5 +275,12 @@ namespace ShaderLab::Rendering
         // Buffer -> texture copy dispatch. Runs only when the lane is
         // wanted AND available.
         void PublishAnalysisTexture();
+
+    public:
+        // Writes float4 elements into the results between dispatches, and
+        // refreshes the pixel-shader copy when one is published.
+        HRESULT WriteResults(uint32_t firstElement, const float* float4s, uint32_t elementCount);
+
+    private:
     };
 }

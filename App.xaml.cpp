@@ -1,8 +1,13 @@
 #include "pch.h"
 #include "App.xaml.h"
+// Every built-in shader effect, registered at startup.
+#include "EffectGraphBuiltIns.h"
 #include "MainWindow.xaml.h"
 #include "Rendering/RenderEngine.h"
-#include "Rendering/EffectGraphFile.h"
+#include "Support/EffectGraphFile.h"
+#include "Support/ShaderLabSupport.h"
+#include "Support/EffectPlugins.h"
+#include "Effects/ShaderLabEffects.h"
 #include "Graph/PropertyWrite.h"
 #include <ShlObj.h>
 #include <fstream>
@@ -61,6 +66,16 @@ namespace winrt::ShaderLab::implementation
 
     void App::OnLaunched([[maybe_unused]] LaunchActivatedEventArgs const& e)
     {
+        ::ShaderLab::Support::RegisterShaderLabSupport();
+        // Plugins from the install, then from the folder user effects load from.
+        auto plugins = ::ShaderLab::Support::LoadEffectPlugins();
+        const auto userPlugins = ::ShaderLab::Support::LoadEffectPluginsIn(
+            ::ShaderLab::Effects::ShaderLabEffects::DefaultUserEffectsDirectory());
+        plugins.insert(plugins.end(), userPlugins.begin(), userPlugins.end());
+        for (const auto& load : plugins)
+            OutputDebugStringW(std::format(L"[EffectPlugins] {} 0x{:08X}\n", load.path.wstring(),
+                                           static_cast<uint32_t>(load.result)).c_str());
+
         // Parse flags from command line. The MCP session starts with the
         // window unless SHADERLAB_MCP=0 or config.json's "mcp": false says not.
         std::wstring cmdLine = GetCommandLineW();
@@ -115,7 +130,7 @@ namespace winrt::ShaderLab::implementation
         // with the count of dirs reaped.
         if (cmdLine.find(L"--reap-now") != std::wstring::npos)
         {
-            uint64_t staleSec = ::ShaderLab::Rendering::cStaleMediaDirSec;
+            uint64_t staleSec = ::ShaderLab::Support::cStaleMediaDirSec;
 
             // Optional --reap-stale-sec=<N> override for tests that don't
             // want to wait through the default window.
@@ -136,9 +151,9 @@ namespace winrt::ShaderLab::implementation
             FILE* fp = nullptr;
             freopen_s(&fp, "CONOUT$", "w", stderr);
 
-            const auto stale = ::ShaderLab::Rendering::FindStaleMediaDirs(
-                ::ShaderLab::Rendering::TempDirectory(), staleSec);
-            const auto reap = ::ShaderLab::Rendering::ReapMediaDirs(stale);
+            const auto stale = ::ShaderLab::Support::FindStaleMediaDirs(
+                ::ShaderLab::Support::TempDirectory(), staleSec);
+            const auto reap = ::ShaderLab::Support::ReapMediaDirs(stale);
             for (const auto& [path, reason] : reap.failures)
                 fwprintf(stderr, L"[reap] FAIL   %s (%hs)\n", path.c_str(), reason.c_str());
             const uint32_t reaped = static_cast<uint32_t>(reap.deleted);

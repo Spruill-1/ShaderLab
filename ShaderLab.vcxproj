@@ -95,12 +95,12 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
     <ClCompile>
-      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
-      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -328,8 +328,8 @@
     <ProjectCapability Include="Msix" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="ShaderLabEngine.vcxproj">
-      <Project>{A7A1E0F1-665C-4D06-9AC7-6D6B6A0D0F01}</Project>
+    <ProjectReference Include="ShaderLabSupport.vcxproj">
+      <Project>{3C5E8A21-7B4D-4F6A-9E12-5D8C0B7A4E63}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <LinkLibraryDependencies>true</LinkLibraryDependencies>
     </ProjectReference>
@@ -346,15 +346,24 @@
     <None Include=".github\workflows\ci.yml" />
     <None Include=".github\workflows\release.yml" />
     <None Include=".gitignore" />
+    <None Include="LICENSE">
+      <DeploymentContent>true</DeploymentContent>
+    </None>
+    <None Include="THIRD-PARTY-NOTICES.txt">
+      <DeploymentContent>true</DeploymentContent>
+    </None>
     <None Include="packages.config" />
     <None Include=".gitmodules" />
     <None Include="scripts\Install.ps1" />
+    <None Include="scripts\Check-EngineBoundary.ps1" />
+    <None Include="scripts\ShaderLabOwnedFiles.txt" />
     <None Include="ShaderLab.vcxproj.filters" />
   </ItemGroup>
   <PropertyGroup Condition="'$(DisableHasPackageAndPublishMenuAddedByProject)'!='true' and '$(EnableMsixTooling)'=='true'">
     <HasPackageAndPublishMenu>true</HasPackageAndPublishMenu>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="build\EffectGraphEngine.targets" />
   <ImportGroup Label="ExtensionTargets">
     <Import Project="packages\Microsoft.Web.WebView2.1.0.3179.45\build\native\Microsoft.Web.WebView2.targets" Condition="Exists('packages\Microsoft.Web.WebView2.1.0.3179.45\build\native\Microsoft.Web.WebView2.targets')" />
     <Import Project="packages\Microsoft.Windows.SDK.BuildTools.MSIX.1.7.20250829.1\build\Microsoft.Windows.SDK.BuildTools.MSIX.targets" Condition="Exists('packages\Microsoft.Windows.SDK.BuildTools.MSIX.1.7.20250829.1\build\Microsoft.Windows.SDK.BuildTools.MSIX.targets')" />
@@ -373,23 +382,7 @@
     <Import Project="packages\Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\Microsoft.Windows.ImplementationLibrary.targets" Condition="Exists('packages\Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\Microsoft.Windows.ImplementationLibrary.targets')" />
   </ImportGroup>
   <!--
-    Copy ShaderLabEngine.dll into the app output and include it in the MSIX package payload.
-    The project reference uses ReferenceOutputAssembly=false (to link only the .lib), so the
-    .dll is not picked up automatically. It must be added to AppxPackagePayload BEFORE
-    _ComputeAppxPackagePayload runs, otherwise the deployed package will be missing the dll
-    and the launched app will fail with "ShaderLabEngine.dll was not found".
-  -->
-  <Target Name="CopyEngineRuntime" AfterTargets="Link" BeforeTargets="_ComputeAppxPackagePayload;AfterBuild" Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll')">
-    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
-    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.pdb" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.pdb')" />
-    <ItemGroup>
-      <AppxPackagePayload Include="$(OutDir)ShaderLabEngine.dll">
-        <TargetPath>ShaderLabEngine.dll</TargetPath>
-      </AppxPackagePayload>
-    </ItemGroup>
-  </Target>
-  <!--
-    Broker payload (stdio-migration Step 5). Mirrors CopyEngineRuntime:
+    Broker payload (stdio-migration Step 5). Like any hand-added payload, it
     must run BeforeTargets="_ComputeAppxPackagePayload" or the package
     builds clean with the Hub application's exe silently missing and
     activation fails at runtime.

@@ -1,11 +1,11 @@
 #include "pch.h"
 #include "PerfMcpRoutes.h"
 
-#include "../Engine/Mcp/McpArgs.h"
-#include "../Engine/Mcp/McpJsonWriter.h"
-#include "../Effects/Performance.h"
-#include "../Graph/GraphModel.h"
-#include "../Rendering/GpuTimer.h"
+#include "../Mcp/McpArgs.h"
+#include "../Mcp/McpJsonWriter.h"
+#include "Effects/Performance.h"
+#include "Graph/GraphModel.h"
+#include "Rendering/GpuTimer.h"
 #include "../Rendering/HostRenderSettings.h"
 #include "../Rendering/PreviewRenderStats.h"
 

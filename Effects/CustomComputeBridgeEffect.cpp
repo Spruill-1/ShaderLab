@@ -362,14 +362,19 @@ float4 main(
                 return Fail(DispatchStage::InputCopy, hr);
             cache = { std::move(created), w, h };
         }
-        // Draw the upstream chain into it; DrawImage does the format
-        // conversion, and Flush submits it (D2D batches until then).
+        // Draw the upstream chain into it in a session of its own; DrawImage
+        // does the format conversion, and EndDraw submits it (D2D batches
+        // until then).
+        HRESULT drawHr = S_OK;
         {
             Rendering::ScopedTarget target(dc, cache.bitmap.get());
+            dc->BeginDraw();
             dc->Clear(D2D1::ColorF(0, 0, 0, 0));
             dc->DrawImage(image, D2D1::Point2F(-static_cast<float>(px.left), -static_cast<float>(px.top)));
+            drawHr = dc->EndDraw();
         }
-        dc->Flush();
+        if (FAILED(drawHr))
+            return Fail(DispatchStage::InputCopy, drawHr);
 
         winrt::com_ptr<IDXGISurface> surface;
         if (const HRESULT hr = cache.bitmap->GetSurface(surface.put()); FAILED(hr))

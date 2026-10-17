@@ -39,22 +39,13 @@ namespace
         auto statsId = g.AddNode(std::move(statsNode));
         g.Connect(srcId, 0, statsId, 0);
         PrepareSourcesAndEvaluate(g, sf);
-        // Wrap ProcessDeferredCompute in a BeginDraw/EndDraw because
-        // DispatchUserD3D11Compute calls dc->DrawImage internally, and
-        // outside an active draw session that DrawImage is a silent
-        // no-op (the compute shader reads a black input texture).
-        // Mirrors MainWindow::RenderFrame's structure.
         // D2D custom effects need TWO evaluation passes for newly
         // created effects -- first creates/initializes, second
         // produces correct output.
         g_dc->SetTarget(nullptr);
-        g_dc->BeginDraw();
         CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-        g_dc->EndDraw();
         PrepareSourcesAndEvaluate(g, sf);
-        g_dc->BeginDraw();
         CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-        g_dc->EndDraw();
 
         auto* n = g.FindNode(statsId);
         TEST("LumStats_NodeExists", n != nullptr);

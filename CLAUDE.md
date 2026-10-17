@@ -7,8 +7,11 @@ The deep reference is [`docs/`](docs/README.md); this file is the part you need
 
 ## Hard rules
 
-- **C++/WinRT only. Never generate C#.** Direct COM access to `ID2D1EffectImpl`,
-  `ID2D1DrawTransform`, `ID2D1ComputeTransform` is the reason this project exists.
+- **C++/WinRT only. Never generate C#** for the engine, the app or the hosts. Direct
+  COM access to `ID2D1EffectImpl`, `ID2D1DrawTransform`, `ID2D1ComputeTransform` is
+  the reason this project exists. The one exception is `bindings/`: the C# (and
+  planned Rust) bindings over `EffectGraph.dll`'s C API and COM interfaces, and
+  their tests, which ship as packages for other languages.
 - **Every new `.cpp` starts with `#include "pch.h"`** (engine-side: `pch_engine.h`).
   Precompiled headers are mandatory; anything else fails to build.
 - **Docs are part of the change, not a follow-up.** A significant change updates the
@@ -63,25 +66,27 @@ Fastest inner loops, cheapest first:
 Prefer headless over the GUI when a question can be answered numerically: it needs no
 deploy, no registration, and gives FP32 readback via `--pixels`.
 
-## The graph-access rule (read before touching `m_graph` from UI code)
+## The graph-access rule (read before touching the live graph from UI code)
 
+The live graph is the GUI's EffectGraph context's `GraphModel`: `MainWindow::Model()`,
+and `NodeGraphController::m_graph` points at it.
 The render worker is the **single writer** of the live `GraphModel` and writes
 continuously — clock-node property inserts every tick, plus every MCP mutation.
 Getting this wrong is a data race that surfaces as an access violation deep inside
 `std::map`, **not** a compile error. Two such crashes shipped before the rule was
 written down; both were `node->properties.find()` from the UI thread during paint.
 
-1. **UI-thread reads → the per-frame `GraphUiSnapshot`, never `m_graph`.**
+1. **UI-thread reads → the per-frame `GraphUiSnapshot`, never `Model()`.**
    `MainWindow::CurrentGraphSnapshot()` / `NodeGraphController::Snapshot()`. At most
    one frame stale. Hold the `shared_ptr` for the whole read.
 2. **Writes (any thread) → `RenderThreadDispatcher::DispatchSync`.** Never mutate
-   `m_graph` from a pointer or interaction handler.
+   `Model()` from a pointer or interaction handler.
 3. **Layout computation** (`RebuildLayout` / `AutoLayout` / `ComputeNodeVisual`) →
-   live `m_graph`, **render thread only** (it must see post-mutation state).
+   live `Model()`, **render thread only** (it must see post-mutation state).
    UI callers use `NodeGraphController::RequestRelayout` / `RequestAutoLayout`,
    which dispatch; the canvas's own commands relayout inside their closures.
 
-`m_graph` itself has no lock: only the render worker touches it.
+The live graph has no lock: only the render worker touches it.
 `NodeGraphController::m_visualsMutex` is the one lock here. Never hold it across
 a `DispatchSync` (a dispatched relayout takes it on the render thread, so that
 deadlocks); don't hold references into `m_visuals` across a dispatch (copy by
@@ -96,25 +101,27 @@ The full list — and it is worth reading before writing any D2D effect — is i
 Effect Gotchas* and [`docs/architecture/d2d-d3d11-hybrid-compute.md`](docs/architecture/d2d-d3d11-hybrid-compute.md).
 The ones that bite most often:
 
-- **The draw-session contract is split, and both halves matter.**
-  `ProcessDeferredCompute` must run **inside** an active `BeginDraw`/`EndDraw` — it
-  calls `dc->DrawImage` internally; outside a draw session that silently no-ops and
-  the compute reads black (Min/Max/Mean all 0, no error anywhere). But
-  `GraphEvaluator::Evaluate` must run **outside** one: the D2D Histogram and
-  custom-analysis readbacks open their *own* `BeginDraw`, and nesting that fails
-  with `D2DERR_WRONG_STATE` (`0x88990001`). Any post-dispatch `Evaluate` sweep that
-  must happen inside the session runs as `Evaluate(EvalMode::Frozen)` so it cannot
-  re-queue a compute node (the Histogram defers its read to the next frame).
-  `Rendering::FrameExecutor::Run` owns this shape, and every host and test renders
-  through it (`MainWindow::RenderFrameToOffscreen`, `HeadlessEngine`) — call it,
-  don't re-sequence the passes yourself. History worth knowing:
+- **Evaluation runs with no draw session open on its device context.**
+  `GraphEvaluator::Evaluate` and `ProcessDeferredCompute` each open a session only
+  for their own drawing (an analysis readback, a compute input the shader cannot
+  read in place) and close it, so calling either inside a `BeginDraw` on the same
+  context nests and fails with `D2DERR_WRONG_STATE` (`0x88990001`); a compute
+  input render that fails fails its node. The post-dispatch sweep runs as
+  `Evaluate(EvalMode::Frozen)` so it cannot re-queue a compute node.
+  `Rendering::FrameExecutor::Run` owns the order, opens a session only for the
+  host's draw, and every host and test renders through it
+  (`MainWindow::RenderFrameToOffscreen`, `HeadlessEngine`) — call it, don't
+  re-sequence the passes yourself. Until 2026-10-16 the frame ran inside one
+  session and `ProcessDeferredCompute` *required* it (outside one its `DrawImage`
+  silently no-oped and compute read black); decision #221. History worth knowing:
   `Evaluate` used to pre-render compute inputs too (`PreRenderInputBitmap`, deleted
   2026-09-25), and getting the split wrong looked like a property-plumbing bug —
   correct on the first frame, then black or **stale** after the first `set-property`.
   Compute inputs are now pre-rendered only inside `ProcessDeferredCompute`, after
   any same-pass producer has dispatched (decision #95).
-- **D2D→D3D11 texture handoff needs an explicit `dc->Flush()`** between `DrawImage`
-  and any D3D11 read, or D3D11 reads zeros.
+- **D2D→D3D11 texture handoff needs the draw submitted** — `EndDraw`, or an
+  explicit `dc->Flush()` inside a session — between `DrawImage` and any D3D11 read,
+  or D3D11 reads zeros.
 - **New D2D custom effects need two evaluation passes** before output is correct.
 - **`D3DCOMPILE_WARNINGS_ARE_ERRORS` optimizes out cbuffer vars** not referenced on
   *all* paths — read every cbuffer var at the top of `main()` before branching.
@@ -146,7 +153,7 @@ The ones that bite most often:
 **MCP-specific:** untyped (`{}`-schema) tool args arrive from Claude Code as JSON
 **strings** — `"203"`, `"true"`. `Graph::WriteProperty` (`Graph/PropertyWrite.cpp`)
 coerces them to the parameter's real type, and both `/graph/set-property`
-(`Engine/Mcp/Routes/PropertyRoutes.cpp`) and `/graph/apply` (`Routes/GraphPatch.cpp`)
+(`Mcp/Routes/PropertyRoutes.cpp`) and `/graph/apply` (`Routes/GraphPatch.cpp`)
 write through it. Keep it that way when touching those paths; without the coercion
 bindings break, shaders read 0, and clocks freeze.
 Diagnostic tell: `graph_get_node` printing `"203"` (quoted = string, broken) vs
@@ -189,16 +196,30 @@ golden-image comparison, and feeding back in as an Image source.
 
 ## Layout
 
-Five projects around one host-agnostic engine:
+Projects around one host-agnostic engine library:
 
-- `ShaderLabEngine.dll` — `Graph/` (model + `GraphUiSnapshot`), `Rendering/`
+- `ShaderLabEngine.lib` — a static library every program links: `Graph/` (the model), `Rendering/`
   (evaluator, `D3D11ComputeRunner`, `DisplayMonitor`, ICC, capture), `Effects/`
-  (built-in effect library with embedded HLSL, registry, compiler, sources),
-  `Engine/Mcp/` (router, JSON-RPC, tool catalog, engine-pure routes, broker crypto),
+  (effect registry, compiler, sources; the built-in shader effects are generated
+  headers, below),
   `Engine/Api/` (EffectGraph, the public COM API for other D3D11 programs: see
   [`docs/architecture/effectgraph-api.md`](docs/architecture/effectgraph-api.md)).
-  `SHADERLAB_ENGINE_ABI_VERSION` in `EngineExport.h` is bumped **manually** on ABI
-  breaks; a mismatch aborts host startup.
+  Nothing is exported from it; there is no engine ABI to keep in step.
+- `ShaderLabSupport.lib` — ShaderLab's programs only, never EffectGraph: `Mcp/` (router,
+  JSON-RPC, tool catalog, the engine routes, broker crypto), ExprTk behind the
+  engine's Numeric Expression hook, `.effectgraph` files (miniz), the
+  `/graph/load-file` / `save-file` routes, and host pieces that sit in the engine's
+  folders (`GraphUiSnapshot`, `GraphLayout`, `RenderThreadDispatcher`, `FramePacer`,
+  `PreviewViewState`, `VideoExport`; the full list is `scripts/ShaderLabOwnedFiles.txt`).
+  Engine code must not include them: `scripts/Check-EngineBoundary.ps1` (CI) fails if it does.
+  ShaderLab code includes engine headers from the root (`"Graph/GraphModel.h"`), never by
+  `../` paths, so it builds the same against this tree or the `EffectGraph.Engine` package
+  (`build/EffectGraphEngine.targets`; `scripts/Test-SplitBuild.ps1` rehearses that). Hosts call `Support::RegisterShaderLabSupport()`
+  at startup. It keeps third-party code out of EffectGraph, which is MIT-0
+  (`LICENSE-EffectGraph`); ShaderLab is MIT.
+- `EffectGraph.dll` — the engine for other programs: exports only the EffectGraph C
+  API (7 functions, including plugin loading) and COM interfaces, with the public header and built-in effect
+  headers in its `include\` folder. ShaderLab's own programs do not use it.
 - `ShaderLab.exe` — WinUI 3 packaged app: XAML, `Controls/` controllers,
   `RenderEngine`, the render worker, app-side MCP routes.
 - `ShaderLabHeadless.exe` — console host, no WinUI. PNG render, FP32 readback,
@@ -207,7 +228,11 @@ Five projects around one host-agnostic engine:
   `--stdio` is the client shim. Does **not** link the engine.
 - `ShaderLabTests.exe` — standalone runner, no WinUI, WARP-capable.
 - `EffectGraphCompile.exe` — builds an effect blob from an Effect Designer `.json` at a
-  consuming project's build (`build/EffectGraph.targets` runs it).
+  consuming project's build (`build/EffectGraph.targets` runs it), and with `--builtins`
+  writes a header per built-in shader effect from `BuiltInEffects.lib`
+  (`BuiltInEffects/BuiltInEffectTable.cpp`, where built-ins are edited). The app,
+  headless and tests include `EffectGraphBuiltIns.h` through
+  `build/EffectGraphBuiltIns.targets`; the engine DLL holds no built-in HLSL.
 
 Pipeline is **always scRGB FP16 linear light** (1.0 = 80 nits), no format switching,
 no built-in tone-mapping pass — tone mappers are composed as graph effects (the ICtCp

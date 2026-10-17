@@ -88,6 +88,24 @@ namespace ShaderLab::Rendering::Evaluator
         return runtime ? runtime->instance.bridgeImpl : nullptr;
     }
 
+    winrt::com_ptr<ID3D11ShaderResourceView> EvaluatorCore::AnalysisBuffer(uint32_t nodeId) const
+    {
+        winrt::com_ptr<ID3D11ShaderResourceView> srv;
+        winrt::com_ptr<Effects::IEngineComputeOutput> output;
+        // The bridge impl, not the D2D effect: D2D's outer QueryInterface
+        // does not reach the impl's interfaces.
+        if (auto* bridge = BridgeFor(nodeId);
+            bridge && SUCCEEDED(bridge->QueryInterface(__uuidof(Effects::IEngineComputeOutput), output.put_void())))
+            output->GetAnalysisSrv(srv.put());
+        return srv;
+    }
+
+    HRESULT EvaluatorCore::WriteAnalysis(uint32_t nodeId, uint32_t firstElement, const float* float4s, uint32_t elementCount)
+    {
+        auto* bridge = BridgeFor(nodeId);
+        return bridge ? bridge->WriteResults(firstElement, float4s, elementCount) : E_NOT_VALID_STATE;
+    }
+
     uint32_t EvaluatorCore::AppliedGpuBits(uint32_t nodeId) const
     {
         const auto* runtime = FindRuntime(nodeId);
@@ -353,18 +371,10 @@ namespace ShaderLab::Rendering::Evaluator
         PublishOutput(node, effect);
 
         // An analysis effect (Histogram) computes when its output is drawn,
-        // so read it back when something changed -- but never in a frozen
-        // pass: that runs inside the host's BeginDraw, where the readback's
-        // own BeginDraw would fail (D2DERR_WRONG_STATE). The node stays dirty
-        // and is read on the next frame.
+        // so read it back when something changed.
         if (wasDirty && node.effectClsid.has_value() &&
             IsEqualGUID(node.effectClsid.value(), CLSID_D2D1Histogram))
-        {
-            if (m_frozen)
-                node.dirty = true;
-            else
-                ReadHistogramOutput(dc, effect, node);
-        }
+            ReadHistogramOutput(dc, effect, node);
     }
 
     void EvaluatorCore::VisitParameterNode(GraphModel& graph, EffectNode& node)

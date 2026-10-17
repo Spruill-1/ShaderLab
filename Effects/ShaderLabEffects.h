@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Graph/EffectNode.h"
 
 namespace ShaderLab::Effects
@@ -122,7 +121,7 @@ namespace ShaderLab::Effects
 
     // Registry of all ShaderLab pre-built effects, plus any user effects
     // registered from outside the build (LoadUserEffects).
-    class SHADERLAB_API ShaderLabEffects
+    class ShaderLabEffects
     {
     public:
         static ShaderLabEffects& Instance();
@@ -166,17 +165,21 @@ namespace ShaderLab::Effects
         // and becomes each descriptor's sourcePath. With `compileCheck` an
         // effect must compile first; an effect blob brings its own bytecode.
         // Returns the names registered. `accept`, when set, picks which of the
-        // JSON's effects to register. Same startup rule as LoadUserEffects.
+        // JSON's effects to register; `adopt`, when set, may change each one
+        // first (an effect blob makes its built-ins built-in). A built-in that
+        // is already registered at the same version counts as registered.
+        // Same startup rule as LoadUserEffects.
         std::vector<std::wstring> RegisterEffectsFromJson(
             std::wstring_view json, const std::wstring& source, bool compileCheck, UserEffectLoadReport& report,
-            const std::function<bool(const ShaderLabEffectDescriptor&)>& accept = {});
+            const std::function<bool(const ShaderLabEffectDescriptor&)>& accept = {},
+            const std::function<void(ShaderLabEffectDescriptor&)>& adopt = {});
 
         // %LOCALAPPDATA%\ShaderLab\effects, or empty if it cannot be resolved.
         static std::wstring DefaultUserEffectsDirectory();
 
     private:
         ShaderLabEffects();
-        void RegisterAll();
+        void RegisterAlwaysAvailable();
 
         std::vector<ShaderLabEffectDescriptor> m_effects;
         UserEffectLoadReport m_userReport;
@@ -186,7 +189,7 @@ namespace ShaderLab::Effects
     // the descriptor id a node's CustomEffectDefinition records. The evaluator
     // reaches them through this interface rather than the catalog singleton.
     // Returned pointers stay valid while the provider is unchanged.
-    class SHADERLAB_API IEffectHooks
+    class IEffectHooks
     {
     public:
         virtual ~IEffectHooks() = default;
@@ -197,21 +200,21 @@ namespace ShaderLab::Effects
     };
 
     // Hooks from ShaderLabEffects::Instance(), the evaluator's default.
-    SHADERLAB_API const IEffectHooks& BuiltInEffectHooks();
+    const IEffectHooks& BuiltInEffectHooks();
 
     // The conflict policy LoadUserEffects applies; public so tests can call it.
-    SHADERLAB_API UserEffectConflict ResolveUserEffectConflict(
+    UserEffectConflict ResolveUserEffectConflict(
         const ShaderLabEffectDescriptor& existing,
         const ShaderLabEffectDescriptor& incoming);
 
     // Shared HLSL color math functions. Shaders get them with
     // #include "shaderlab_colormath.hlsli"; the text has an include guard.
     inline constexpr const char* cColorMathIncludeName = "shaderlab_colormath.hlsli";
-    SHADERLAB_API const std::string& GetColorMathHLSL();
+    const std::string& GetColorMathHLSL();
 
     // Gamut boundary search and the ICtCp Gamut Boundary LUT's geometry,
     // stamp and reader, as #include "shaderlab_gamut.hlsli". It includes the
     // color math itself and has an include guard.
     inline constexpr const char* cGamutIncludeName = "shaderlab_gamut.hlsli";
-    SHADERLAB_API const std::string& GetGamutHLSL();
+    const std::string& GetGamutHLSL();
 }

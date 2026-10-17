@@ -35,6 +35,21 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 
+// What the engine library links against, so every program that links it does.
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "dxguid.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "mscms.lib")
+#pragma comment(lib, "windowsapp.lib")
+#pragma comment(lib, "Cabinet.lib")
+#pragma comment(lib, "bcrypt.lib")
+
 // STL
 #include <algorithm>
 #include <array>

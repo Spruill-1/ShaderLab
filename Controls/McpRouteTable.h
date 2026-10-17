@@ -17,7 +17,7 @@
 // table may be discarded once the routes are added; each route keeps what
 // it needs.
 
-#include "../Engine/Mcp/McpRouter.h"
+#include "../Mcp/McpRouter.h"
 #include "../Rendering/RenderThreadDispatcher.h"
 
 #include <functional>

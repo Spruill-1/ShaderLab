@@ -3,13 +3,13 @@
 
 #include "../../Graph/GraphModel.h"
 #include "../../Rendering/GraphEvaluator.h"
-#include "../../Engine/Mcp/McpArgs.h"
-#include "../../Engine/Mcp/McpJsonWriter.h"
-#include "../../Engine/Mcp/McpJsonRpc.h"
-#include "../../Engine/Mcp/McpRouter.h"
-#include "../../Engine/Mcp/McpSessionClient.h"
-#include "../../Engine/Mcp/McpToolCatalog.h"
-#include "../../Engine/Mcp/EngineMcpRoutes.h"
+#include "../../Mcp/McpArgs.h"
+#include "../../Mcp/McpJsonWriter.h"
+#include "../../Mcp/McpJsonRpc.h"
+#include "../../Mcp/McpRouter.h"
+#include "../../Mcp/McpSessionClient.h"
+#include "../../Mcp/McpToolCatalog.h"
+#include "../../Mcp/EngineMcpRoutes.h"
 #include "Graph/GraphEdits.h"
 
 #include <cstdio>
@@ -18,8 +18,8 @@
 
 // The engine's MCP routes as a client sees them: the JSON writer every body
 // goes through, error codes, argument coercion, /graph/apply's all-or-nothing
-// contract, and the server faults that must not read as bad requests. No
-// device: a graph-only sink.
+// contract, and the server faults that must not read as bad requests. The
+// sink is a bare context on the shared device, with no host hooks.
 namespace ShaderLab::Tests
 {
     namespace
@@ -28,17 +28,15 @@ namespace ShaderLab::Tests
 
         struct GraphOnlySink : Mcp::IEngineCommandSink
         {
-            Graph::GraphModel graph;
-            Rendering::GraphEvaluator evaluator;
+            winrt::com_ptr<IEffectGraphContextInternal> context = CreateTestContext();
+            Graph::GraphModel& graph = context->Model();
             bool throwOnNodeChanged{ false };
             int nodesAdded{ 0 };
 
             Mcp::Response Dispatch(std::function<Mcp::Response(Mcp::EngineContext&)> closure) override
             {
-                Mcp::EngineContext context;
-                context.graph = &graph;
-                context.evaluator = &evaluator;
-                return closure(context);
+                Mcp::EngineContext engineContext(*context);
+                return closure(engineContext);
             }
             void OnNodeAdded(uint32_t) override { ++nodesAdded; }
             void OnNodeChanged(uint32_t) override

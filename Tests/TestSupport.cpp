@@ -1,6 +1,7 @@
 #include "pch_engine.h"
 #include "TestSupport.h"
 #include "ShaderTestBench.h"
+#include "Rendering/DeviceStack.h"
 #include "Rendering/SourceRuntime.h"
 #include "Effects/EffectRegistry.h"
 #include "Engine/Utf8.h"
@@ -17,18 +18,49 @@ namespace ShaderLab::Tests
 
     namespace
     {
+        winrt::com_ptr<IEffectGraphContextInternal> s_caseContext;
         std::unique_ptr<Rendering::GraphEvaluator> s_caseEvaluator;
         std::unique_ptr<ShaderTestBench> s_bench;
     }
 
+    winrt::com_ptr<IEffectGraphContextInternal> CreateTestContext()
+    {
+        winrt::com_ptr<IEffectGraphContextInternal> context;
+        winrt::check_hresult(EffectGraphCreateContext(g_d3dDevice.get(), nullptr,
+            __uuidof(IEffectGraphContextInternal), context.put_void()));
+        // The process defaults the cases set, as ShaderLab's hosts pin their own.
+        context->Evaluator().FollowDefaultOptions();
+        return context;
+    }
+
+    IEffectGraphContextInternal& CaseContext()
+    {
+        if (!s_caseContext) BeginCaseContext();
+        return *s_caseContext;
+    }
+
     Rendering::GraphEvaluator& CaseEvaluator()
     {
-        if (!s_caseEvaluator) s_caseEvaluator = std::make_unique<Rendering::GraphEvaluator>();
-        return *s_caseEvaluator;
+        return s_caseEvaluator ? *s_caseEvaluator : CaseContext().Evaluator();
     }
 
     void ResetCaseEvaluator() { s_caseEvaluator = std::make_unique<Rendering::GraphEvaluator>(); }
-    void ReleaseCaseEvaluator() { s_caseEvaluator.reset(); }
+
+    void BeginCaseContext()
+    {
+        EndCaseContext();
+        s_caseContext = CreateTestContext();
+        g_dc.copy_from(s_caseContext->DeviceContext());
+        g_d2dFactory = s_caseContext->Devices().d2dFactory;
+    }
+
+    void EndCaseContext()
+    {
+        s_caseEvaluator.reset();
+        g_dc = nullptr;
+        g_d2dFactory = nullptr;
+        s_caseContext = nullptr;
+    }
 
     ShaderTestBench& Bench()
     {

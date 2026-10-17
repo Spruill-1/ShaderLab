@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 
 namespace ShaderLab::Graph
 {
@@ -27,7 +26,7 @@ namespace ShaderLab::Graph
 
     // The kind of a node. A marker counts only when it is a true bool. An
     // Image node with an empty path is still an Image: it has no file yet.
-    SHADERLAB_API SourceKind ClassifySource(const EffectNode& node);
+    SourceKind ClassifySource(const EffectNode& node);
 
     // DesktopDuplication or GraphicsCapture.
     inline bool IsLiveCapture(SourceKind kind)

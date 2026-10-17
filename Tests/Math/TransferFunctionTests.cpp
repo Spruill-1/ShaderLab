@@ -14,7 +14,7 @@ namespace ShaderLab::Tests
         std::printf("\n=== Math: Transfer Functions ===\n");
 
         // ---- API anchors ---------------------------------------------------
-        // Note: PQ_InvEOTF in Effects/ShaderLabEffects.cpp takes L *in nits*
+        // Note: PQ_InvEOTF in Effects/ColorMath.cpp takes L *in nits*
         // (it divides by 10000 internally), not normalized [0,1]. PQ_EOTF
         // takes the normalized PQ signal [0,1] and returns nits. So the
         // round trip "x nits -> PQ_InvEOTF -> N -> PQ_EOTF -> y nits" should

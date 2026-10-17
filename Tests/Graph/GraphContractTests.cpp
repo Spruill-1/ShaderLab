@@ -2,6 +2,7 @@
 #include "../TestSupport.h"
 
 #include "../../Graph/GraphModel.h"
+#include "Engine/Api/EffectGraphVersion.h"
 #include "../../Graph/NodeContracts.h"
 #include "../../Graph/SourceKind.h"
 #include "../../Effects/ShaderLabEffects.h"
@@ -492,6 +493,31 @@ namespace ShaderLab::Tests
             authored.customEffect.emplace();
             const auto own = Effects::CompileIdentityOf(authored);
             TEST("Identity_AuthoredUsesName", own.effectId == L"Mine" && own.effectVersion == 1);
+        }
+
+        SL_TEST_CASE(TestGraphFormatVersion, Tag::Fast)
+        {
+            std::printf("\n=== Graph format version ===\n");
+            GraphModel graph;
+            const auto saved = WDJ::JsonObject::Parse(graph.ToJson());
+            TEST("FormatVersion_Written", saved.GetNamedNumber(L"formatVersion") == cGraphFormatVersion);
+            TEST("FormatVersion_EffectGraphVersionWritten",
+                 saved.GetNamedString(L"effectGraphVersion") == winrt::to_hstring(EFFECTGRAPH_VERSION_STRING));
+            TEST("FormatVersion_NoAppVersion", !saved.HasKey(L"appVersion"));
+
+            auto refusal = [](const wchar_t* json) -> std::string
+            {
+                try { GraphModel::FromJson(json); }
+                catch (const std::exception& e) { return e.what(); }
+                return {};
+            };
+            const auto newer = refusal(LR"({"formatVersion":99,"effectGraphVersion":"9.9.9","nodes":[],"edges":[]})");
+            TEST("FormatVersion_NewerRefused", newer.find("format 99") != std::string::npos &&
+                 newer.find("EffectGraph 9.9.9") != std::string::npos);
+            const auto legacy = refusal(LR"({"formatVersion":99,"appVersion":"1.9.0","nodes":[],"edges":[]})");
+            TEST("FormatVersion_LegacyAppVersionNamed", legacy.find("ShaderLab 1.9.0") != std::string::npos);
+            TEST("FormatVersion_CurrentLoads",
+                 refusal(LR"({"formatVersion":2,"appVersion":"1.9.0","nodes":[],"edges":[]})").empty());
         }
     }
 }

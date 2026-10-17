@@ -42,9 +42,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="EngineExport.h">
-      <Filter>Engine</Filter>
-    </ClInclude>
     <ClInclude Include="pch_engine.h">
       <Filter>Engine</Filter>
     </ClInclude>
@@ -140,8 +137,17 @@
     <ClCompile Include="Tests\Persistence\PackageTests.cpp">
       <Filter>Tests\Persistence</Filter>
     </ClCompile>
+    <ClCompile Include="Tests\Api\EffectGraphPluginTests.cpp">
+      <Filter>Tests\Api</Filter>
+    </ClCompile>
     <ClCompile Include="Tests\Api\EffectGraphApiTests.cpp">
       <Filter>Tests\Api</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Api\EffectGraphDllTests.cpp">
+      <Filter>Tests\Api</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Effects\BuiltInEffectTests.cpp">
+      <Filter>Tests\Effects</Filter>
     </ClCompile>
     <ClCompile Include="Tests\Effects\EffectBlobTests.cpp">
       <Filter>Tests\Effects</Filter>

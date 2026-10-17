@@ -2,7 +2,7 @@
 
 #include "pch.h"
 #include "../Graph/GraphUiSnapshot.h"
-#include "../Effects/PropertyMetadata.h"
+#include "Effects/PropertyMetadata.h"
 
 #include <functional>
 #include <map>

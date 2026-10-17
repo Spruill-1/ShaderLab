@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Graph/EffectNode.h"
 
 namespace ShaderLab::Graph
@@ -37,12 +36,12 @@ namespace ShaderLab::Effects
     // `graph`), "Desktop Duplication" / "DXGI Duplicate Output" / "Display
     // Capture" (fails, listing the outputs, when the adapter:output pair does
     // not exist), and "Video Source" / "Video" / "Image Source" / "Image".
-    SHADERLAB_API NodeCreateResult CreateNodeByName(
+    NodeCreateResult CreateNodeByName(
         std::wstring_view name, const NodeCreateArgs& args, const Graph::GraphModel& graph);
 
     // A node running an authored custom effect: one input pin per input name,
     // an output pin and the custom effect's CLSID unless it is a D3D11 compute
     // (data only), each parameter at its default, and contracts derived from
     // those properties as a loaded graph's would be.
-    SHADERLAB_API Graph::EffectNode CreateCustomEffectNode(Graph::CustomEffectDefinition definition, std::wstring name);
+    Graph::EffectNode CreateCustomEffectNode(Graph::CustomEffectDefinition definition, std::wstring name);
 }

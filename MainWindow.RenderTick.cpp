@@ -69,6 +69,15 @@ namespace winrt::ShaderLab::implementation
         winrt::Windows::Foundation::IInspectable const& /*args*/)
     {
         if (m_isShuttingDown) return;
+        // Before the initialized check: after a failed recovery there is no
+        // render engine, and this is what brings it back.
+        if (!m_adapterSwitchInProgress.load(std::memory_order_acquire) &&
+            (FAILED(m_deviceLost.load(std::memory_order_acquire)) ||
+             (m_deviceUnavailable.load(std::memory_order_acquire) && std::chrono::steady_clock::now() >= m_nextDeviceRetry)))
+        {
+            RecoverDevice();
+            return;
+        }
         if (!m_renderEngine.IsInitialized()) return;
 
         try
@@ -192,7 +201,7 @@ namespace winrt::ShaderLab::implementation
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
         m_renderDispatcher.RegisterConsumer();
         // The source runtime is this thread's while it runs.
-        m_sourceFactory.SetOwnerThread(std::this_thread::get_id());
+        Sources().SetOwnerThread(std::this_thread::get_id());
 
         auto last = std::chrono::steady_clock::now();
         ::ShaderLab::Rendering::FramePacer pacer(m_targetRefreshHz.load(std::memory_order_relaxed));
@@ -225,6 +234,13 @@ namespace winrt::ShaderLab::implementation
                 break;
             if (m_isShuttingDown) break;
             if (!m_renderEngine.IsInitialized()) continue;
+            // A removed device renders nothing more; the UI tick recovers.
+            if (FAILED(m_deviceLost.load(std::memory_order_acquire))) continue;
+            if (const HRESULT removed = m_renderEngine.D3DDevice()->GetDeviceRemovedReason(); FAILED(removed))
+            {
+                m_deviceLost.store(removed, std::memory_order_release);
+                continue;
+            }
 
             auto now = std::chrono::steady_clock::now();
             double dt = std::chrono::duration<double>(now - last).count();
@@ -243,27 +259,27 @@ namespace winrt::ShaderLab::implementation
                 // context to avoid cross-context state races.
                 if (auto* dc5 = static_cast<ID2D1DeviceContext5*>(m_renderEngine.RenderD2DContext()))
                 {
-                    auto nodes = m_graph.MutableNodes();
-                    if (m_sourceFactory.TickAndUploadLiveCaptures(nodes, dc5))
+                    auto nodes = Model().MutableNodes();
+                    if (Sources().TickAndUploadLiveCaptures(nodes, dc5))
                         m_forceRender = true;
                 }
 
-                ::ShaderLab::Graph::AdvanceClocks(m_graph, dt);
+                ::ShaderLab::Graph::AdvanceClocks(Model(), dt);
 
-                m_graphEvaluator.ResolveSourceBindings(m_graph);
+                Evaluator().ResolveSourceBindings(Model());
 
                 if (auto* dc = m_renderEngine.RenderD2DContext())
                 {
                     // Per-video failures land on their nodes; anything else
                     // reaches the tick's own handler.
-                    m_sourceFactory.TickAndUploadVideos(m_graph.MutableNodes(), dc);
+                    Sources().TickAndUploadVideos(Model().MutableNodes(), dc);
                 }
 
                 // Before the dirty check, so a change counts for the nodes it reaches.
-                m_graph.PropagateDirtyDownstream();
+                Model().PropagateDirtyDownstream();
 
                 bool wasForceRender = m_forceRender;
-                bool hasDirty = m_graph.HasDirtyNodes();
+                bool hasDirty = Model().HasDirtyNodes();
                 // Open output windows need a frame every tick even when
                 // nothing is dirty (a static source feeding an Output node).
                 const bool hasOutputWindows = !LiveSinkNodeIds(m_outputSinksMutex, m_outputSinks).empty();
@@ -282,7 +298,7 @@ namespace winrt::ShaderLab::implementation
                 // An async analysis readback still in flight needs frames to
                 // land: its values arrive on a later Evaluate, which then
                 // re-dirties whatever is bound to them.
-                bool pendingReadback = m_graphEvaluator.HasPendingReadbacks();
+                bool pendingReadback = Evaluator().HasPendingReadbacks();
                 bool needsEval = hasDirty || Preview().FitPending() || m_forceRender
                               || hasOutputWindows || gpuTiming || forceRedraw
                               || unthrottled || pendingReadback;
@@ -303,7 +319,7 @@ namespace winrt::ShaderLab::implementation
                 // re-reads the file when its path changes (SourceNodeFactory),
                 // so this measures the pipeline, not disk and WIC.
                 if (needsEval && forceRedraw)
-                    m_graph.MarkAllDirty();
+                    Model().MarkAllDirty();
                 if (needsEval)
                 {
                     // Taken before the frame, so an edit made while it renders
@@ -341,15 +357,15 @@ namespace winrt::ShaderLab::implementation
         }
 
         m_renderDispatcher.Drain();
-        m_sourceFactory.SetOwnerThread({});
+        Sources().SetOwnerThread({});
     }
 
     void MainWindow::PublishGraphSnapshot()
     {
         auto snapshot = ::ShaderLab::Graph::BuildGraphUiSnapshot(
-            m_graph, Preview().NodeId(), m_graphGeneration,
+            Model(), Preview().NodeId(), m_graphGeneration,
             m_frameGeneration.load(std::memory_order_acquire),
-            m_sourceFactory.VideoSourceStatuses());
+            Sources().VideoSourceStatuses());
         std::atomic_store(&m_uiGraphSnapshot,
             std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>(std::move(snapshot)));
     }
@@ -415,7 +431,7 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::RenderFrameToOffscreen()
     {
-        // Render worker only: it writes m_graph and uses the render context.
+        // Render worker only: it writes Model() and uses the render context.
         if (m_isShuttingDown) return;
         if (!m_renderEngine.IsInitialized()) return;
 
@@ -465,7 +481,7 @@ namespace winrt::ShaderLab::implementation
         // count moves in any of the frame's evaluation passes.
         m_previewRenderStats.Initialize(m_renderEngine.D3DDevice());
         m_previewRenderStats.SetNode(preview.nodeId);
-        const uint64_t previewChangesBefore = m_graphEvaluator.OutputChangeCount(preview.nodeId);
+        const uint64_t previewChangesBefore = Evaluator().OutputChangeCount(preview.nodeId);
         m_previewRenderStats.BeginFrame(std::chrono::steady_clock::now());
         gpu.Begin(::ShaderLab::Rendering::GpuSpan::SourcesPrep);
 
@@ -474,7 +490,7 @@ namespace winrt::ShaderLab::implementation
         // source preparation.
         auto tSourcesStart = std::chrono::steady_clock::now();
 
-        ::ShaderLab::Rendering::PrepareSources(m_graph, m_sourceFactory,
+        ::ShaderLab::Rendering::PrepareSources(Model(), Sources(),
             { dc, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext() }, ::ShaderLab::Rendering::SourceScope::Changed);
 
         auto tSourcesEnd = std::chrono::steady_clock::now();
@@ -501,14 +517,14 @@ namespace winrt::ShaderLab::implementation
             std::unordered_set<uint32_t> interest;
             if (::ShaderLab::Rendering::HostRenderSettings::IsCpuAnalysisHintAllNodesEnabled())
             {
-                for (const auto& n : m_graph.Nodes())
+                for (const auto& n : Model().Nodes())
                     if (n.type == ::ShaderLab::Graph::NodeType::ComputeShader)
                         interest.insert(n.id);
             }
             if (preview.selectedNodeId != 0)
             {
                 interest.insert(preview.selectedNodeId);
-                if (auto* sel = m_graph.FindNode(preview.selectedNodeId))
+                if (auto* sel = Model().FindNode(preview.selectedNodeId))
                 {
                     ::ShaderLab::Graph::ForEachBindingSource(*sel,
                         [&](uint32_t sourceNodeId) { interest.insert(sourceNodeId); });
@@ -563,7 +579,7 @@ namespace winrt::ShaderLab::implementation
                 ctx->SetDpi(oldDpiX, oldDpiY);
         };
 
-        const auto frame = ::ShaderLab::Rendering::FrameExecutor::Run(m_graph, m_graphEvaluator, dc, request);
+        const auto frame = ::ShaderLab::Rendering::FrameExecutor::Run(Model(), Evaluator(), dc, request);
         if (frame.computeRan)
             m_nodeGraphController.SetNeedsRedraw();
         const HRESULT hrEnd = frame.endDraw;
@@ -575,7 +591,7 @@ namespace winrt::ShaderLab::implementation
         gpu.End(::ShaderLab::Rendering::GpuSpan::Frame);
         gpu.EndFrame();
         m_previewRenderStats.EndFrame(
-            preview.nodeId != 0 && m_graphEvaluator.OutputChangeCount(preview.nodeId) != previewChangesBefore,
+            preview.nodeId != 0 && Evaluator().OutputChangeCount(preview.nodeId) != previewChangesBefore,
             std::chrono::steady_clock::now());
 
         // Publish per-node GPU results onto the nodes, where the canvas picks
@@ -601,7 +617,7 @@ namespace winrt::ShaderLab::implementation
             const double chainMs = gpu.SpanMs(::ShaderLab::Rendering::GpuSpan::Draw);
             const bool timing = gpu.IsEnabled();
 
-            for (auto& n : m_graph.MutableNodes())
+            for (auto& n : Model().MutableNodes())
             {
                 // Same rule the evaluator uses to route a node to the D3D11
                 // bridge. Kept in sync deliberately: a node the evaluator
@@ -695,8 +711,8 @@ namespace winrt::ShaderLab::implementation
             t.drawUs            = t.drawUs            * (1-a) + usec(tComputeEnd,  tDrawEnd)    * a;
             t.endDrawFlushUs    = t.endDrawFlushUs    * (1-a) + usec(tDrawEnd,     tEndDraw)    * a;
             t.computeDispatches = computeCount;
-            t.cachedEffects      = m_graphEvaluator.CachedEffectCount();
-            t.cacheInvalidations = m_graphEvaluator.CacheInvalidations();
+            t.cachedEffects      = Evaluator().CachedEffectCount();
+            t.cacheInvalidations = Evaluator().CacheInvalidations();
             using GS = ::ShaderLab::Rendering::GpuSpan;
             t.gpuAvailable       = gpu.IsInitialized();
             t.gpuEnabled         = gpu.IsEnabled();
@@ -820,7 +836,12 @@ namespace winrt::ShaderLab::implementation
         const UINT interval =
             ::ShaderLab::Rendering::HostRenderSettings::IsUnthrottledRenderEnabled() ? 0u : 1u;
         DXGI_PRESENT_PARAMETERS params{};
-        swap->Present1(interval, 0, &params);
+        hr = swap->Present1(interval, 0, &params);
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+        {
+            const HRESULT reason = m_renderEngine.D3DDevice()->GetDeviceRemovedReason();
+            m_deviceLost.store(FAILED(reason) ? reason : hr, std::memory_order_release);
+        }
     }
 
 }

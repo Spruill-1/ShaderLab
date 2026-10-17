@@ -1,0 +1,20 @@
+# Files that belong to ShaderLab, not to EffectGraph, although some sit in the
+# engine's folders. One glob per line, relative to the repo root.
+# scripts/Check-EngineBoundary.ps1 fails if engine code includes any of them,
+# and the repo split hands this list to git filter-repo.
+Mcp/**
+Support/**
+Graph/GraphUiSnapshot.*
+Graph/GraphLayout.*
+Graph/ParameterVisibility.*
+Rendering/PreviewViewState.*
+Rendering/FramePacer.h
+Rendering/RenderThreadDispatcher.h
+Rendering/VideoExport.*
+Rendering/FfmpegProcess.*
+Rendering/PreviewRenderStats.h
+Rendering/FrameTimings.h
+Rendering/RenderEngine.*
+Rendering/HostRenderSettings.*
+pch_host.cpp
+Version.h

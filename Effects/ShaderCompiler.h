@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Graph/PropertyValue.h"
 #include "ShaderIncludes.h"
 
@@ -38,7 +37,7 @@ namespace ShaderLab::Effects
         bool                     succeeded{ false };
 
         // Human-readable error string (empty on success).
-        SHADERLAB_API std::wstring ErrorMessage() const;
+        std::wstring ErrorMessage() const;
     };
 
     // Reflection result.
@@ -51,7 +50,7 @@ namespace ShaderLab::Effects
 
     // HLSL shader compilation and reflection utilities.
     // Wraps D3DCompile and D3DReflect for use by the custom effect system.
-    class SHADERLAB_API ShaderCompiler
+    class ShaderCompiler
     {
     public:
         // Compile an HLSL file from disk.
@@ -107,7 +106,7 @@ namespace ShaderLab::Effects
     //
     // Returns true if any bytes were written. `dest` may not be null;
     // `remaining` is the remaining cbuffer bytes from `dest`.
-    SHADERLAB_API bool PackPropertyToCBuffer(
+    bool PackPropertyToCBuffer(
         BYTE* dest, uint32_t remaining,
         D3D_SHADER_VARIABLE_TYPE hlslType,
         uint32_t hlslColumns,

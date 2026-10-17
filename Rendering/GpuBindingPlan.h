@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Graph/GraphModel.h"
 #include "../Effects/ShaderVariants.h"
 
@@ -45,14 +44,14 @@ namespace ShaderLab::Rendering
 
     // The lane a consumer binds through: StructuredBuffer for a D3D11 compute
     // node, Texture for a pixel shader, CBuffer (no lane) for anything else.
-    SHADERLAB_API Effects::GpuBindingMode GpuLaneFor(const Graph::EffectNode& consumer);
+    Effects::GpuBindingMode GpuLaneFor(const Graph::EffectNode& consumer);
 
     // The float4 index a lane loads for a binding from `producer`'s analysis
     // row, or nullopt when no lane can serve it. A lane loads one float4 and
     // swizzles it by the parameter type (.x, .xy, ...), so destination
     // component i must come from component i of one element of the source
     // field; a FloatArray element is servable only from a pixel's .x.
-    SHADERLAB_API std::optional<uint32_t> GpuBindingFieldIndex(
+    std::optional<uint32_t> GpuBindingFieldIndex(
         const Graph::PropertyBinding& binding, const Graph::EffectNode& producer);
 
     // Plans which of `consumer`'s bindings its lane serves. A binding qualifies
@@ -61,7 +60,7 @@ namespace ShaderLab::Rendering
     // `producerReady(producerId)` says whether that producer's GPU output
     // exists for this use; leave it empty for the shape the consumer will run
     // once its producers have dispatched.
-    SHADERLAB_API GpuBindingPlan PlanGpuBindings(
+    GpuBindingPlan PlanGpuBindings(
         const Graph::EffectNode& consumer,
         const Graph::GraphModel& graph,
         bool gpuBindingsEnabled,

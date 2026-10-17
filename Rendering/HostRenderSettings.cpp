@@ -1,6 +1,6 @@
 #include "pch.h"
 #include "HostRenderSettings.h"
-#include "../Effects/Performance.h"
+#include "Effects/Performance.h"
 
 namespace ShaderLab::Rendering::HostRenderSettings
 {

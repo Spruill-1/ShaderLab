@@ -4,7 +4,7 @@
 // sRGB, clamped), JPEG XR (64bpp half, HDR preserved), and the raw / CSV
 // formats of --pixels.
 
-#include "../Rendering/PixelReadback.h"
+#include "Rendering/PixelReadback.h"
 
 #include <string>
 #include <wincodec.h>

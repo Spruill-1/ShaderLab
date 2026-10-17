@@ -428,9 +428,7 @@ namespace
         g_dc->SetTarget(nullptr);
         CaseEvaluator().Evaluate(g, g_dc.get());
         CaseEvaluator().Evaluate(g, g_dc.get());
-        g_dc->BeginDraw();
         CaseEvaluator().ProcessDeferredCompute(g, g_dc.get());
-        g_dc->EndDraw();
         TEST("Perf_BoundComputeConsumerDispatchedOnce", CaseEvaluator().DispatchesLastFrame() == 2);
         if (CaseEvaluator().DispatchesLastFrame() != 2)
             printf("    (debug) dispatches=%u\n", CaseEvaluator().DispatchesLastFrame());

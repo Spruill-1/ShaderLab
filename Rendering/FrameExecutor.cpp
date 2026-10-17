@@ -30,7 +30,6 @@ namespace ShaderLab::Rendering
 
         GpuTimer* timer = request.timer;
 
-        // ---- outside the draw session --------------------------------------
         if (request.markAllDirty)
             graph.MarkAllDirty();
         graph.PropagateDirtyDownstream();
@@ -51,9 +50,6 @@ namespace ShaderLab::Rendering
         if (timer) timer->End(GpuSpan::Evaluate);
         result.evaluateEnd = std::chrono::steady_clock::now();
 
-        // ---- inside the draw session ---------------------------------------
-        dc->SetTarget(request.target);
-        dc->BeginDraw();
         if (timer) timer->Begin(GpuSpan::DeferredCompute);
         if (request.analysisInterest)
             evaluator.SetCpuAnalysisInterest(*request.analysisInterest);
@@ -65,17 +61,19 @@ namespace ShaderLab::Rendering
             evaluator.Evaluate(graph, dc, GraphEvaluator::EvalMode::Frozen);
             ++result.passes;
         }
-        if (timer) timer->End(GpuSpan::DeferredCompute, dc);
+        if (timer) timer->End(GpuSpan::DeferredCompute);
         result.computeEnd = std::chrono::steady_clock::now();
 
         if (timer) timer->Begin(GpuSpan::Draw);
+        result.drawEnd = result.computeEnd;
         if (request.draw)
         {
             dc->SetTarget(request.target);
+            dc->BeginDraw();
             request.draw(dc);
+            result.drawEnd = std::chrono::steady_clock::now();
+            result.endDraw = dc->EndDraw();
         }
-        result.drawEnd = std::chrono::steady_clock::now();
-        result.endDraw = dc->EndDraw();
         result.end = std::chrono::steady_clock::now();
         if (timer) timer->End(GpuSpan::Draw);
         return result;

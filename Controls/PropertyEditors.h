@@ -1,8 +1,8 @@
 #pragma once
 
 #include "pch.h"
-#include "../Graph/PropertyValue.h"
-#include "../Effects/PropertyMetadata.h"
+#include "Graph/PropertyValue.h"
+#include "Effects/PropertyMetadata.h"
 
 #include <functional>
 #include <optional>

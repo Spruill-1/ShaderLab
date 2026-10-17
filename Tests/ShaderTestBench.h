@@ -4,7 +4,7 @@
 // ===============
 //
 // A tiny D3D11 compute test harness for unit-testing the HLSL color-math
-// helpers that ship inside Effects/ShaderLabEffects.cpp. Each test author
+// helpers in Effects/ColorMath.cpp (shaderlab_colormath.hlsli). Each test author
 // writes a few lines of HLSL that compute a value and write it into a
 // `RWStructuredBuffer<float4> Result` slot; the bench compiles + dispatches
 // + reads back, and the caller asserts on the result with TEST()

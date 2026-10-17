@@ -6,7 +6,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="EngineExport.h" />
     <ClInclude Include="pch_engine.h" />
   </ItemGroup>
   <ItemGroup>

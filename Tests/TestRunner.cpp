@@ -1,7 +1,10 @@
 #include "pch_engine.h"
 #include "TestSupport.h"
+// Every built-in shader effect, registered at startup.
+#include "EffectGraphBuiltIns.h"
 #include "Rendering/DeviceStack.h"
 #include "Engine/EngineBootstrap.h"
+#include "Support/ShaderLabSupport.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -142,14 +145,14 @@ namespace
         return out;
     }
 
-    // Each case gets a fresh evaluator and the process-default evaluator
+    // Each case gets a fresh context and the process-default evaluator
     // options as they were before it. A throw fails the case and the run
     // goes on.
     void RunCase(const TestCase& testCase)
     {
         g_currentCase = testCase.name;
         ScopedPerformanceSettings settings;
-        ResetCaseEvaluator();
+        BeginCaseContext();
         std::string thrown;
         try
         {
@@ -174,7 +177,7 @@ namespace
             const std::string name = std::string(testCase.name) + " threw: " + thrown;
             ReportResult(name.c_str(), false, testCase.file, testCase.line);
         }
-        ReleaseCaseEvaluator();
+        EndCaseContext();
         g_currentCase = "";
     }
 
@@ -191,9 +194,8 @@ namespace
             ? "on" : "off (WARP or CI; SHADERLAB_TIMING_TESTS=1 forces them)");
     }
 
-    // The device stack every host renders on, plus the engine's D2D effects.
-    // Any failure here is fatal: it would surface later as a null
-    // dereference inside some test.
+    // The D3D11 device every case's context is created on. Any failure here
+    // is fatal: it would surface later as a null dereference inside some test.
     bool CreateTestDevice(bool warp)
     {
         ShaderLab::Rendering::DeviceStackOptions deviceOptions;
@@ -208,22 +210,14 @@ namespace
         }
         g_d3dDevice = device.d3dDevice;
         g_d3dContext = device.d3dContext;
-        g_d2dFactory = device.d2dFactory;
         g_useWarp = warp;
 
-        hr = device.CreateDeviceContext(g_dc);
+        // A context must be creatable on it, or every case would fail alike.
+        winrt::com_ptr<IEffectGraphContext> probe;
+        hr = EffectGraphCreateContext(g_d3dDevice.get(), nullptr, IID_PPV_ARGS(probe.put()));
         if (FAILED(hr))
         {
-            std::printf("FATAL: CreateDeviceContext failed 0x%08X\n", static_cast<uint32_t>(hr));
-            return false;
-        }
-
-        winrt::com_ptr<ID2D1Factory1> factory1;
-        g_d2dFactory->QueryInterface(factory1.put());
-        hr = ShaderLab::Engine::RegisterEngineD2DEffects(factory1.get());
-        if (FAILED(hr))
-        {
-            std::printf("FATAL: registering the engine's D2D effects failed 0x%08X\n", static_cast<uint32_t>(hr));
+            std::printf("FATAL: EffectGraphCreateContext failed 0x%08X\n", static_cast<uint32_t>(hr));
             return false;
         }
         return true;
@@ -279,6 +273,7 @@ int main(int argc, char* argv[])
     {
         ~EngineServicesScope() { ShaderLab::Engine::ShutdownEngineServices(); }
     } engineServices;
+    ShaderLab::Support::RegisterShaderLabSupport();
 
     std::printf("ShaderLab Test Runner\n");
     std::printf("=====================\n");

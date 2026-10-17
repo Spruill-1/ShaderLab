@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 
 #include <functional>
 
@@ -23,11 +22,11 @@ namespace ShaderLab::Rendering
     };
 
     // A node's output, safe to draw now, or nullptr with the reason.
-    SHADERLAB_API ID2D1Image* ResolveNodeImage(const Graph::GraphModel& graph, uint32_t nodeId,
+    ID2D1Image* ResolveNodeImage(const Graph::GraphModel& graph, uint32_t nodeId,
                                                NodeImageStatus* status = nullptr);
 
     // An image's bounds in pixels: measured at 96 DPI, the context's DPI restored.
-    SHADERLAB_API HRESULT GetImageBounds96Dpi(ID2D1DeviceContext* dc, ID2D1Image* image, D2D1_RECT_F& bounds);
+    HRESULT GetImageBounds96Dpi(ID2D1DeviceContext* dc, ID2D1Image* image, D2D1_RECT_F& bounds);
 
     // Pixels copied to the CPU, `pitch` bytes per row.
     struct PixelBuffer
@@ -45,15 +44,15 @@ namespace ShaderLab::Rendering
     // draw session on `dc`. The context's target, DPI and transform are
     // restored on every path. Returns the first failing call's HRESULT, or
     // EndDraw's.
-    SHADERLAB_API HRESULT RenderToPixels(ID2D1DeviceContext* dc, uint32_t width, uint32_t height,
+    HRESULT RenderToPixels(ID2D1DeviceContext* dc, uint32_t width, uint32_t height,
                                          DXGI_FORMAT format, const D2D1_COLOR_F& clear,
                                          const std::function<void(ID2D1DeviceContext*)>& draw,
                                          PixelBuffer& out);
 
     // Encodes 8-bit BGRA pixels as PNG into memory.
-    SHADERLAB_API HRESULT EncodePng(const PixelBuffer& pixels, std::vector<uint8_t>& png);
+    HRESULT EncodePng(const PixelBuffer& pixels, std::vector<uint8_t>& png);
 
     // Encodes pixels to a file: 8-bit BGRA as PNG, R16G16B16A16_FLOAT as
     // lossless JPEG XR tagged scRGB.
-    SHADERLAB_API HRESULT EncodeToFile(const PixelBuffer& pixels, const std::wstring& path);
+    HRESULT EncodeToFile(const PixelBuffer& pixels, const std::wstring& path);
 }

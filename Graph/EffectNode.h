@@ -225,6 +225,54 @@ namespace ShaderLab::Graph
         return fields;
     }
 
+    // The array length a value's arrayData holds (0 for a scalar or vector).
+    inline uint32_t AnalysisFieldArrayLength(const AnalysisFieldValue& value)
+    {
+        if (!AnalysisFieldIsArray(value.type)) return 0;
+        const uint32_t componentCount = AnalysisFieldComponentCount(value.type);
+        return value.type == AnalysisFieldType::FloatArray
+            ? static_cast<uint32_t>(value.arrayData.size())
+            : static_cast<uint32_t>(value.arrayData.size() / (std::max)(componentCount, 1u));
+    }
+
+    // The descriptors that lay values out as they are.
+    inline std::vector<AnalysisFieldDescriptor> AnalysisLayoutOf(const std::vector<AnalysisFieldValue>& values)
+    {
+        std::vector<AnalysisFieldDescriptor> layout;
+        layout.reserve(values.size());
+        for (const auto& value : values)
+            layout.push_back({ value.name, value.type, AnalysisFieldArrayLength(value) });
+        return layout;
+    }
+
+    // Packs values into the row of float4s UnpackAnalysisFields reads.
+    inline std::vector<float> PackAnalysisFields(const std::vector<AnalysisFieldValue>& values)
+    {
+        std::vector<float> float4s;
+        for (const auto& value : values)
+        {
+            const size_t start = float4s.size();
+            const uint32_t arrayLength = AnalysisFieldArrayLength(value);
+            float4s.resize(start + static_cast<size_t>(AnalysisFieldPixelCount(value.type, arrayLength)) * 4, 0.0f);
+            const uint32_t componentCount = AnalysisFieldComponentCount(value.type);
+            if (!AnalysisFieldIsArray(value.type))
+            {
+                for (uint32_t c = 0; c < componentCount; ++c) float4s[start + c] = value.components[c];
+            }
+            else if (value.type == AnalysisFieldType::FloatArray)
+            {
+                std::copy(value.arrayData.begin(), value.arrayData.end(), float4s.begin() + start);
+            }
+            else
+            {
+                for (uint32_t i = 0; i < arrayLength; ++i)
+                    for (uint32_t c = 0; c < componentCount; ++c)
+                        float4s[start + i * 4 + c] = value.arrayData[static_cast<size_t>(i) * componentCount + c];
+            }
+        }
+        return float4s;
+    }
+
     // Complete definition of a custom effect authored in the Effect Designer.
     // Stored per-node and serialized with the graph JSON.
     struct CustomEffectDefinition

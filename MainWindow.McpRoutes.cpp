@@ -5,12 +5,13 @@
 
 #include "pch.h"
 #include "MainWindow.xaml.h"
-#include "Engine/Mcp/McpRouter.h"
-#include "Engine/Mcp/McpJsonRpc.h"
-#include "Engine/Mcp/McpJsonWriter.h"
-#include "Engine/Mcp/McpTimeouts.h"
+#include "Mcp/McpRouter.h"
+#include "Mcp/McpJsonRpc.h"
+#include "Mcp/McpJsonWriter.h"
+#include "Mcp/McpTimeouts.h"
 #include "Controls/McpRouteTable.h"
 #include "Controls/PerfMcpRoutes.h"
+#include "Support/PackageRoutes.h"
 
 namespace winrt::ShaderLab::implementation
 {
@@ -71,6 +72,12 @@ namespace winrt::ShaderLab::implementation
         // is being rebuilt, so there is nothing to marshal to.
         if (window->m_adapterSwitchInProgress.load(std::memory_order_acquire))
             return ::ShaderLab::Mcp::ErrorResponse(503, "GPU adapter switch in progress; retry shortly");
+        // Without a device the worker renders nothing: answer now rather than
+        // after the dispatch timeout.
+        if (window->m_deviceUnavailable.load(std::memory_order_acquire) ||
+            FAILED(window->m_deviceLost.load(std::memory_order_acquire)))
+            return ::ShaderLab::Mcp::ErrorResponse(503,
+                "No GPU device: it was removed or none came up; ShaderLab retries every few seconds, or use switch_gpu");
 
         // The render worker is the graph's single writer; a call from the
         // worker itself runs inline. Exceptions reach the router, which
@@ -78,15 +85,8 @@ namespace winrt::ShaderLab::implementation
         return window->m_renderDispatcher.DispatchSync(
             [this, &closure]() -> ::ShaderLab::Mcp::Response
             {
-                ::ShaderLab::Mcp::EngineContext ctx{};
-                ctx.graph = &window->m_graph;
-                ctx.evaluator = &window->m_graphEvaluator;
+                ::ShaderLab::Mcp::EngineContext ctx(*window->m_context);
                 ctx.displayMonitor = &window->m_displayMonitor;
-                ctx.sourceFactory = &window->m_sourceFactory;
-                // The render D2D context, shared with the per-frame render path.
-                ctx.dc = window->m_renderEngine.RenderD2DContext();
-                ctx.d3dDevice = window->m_renderEngine.D3DDevice();
-                ctx.d3dContext = window->m_renderEngine.D3DContext();
                 // m_readbackNodeId makes the frame evaluate nodeId even when
                 // no preview or output window needs it.
                 ctx.renderFrame = [this](uint32_t nodeId)
@@ -129,7 +129,7 @@ namespace winrt::ShaderLab::implementation
         window->m_forceRender = true;
         // An Output node gets its window, as when it is added from the toolbar.
         bool isOutput = false;
-        if (auto* n = window->m_graph.FindNode(nodeId))
+        if (auto* n = window->Model().FindNode(nodeId))
             isOutput = (n->type == ::ShaderLab::Graph::NodeType::Output);
         auto* w = window;
         w->DispatcherQueue().TryEnqueue([w, nodeId, isOutput]{
@@ -150,7 +150,7 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::GuiEngineCommandSink::OnNodeRemoved(uint32_t nodeId)
     {
-        window->m_graphEvaluator.InvalidateNode(nodeId);
+        window->Evaluator().InvalidateNode(nodeId);
         // RemoveNode already dirtied the removed node's consumers.
         window->m_forceRender = true;
         auto* w = window;
@@ -168,7 +168,7 @@ namespace winrt::ShaderLab::implementation
         // A visibleWhen parameter can show or hide a pin when a property
         // changes, so such a node's layout is rebuilt. This already runs on
         // the render worker, layout's home.
-        if (auto* n = window->m_graph.FindNode(nodeId))
+        if (auto* n = window->Model().FindNode(nodeId))
         {
             if (n->customEffect.has_value())
             {
@@ -186,9 +186,7 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::GuiEngineCommandSink::OnGraphCleared()
     {
-        window->m_graphEvaluator.ReleaseCache();
         window->Preview().ClearNode();
-        window->m_graph.MarkAllDirty();
         window->m_forceRender = true;
         auto* w = window;
         w->DispatcherQueue().TryEnqueue([w]{
@@ -264,7 +262,7 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::GuiEngineCommandSink::OnDisplayProfileChanged()
     {
-        window->m_graph.MarkAllDirty();
+        window->Model().MarkAllDirty();
         window->m_forceRender = true;
         auto* w = window;
         w->DispatcherQueue().TryEnqueue([w]{ w->UpdateStatusBar(); });
@@ -288,9 +286,10 @@ namespace winrt::ShaderLab::implementation
             });
 
         ::ShaderLab::Mcp::RegisterEngineRoutes(*m_mcpServer, *m_engineSink);
+        ::ShaderLab::Support::RegisterPackageRoutes(*m_mcpServer, *m_engineSink);
 
         // POST /: the JSON-RPC dispatcher, which forwards tools/call to the
-        // routes through Engine/Mcp/McpToolCatalog.
+        // routes through Mcp/McpToolCatalog.
         ::ShaderLab::Mcp::JsonRpcOptions rpcOptions;
         rpcOptions.hostKind = "gui";
         ::ShaderLab::Mcp::RegisterJsonRpcEndpoint(*m_mcpServer, std::move(rpcOptions));
@@ -307,7 +306,7 @@ namespace winrt::ShaderLab::implementation
             .timings = m_frameTimings,
             .previewStats = m_previewRenderStats,
             .gpuTimer = m_renderEngine.Timer(),
-            .graph = m_graph,
+            .graph = Model(),
             .renderDispatcher = m_renderDispatcher,
             .forceContinuousRedraw = m_forceContinuousRedraw,
             .forceRender = m_forceRender,

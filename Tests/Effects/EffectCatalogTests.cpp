@@ -98,7 +98,7 @@ namespace
                 // CIE Chromaticity Plot legitimately reads no TEXCOORD: it takes
                 // the scene coordinate for diagram geometry and derives its own
                 // histogram texel coords via GetDimensions(). Recorded rather
-                // than silently tolerated -- see ShaderLabEffects.cpp.
+                // than silently tolerated -- see BuiltInEffects/BuiltInEffectTable.cpp.
                 const bool knownException = (e.name == L"CIE Chromaticity Plot");
                 if (!knownException && texIdx != want) sharedTexcoord += e.name + L" ";
             }

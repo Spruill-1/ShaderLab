@@ -3,7 +3,7 @@
 
 #include "pch.h"
 #include "MainWindow.xaml.h"
-#include "Engine/Mcp/McpPeerIdentity.h"
+#include "Mcp/McpPeerIdentity.h"
 #include "Version.h"
 
 #include <appmodel.h>

@@ -9,14 +9,14 @@
 
 #include "HeadlessArgs.h"
 
-#include "../Engine/Api/EffectGraphInternal.h"
-#include "../Graph/GraphModel.h"
-#include "../Rendering/DeviceStack.h"
-#include "../Rendering/GraphEvaluator.h"
-#include "../Effects/SourceNodeFactory.h"
-#include "../Rendering/DisplayMonitor.h"
-#include "../Rendering/GpuTimer.h"
-#include "../Engine/Mcp/EngineMcpRoutes.h"
+#include "Engine/Api/EffectGraphInternal.h"
+#include "Graph/GraphModel.h"
+#include "Rendering/DeviceStack.h"
+#include "Rendering/GraphEvaluator.h"
+#include "Effects/SourceNodeFactory.h"
+#include "Rendering/DisplayMonitor.h"
+#include "Rendering/GpuTimer.h"
+#include "../Mcp/EngineMcpRoutes.h"
 
 #include <memory>
 #include <string>
@@ -72,6 +72,10 @@ namespace ShaderLab::Headless
         void RenderFrame();
         // One frame demanding only `nodeId`. Returns EndDraw's result.
         HRESULT RenderFrameFor(uint32_t nodeId);
+        // A frame that found the device removed moves the context to a new
+        // device on the same --adapter choice and runs once more; these do
+        // that around RunFrame. False when no new device came up.
+        bool RecoverDevice(HRESULT reason);
 
         // The engine routes, plus POST /render/video.
         void RegisterRoutes(McpRouter& router);
@@ -90,6 +94,7 @@ namespace ShaderLab::Headless
 
     private:
         HeadlessEngine() = default;
+        Rendering::FrameResult RunFrameRecovering(const Rendering::FrameRequest& request);
 
         // Declaration order is teardown order reversed: the media directory
         // outlives the context, whose sources hold files in it.
@@ -98,5 +103,6 @@ namespace ShaderLab::Headless
         winrt::com_ptr<ID2D1DeviceContext5>         m_dc;   // the context's own
         Rendering::GpuTimer                         m_gpuTimer;
         Rendering::DisplayMonitor                   m_displayMonitor;
+        Rendering::AdapterChoice                    m_adapterChoice{ Rendering::AdapterChoice::Hardware };
     };
 }

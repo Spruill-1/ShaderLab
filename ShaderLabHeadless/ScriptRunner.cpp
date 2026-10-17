@@ -3,10 +3,9 @@
 #include "GpuBench.h"
 #include "HeadlessEngine.h"
 
-#include "../EngineExport.h"
-#include "../Engine/Utf8.h"
-#include "../Engine/Mcp/McpArgs.h"
-#include "../Engine/Mcp/McpRouter.h"
+#include "Engine/Utf8.h"
+#include "../Mcp/McpArgs.h"
+#include "../Mcp/McpRouter.h"
 
 #include <cstdio>
 #include <fstream>
@@ -322,8 +321,6 @@ namespace ShaderLab::Headless
 
         ScriptRunner runner(engine, router, args);
         WDJ::JsonObject outDoc;
-        outDoc.Insert(L"abiVersion", WDJ::JsonValue::CreateNumberValue(
-            static_cast<double>(::ShaderLab_GetAbiVersion())));
         outDoc.Insert(L"stepCount", WDJ::JsonValue::CreateNumberValue(static_cast<double>(steps.Size())));
         outDoc.Insert(L"results", runner.Run(steps));
         const std::string outUtf8 = WideToUtf8(outDoc.Stringify());

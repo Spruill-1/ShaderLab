@@ -4,9 +4,9 @@
 
 #include "pch.h"
 #include "MainWindow.xaml.h"
-#include "Engine/Mcp/McpArgs.h"
-#include "Engine/Mcp/McpJsonWriter.h"
-#include "Engine/Mcp/McpSerialize.h"
+#include "Mcp/McpArgs.h"
+#include "Mcp/McpJsonWriter.h"
+#include "Mcp/McpSerialize.h"
 #include "Graph/GraphEdits.h"
 #include "Controls/McpRouteTable.h"
 #include "Rendering/ImageCapture.h"
@@ -184,7 +184,7 @@ namespace winrt::ShaderLab::implementation
                 if (!argError.empty())
                     return Mcp::ErrorResponse(400, argError);
 
-                if (!::ShaderLab::Graph::RenameNode(m_graph, *nodeId, *name))
+                if (!::ShaderLab::Graph::RenameNode(Model(), *nodeId, *name))
                     return Mcp::ErrorResponse(404, "Node not found");
                 m_nodeGraphController.RebuildLayout();
                 DispatcherQueue().TryEnqueue([this]
@@ -303,12 +303,12 @@ namespace winrt::ShaderLab::implementation
                 auto* dc = m_renderEngine.RenderD2DContext();
                 if (!dc)
                     return Mcp::ErrorResponse(500, "No device context");
-                if (!m_graph.FindNode(*nodeId))
+                if (!Model().FindNode(*nodeId))
                     return Mcp::ErrorResponse(404, "Node not found");
                 // Measured on the render context, which owns the images.
                 auto boundsOf = [&](uint32_t id) -> std::optional<D2D1_RECT_F>
                 {
-                    auto* image = ::ShaderLab::Rendering::ResolveNodeImage(m_graph, id);
+                    auto* image = ::ShaderLab::Rendering::ResolveNodeImage(Model(), id);
                     D2D1_RECT_F b{};
                     if (!image || FAILED(::ShaderLab::Rendering::GetImageBounds96Dpi(dc, image, b))) return std::nullopt;
                     const float w = b.right - b.left, h = b.bottom - b.top;
@@ -326,7 +326,7 @@ namespace winrt::ShaderLab::implementation
                 const int32_t pixelY = static_cast<int32_t>(bounds->top) +
                     static_cast<int32_t>((std::min)(normY * imageH, static_cast<float>(imageH - 1)));
 
-                const auto traced = ::ShaderLab::Rendering::TracePixel(m_graph, *nodeId, pixelX, pixelY, dc);
+                const auto traced = ::ShaderLab::Rendering::TracePixel(Model(), *nodeId, pixelX, pixelY, dc);
                 if (!traced.root || FAILED(traced.hr))
                     return Mcp::ErrorResponse(500, std::format("Pixel trace failed 0x{:08X}", static_cast<uint32_t>(traced.hr)));
                 const auto& trace = traced.root;

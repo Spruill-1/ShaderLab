@@ -1,14 +1,14 @@
 #include "pch_engine.h"
 #include "VideoExport.h"
-#include "GraphEvaluator.h"
-#include "FrameExecutor.h"
+#include "Rendering/GraphEvaluator.h"
+#include "Rendering/FrameExecutor.h"
 #include "FfmpegProcess.h"
-#include "../Graph/ClockModel.h"
-#include "../Graph/GraphModel.h"
-#include "../Graph/SourceKind.h"
-#include "../Effects/ShaderCompiler.h"
-#include "../Effects/ShaderLabEffects.h"
-#include "../Effects/SourceNodeFactory.h"
+#include "Graph/ClockModel.h"
+#include "Graph/GraphModel.h"
+#include "Graph/SourceKind.h"
+#include "Effects/ShaderCompiler.h"
+#include "Effects/ShaderLabEffects.h"
+#include "Effects/SourceNodeFactory.h"
 
 #include <algorithm>
 #include <chrono>

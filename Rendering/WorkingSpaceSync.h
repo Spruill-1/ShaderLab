@@ -11,7 +11,6 @@
 // headless host and the display-profile MCP routes share it and it needs no
 // device or DisplayMonitor.
 
-#include "../EngineExport.h"
 
 namespace ShaderLab::Graph
 {
@@ -27,7 +26,7 @@ namespace ShaderLab::Rendering
     // Marks the node dirty only when at least one field changed value, so
     // callers can pump this every render tick without invalidating the cache
     // when the profile is stable. Returns true if any node was modified.
-    SHADERLAB_API bool UpdateWorkingSpaceNodes(
+    bool UpdateWorkingSpaceNodes(
         Graph::GraphModel& graph,
         const DisplayProfile& profile);
 }

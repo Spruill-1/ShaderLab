@@ -132,7 +132,7 @@ namespace ShaderLab::Rendering
             // with cancelled=true so this promise FAILS FAST rather than the
             // caller eating its full timeout. This is what makes the
             // render < DispatchSync < shim < client timeout ladder
-            // enforceable (see Engine/Mcp/McpTimeouts.h).
+            // enforceable (see Mcp/McpTimeouts.h in ShaderLab).
             Item item =
                 [this, prom, claim, fn = std::forward<F>(fn)](bool cancelled) mutable
                 {

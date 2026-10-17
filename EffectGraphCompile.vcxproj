@@ -82,12 +82,12 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
     <ClCompile>
-      <PreprocessorDefinitions>WIN32;_CONSOLE;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;WIN32;_CONSOLE;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
-      <PreprocessorDefinitions>WIN32;_CONSOLE;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;WIN32;_CONSOLE;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -95,7 +95,6 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="EngineExport.h" />
     <ClInclude Include="pch_engine.h" />
   </ItemGroup>
   <ItemGroup>
@@ -105,15 +104,17 @@
     <ClCompile Include="EffectGraphCompile\Main.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="BuiltInEffects.vcxproj">
+      <Project>{463424C5-37AA-4129-ABAB-1CD7F3BF2215}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>true</LinkLibraryDependencies>
+    </ProjectReference>
     <ProjectReference Include="ShaderLabEngine.vcxproj">
       <Project>{A7A1E0F1-665C-4D06-9AC7-6D6B6A0D0F01}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <LinkLibraryDependencies>true</LinkLibraryDependencies>
     </ProjectReference>
   </ItemGroup>
-  <Target Name="CopyEngineRuntime" AfterTargets="Build">
-    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll')" />
-  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
     <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets')" />

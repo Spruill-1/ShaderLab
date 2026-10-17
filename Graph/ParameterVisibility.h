@@ -1,8 +1,7 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
-#include "EffectNode.h"
+#include "Graph/EffectNode.h"
 
 // Conditional visibility of custom-effect parameters (ParameterDefinition::
 // visibleWhen), read by the Properties panel and the canvas pin layout.
@@ -12,7 +11,7 @@ namespace ShaderLab::Graph
     // compared numerically; == and != within 0.001) against the node's
     // properties. True (visible) when the condition is empty, does not parse,
     // names a missing or non-numeric property, or holds.
-    SHADERLAB_API bool EvaluateVisibleWhen(
+    bool EvaluateVisibleWhen(
         const std::wstring& condition,
         const std::map<std::wstring, PropertyValue>& props);
 
@@ -20,5 +19,5 @@ namespace ShaderLab::Graph
     // without a custom effect shows every property; one with a custom effect
     // shows only declared parameters whose visibleWhen holds, so host-fed
     // backing values (Working Space) stay hidden.
-    SHADERLAB_API bool IsParameterShown(const EffectNode& node, const std::wstring& key);
+    bool IsParameterShown(const EffectNode& node, const std::wstring& key);
 }

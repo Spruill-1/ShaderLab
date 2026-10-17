@@ -9,8 +9,9 @@
 using namespace ShaderLab::Graph;
 
 // D3D11 compute nodes: Evaluate queues them (QueueD3D11Compute) and
-// ProcessDeferredCompute dispatches them through their bridge effect, inside
-// the host's draw session, once every D2D effect of the pass exists.
+// ProcessDeferredCompute dispatches them through their bridge effect once
+// every D2D effect of the pass exists. It runs outside any draw session and
+// opens its own only to render an input the shader cannot read in place.
 namespace ShaderLab::Rendering::Evaluator
 {
     namespace
@@ -240,15 +241,21 @@ namespace ShaderLab::Rendering::Evaluator
             target = { std::move(newBitmap), w, h };
         }
 
-        // Inline SetTarget + Clear + DrawImage: a nested BeginDraw would fail
-        // inside the outer session. Integer origin: see SnapComputeInputRect.
+        // Its own draw session, whose EndDraw submits the draw before the
+        // bridge's D3D11 compute reads it. Integer origin: see SnapComputeInputRect.
+        HRESULT drawHr = S_OK;
         {
             ScopedTarget scopedTarget(dc, target.bitmap.get());
+            dc->BeginDraw();
             dc->Clear(D2D1::ColorF(0, 0, 0, 0));
             dc->DrawImage(image, D2D1::Point2F(-static_cast<float>(px.left), -static_cast<float>(px.top)));
+            drawHr = dc->EndDraw();
         }
-        // The bridge's D3D11 compute reads it next.
-        dc->Flush();
+        if (FAILED(drawHr))
+        {
+            if (failHr) *failHr = drawHr;
+            return nullptr;
+        }
         return target.bitmap.get();
     }
 

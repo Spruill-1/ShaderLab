@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Graph/GraphModel.h"
 
 namespace ShaderLab::Effects { class SourceNodeFactory; }
@@ -31,7 +30,7 @@ namespace ShaderLab::Rendering
     // scope. A failure lands on the node's runtimeError and does not stop
     // the other sources; one that throws also leaves the node clean, so it
     // does not keep the graph re-rendering.
-    SHADERLAB_API void PrepareSources(Graph::GraphModel& graph, Effects::SourceNodeFactory& factory,
+    void PrepareSources(Graph::GraphModel& graph, Effects::SourceNodeFactory& factory,
                                       const SourceDevices& devices, SourceScope scope);
 
     // Ticks video sources until each shows the frame for its Time, for hosts
@@ -40,7 +39,7 @@ namespace ShaderLab::Rendering
     // A video that misses the timeout prints a [ShaderLab] line to stderr and
     // is not waited on again at that time until the factory forgets its
     // timeouts (graph load or clear). Returns false if any video missed.
-    SHADERLAB_API bool SettleVideoSources(Graph::GraphModel& graph, Effects::SourceNodeFactory& factory,
+    bool SettleVideoSources(Graph::GraphModel& graph, Effects::SourceNodeFactory& factory,
                                           GraphEvaluator& evaluator, ID2D1DeviceContext5* dc,
                                           std::chrono::milliseconds timeout = std::chrono::seconds(5));
 }

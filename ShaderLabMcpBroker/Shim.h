@@ -8,7 +8,7 @@
 
 #include "BrokerPipeIo.h"
 
-#include "../Engine/Mcp/McpChannel.h"
+#include "../Mcp/McpChannel.h"
 
 #include <optional>
 #include <string>

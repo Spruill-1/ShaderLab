@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Graph/PropertyValue.h"
 #include "IEngineComputeOutput.h"
 #include "IEngineComputeTexture.h"
@@ -248,6 +247,10 @@ namespace ShaderLab::Effects
         // Newest completed async readback, if any landed since the last call.
         bool PollAnalysisReadback(std::vector<float>& out);
         bool HasPendingReadback() const { return m_runner.HasPendingReadback(); }
+        HRESULT WriteResults(uint32_t firstElement, const float* float4s, uint32_t elementCount)
+        {
+            return m_runner.WriteResults(firstElement, float4s, elementCount);
+        }
         // The last blocking readback's Map result (the dispatch itself succeeded).
         HRESULT LastReadbackResult() const { return m_runner.LastReadbackResult(); }
 

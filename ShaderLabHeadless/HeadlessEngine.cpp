@@ -1,14 +1,15 @@
 #include "pch_engine.h"
 #include "HeadlessEngine.h"
 
-#include "../Engine/Mcp/McpRouter.h"
-#include "../Graph/ClockModel.h"
-#include "../Rendering/EffectGraphFile.h"
-#include "../Rendering/FrameExecutor.h"
-#include "../Rendering/PipelineFormat.h"
-#include "../Rendering/SourceRuntime.h"
-#include "../Rendering/WorkingSpaceSync.h"
-#include "../Effects/Performance.h"
+#include "../Mcp/McpRouter.h"
+#include "Graph/ClockModel.h"
+#include "../Support/EffectGraphFile.h"
+#include "../Support/PackageRoutes.h"
+#include "Rendering/FrameExecutor.h"
+#include "Rendering/PipelineFormat.h"
+#include "Rendering/SourceRuntime.h"
+#include "Rendering/WorkingSpaceSync.h"
+#include "Effects/Performance.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -75,7 +76,7 @@ namespace ShaderLab::Headless
             wchar_t tempRoot[MAX_PATH + 1]{};
             GetTempPathW(MAX_PATH + 1, tempRoot);
             std::wstring loadError;
-            auto loaded = Rendering::EffectGraphFile::LoadAny(path, tempRoot, loadError);
+            auto loaded = Support::EffectGraphFile::LoadAny(path, tempRoot, loadError);
             if (!loaded.has_value())
             {
                 std::wprintf(L"FATAL: could not read graph file: %ls\n", loadError.c_str());
@@ -99,7 +100,7 @@ namespace ShaderLab::Headless
                 return false;
             }
 
-            Rendering::EffectGraphFile::ResolveMediaTokens(graph, loaded->mediaMap);
+            Support::EffectGraphFile::ResolveMediaTokens(graph, loaded->mediaMap);
             extractDir = loaded->extractDir;
             return true;
         }
@@ -142,7 +143,8 @@ namespace ShaderLab::Headless
             failure = ExitCode::Device;
             return nullptr;
         }
-        engine->m_context->GetD2DDeviceContext(engine->m_dc.put());
+        engine->m_dc.copy_from(engine->m_context->DeviceContext());
+        engine->m_adapterChoice = deviceOptions.choice;
 
         std::wstring extractDir;
         if (!LoadGraphFromPath(args.graphPath, engine->Model(), extractDir, failure))
@@ -194,38 +196,67 @@ namespace ShaderLab::Headless
         Rendering::SettleVideoSources(Model(), Sources(), Evaluator(), m_dc.get());
     }
 
-    void HeadlessEngine::RenderFrame()
+    bool HeadlessEngine::RecoverDevice(HRESULT reason)
+    {
+        std::fwprintf(stderr, L"[ShaderLab] the device was removed (0x%08X); moving to a new one\n",
+                      static_cast<uint32_t>(reason));
+        Rendering::DeviceStackOptions options;
+        options.choice = m_adapterChoice;
+        Rendering::DeviceStack device;
+        std::wstring failedStep;
+        HRESULT hr = Rendering::CreateDeviceStack(options, device, &failedStep);
+        if (SUCCEEDED(hr)) hr = m_context->MoveToDevice(device.d3dDevice.get());
+        if (FAILED(hr))
+        {
+            std::fwprintf(stderr, L"[ShaderLab] no new device (0x%08X)\n", static_cast<uint32_t>(hr));
+            return false;
+        }
+        m_dc.copy_from(m_context->DeviceContext());
+        // The timer's queries belonged to the old device.
+        const bool timing = m_gpuTimer.IsEnabled();
+        Evaluator().SetGpuTimer(nullptr);
+        m_gpuTimer.Shutdown();
+        m_gpuTimer.Initialize(D3DDevice());
+        m_gpuTimer.SetEnabled(timing);
+        Evaluator().SetGpuTimer(&m_gpuTimer);
+        return true;
+    }
+
+    Rendering::FrameResult HeadlessEngine::RunFrameRecovering(const Rendering::FrameRequest& request)
     {
         // RunFrame syncs Working Space nodes and settles videos itself.
         m_context->SetDisplayProfile(m_displayMonitor.ActiveProfile());
-        m_context->RunFrame({});
+        auto result = m_context->RunFrame(request);
+        if (FAILED(result.deviceRemoved) && RecoverDevice(result.deviceRemoved))
+            result = m_context->RunFrame(request);
+        return result;
+    }
+
+    void HeadlessEngine::RenderFrame()
+    {
+        RunFrameRecovering({});
     }
 
     HRESULT HeadlessEngine::RenderFrameFor(uint32_t nodeId)
     {
-        m_context->SetDisplayProfile(m_displayMonitor.ActiveProfile());
         Rendering::FrameRequest request;
         request.demand = Rendering::FrameDemand::Roots;
         request.roots = { nodeId };
-        return m_context->RunFrame(request).endDraw;
+        const auto result = RunFrameRecovering(request);
+        return FAILED(result.deviceRemoved) ? result.deviceRemoved : result.endDraw;
     }
 
     void HeadlessEngine::RegisterRoutes(McpRouter& router)
     {
         Mcp::RegisterEngineRoutes(router, *this);
+        Support::RegisterPackageRoutes(router, *this);
         Mcp::RegisterVideoExportRoute(router, *this);
     }
 
     Mcp::Response HeadlessEngine::Dispatch(std::function<Mcp::Response(Mcp::EngineContext&)> closure)
     {
-        Mcp::EngineContext ctx{};
-        ctx.graph          = &Model();
-        ctx.evaluator      = &Evaluator();
+        Mcp::EngineContext ctx(*m_context);
         ctx.displayMonitor = &m_displayMonitor;
-        ctx.sourceFactory  = &Sources();
-        ctx.dc             = m_dc.get();
-        ctx.d3dDevice      = D3DDevice();
-        ctx.d3dContext     = D3DContext();
         // Every node is demanded, so a full frame covers any node a route reads.
         ctx.renderFrame    = [this](uint32_t) { RenderFrame(); };
         // No swap chain to ask: headless always renders scRGB FP16.

@@ -1,8 +1,8 @@
 #include "pch_engine.h"
 #include "BrokerPipeIo.h"
 
-#include "../Engine/Mcp/McpPeerIdentity.h"
-#include "../Engine/Mcp/McpTypes.h"
+#include "../Mcp/McpPeerIdentity.h"
+#include "../Mcp/McpTypes.h"
 
 #include <shlobj.h>
 

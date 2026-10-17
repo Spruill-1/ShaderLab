@@ -79,7 +79,7 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::UpdateWorkingSpaceNodes()
     {
         // A changed node forces a frame so its consumers re-render.
-        if (::ShaderLab::Rendering::UpdateWorkingSpaceNodes(m_graph, m_displayMonitor.ActiveProfile()))
+        if (::ShaderLab::Rendering::UpdateWorkingSpaceNodes(Model(), m_displayMonitor.ActiveProfile()))
             m_forceRender = true;
     }
 

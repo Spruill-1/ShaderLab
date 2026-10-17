@@ -1,7 +1,7 @@
 #include "pch_engine.h"
 #include "HeadlessArgs.h"
 
-#include "../Graph/PropertyWrite.h"
+#include "Graph/PropertyWrite.h"
 #include "../Rendering/VideoExport.h"
 
 #include <cstdio>

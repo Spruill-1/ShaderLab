@@ -252,8 +252,11 @@ namespace
 
         winrt::com_ptr<IEffectGraphContext> context;
         winrt::check_hresult(EffectGraphCreateContext(g_d3dDevice.get(), nullptr, IID_PPV_ARGS(context.put())));
-        winrt::com_ptr<ID2D1DeviceContext5> dc;
-        context->GetD2DDeviceContext(dc.put());
+        winrt::com_ptr<ID2D1Device> d2dDevice;
+        context->GetD2DDevice(d2dDevice.put());
+        winrt::com_ptr<ID2D1DeviceContext> created;
+        winrt::check_hresult(d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, created.put()));
+        auto dc = created.as<ID2D1DeviceContext5>();
         Effects::ImageLoader loader;
         auto bitmap = loader.LoadFromFile(imagePath, dc.get());
         TEST("Real_ImageLoads", bitmap != nullptr);

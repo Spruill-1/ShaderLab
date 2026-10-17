@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 
 namespace ShaderLab::Effects
 {
@@ -19,7 +18,7 @@ namespace ShaderLab::Effects
     // The result is flattened once at load, so downstream consumers see a
     // single canonical format regardless of source. When any step fails the
     // load fails: there is no "best effort" encoded bitmap.
-    class SHADERLAB_API ImageLoader
+    class ImageLoader
     {
     public:
         // Does not touch COM; the WIC factory is created on the first load.

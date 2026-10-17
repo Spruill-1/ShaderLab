@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Graph/EffectNode.h"
 #include "BytecodeCache.h"
 
@@ -47,33 +46,33 @@ namespace ShaderLab::Effects
     }
 
     // Packs one mode per gpu-bindable parameter, in declaration order.
-    SHADERLAB_API uint32_t PackBindingModes(std::span<const GpuBindingMode> modes);
+    uint32_t PackBindingModes(std::span<const GpuBindingMode> modes);
 
     // UTF-8 names of the gpu-bindable parameters, in declaration order.
-    SHADERLAB_API std::vector<std::string> GpuBindableNames(const Graph::CustomEffectDefinition& def);
+    std::vector<std::string> GpuBindableNames(const Graph::CustomEffectDefinition& def);
 
     // UTF-8 names of the specialised parameters, in option key order.
-    SHADERLAB_API std::vector<std::string> SpecializedOptionNames(const Graph::CustomEffectDefinition& def);
+    std::vector<std::string> SpecializedOptionNames(const Graph::CustomEffectDefinition& def);
 
     // The option key a node's values select (0 = generic).
-    SHADERLAB_API uint64_t OptionKeyFor(const Graph::CustomEffectDefinition& def,
+    uint64_t OptionKeyFor(const Graph::CustomEffectDefinition& def,
                                         const std::map<std::wstring, Graph::PropertyValue>& values);
 
     // Every fully specialised option key. Empty when nothing is specialised
     // or there are more than cMaxOptionCombinations combinations.
     inline constexpr size_t cMaxOptionCombinations = 64;
-    SHADERLAB_API std::vector<uint64_t> AllOptionKeys(const Graph::CustomEffectDefinition& def);
+    std::vector<uint64_t> AllOptionKeys(const Graph::CustomEffectDefinition& def);
 
     // Number of fully specialised combinations, 0 when nothing is
     // specialised. Stops multiplying once past a million.
-    SHADERLAB_API size_t OptionCombinationCount(const Graph::CustomEffectDefinition& def);
+    size_t OptionCombinationCount(const Graph::CustomEffectDefinition& def);
 
     using MacroPair = std::pair<std::string, std::string>;
 
     // The (name, value) macros one variant compiles with: _SLPARAM_<name>_GPU
     // for every gpu-bindable parameter, and _SLOPT_<name>_MODE plus
     // _SLOPT_<name> for every specialised option.
-    SHADERLAB_API std::vector<MacroPair> BuildVariantMacros(
+    std::vector<MacroPair> BuildVariantMacros(
         const std::vector<std::string>& gpuNames, uint32_t bindingBits,
         const std::vector<std::string>& optionNames, uint64_t optionKey);
 
@@ -82,20 +81,20 @@ namespace ShaderLab::Effects
     // that must match the field list by hand. A character outside
     // [A-Za-z0-9_] becomes '_'; a name that then repeats is left out.
     // Every compile of a definition gets these.
-    SHADERLAB_API std::vector<MacroPair> AnalysisFieldMacros(const Graph::CustomEffectDefinition& def);
+    std::vector<MacroPair> AnalysisFieldMacros(const Graph::CustomEffectDefinition& def);
 
     // Macros for the generic build: every gpu-bindable parameter in cbuffer
     // mode, every option read at run time, and the analysis field indices.
-    SHADERLAB_API std::vector<MacroPair> GenericVariantMacros(const Graph::CustomEffectDefinition& def);
+    std::vector<MacroPair> GenericVariantMacros(const Graph::CustomEffectDefinition& def);
 
     // The cache request for one variant of a definition. `canonicalHlsl` is
     // CanonicalizeHlslSource(def.hlslSource); callers building several
     // variants canonicalise once. The baseline is bindingBits 0, optionKey 0.
-    SHADERLAB_API BytecodeCompileRequest MakeVariantRequest(
+    BytecodeCompileRequest MakeVariantRequest(
         const Graph::CustomEffectDefinition& def, std::string canonicalHlsl,
         const std::wstring& effectId, uint32_t effectVersion, const std::string& target,
         uint32_t bindingBits, uint64_t optionKey);
-    SHADERLAB_API BytecodeCompileRequest MakeVariantRequest(
+    BytecodeCompileRequest MakeVariantRequest(
         const Graph::CustomEffectDefinition& def,
         const std::wstring& effectId, uint32_t effectVersion, const std::string& target,
         uint32_t bindingBits, uint64_t optionKey);
@@ -108,16 +107,16 @@ namespace ShaderLab::Effects
         std::wstring effectId;
         uint32_t effectVersion{ 1 };
     };
-    SHADERLAB_API CompileIdentity CompileIdentityOf(const Graph::EffectNode& node);
+    CompileIdentity CompileIdentityOf(const Graph::EffectNode& node);
 
     // The shader target a definition compiles to: ps_5_0 or cs_5_0.
-    SHADERLAB_API std::string ShaderTargetFor(const Graph::CustomEffectDefinition& def);
+    std::string ShaderTargetFor(const Graph::CustomEffectDefinition& def);
 
     // Queues the baseline plus one variant per gpu-bindable parameter in the
     // target's GPU mode, so a binding wired later finds its shader warm.
     // Idempotent. An effect with specialised options is skipped: its option
     // variants are precompiled for the binding shape in use.
-    SHADERLAB_API void PrecompileBindingShapes(
+    void PrecompileBindingShapes(
         BytecodeCache& cache, const Graph::CustomEffectDefinition& def,
         const std::wstring& effectId, uint32_t effectVersion, const std::string& target);
 }

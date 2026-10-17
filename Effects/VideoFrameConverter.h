@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "VideoFrameReader.h"
 
 namespace ShaderLab::Effects
@@ -15,7 +14,7 @@ namespace ShaderLab::Effects
     // context and submitted with one ExecuteCommandList, because the
     // immediate context is shared with D2D and multithread protection
     // serializes single calls, not sequences of them.
-    class SHADERLAB_API VideoFrameConverter
+    class VideoFrameConverter
     {
     public:
         VideoFrameConverter() = default;

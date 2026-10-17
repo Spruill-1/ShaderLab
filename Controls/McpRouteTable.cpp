@@ -1,8 +1,8 @@
 #include "pch.h"
 #include "McpRouteTable.h"
 
-#include "../Engine/Mcp/McpJsonWriter.h"
-#include "../Engine/Mcp/McpTimeouts.h"
+#include "../Mcp/McpJsonWriter.h"
+#include "../Mcp/McpTimeouts.h"
 
 namespace ShaderLab::Controls
 {

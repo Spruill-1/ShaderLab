@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "EffectNode.h"
 
 // Parameter-node semantics (Float Parameter and its kin: a node whose Value
@@ -17,13 +16,13 @@ namespace ShaderLab::Graph
         float max{ 1.0f };
         float step{ 0.01f };
     };
-    SHADERLAB_API ParameterRange ReadParameterRange(const EffectNode& node);
+    ParameterRange ReadParameterRange(const EffectNode& node);
 
     // Where Value sits in its range, from 0 to 1.
-    SHADERLAB_API float ParameterNormalizedValue(const EffectNode& node);
+    float ParameterNormalizedValue(const EffectNode& node);
 
     // Sets Value to the point `normalized` (0 to 1, clamped) of the range,
     // snapped to the step and marks the node dirty. Returns false, writing
     // nothing, when the node has no Value or the value would not move.
-    SHADERLAB_API bool SetParameterNormalized(EffectNode& node, double normalized);
+    bool SetParameterNormalized(EffectNode& node, double normalized);
 }

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "VideoFrameConverter.h"
 #include "VideoFrameReader.h"
 #include "VideoSeekModel.h"
@@ -21,7 +20,7 @@ namespace ShaderLab::Effects
     // a queue. UploadIfReady() shows the newest queued frame that starts at
     // or before the target and drops older ones, so a late tick skips frames
     // instead of slowing playback.
-    class SHADERLAB_API VideoSourceProvider
+    class VideoSourceProvider
     {
     public:
         VideoSourceProvider();

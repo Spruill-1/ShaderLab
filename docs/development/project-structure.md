@@ -4,7 +4,13 @@
 ShaderLab/
 ├── ShaderLab.slnx                  # Solution file
 ├── ShaderLab.vcxproj               # WinUI 3 app project (MSIX packaged app; packages the Hub too)
-├── ShaderLabEngine.vcxproj         # Shared native engine DLL project
+├── ShaderLabEngine.vcxproj         # Host-agnostic engine, a static library every program links
+├── ShaderLabSupport.vcxproj        # ShaderLab-only static library: ExprTk, .effectgraph files (miniz), package routes
+├── EffectGraph.vcxproj             # EffectGraph.dll: the engine for outside programs, exporting only EffectGraphDll\EffectGraph.def
+├── BuiltInEffects.vcxproj          # Static library of the built-in shader effects' source, for EffectGraphCompile and the tests
+├── EffectGraphCompile.vcxproj      # Effect blob / header generator (out-of-tree effects; --builtins)
+├── TestEffectPlugin.vcxproj        # Effect plugin the tests load (Tests/TestPlugin): built like a real one, links no engine
+├── pch_host.cpp                    # ShaderLab's own /Yc source for pch_engine.h (headless, support library, broker)
 ├── ShaderLabTests.vcxproj          # Standalone console test runner project
 ├── ShaderLabHeadless.vcxproj       # Console host project (no WinUI dependency)
 ├── ShaderLabMcpBroker.vcxproj      # MCP broker (hub + stdio shim); no engine link
@@ -12,9 +18,7 @@ ShaderLab/
 ├── packages.config                 # NuGet package manifest
 ├── Package.appxmanifest            # MSIX app identity
 ├── app.manifest                    # DPI awareness, heap type
-├── EngineExport.h                  # SHADERLAB_API import/export macro + ABI version constant (history: architecture/engine-host-split.md)
-├── EngineExport.cpp                # ShaderLab_GetAbiVersion() C export
-├── Version.h                       # App version + graph format version
+├── Version.h                       # ShaderLab's version (EffectGraph's is Engine/Api/EffectGraphVersion.h)
 ├── README.md                       # Slim repo intro: install, dev quickstart, doc index
 ├── CHANGELOG.md                    # Version history
 ├── .gitmodules                     # third_party submodule pins (exprtk, miniz)
@@ -35,7 +39,7 @@ ShaderLab/
 │
 ├── Engine/EngineBootstrap.h / .cpp # Engine DLL: register D2D effect classes, configure the bytecode cache, ShutdownEngineServices
 ├── Engine/Utf8.h                   # WideToUtf8 / Utf8ToWide, the one UTF-8 conversion every project uses
-├── Engine/Mcp/                     # Engine DLL: MCP router + engine-pure routes
+├── Mcp/                            # ShaderLabSupport.lib: MCP router + engine routes (not EffectGraph; decision #225)
 │   ├── McpRouter.h / .cpp          # Pure route registry (longest-prefix, query split, HasRoute)
 │   ├── McpTypes.h                  # Transport-neutral Mcp::Response (+ noReply) + shared JsonEscape/WideToUtf8
 │   ├── McpArgs.h                   # Typed tool-argument readers (bool / number / uint / int / string / object / array, Require*) + ToUntypedValue
@@ -69,7 +73,8 @@ ShaderLab/
 │   │                               # registers a case, SL_REGISTER_TEST wraps an existing function.
 │   │                               # Tags: fast gpu video timing mcp math manual last. TIMING_TEST is
 │   │                               # asserted on hardware outside CI; SHADERLAB_TIMING_TESTS=1/0 overrides
-│   ├── TestSupport.h / .cpp        # Shared device, CaseEvaluator() (fresh per case), FindFixture,
+│   ├── TestSupport.h / .cpp        # Shared D3D11 device, CaseContext() (an EffectGraph context per case; g_dc and
+│   │                               # CaseEvaluator() are its), CreateTestContext, FindFixture,
 │   │                               # SkipMissingFixture, ScopedTempDir, frame and pattern-source helpers
 │   ├── ShaderTestBench.h / .cpp    # D3D11 compute test harness for HLSL math (Bench())
 │   ├── FixtureManifestTests.cpp    # fixtures/manifest.json: committed fixtures present, clip SHA-256s match
@@ -122,7 +127,7 @@ ShaderLab/
 │   └── ImageOutput.h / .cpp        # PNG / JPEG XR encode, --pixels file formats
 │
 ├── ShaderLabMcpBroker/            # MCP broker binary: --hub relay + --stdio shim (no engine link;
-│   │                               # compiles Engine/Mcp/Mcp{Frame,Crypto,PeerIdentity,Channel})
+│   │                               # compiles Mcp/Mcp{Frame,Crypto,PeerIdentity,Channel})
 │   ├── Main.cpp                    # argument parsing, picks the mode
 │   ├── BrokerPipeIo.h / .cpp       # log, pipe names, overlapped framed I/O, control frames, ConnectToHub
 │   ├── Hub.h / .cpp                # election, user-only pipe DACL, session registry + channel relay,
@@ -130,7 +135,7 @@ ShaderLab/
 │   └── Shim.h / .cpp               # JSON-RPC method and tool tables, session pinning + handshake,
 │                                   # tools/list splice
 │
-├── Graph/                          # Engine: effect graph data model
+├── Graph/                          # Engine: effect graph data model (files marked ShaderLab build into ShaderLabSupport.lib)
 │   ├── NodeType.h                  # NodeType enum
 │   ├── PropertyValue.h             # std::variant type for node properties
 │   ├── EffectNode.h                # EffectNode struct, ParameterDefinition, AnalysisFieldDef
@@ -139,23 +144,24 @@ ShaderLab/
 │   ├── ClockModel.h / .cpp         # Clock time semantics: live advance, AutoDuration, fixed timeline, SeekClock / SetClockPlaying
 │   ├── PropertyWrite.h / .cpp      # WriteProperty: untyped value -> the property's type (set-property, apply)
 │   ├── ParameterModel.h / .cpp     # Parameter range + normalized slider value (canvas sliders)
-│   ├── ParameterVisibility.h / .cpp # visibleWhen conditions, IsParameterShown (panel and canvas pins)
+│   ├── ParameterVisibility.h / .cpp # ShaderLab: visibleWhen conditions, IsParameterShown (panel and canvas pins)
 │   ├── GraphEdits.h / .cpp         # EditNodeProperty, paste cloning, Numeric Expression inputs
-│   ├── GraphLayout.h / .cpp        # ComputeAutoLayout: canvas columns by dependency depth (pure, tested)
+│   ├── GraphLayout.h / .cpp        # ShaderLab: ComputeAutoLayout, canvas columns by dependency depth (pure, tested)
 │   ├── ValueFormat.h / .cpp        # Display text for property values and analysis fields
-│   ├── GraphUiSnapshot.h / .cpp    # Immutable per-frame value copy of nodes + edges for UI-thread reads (decision #70)
+│   ├── GraphUiSnapshot.h / .cpp    # ShaderLab: immutable per-frame value copy of nodes + edges for UI-thread reads (decision #70)
+│   ├── VideoSourceStatus.h         # A video source's playback state, copied out on the render thread
 │
-├── Rendering/                      # Engine: rendering + analysis (RenderEngine stays app-side)
+├── Rendering/                      # Engine: rendering + analysis (files marked ShaderLab or App-only are not the engine's)
 │   ├── DisplayInfo.h               # DisplayCapabilities struct
 │   ├── DisplayMonitor.h / .cpp     # WinRT AdvancedColorInfoChanged event + simulated profile
 │   ├── DisplayProfile.h            # DisplayProfile struct + preset factories
 │   ├── IccProfileParser.h / .cpp   # mscms.dll-based ICC reader
 │   ├── PipelineFormat.h            # PipelineFormat struct (scRGB FP16 always)
-│   ├── RenderEngine.h / .cpp       # App-only D3D11 + D2D1 + swap chain lifecycle
+│   ├── RenderEngine.h / .cpp       # App-only D3D11 device + swap chain; D2D from the EffectGraph context
 │   ├── HostRenderSettings.h / .cpp # App-only render-loop policy: unthrottled mode, analysis hint scope, readout presets
 │   ├── FrameTimings.h              # App-only: render / UI frame timings and the board that publishes them (/perf, status bar)
-│   ├── FramePacer.h                # Frame deadlines for the throttled render worker
-│   ├── RenderThreadDispatcher.h    # Closure queue for UI → render-worker marshalling
+│   ├── FramePacer.h                # ShaderLab: frame deadlines for the throttled render worker
+│   ├── RenderThreadDispatcher.h    # ShaderLab: closure queue for UI → render-worker marshalling
 │   ├── GraphEvaluator.h / .cpp     # Exported facade over Evaluator/EvaluatorCore (one pointer, stable ABI)
 │   ├── Evaluator/                  # The evaluator, split by seam (topological-evaluation.md)
 │   │   ├── EvaluatorCore.h / .cpp  # The pull-dirty walk, one visitor per node kind, per-node records
@@ -175,20 +181,29 @@ ShaderLab/
 │   ├── EvaluatorOptions.h          # Per-evaluator behaviour switches (GPU bindings, readback skip, caching, ...)
 │   ├── SourceRuntime.h / .cpp      # Per-frame source preparation and offline video settling
 │   ├── D3D11ComputeRunner.h / .cpp # Generic D3D11 compute dispatch for user shaders
-│   ├── FfmpegProcess.h / .cpp      # ffmpeg child process with a drained log pipe (video export)
+│   ├── FfmpegProcess.h / .cpp      # ShaderLab: ffmpeg child process with a drained log pipe (video export)
 │   ├── PixelReadback.h / .cpp      # Engine helper: FP32 RGBA region readback
 │   ├── PixelTrace.h / .cpp         # TracePixel: one pixel at a node and every node upstream; HDR10 via BT.2020
-│   ├── PreviewViewState.h / .cpp   # The preview's node, view, auto-fit and per-node memory (thread-safe, tested)
+│   ├── PreviewViewState.h / .cpp   # ShaderLab: the preview's node, view, auto-fit and per-node memory (thread-safe, tested)
 │   ├── CaptureNode.h / .cpp        # Engine helper: PNG of any node's output (on ImageCapture)
 │   ├── ImageCapture.h / .cpp       # Engine helper: resolve a node's image, 96-DPI bounds, RenderToPixels, PNG / JXR encode
 │   ├── DeviceStack.h / .cpp        # Engine helper: the D3D11 + D2D device stack every host creates (adapter choice, WARP fallback)
 │   ├── GpuBindingPlan.h / .cpp     # PlanGpuBindings: which bindings a consumer's GPU lane serves (decision #141)
 │   ├── WorkingSpaceSync.h / .cpp   # Engine helper: refresh Working Space parameter nodes from a DisplayProfile
+│   ├── MathExpression.h / .cpp     # Numeric Expression hook: dispatches to the evaluator a host registers
+│
+├── Support/                        # ShaderLabSupport.lib: ShaderLab's programs only, not EffectGraph (decision #224)
+│   ├── ShaderLabSupport.h / .cpp   # RegisterShaderLabSupport: every program calls it at startup
+│   ├── ExprTkEvaluator.h / .cpp    # ExprTk behind the Numeric Expression hook (PCH disabled on .cpp)
 │   ├── EffectGraphFile.h / .cpp    # .effectgraph zip container (miniz DEFLATE) + embedded media
-│   ├── MathExpression.h / .cpp     # ExprTk-backed expression evaluator (PCH disabled on .cpp)
+│   ├── PackageRoutes.h / .cpp      # MCP /graph/load-file and /graph/save-file
+│   ├── EffectPlugins.h / .cpp      # Which plugin DLLs ShaderLab loads (package Effects\ folders), and loading them
 │
 ├── Effects/                        # Engine: built-in effect wrappers + custom effect base
-│   ├── ShaderLabEffects.h / .cpp   # 38 ShaderLab effects (versioned) — embedded HLSL
+│   ├── ShaderLabEffects.h / .cpp   # Effect registry; the 8 built-ins with no shader; queued headers register on first use
+│   ├── BuiltInEffects.h / .cpp     # Every built-in's name and id, class ids, header names, the not-included message
+│   ├── BuiltInEffectHooks.cpp      # The C++ three built-ins carry beyond their HLSL, attached by effect id
+│   ├── GamutLutGeometry.h          # The gamut boundary table's size, shared by the LUT effect and shaderlab_gamut.hlsli
 │   ├── ColorMath.cpp               # Shared HLSL color math library, served as shaderlab_colormath.hlsli
 │   ├── ColorMathCpu.h              # CPU port of the ICtCp path, for derived-constant tables (tested against the HLSL)
 │   ├── PropertyMetadata.h          # Effect property metadata for UI generation
@@ -240,18 +255,24 @@ ShaderLab/
 ├── Shaders/                        # HLSL source files (user shaders)
 ├── Assets/                         # App icons, splash screen
 ├── third_party/
-│   ├── exprtk/                     # submodule: ArashPartow/exprtk (MIT) — exprtk.hpp
+│   ├── exprtk/                     # submodule: ArashPartow/exprtk (MIT) — exprtk.hpp; Support only
 │   ├── miniz/                      # submodule: richgel999/miniz @ 3.1.2 (MIT)
 │   └── miniz_export.h              # in-tree shim: empty MINIZ_EXPORT (upstream CMake-generates it)
 ├── scripts/
 │   ├── EnsureDevCert.ps1           # Generates + installs CN=ShaderLab dev cert for F5
-│   └── Install.ps1                 # Per-arch unsigned-MSIX installer for end users
+│   ├── Install.ps1                 # Per-arch unsigned-MSIX installer for end users
+│   ├── ShaderLabOwnedFiles.txt     # ShaderLab's files inside the engine's folders (and the repo-split path list)
+│   ├── Check-EngineBoundary.ps1    # CI: fails if engine code includes a ShaderLab-owned file
+│   └── Test-SplitBuild.ps1         # Builds ShaderLab's files alone against the EffectGraph.Engine package
 ├── .github/
 │   ├── workflows/
 │   │   ├── ci.yml                  # PR / push CI: build-and-test (unit + MCP suite vs headless serve) + clean-clone-smoke
 │   │   └── release.yml             # Tagged-release matrix (x64 + ARM64)
 │   └── copilot-instructions.md
-├── <Platform>\<Config>\ShaderLabEngine\   # Engine DLL output (x64|ARM64 × Debug|Release)
+├── <Platform>\<Config>\ShaderLabEngine\   # Engine library output (x64|ARM64 × Debug|Release)
+├── <Platform>\<Config>\ShaderLabEngine.Package\ # The same built for EffectGraph.Engine (no /GL, /Z7)
+├── <Platform>\<Config>\EffectGraph\       # EffectGraph.dll, EffectGraph.lib and include\ (the public header + built-in effect headers)
+├── <Platform>\<Config>\EffectGraphBuiltIns\ # Generated built-in effect headers + their compile cache
 ├── <Platform>\<Config>\ShaderLab\         # WinUI app output — deploy from here, never from AppX\
 ├── <Platform>\<Config>\ShaderLabTests\    # Console test output
 ├── <Platform>\<Config>\ShaderLabHeadless\ # Console host output

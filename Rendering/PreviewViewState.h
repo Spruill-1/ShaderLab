@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 
 #include <mutex>
 #include <unordered_map>
@@ -25,12 +24,12 @@ namespace ShaderLab::Rendering
     // viewport, at 95% of the tighter axis. An unbounded image (wider or
     // taller than 100000) gets zoom 1 at the origin. Nothing while the
     // viewport or the image is empty.
-    SHADERLAB_API std::optional<PreviewView> FitPreviewView(const D2D1_RECT_F& bounds,
+    std::optional<PreviewView> FitPreviewView(const D2D1_RECT_F& bounds,
                                                             float viewportW, float viewportH);
 
     // The view after zooming by `factor` about a screen point, zoom clamped
     // to [0.01, 100].
-    SHADERLAB_API PreviewView ZoomPreviewAbout(const PreviewView& view, float x, float y, float factor);
+    PreviewView ZoomPreviewAbout(const PreviewView& view, float x, float y, float factor);
 
     // What one preview frame is drawn with, read once at its start.
     struct PreviewFrame
@@ -42,7 +41,7 @@ namespace ShaderLab::Rendering
         uint64_t version{ 0 };          // bumped by every edit
     };
 
-    class SHADERLAB_API PreviewViewState
+    class PreviewViewState
     {
     public:
         PreviewFrame Frame() const;

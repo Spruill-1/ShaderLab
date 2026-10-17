@@ -1,11 +1,11 @@
 #include "pch_engine.h"
 #include "../TestSupport.h"
-#include "Engine/Mcp/McpChannel.h"
-#include "Engine/Mcp/McpCrypto.h"
-#include "Engine/Mcp/McpFrame.h"
-#include "Engine/Mcp/McpPeerIdentity.h"
-#include "Engine/Mcp/McpRouter.h"
-#include "Engine/Mcp/McpSessionClient.h"
+#include "Mcp/McpChannel.h"
+#include "Mcp/McpCrypto.h"
+#include "Mcp/McpFrame.h"
+#include "Mcp/McpPeerIdentity.h"
+#include "Mcp/McpRouter.h"
+#include "Mcp/McpSessionClient.h"
 #include "Graph/GraphModel.h"
 #include "Rendering/GraphEvaluator.h"
 
@@ -324,7 +324,7 @@ namespace
             TEST("Peer_UnpackagedAcceptedWithGate",
                 EvaluatePairing(unpackA, unpackB, buildId, buildId) == PairingVerdict::Accept);
             TEST("Peer_UnpackagedBuildMismatchRefused",
-                EvaluatePairing(unpackA, unpackB, buildId, L"other#abi9")
+                EvaluatePairing(unpackA, unpackB, buildId, L"other#rev9")
                     == PairingVerdict::RefusedMismatch);
 
             PeerIdentity otherDir = unpackB;

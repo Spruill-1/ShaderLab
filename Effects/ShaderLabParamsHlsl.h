@@ -14,7 +14,6 @@
 //   #include "shaderlab_params.hlsli"
 // to this string, no on-disk lookup needed.
 
-#include "../EngineExport.h"
 
 namespace ShaderLab::Effects
 {
@@ -25,11 +24,11 @@ namespace ShaderLab::Effects
 
     // Returns the embedded macro library content. Pointer remains
     // valid for the process lifetime; do not free.
-    SHADERLAB_API const char* GetShaderLabParamsHLSL();
+    const char* GetShaderLabParamsHLSL();
 
     // Length of the embedded content in bytes (excluding any trailing
     // null terminator). Matches strlen(GetShaderLabParamsHLSL()).
-    SHADERLAB_API size_t GetShaderLabParamsHLSLLength();
+    size_t GetShaderLabParamsHLSLLength();
 
     // Multi-group reduction contract, shared by the HLSL library below
     // (as SHADERLAB_REDUCE_* defines -- a test asserts they match) and

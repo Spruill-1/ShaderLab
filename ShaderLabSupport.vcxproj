@@ -1,0 +1,227 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props" Condition="Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props')" />
+  <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.props" Condition="Exists('packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.props')" />
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{3C5E8A21-7B4D-4F6A-9E12-5D8C0B7A4E63}</ProjectGuid>
+    <ProjectName>ShaderLabSupport</ProjectName>
+    <RootNamespace>ShaderLabSupport</RootNamespace>
+    <TargetName>ShaderLabSupport</TargetName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>10.0.22621.0</WindowsTargetPlatformMinVersion>
+    <Keyword>Win32Proj</Keyword>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|ARM64"><Configuration>Debug</Configuration><Platform>ARM64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64"><Configuration>Release</Configuration><Platform>ARM64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset Condition="'$(VisualStudioVersion)' &gt;= '18.0'">v145</PlatformToolset>
+    <PlatformToolset Condition="'$(VisualStudioVersion)' &lt; '18.0'">v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <LinkIncremental>true</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset Condition="'$(VisualStudioVersion)' &gt;= '18.0'">v145</PlatformToolset>
+    <PlatformToolset Condition="'$(VisualStudioVersion)' &lt; '18.0'">v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <LinkIncremental>true</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset Condition="'$(VisualStudioVersion)' &gt;= '18.0'">v145</PlatformToolset>
+    <PlatformToolset Condition="'$(VisualStudioVersion)' &lt; '18.0'">v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset Condition="'$(VisualStudioVersion)' &gt;= '18.0'">v145</PlatformToolset>
+    <PlatformToolset Condition="'$(VisualStudioVersion)' &lt; '18.0'">v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabSupport\</OutDir>
+    <IntDir>$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabSupport\obj\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- third_party\ itself is on the path so miniz.h's #include "miniz_export.h"
+           resolves to our in-tree shim (the real one is CMake-generated upstream). -->
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)third_party;$(ProjectDir)third_party\exprtk;$(ProjectDir)third_party\miniz;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch_engine.h</PrecompiledHeaderFile>
+      <PrecompiledHeaderOutputFile>$(IntDir)pch_support.pch</PrecompiledHeaderOutputFile>
+      <WarningLevel>Level4</WarningLevel>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <DisableSpecificWarnings>4251;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <!-- C4715: falling off the end of a value-returning function is undefined behavior. -->
+      <TreatSpecificWarningsAsErrors>4715;%(TreatSpecificWarningsAsErrors)</TreatSpecificWarningsAsErrors>
+      <AdditionalOptions>%(AdditionalOptions) /bigobj /utf-8</AdditionalOptions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;WIN32;_WINDOWS;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;WIN32;_WINDOWS;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <!-- ShaderLab's own pieces that EffectGraph does not ship: ExprTk behind the
+       engine's Numeric Expression hook, .effectgraph packages (miniz), the
+       MCP layer (router, JSON-RPC, tool catalog, routes, broker crypto), and the
+       host-side pieces that sit in Graph\ and Rendering\ (UI snapshot, layout,
+       preview state, frame pacing, the render-thread dispatcher, video export). -->
+  <ItemGroup>
+    <ClInclude Include="Support\ShaderLabSupport.h" />
+    <ClInclude Include="Support\ExprTkEvaluator.h" />
+    <ClInclude Include="Support\EffectGraphFile.h" />
+    <ClInclude Include="Support\PackageRoutes.h" />
+    <ClInclude Include="Support\EffectPlugins.h" />
+    <ClInclude Include="Graph\ParameterVisibility.h" />
+    <ClInclude Include="Graph\GraphLayout.h" />
+    <ClInclude Include="Graph\GraphUiSnapshot.h" />
+    <ClInclude Include="Rendering\FfmpegProcess.h" />
+    <ClInclude Include="Rendering\FramePacer.h" />
+    <ClInclude Include="Rendering\PreviewRenderStats.h" />
+    <ClInclude Include="Rendering\RenderThreadDispatcher.h" />
+    <ClInclude Include="Rendering\PreviewViewState.h" />
+    <ClInclude Include="Rendering\VideoExport.h" />
+    <ClInclude Include="Mcp\EngineMcpRoutes.h" />
+    <ClInclude Include="Mcp\McpArgs.h" />
+    <ClInclude Include="Mcp\McpChannel.h" />
+    <ClInclude Include="Mcp\McpCrypto.h" />
+    <ClInclude Include="Mcp\McpFrame.h" />
+    <ClInclude Include="Mcp\McpJsonRpc.h" />
+    <ClInclude Include="Mcp\McpJsonWriter.h" />
+    <ClInclude Include="Mcp\McpPeerIdentity.h" />
+    <ClInclude Include="Mcp\McpRouter.h" />
+    <ClInclude Include="Mcp\McpSerialize.h" />
+    <ClInclude Include="Mcp\McpSessionClient.h" />
+    <ClInclude Include="Mcp\McpTimeouts.h" />
+    <ClInclude Include="Mcp\McpToolCatalog.h" />
+    <ClInclude Include="Mcp\McpTypes.h" />
+    <ClInclude Include="Mcp\Routes\GraphPatch.h" />
+    <ClInclude Include="Mcp\Routes\RouteSupport.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch_host.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="Support\ShaderLabSupport.cpp" />
+    <ClCompile Include="Support\EffectGraphFile.cpp" />
+    <ClCompile Include="Support\PackageRoutes.cpp" />
+    <ClCompile Include="Support\EffectPlugins.cpp" />
+    <ClCompile Include="Graph\ParameterVisibility.cpp" />
+    <ClCompile Include="Graph\GraphLayout.cpp" />
+    <ClCompile Include="Graph\GraphUiSnapshot.cpp" />
+    <ClCompile Include="Rendering\FfmpegProcess.cpp" />
+    <ClCompile Include="Rendering\PreviewViewState.cpp" />
+    <ClCompile Include="Rendering\VideoExport.cpp" />
+    <ClCompile Include="Mcp\EngineMcpRoutes.cpp" />
+    <ClCompile Include="Mcp\McpChannel.cpp" />
+    <ClCompile Include="Mcp\McpCrypto.cpp" />
+    <ClCompile Include="Mcp\McpFrame.cpp" />
+    <ClCompile Include="Mcp\McpJsonRpc.cpp" />
+    <ClCompile Include="Mcp\McpPeerIdentity.cpp" />
+    <ClCompile Include="Mcp\McpRouter.cpp" />
+    <ClCompile Include="Mcp\McpSerialize.cpp" />
+    <ClCompile Include="Mcp\McpSessionClient.cpp" />
+    <ClCompile Include="Mcp\McpToolCatalog.cpp" />
+    <ClCompile Include="Mcp\Routes\CatalogRoutes.cpp" />
+    <ClCompile Include="Mcp\Routes\DisplayRoutes.cpp" />
+    <ClCompile Include="Mcp\Routes\EffectRoutes.cpp" />
+    <ClCompile Include="Mcp\Routes\FileRoutes.cpp" />
+    <ClCompile Include="Mcp\Routes\GraphPatch.cpp" />
+    <ClCompile Include="Mcp\Routes\GraphRoutes.cpp" />
+    <ClCompile Include="Mcp\Routes\PropertyRoutes.cpp" />
+    <ClCompile Include="Mcp\Routes\ReadbackRoutes.cpp" />
+    <ClCompile Include="Mcp\Routes\RouteSupport.cpp" />
+    <ClCompile Include="Mcp\Routes\VideoRoutes.cpp" />
+    <ClCompile Include="Support\ExprTkEvaluator.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <!-- miniz (submodule, tag 3.1.2). The upstream git tree ships split sources;
+         only these three are needed for the .effectgraph DEFLATE path
+         (mz_free, tdefl_compress_mem_to_heap, tinfl_decompress_mem_to_heap).
+         miniz_zip.c is deliberately omitted: EffectGraphFile.cpp writes the
+         ZIP container itself and only uses raw DEFLATE. -->
+    <ClCompile Include="third_party\miniz\miniz.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <CompileAs>CompileAsC</CompileAs>
+      <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="third_party\miniz\miniz_tdef.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <CompileAs>CompileAsC</CompileAs>
+      <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="third_party\miniz\miniz_tinfl.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <CompileAs>CompileAsC</CompileAs>
+      <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <PropertyGroup>
+    <EffectGraphEngineHeadersOnly>true</EffectGraphEngineHeadersOnly>
+  </PropertyGroup>
+  <Import Project="build\EffectGraphEngine.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets')" />
+    <Import Project="packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets" Condition="Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets')" />
+  </ImportGroup>
+  <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">
+    <PropertyGroup>
+      <ErrorText>This project references NuGet package(s) that are missing on this computer. Use NuGet Package Restore to download them. For more information, see http://go.microsoft.com/fwlink/?LinkID=322105. The missing file is {0}.</ErrorText>
+    </PropertyGroup>
+    <Error Condition="!Exists('packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.props')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.props'))" />
+    <Error Condition="!Exists('packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets'))" />
+    <Error Condition="!Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props'))" />
+    <Error Condition="!Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets'))" />
+  </Target>
+
+  <!-- exprtk and miniz are git submodules under third_party\. If the working
+       copy was cloned without them, fail with an actionable message instead of
+       a wall of missing-header errors. -->
+  <Target Name="VerifySubmodules" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(ProjectDir)third_party\exprtk\exprtk.hpp')"
+           Text="Missing third_party\exprtk\exprtk.hpp. The exprtk and miniz dependencies are git submodules. Run: git submodule update --init --recursive" />
+    <Error Condition="!Exists('$(ProjectDir)third_party\miniz\miniz.c')"
+           Text="Missing third_party\miniz\miniz.c. The exprtk and miniz dependencies are git submodules. Run: git submodule update --init --recursive" />
+  </Target>
+
+  <!-- exprtk and miniz are git submodules under third_party\. If the working
+       copy was cloned without them, fail with an actionable message instead of
+       a wall of missing-header errors. -->
+  <Target Name="VerifySubmodules" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(ProjectDir)third_party\exprtk\exprtk.hpp')"
+           Text="Missing third_party\exprtk\exprtk.hpp. The exprtk and miniz dependencies are git submodules. Run: git submodule update --init --recursive" />
+    <Error Condition="!Exists('$(ProjectDir)third_party\miniz\miniz.c')"
+           Text="Missing third_party\miniz\miniz.c. The exprtk and miniz dependencies are git submodules. Run: git submodule update --init --recursive" />
+  </Target>
+</Project>

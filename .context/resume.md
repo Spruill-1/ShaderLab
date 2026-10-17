@@ -41,7 +41,7 @@ with a particular focus on tone-mapping and colour-correction R&D.
 
 | Project | Output | Purpose |
 |--------|--------|---------|
-| `ShaderLabEngine.vcxproj` | `ShaderLabEngine.dll` | Host-agnostic engine: graph model + `GraphUiSnapshot`, evaluator, `RenderThreadDispatcher`, ICC reader, video + live-capture sources, ExprTk math, D3D11 compute runner + `CustomComputeBridgeEffect` + `BytecodeCache`, `IEngineComputeOutput` COM interface, and the whole MCP protocol surface (router, JSON-RPC dispatcher, tool catalog, engine-pure routes, broker crypto). Exported via `SHADERLAB_API`. |
+| `ShaderLabEngine.vcxproj` | `ShaderLabEngine.lib` (static) | Host-agnostic engine, linked into every program: graph model + `GraphUiSnapshot`, evaluator, `RenderThreadDispatcher`, ICC reader, video + live-capture sources, ExprTk math, D3D11 compute runner + `CustomComputeBridgeEffect` + `BytecodeCache`, `IEngineComputeOutput` COM interface, and the whole MCP protocol surface (router, JSON-RPC dispatcher, tool catalog, engine-pure routes, broker crypto). Exported via `SHADERLAB_API`. |
 | `ShaderLab.vcxproj` | `ShaderLab.exe` (MSIX) | WinUI 3 packaged app. `RenderEngine` (app-only), all XAML, controllers, the render worker thread, and the UI-coupled MCP routes in `MainWindow.McpRoutes.cpp` + `GuiEngineCommandSink`. Depends on the engine DLL. |
 | `ShaderLabTests.vcxproj` | `ShaderLabTests.exe` | Standalone console runner — graph/evaluator/bindings, bytecode cache, snapshot, dispatcher, MCP router + JSON-RPC contracts, broker frame codec / crypto / peer identity, GPU-binding matrices, and the HLSL math bench. No WinUI; CI runs it on `--adapter warp`. |
 | `ShaderLabHeadless.vcxproj` | `ShaderLabHeadless.exe` | Console host, no WinUI: image render (PNG or JPEG XR, chosen by output extension), `.effectgraph` ZIP + embedded media, FP32 pixel readback, JSON batch script mode, MCP session mode, bytecode-cache ops. |
@@ -82,8 +82,9 @@ Two locks with a strict order (`m_graphMutex` → `m_visualsMutex`); never hold
 ### Core
 - Node-based DAG graph editor for D2D effect composition.
 - Wrapped built-in D2D effects, grouped by category (`Effects/EffectRegistry.cpp`), plus
-  the ShaderLab effect library with embedded HLSL (`Effects/ShaderLabEffects.cpp` +
-  `Effects/ColorMath.cpp`).
+  the ShaderLab effect library: shader effects in `BuiltInEffects/BuiltInEffectTable.cpp`,
+  generated into per-effect headers at build time, the registry and non-shader nodes in
+  `Effects/ShaderLabEffects.cpp`, shared HLSL in `Effects/ColorMath.cpp`.
 - Three custom-effect flavours: pixel (`ID2D1DrawTransform`), D2D compute
   (`ID2D1ComputeTransform`, per-tile), and **D3D11 compute** — the last routed through
   `CustomComputeBridgeEffect` + `D3D11ComputeRunner`, which implements

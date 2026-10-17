@@ -1,6 +1,6 @@
 # Numeric Expression Node (ExprTk)
 
-A single, expression-driven math node replaces the legacy fixed-op math primitives. Implemented in `Rendering/MathExpression.{h,cpp}` (PCH disabled on the .cpp so the heavy ExprTk template instantiations don't leak into the rest of the engine TU).
+A single, expression-driven math node replaces the legacy fixed-op math primitives. The engine evaluates it through a hook, `Rendering/MathExpression.{h,cpp}`; ShaderLab's programs register ExprTk there (`Support/ExprTkEvaluator.cpp`, PCH disabled so the heavy ExprTk template instantiations stay in one translation unit) by calling `Support::RegisterShaderLabSupport()` at startup. EffectGraph has no expression language: there, every expression fails with an error saying no evaluator is registered (decision #224).
 
 - **Dynamic inputs**: starts with one input `A`. Use the **➕ Add Input** button in the Properties panel to add `B`, `C`, … up to `Z` (26-input cap). Each row has an **✕** button to remove just that input. Both are engine edits in `Graph/GraphEdits` (`AddExpressionInput`, `RemoveExpressionInput`, `CanRemoveExpressionInput`), so removing an input also drops any binding to it and the last input cannot go.
 - **Expression**: a `TextBox` at the top of the Properties panel holds the formula. Examples:
@@ -14,7 +14,7 @@ A single, expression-driven math node replaces the legacy fixed-op math primitiv
 - **Errors**: parse / evaluation errors surface in the per-node log pane (`node_logs` MCP tool). The node short-circuits to `0.0` until the expression compiles cleanly.
 - **Persistence**: the expression and the live input list both round-trip through graph JSON.
 
-**ExprTk feature flags.** `Rendering/MathExpression.cpp` defines
+**ExprTk feature flags.** `Support/ExprTkEvaluator.cpp` defines
 `exprtk_disable_string_capabilities`, `exprtk_disable_rtl_io`, `exprtk_disable_rtl_io_file`,
 `exprtk_disable_rtl_vecops`, `exprtk_disable_enhanced_features`, and
 `exprtk_disable_caseinsensitivity` *before* `#include`-ing `exprtk.hpp`. This trims the

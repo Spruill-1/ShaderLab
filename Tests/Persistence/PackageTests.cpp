@@ -1,7 +1,7 @@
 #include "pch_engine.h"
 #include "../TestSupport.h"
 #include "Graph/GraphModel.h"
-#include "Rendering/EffectGraphFile.h"
+#include "Support/EffectGraphFile.h"
 #include "Rendering/GraphEvaluator.h"
 
 #include <chrono>
@@ -22,7 +22,7 @@ namespace
     {
         printf("\n=== .effectgraph save: unchanged media is reused ===\n");
         namespace fs = std::filesystem;
-        using ShaderLab::Rendering::EffectGraphFile;
+        using ShaderLab::Support::EffectGraphFile;
         const ScopedTempDir tempDir(L"ShaderLabPackageTest");
         const fs::path dir = tempDir.Path();
         std::error_code ec;
@@ -143,7 +143,7 @@ namespace
     {
         printf("\n=== .effectgraph load: untrusted archive input ===\n");
         namespace fs = std::filesystem;
-        using ShaderLab::Rendering::EffectGraphFile;
+        using ShaderLab::Support::EffectGraphFile;
         const ScopedTempDir tempDir(L"ShaderLabUntrustedPackageTest");
         const fs::path dir = tempDir.Path();
         std::error_code ec;
@@ -241,7 +241,7 @@ namespace
     {
         printf("\n=== .effectgraph save: progress and failure cleanup ===\n");
         namespace fs = std::filesystem;
-        using ShaderLab::Rendering::EffectGraphFile;
+        using ShaderLab::Support::EffectGraphFile;
         const ScopedTempDir tempDir(L"ShaderLabPackageProgressTest");
         const fs::path dir = tempDir.Path();
         std::error_code ec;

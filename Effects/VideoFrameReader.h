@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 
 namespace ShaderLab::Effects
 {
@@ -12,7 +11,7 @@ namespace ShaderLab::Effects
     // once from the native media type, that picks the decode format and
     // drives the conversion shader. An attribute the file does not carry is
     // Unknown, and DescribeVideoColor resolves it from the others.
-    struct SHADERLAB_API VideoColorDescription
+    struct VideoColorDescription
     {
         enum class Transfer : uint8_t { Unknown, Sdr, Pq, Hlg };      // Sdr: the sRGB curve
         enum class Primaries : uint8_t { Unknown, Bt709, Bt2020 };
@@ -49,8 +48,8 @@ namespace ShaderLab::Effects
     //   - matrix: as tagged; untagged, BT.2020 for HDR and BT.709 for SDR.
     //   - range: as tagged; untagged, limited.
     // The file name plays no part.
-    SHADERLAB_API VideoColorDescription DescribeVideoColor(const VideoColorTags& tags);
-    SHADERLAB_API VideoColorTags ReadVideoColorTags(IMFMediaType* nativeType);
+    VideoColorDescription DescribeVideoColor(const VideoColorTags& tags);
+    VideoColorTags ReadVideoColorTags(IMFMediaType* nativeType);
 
     // A decoded frame waiting in the provider's queue: raw bytes (CPU path)
     // or the decoder's sample (zero-copy path). The provider stamps the
@@ -91,7 +90,7 @@ namespace ShaderLab::Effects
     // describes the stream's colour, negotiates the output format, and copies
     // a decoded sample out. No D2D. The reader itself is used from the
     // provider's decode thread; Open and Close run with that thread stopped.
-    class SHADERLAB_API VideoFrameReader
+    class VideoFrameReader
     {
     public:
         VideoFrameReader() = default;

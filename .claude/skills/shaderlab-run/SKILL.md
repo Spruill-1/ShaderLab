@@ -13,8 +13,8 @@ Prefer **headless** when the question is numeric — it skips all of this. See
 
 ## 0. Build first
 
-Use the **shaderlab-build** skill. The GUI locks `ShaderLab.exe` and
-`ShaderLabEngine.dll` in the layout, and a lingering `ShaderLabMcpBroker` hub locks
+Use the **shaderlab-build** skill. The GUI locks `ShaderLab.exe` in the layout,
+and a lingering `ShaderLabMcpBroker` hub locks
 the layout's broker copy — **kill both before rebuilding** or the copy step fails.
 
 ```pwsh

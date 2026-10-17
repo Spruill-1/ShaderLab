@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../../EngineExport.h"
 #include "../../Graph/EffectNode.h"
 
 // Parameter nodes (Clock, Math Expression, Random, Working Space, plain
@@ -12,5 +11,5 @@ namespace ShaderLab::Rendering::Evaluator
     // The analysis fields `node` publishes, by its NodeKind. Sets or clears
     // node.runtimeError for an expression that does not parse. `node` must
     // carry a customEffect.
-    SHADERLAB_API std::vector<Graph::AnalysisFieldValue> ParameterNodeFields(Graph::EffectNode& node);
+    std::vector<Graph::AnalysisFieldValue> ParameterNodeFields(Graph::EffectNode& node);
 }

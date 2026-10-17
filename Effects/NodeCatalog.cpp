@@ -1,6 +1,7 @@
 #include "pch_engine.h"
 #include "NodeCatalog.h"
 #include "../Graph/GraphModel.h"
+#include "BuiltInEffects.h"
 #include "CustomComputeShaderEffect.h"
 #include "CustomPixelShaderEffect.h"
 #include "DxgiDuplicationSourceProvider.h"
@@ -152,7 +153,8 @@ namespace ShaderLab::Effects
             return result;
         }
 
-        result.error = L"Unknown effect name: " + std::wstring(name);
+        result.error = MissingBuiltInMessage(name);
+        if (result.error.empty()) result.error = L"Unknown effect name: " + std::wstring(name);
         return result;
     }
 }

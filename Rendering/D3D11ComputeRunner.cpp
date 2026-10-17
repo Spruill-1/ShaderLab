@@ -286,6 +286,24 @@ void main(uint3 tid : SV_DispatchThreadID)
         m_analysisTexFilled = true;
     }
 
+    HRESULT D3D11ComputeRunner::WriteResults(uint32_t firstElement, const float* float4s, uint32_t elementCount)
+    {
+        if (!m_resultBuffer || !m_immediate || !float4s || elementCount == 0 ||
+            uint64_t{ firstElement } + elementCount > m_resultCount)
+            return E_INVALIDARG;
+        // On the immediate context: one call, which multithread protection
+        // keeps whole; the copy pass that follows is recorded and submitted
+        // after it.
+        const D3D11_BOX box{ firstElement * 16u, 0, 0, (firstElement + elementCount) * 16u, 1, 1 };
+        m_immediate->UpdateSubresource(m_resultBuffer.get(), 0, &box, float4s, 0, 0);
+        if (m_analysisTexWanted && m_analysisTexFilled)
+        {
+            PublishAnalysisTexture();
+            SubmitRecorded();
+        }
+        return S_OK;
+    }
+
     HRESULT D3D11ComputeRunner::EnsureBuffers(uint32_t resultCount)
     {
         if (m_resultCount == resultCount && m_resultBuffer) return S_OK;

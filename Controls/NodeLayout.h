@@ -1,7 +1,7 @@
 #pragma once
 
 #include "pch.h"
-#include "../Graph/EffectNode.h"
+#include "Graph/EffectNode.h"
 
 // Canvas geometry of one node: its box, pins and inline controls. A pure
 // function of the node, used by the canvas paint and hit-tests.

@@ -4,10 +4,11 @@
 #include "MainWindow.g.cpp"
 #endif
 
+#include "Rendering/DeviceStack.h"
 #include "Rendering/FramePacer.h"
 #include "Rendering/PipelineFormat.h"
 #include "Rendering/IccProfileParser.h"
-#include "Rendering/EffectGraphFile.h"
+#include "Support/EffectGraphFile.h"
 #include "Rendering/PixelReadback.h"
 #include "Rendering/CaptureNode.h"
 #include "Rendering/ImageCapture.h"
@@ -23,7 +24,6 @@
 #include "Rendering/HostRenderSettings.h"
 #include "Engine/EngineBootstrap.h"
 #include "Version.h"
-#include "EngineExport.h"
 #include <microsoft.ui.xaml.media.dxinterop.h>
 #include <shlobj.h>
 #include <KnownFolders.h>
@@ -39,20 +39,6 @@ namespace winrt::ShaderLab::implementation
     MainWindow::MainWindow()
     {
         InitializeComponent();
-
-        // Engine ABI compatibility check. Mismatch means the loaded
-        // ShaderLabEngine.dll is from a different build than the headers
-        // we compiled against -- abort early with a friendly message
-        // instead of failing later in an obscure way.
-        if (::ShaderLab_GetAbiVersion() != SHADERLAB_ENGINE_ABI_VERSION)
-        {
-            wchar_t msg[256];
-            swprintf_s(msg, L"ShaderLab engine ABI mismatch (header %u, DLL %u). Rebuild and redeploy.",
-                static_cast<unsigned>(SHADERLAB_ENGINE_ABI_VERSION),
-                static_cast<unsigned>(::ShaderLab_GetAbiVersion()));
-            ::MessageBoxW(nullptr, msg, L"ShaderLab", MB_OK | MB_ICONERROR);
-            ::ExitProcess(1);
-        }
 
         Title(std::wstring(L"ShaderLab v") + ::ShaderLab::VersionString + L" \u2014 HDR Shader Effect Development");
         // After Title() we'll refresh from RefreshTitleBar() once a graph
@@ -163,8 +149,8 @@ namespace winrt::ShaderLab::implementation
             // Graph writes and layout belong to the render thread.
             m_renderDispatcher.DispatchSync([this]
             {
-                for (const uint32_t id : ::ShaderLab::Effects::UpgradeOutdatedNodes(m_graph))
-                    m_graphEvaluator.InvalidateNode(id);
+                for (const uint32_t id : ::ShaderLab::Effects::UpgradeOutdatedNodes(Model()))
+                    Evaluator().InvalidateNode(id);
                 m_nodeGraphController.RebuildLayout();
             });
             m_forceRender = true;
@@ -240,13 +226,13 @@ namespace winrt::ShaderLab::implementation
                 return m_renderDispatcher.DispatchSync([this, &edit]
                 {
                     ::ShaderLab::Controls::PanelGraphEdit context{
-                        m_graph,
+                        Model(),
                         [this] { m_nodeGraphController.RebuildLayout(); },
-                        [this](uint32_t id) { m_graphEvaluator.InvalidateNode(id); },
+                        [this](uint32_t id) { Evaluator().InvalidateNode(id); },
                         [this](::ShaderLab::Graph::EffectNode& node)
                         {
                             if (auto* dc = m_renderEngine.RenderD2DContext())
-                                m_sourceFactory.PrepareSourceNode(node, dc, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                                Sources().PrepareSourceNode(node, dc, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
                         } };
                     return edit(context);
                 });
@@ -273,6 +259,13 @@ namespace winrt::ShaderLab::implementation
         McpServerToggle().Click([this](auto&&, auto&&)
         {
             bool checked = McpServerToggle().IsChecked().GetBoolean();
+            // The routes need the context; until the preview panel loads,
+            // OnPreviewPanelLoaded starts MCP itself.
+            if (checked && !m_context)
+            {
+                McpServerToggle().IsChecked(false);
+                return;
+            }
             if (checked)
             {
                 if (!m_mcpServer)
@@ -374,7 +367,8 @@ namespace winrt::ShaderLab::implementation
         // Release UI-side offscreen wrappers before tearing down render engine.
         for (auto& b : m_offscreenSourceBitmapUi) b = nullptr;
 
-        m_graphEvaluator.ReleaseCache(m_graph);
+        // The worker is joined, so this thread may release the context.
+        m_context = nullptr;
         m_displayMonitor.Shutdown();
         m_renderEngine.Shutdown();
         ::ShaderLab::Engine::ShutdownEngineServices();
@@ -414,9 +408,26 @@ namespace winrt::ShaderLab::implementation
 
         m_displayMonitor.Initialize(m_hwnd);
 
-        // Create D3D11/D2D1 device stack and swap chain on the PreviewPanel.
-        m_renderEngine.Initialize(m_hwnd, PreviewPanel(),
-            ::ShaderLab::Rendering::FormatScRgbFP16, m_devicePref);
+        // The device, then the context on it (created once, moved on an
+        // adapter switch), then the swap chain on the context's D2D device.
+        m_renderEngine.CreateDevice(m_devicePref);
+        if (!m_context)
+        {
+            EFFECTGRAPH_CONTEXT_DESC desc{};
+            // Compile on the cache's worker threads, not the render thread,
+            // so a slow compile cannot stall UI actions that dispatch to it.
+            desc.flags = EFFECTGRAPH_CONTEXT_FLAGS_ASYNC_COMPILE;
+            const std::wstring cacheRoot = BytecodeCacheRoot();
+            desc.shaderCacheDirectory = cacheRoot.c_str();
+            winrt::check_hresult(EffectGraphCreateContext(m_renderEngine.D3DDevice(), &desc,
+                __uuidof(IEffectGraphContextInternal), m_context.put_void()));
+        }
+        else
+        {
+            winrt::check_hresult(m_context->MoveToDevice(m_renderEngine.D3DDevice()));
+        }
+        m_renderEngine.Initialize(m_hwnd, PreviewPanel(), ::ShaderLab::Rendering::FormatScRgbFP16,
+            m_context->Devices().d2dDevice.get(), m_context->DeviceContext());
 
         // The GUI's evaluator follows the process defaults, which the
         // performance flyout and the /perf MCP routes edit. Skip unneeded
@@ -432,10 +443,7 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Performance::SetAsyncAnalysisReadbackEnabled(true);
         // Per-node GPU attribution. The evaluator brackets each compute
         // dispatch when this is set AND timing is enabled; no-op otherwise.
-        m_graphEvaluator.SetGpuTimer(&m_renderEngine.Timer());
-        // Compile shaders on the cache's worker threads, not the render thread,
-        // so a slow compile cannot stall UI actions that dispatch to it.
-        m_graphEvaluator.SetAsyncCompile(true);
+        Evaluator().SetGpuTimer(&m_renderEngine.Timer());
         // Option variants report on a status line rather than the compile dialog.
         m_compileProgress.SetVariantStatusText(VariantCompileText());
         // Reflect that default in the flyout, so the checkbox is not
@@ -474,33 +482,16 @@ namespace winrt::ShaderLab::implementation
         });
     }
 
-    void MainWindow::RegisterCustomEffects()
+    // The on-disk bytecode cache, under %LOCALAPPDATA%; empty when that
+    // folder cannot be found, which leaves the cache in memory only.
+    std::wstring MainWindow::BytecodeCacheRoot()
     {
-        if (m_customEffectsRegistered) return;
-
-        auto* factory = m_renderEngine.D2DFactory();
-        if (!factory) return;
-
-        winrt::com_ptr<ID2D1Factory1> factory1;
-        factory->QueryInterface(IID_PPV_ARGS(factory1.put()));
-        if (!factory1) return;
-
-        const HRESULT registerHr = ::ShaderLab::Engine::RegisterEngineD2DEffects(factory1.get());
-        OutputDebugStringW(std::format(L"[CustomFX] Registered engine D2D effects (0x{:08X})\n",
-            static_cast<uint32_t>(registerHr)).c_str());
-
-        // The on-disk bytecode cache lives under %LOCALAPPDATA%.
-        // Background-reap entries older than 90 days on engine init.
         wchar_t* localAppData = nullptr;
+        std::wstring root;
         if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &localAppData)) && localAppData)
-        {
-            std::wstring cacheRoot = std::wstring(localAppData) + L"\\ShaderLab\\bytecode";
-            ::CoTaskMemFree(localAppData);
-            ::ShaderLab::Engine::ConfigureBytecodeCache(cacheRoot);
-            OutputDebugStringW((L"[CustomFX] BytecodeCache root: " + cacheRoot + L"\n").c_str());
-        }
-
-        m_customEffectsRegistered = true;
+            root = std::wstring(localAppData) + L"\\ShaderLab\\bytecode";
+        ::CoTaskMemFree(localAppData);
+        return root;
     }
 
     void MainWindow::OnPreviewPanelLoaded()
@@ -508,7 +499,6 @@ namespace winrt::ShaderLab::implementation
         if (!m_hwnd || m_renderEngine.IsInitialized()) return;
 
         InitializeRendering();
-        RegisterCustomEffects();
 
         // Register the MCP routes; the session starts now unless auto-start is off.
         SetupMcpRoutes();
@@ -535,7 +525,7 @@ namespace winrt::ShaderLab::implementation
         // the render worker publishes, never the live graph. See the THREADING
         // RULE block in NodeGraphController.h. The worker is not running yet,
         // so this thread lays out.
-        m_nodeGraphController.Attach(m_graph, m_renderDispatcher, [this] { return CurrentGraphSnapshot(); });
+        m_nodeGraphController.Attach(Model(), m_renderDispatcher, [this] { return CurrentGraphSnapshot(); });
         m_nodeGraphController.RebuildLayout();
         m_nodeGraphController.SetConnectionCallback(
             [this](uint32_t srcId, uint32_t srcPin, uint32_t dstId, uint32_t dstPin, bool isData) {
@@ -740,12 +730,10 @@ namespace winrt::ShaderLab::implementation
         m_renderDispatcher.ResetConsumer();
     }
 
-    // Drops every resource bound to the current device, the graph's included.
-    // The worker must be stopped.
+    // Drops the window's resources bound to the current device; the context
+    // drops its own when it moves. The worker must be stopped.
     void MainWindow::TearDownDeviceResources()
     {
-        m_graphEvaluator.ReleaseCache(m_graph);
-        m_sourceFactory.ReleaseCache();
         m_nodeGraphController.ReleaseDeviceResources();
         if (auto panelNative = NodeGraphPanel().try_as<ISwapChainPanelNative>())
             panelNative->SetSwapChain(nullptr);
@@ -765,7 +753,6 @@ namespace winrt::ShaderLab::implementation
         }
         for (auto& w : m_logWindows) w->Close();
         m_logWindows.clear();
-        m_graph.Clear();
         m_displayMonitor.SetCallback(nullptr);
         m_displayMonitor.Shutdown();
         m_renderEngine.Shutdown();
@@ -799,38 +786,19 @@ namespace winrt::ShaderLab::implementation
         if (auto error = tryInitialize())
         {
             OutputDebugStringW((L"[GPU Switch] " + *error + L"; falling back to the default adapter\n").c_str());
+            // Whatever the failed attempt created goes before the retry.
+            m_displayMonitor.Shutdown();
+            m_renderEngine.Shutdown();
             m_devicePref = ::ShaderLab::Rendering::DevicePreference::Default;
             if (auto fallbackError = tryInitialize())
+            {
+                m_displayMonitor.Shutdown();
+                m_renderEngine.Shutdown();
                 return fallbackError;
+            }
         }
-        m_customEffectsRegistered = false;
-        RegisterCustomEffects();
         InitializeGraphPanel();
         return std::nullopt;
-    }
-
-    // Reloads the graph saved before the switch. The worker is stopped, so the
-    // graph is used directly.
-    void MainWindow::RestoreGraph(const winrt::hstring& graphJson, const SavedView& view)
-    {
-        try
-        {
-            m_graph = ::ShaderLab::Graph::GraphModel::FromJson(graphJson);
-        }
-        catch (...) {}  // intentional: a failed reload leaves the empty graph; ResetAfterGraphLoad copes
-        ResetAfterGraphLoad(false);
-        m_nodeGraphController.RebuildLayout();
-
-        m_nodeGraphController.SetPanOffset(view.canvasPan.x, view.canvasPan.y);
-        m_nodeGraphController.SetZoom(view.canvasZoom);
-        Preview().Restore(m_graph.FindNode(view.previewNodeId) ? view.previewNodeId : 0, view.preview);
-        PublishGraphSnapshot();
-        if (view.selectedNodeId != 0 && m_graph.FindNode(view.selectedNodeId))
-        {
-            Preview().SetSelectedNode(view.selectedNodeId);
-            m_nodeGraphController.SelectNode(view.selectedNodeId);
-            m_propertiesPanel.Rebuild();
-        }
     }
 
     // Re-prepares the sources on the new device, on the render thread with its
@@ -842,7 +810,7 @@ namespace winrt::ShaderLab::implementation
             std::vector<uint32_t> videoIds;
             auto* dc = m_renderEngine.RenderD2DContext();
             if (!dc) return videoIds;
-            for (auto& node : m_graph.MutableNodes())
+            for (auto& node : Model().MutableNodes())
             {
                 if (node.type != ::ShaderLab::Graph::NodeType::Source) continue;
                 ::ShaderLab::Graph::MarkNodeChanged(node);
@@ -851,7 +819,7 @@ namespace winrt::ShaderLab::implementation
                     videoIds.push_back(node.id);
                     continue;
                 }
-                m_sourceFactory.PrepareSourceNode(node, dc, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                Sources().PrepareSourceNode(node, dc, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
             }
             return videoIds;
         });
@@ -861,10 +829,10 @@ namespace winrt::ShaderLab::implementation
             {
                 m_renderDispatcher.DispatchSync([this, videoNodeId]
                 {
-                    auto* videoNode = m_graph.FindNode(videoNodeId);
+                    auto* videoNode = Model().FindNode(videoNodeId);
                     auto* dc = m_renderEngine.RenderD2DContext();
                     if (!videoNode || !dc) return;
-                    m_sourceFactory.PrepareSourceNode(*videoNode, dc, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                    Sources().PrepareSourceNode(*videoNode, dc, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
                 });
             });
         }
@@ -874,10 +842,10 @@ namespace winrt::ShaderLab::implementation
         {
             m_renderDispatcher.DispatchSync([this]
             {
-                for (auto& node : m_graph.MutableNodes())
+                for (auto& node : Model().MutableNodes())
                 {
                     if (node.type == ::ShaderLab::Graph::NodeType::Source && !node.runtimeError.empty())
-                        ::ShaderLab::Graph::RetryNode(m_graph, node.id);
+                        ::ShaderLab::Graph::RetryNode(Model(), node.id);
                 }
             });
             m_forceRender = true;
@@ -915,22 +883,24 @@ namespace winrt::ShaderLab::implementation
         if (m_renderTimer) m_renderTimer.Stop();
         StopRenderWorker();
 
-        const auto graphJson = m_graph.ToJson();
-        const SavedView view{ Preview().NodeId(), SelectedNodeId(), Preview().View(),
-                              m_nodeGraphController.PanOffset(), m_nodeGraphController.Zoom() };
-
         TearDownDeviceResources();
         if (const auto error = RebuildDeviceResources(pref, adapterLuid))
         {
-            // No device: the graph is gone with it, and nothing renders until
-            // another switch succeeds.
-            PipelineFormatText().Text(L"Error: GPU switch failed: " + *error);
+            // No device: the graph is kept in the context, nothing renders,
+            // and the UI tick tries again in a few seconds.
+            PipelineFormatText().Text(L"Error: no GPU device (" + *error + L"); retrying");
+            m_deviceUnavailable.store(true, std::memory_order_release);
+            m_nextDeviceRetry = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             if (m_renderTimer) m_renderTimer.Start();
             m_adapterSwitchInProgress.store(false, std::memory_order_release);
             return;
         }
+        m_deviceUnavailable.store(false, std::memory_order_release);
+        m_deviceLost.store(S_OK, std::memory_order_release);
 
-        RestoreGraph(graphJson, view);
+        // The graph, view and selection are as they were; the context left
+        // every node dirty.
+        PublishGraphSnapshot();
         m_forceRender = true;
         UpdateStatusBar();
 
@@ -939,6 +909,21 @@ namespace winrt::ShaderLab::implementation
         ReopenOutputWindows();
         if (m_renderTimer) m_renderTimer.Start();
         m_adapterSwitchInProgress.store(false, std::memory_order_release);
+    }
+
+    void MainWindow::RecoverDevice()
+    {
+        const HRESULT reason = m_deviceLost.exchange(S_OK, std::memory_order_acq_rel);
+        if (FAILED(reason))
+            OutputDebugStringW(std::format(L"[GPU] Device removed (0x{:08X}); recovering\n",
+                static_cast<uint32_t>(reason)).c_str());
+        SwitchAdapter(m_devicePref, m_renderEngine.PreferredAdapterLuid());
+        if (!m_deviceUnavailable.load(std::memory_order_acquire))
+        {
+            PipelineFormatText().Text(FAILED(reason)
+                ? winrt::hstring(std::format(L"Recovered from a lost GPU device (0x{:08X})", static_cast<uint32_t>(reason)))
+                : winrt::hstring(L"GPU device available again"));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -983,13 +968,13 @@ namespace winrt::ShaderLab::implementation
                         ? ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(path)
                         : ::ShaderLab::Effects::SourceNodeFactory::CreateImageSourceNode(path);
 
-                    auto id = m_graph.AddNode(std::move(node));
+                    auto id = Model().AddNode(std::move(node));
                     m_nodeLogs[id].Info(std::format(L"Dropped: {}",
                         std::filesystem::path(path).filename().wstring()));
 
-                    auto* addedNode = m_graph.FindNode(id);
+                    auto* addedNode = Model().FindNode(id);
                     if (addedNode && dc)
-                        m_sourceFactory.PrepareSourceNode(*addedNode, dc, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                        Sources().PrepareSourceNode(*addedNode, dc, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
                 }
                 m_nodeGraphController.AutoLayout();
                 return 0;
@@ -1451,8 +1436,8 @@ namespace winrt::ShaderLab::implementation
         // provider the worker may be ticking.
         m_renderDispatcher.DispatchSync([this, nodeId, item]
         {
-            m_sourceFactory.RegisterGraphicsCaptureItem(nodeId, item);
-            ::ShaderLab::Graph::ResetNodeOutput(m_graph, nodeId);
+            Sources().RegisterGraphicsCaptureItem(nodeId, item);
+            ::ShaderLab::Graph::ResetNodeOutput(Model(), nodeId);
         });
 
         PrepareSourceOnRenderThread(nodeId);
@@ -1464,10 +1449,10 @@ namespace winrt::ShaderLab::implementation
     {
         m_renderDispatcher.DispatchSync([this, nodeId]
         {
-            auto* node = m_graph.FindNode(nodeId);
+            auto* node = Model().FindNode(nodeId);
             auto* dc = m_renderEngine.RenderD2DContext();
             if (node && dc)
-                m_sourceFactory.PrepareSourceNode(*node, dc, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                Sources().PrepareSourceNode(*node, dc, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
         });
     }
 
@@ -1486,7 +1471,7 @@ namespace winrt::ShaderLab::implementation
 
     ID2D1Image* MainWindow::ResolveDisplayImage(uint32_t nodeId)
     {
-        return ::ShaderLab::Rendering::ResolveNodeImage(m_graph, nodeId);
+        return ::ShaderLab::Rendering::ResolveNodeImage(Model(), nodeId);
     }
 
     // -----------------------------------------------------------------------
@@ -1496,7 +1481,7 @@ namespace winrt::ShaderLab::implementation
     // Safe on any thread: returns what the render worker measured on the
     // render context while drawing the preview (at most one frame stale). The
     // image itself is never touched here -- it belongs to the render context,
-    // and the UI thread must not walk m_graph to find it anyway.
+    // and the UI thread must not walk Model() to find it anyway.
     D2D1_RECT_F MainWindow::GetPreviewImageBounds()
     {
         std::scoped_lock lock(m_previewBoundsMutex);
@@ -1529,7 +1514,7 @@ namespace winrt::ShaderLab::implementation
         {
             trace = m_renderDispatcher.DispatchSync([this, nodeId, x, y]
             {
-                return ::ShaderLab::Rendering::TracePixel(m_graph, nodeId, x, y,
+                return ::ShaderLab::Rendering::TracePixel(Model(), nodeId, x, y,
                                                           m_renderEngine.RenderD2DContext()).root;
             });
         }
@@ -1919,7 +1904,7 @@ namespace winrt::ShaderLab::implementation
                 // Graph writes belong to the render thread.
                 const bool hlslChanged = m_renderDispatcher.DispatchSync([this, nodeId, &def]
                 {
-                    auto* node = m_graph.FindNode(nodeId);
+                    auto* node = Model().FindNode(nodeId);
                     if (!node) return false;
 
                     // Name enforcement: if HLSL changed and other nodes share
@@ -1931,10 +1916,10 @@ namespace winrt::ShaderLab::implementation
                     // from the node's properties: host-injected values such as
                     // InputMask live there, not among the parameters.
                     ::ShaderLab::Graph::DeriveContracts(def, node->properties);
-                    ::ShaderLab::Graph::ReplaceCustomEffect(m_graph, nodeId, std::move(def));
-                    m_graphEvaluator.UpdateNodeShader(nodeId, *node);
+                    ::ShaderLab::Graph::ReplaceCustomEffect(Model(), nodeId, std::move(def));
+                    Evaluator().UpdateNodeShader(nodeId, *node);
 
-                    if (changed && m_graph.EnsureUniqueCustomEffectName(nodeId))
+                    if (changed && Model().EnsureUniqueCustomEffectName(nodeId))
                         m_nodeGraphController.RebuildLayout();
                     return changed;
                 });
@@ -1952,7 +1937,7 @@ namespace winrt::ShaderLab::implementation
     {
         // The render-thread context: this runs inside a render dispatch.
         auto result = ::ShaderLab::Rendering::CaptureNodeAsPng(
-            m_graph, Preview().NodeId(), m_renderEngine.RenderD2DContext());
+            Model(), Preview().NodeId(), m_renderEngine.RenderD2DContext());
         return std::move(result.png);
     }
 
@@ -2274,8 +2259,8 @@ namespace winrt::ShaderLab::implementation
             m_renderDispatcher.DispatchSync([this, &closedNodeIds] {
                 for (uint32_t nodeId : closedNodeIds)
                 {
-                    m_graph.RemoveNode(nodeId);
-                    m_graphEvaluator.InvalidateNode(nodeId);
+                    Model().RemoveNode(nodeId);
+                    Evaluator().InvalidateNode(nodeId);
                 }
                 m_nodeGraphController.RebuildLayout();
             });
@@ -2572,8 +2557,8 @@ namespace winrt::ShaderLab::implementation
         // On the render thread: ReleaseCache frees effects and nulls every
         // node's cachedOutput, and the worker is the graph's single writer.
         m_renderDispatcher.DispatchSync([this] {
-            m_graphEvaluator.ReleaseCache(m_graph);
-            m_graph.MarkAllDirty();
+            Evaluator().ReleaseCache(Model());
+            Model().MarkAllDirty();
             m_forceRender = true;
         });
     }

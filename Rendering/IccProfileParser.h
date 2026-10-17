@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "DisplayProfile.h"
 
 namespace ShaderLab::Rendering
@@ -17,7 +16,7 @@ namespace ShaderLab::Rendering
     };
 
     // Parses ICC profile binary files to extract display colorimetry data.
-    class SHADERLAB_API IccProfileParser
+    class IccProfileParser
     {
     public:
         static std::optional<IccProfileData> LoadFromFile(const std::wstring& filePath);
@@ -25,8 +24,8 @@ namespace ShaderLab::Rendering
 
     // The text of a 'desc' (ICC v2) or 'mluc' (ICC v4, first record) tag
     // body, or empty when the tag is malformed. The bytes are untrusted.
-    SHADERLAB_API std::wstring ParseIccDescriptionTag(const uint8_t* data, size_t size);
+    std::wstring ParseIccDescriptionTag(const uint8_t* data, size_t size);
 
     // Converts parsed ICC data into a full DisplayProfile.
-    SHADERLAB_API DisplayProfile DisplayProfileFromIcc(const IccProfileData& icc);
+    DisplayProfile DisplayProfileFromIcc(const IccProfileData& icc);
 }

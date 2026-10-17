@@ -1,9 +1,8 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Graph/EffectNode.h"
-#include "../Graph/GraphUiSnapshot.h"
+#include "../Graph/VideoSourceStatus.h"
 #include <span>
 #include "ImageLoader.h"
 #include "VideoSourceProvider.h"
@@ -19,14 +18,14 @@ namespace ShaderLab::Effects
     // Threading: the instance belongs to the thread that renders with it. A
     // host whose render thread differs from the thread that created it names
     // that thread with SetOwnerThread; debug builds then assert every call
-    // comes from it. The UI reads video state from GraphUiSnapshot, never
-    // from here.
+    // comes from it. A UI reads video state from a copy the render thread
+    // publishes (VideoSourceStatuses), never from here.
     //
     // Colour: every image a Source produces is linear scRGB (1.0 = 80 nits).
     //
     // Errors: no member throws. A Source that cannot produce its image gets
     // the reason in node.runtimeError.
-    class SHADERLAB_API SourceNodeFactory
+    class SourceNodeFactory
     {
     public:
         SourceNodeFactory();
@@ -88,7 +87,9 @@ namespace ShaderLab::Effects
             ID3D11Device* d3dDevice = nullptr,
             ID3D11DeviceContext* d3dContext = nullptr);
 
-        // Release all cached bitmaps, flood effects, and providers.
+        // Releases everything made on the device: bitmaps, flood effects and
+        // providers. The window or monitor picked for a capture is kept, so
+        // the capture reopens on the next device by itself.
         void ReleaseCache();
 
         // Show each video's frame for its Time property (Clock-bound or

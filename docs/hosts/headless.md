@@ -112,7 +112,7 @@ Three flags pin it:
 | Flag | Effect |
 |---|---|
 | `--display-profile NAME` | Replace the live profile with a fully-determined preset: `srgb-sdr`, `srgb-270`, `p3-600`, `p3-1000`, `bt2020-1000`, `bt2020-4000`, `adobergb`. An unknown name is a usage error (exit 1) — never a silent fallback to the live display, which would defeat the flag. |
-| `--effects-dir DIR` | Register user effects from every `*.json` saved graph in `DIR` (repeatable). Headless never reads the GUI's `%LOCALAPPDATA%\ShaderLab\effects` folder by itself. Loaded effects are listed as `User effect:` lines and failures as `[ShaderLab] user effect not loaded:` lines, both on stderr. See [User Effects](../effects/user-effects.md). |
+| `--effects-dir DIR` | Register user effects from every `*.json` saved graph and every effect plugin `*.dll` in `DIR` (repeatable). Headless never reads the GUI's `%LOCALAPPDATA%\ShaderLab\effects` folder by itself. Loaded effects are listed as `User effect:` and `Effect plugin:` lines and failures as `[ShaderLab] user effect not loaded:` and `[ShaderLab] effect plugin not loaded:` lines, all on stderr. See [User Effects](../effects/user-effects.md). |
 | `--display-sdr-white N` | Override SDR white level (nits) on top of that preset, or on top of the live profile when no preset is named. |
 | `--display-peak-nits N` | Override peak luminance (nits), same layering. Also lowers `MaxFullFrameNits` if it would otherwise exceed the new peak. |
 
@@ -172,8 +172,8 @@ The MCP route registry (`RegisterEngineRoutes`) is what backs every host — the
 |---|---|
 | 0 | Success |
 | 1 | Usage: a bad, missing or malformed argument |
-| 2 | `ShaderLabEngine.dll` does not match the headers the host was built with |
-| 3 | Device: D3D11 device or EffectGraph context creation (which registers the engine's effects), or `%LOCALAPPDATA%` for the cache modes |
+| 2 | Retired: reported an engine DLL from another build, before the engine was linked statically |
+| 3 | Device: D3D11 device or EffectGraph context creation (which registers the engine's effects), or `%LOCALAPPDATA%` for the cache modes. A device removed later (a driver reset) is not an exit: the next frame moves to a new device on the same `--adapter` choice and runs again |
 | 4 | `--graph` or `--script` file could not be read |
 | 5 | `--graph` or `--script` file is not valid |
 | 6 | `--node` is not in the graph |

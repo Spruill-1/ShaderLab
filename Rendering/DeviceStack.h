@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 
 // The D3D11 + D2D device stack every host renders on, created one way: BGRA
 // support for D2D interop, D3D10 multithread protection (video decode and the
@@ -48,12 +47,12 @@ namespace ShaderLab::Rendering
 
     // Creates the stack. On failure returns the HRESULT and, when given,
     // names the step that failed in failedStep.
-    SHADERLAB_API HRESULT CreateDeviceStack(const DeviceStackOptions& options, DeviceStack& stack,
+    HRESULT CreateDeviceStack(const DeviceStackOptions& options, DeviceStack& stack,
                                             std::wstring* failedStep = nullptr);
 
     // Builds the rest of the stack on a device the caller created: its DXGI
     // factory, multithread protection, and a D2D factory and device. The
     // device must have D3D11_CREATE_DEVICE_BGRA_SUPPORT.
-    SHADERLAB_API HRESULT CreateDeviceStackOn(ID3D11Device* device, DeviceStack& stack,
+    HRESULT CreateDeviceStackOn(ID3D11Device* device, DeviceStack& stack,
                                               std::wstring* failedStep = nullptr);
 }

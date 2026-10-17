@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 
 namespace ShaderLab::Rendering
 {
@@ -32,9 +31,9 @@ namespace ShaderLab::Rendering
         Count
     };
 
-    SHADERLAB_API const wchar_t* GpuSpanName(GpuSpan s);
+    const wchar_t* GpuSpanName(GpuSpan s);
 
-    class SHADERLAB_API GpuTimer
+    class GpuTimer
     {
     public:
         static constexpr uint32_t kSpanCount = static_cast<uint32_t>(GpuSpan::Count);

@@ -7,17 +7,17 @@
 #include "../../Graph/ParameterModel.h"
 #include "../../Rendering/GpuBindingPlan.h"
 #include "../../Rendering/GraphEvaluator.h"
-#include "../../Rendering/EffectGraphFile.h"
+#include "../../Support/EffectGraphFile.h"
 #include "../../Rendering/DisplayMonitor.h"
 #include "../../Rendering/DisplayProfile.h"
 #include "../../Effects/NodeCatalog.h"
 #include "../../Effects/ShaderIncludes.h"
 #include "../../Effects/ShaderLabEffects.h"
 #include "../../Effects/ShaderVariants.h"
-#include "../../Engine/Mcp/McpArgs.h"
-#include "../../Engine/Mcp/McpSerialize.h"
-#include "../../Engine/Mcp/McpRouter.h"
-#include "../../Engine/Mcp/EngineMcpRoutes.h"
+#include "../../Mcp/McpArgs.h"
+#include "../../Mcp/McpSerialize.h"
+#include "../../Mcp/McpRouter.h"
+#include "../../Mcp/EngineMcpRoutes.h"
 #include "Graph/GraphEdits.h"
 
 #include <cstdio>
@@ -391,19 +391,17 @@ namespace ShaderLab::Tests
             printf("\n=== MCP routes share one owner per policy ===\n");
             struct GraphOnlySink : Mcp::IEngineCommandSink
             {
-                GraphModel* graph{ nullptr };
-                Rendering::GraphEvaluator evaluator;
+                IEffectGraphContextInternal* context{ nullptr };
                 Mcp::Response Dispatch(std::function<Mcp::Response(Mcp::EngineContext&)> closure) override
                 {
-                    Mcp::EngineContext context;
-                    context.graph = graph;
-                    context.evaluator = &evaluator;
-                    return closure(context);
+                    Mcp::EngineContext engineContext(*context);
+                    return closure(engineContext);
                 }
             };
-            GraphModel graph;
+            auto context = CreateTestContext();
+            auto& graph = context->Model();
             GraphOnlySink sink;
-            sink.graph = &graph;
+            sink.context = context.get();
             McpRouter router;
             Mcp::RegisterEngineRoutes(router, sink);
 
@@ -488,8 +486,8 @@ namespace ShaderLab::Tests
             fs::create_directories(fresh);
             fs::create_directories(old);
             fs::create_directories(other);
-            Rendering::TouchMediaHeartbeat(fresh.wstring());
-            Rendering::TouchMediaHeartbeat(old.wstring());
+            Support::TouchMediaHeartbeat(fresh.wstring());
+            Support::TouchMediaHeartbeat(old.wstring());
             std::ofstream(old / L"clip.mp4", std::ios::binary) << "0123456789";
 
             // Age the old folder's heartbeat by an hour.
@@ -508,10 +506,10 @@ namespace ShaderLab::Tests
                 ::CloseHandle(beat);
             }
 
-            const auto stale = Rendering::FindStaleMediaDirs(root.wstring() + L"\\", Rendering::cStaleMediaDirSec, true);
+            const auto stale = Support::FindStaleMediaDirs(root.wstring() + L"\\", Support::cStaleMediaDirSec, true);
             TEST("StaleMedia_OnlyTheOldFolder", stale.size() == 1 && fs::path(stale[0].path).filename() == L"ShaderLab-old");
             TEST("StaleMedia_CountsBytes", !stale.empty() && stale[0].bytes >= 10);
-            const auto reaped = Rendering::ReapMediaDirs(stale);
+            const auto reaped = Support::ReapMediaDirs(stale);
             TEST("StaleMedia_Reaped", reaped.deleted == 1 && !fs::exists(old) && fs::exists(fresh) && fs::exists(other));
             fs::remove_all(root, ec);
         }

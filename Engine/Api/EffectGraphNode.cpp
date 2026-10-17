@@ -192,10 +192,19 @@ namespace ShaderLab::Api
     {
         if (!values) return E_POINTER;
         *values = nullptr;
-        const auto* node = Live();
-        if (!node) return EFFECTGRAPH_E_NODE_REMOVED;
-        winrt::make<Values>(node->analysisOutput.fields).as<IEffectGraphValues>().copy_to(values);
+        if (!Live()) return EFFECTGRAPH_E_NODE_REMOVED;
+        std::vector<Graph::AnalysisFieldValue> fields;
+        if (HRESULT hr = m_context->ValuesOf(m_nodeId, fields); FAILED(hr)) return hr;
+        winrt::make<Values>(std::move(fields)).as<IEffectGraphValues>().copy_to(values);
         return S_OK;
+    }
+
+    HRESULT NodeBase::GetValuesBufferImpl(IEffectGraphValuesBuffer** buffer)
+    {
+        if (!buffer) return E_POINTER;
+        *buffer = nullptr;
+        if (!Live()) return EFFECTGRAPH_E_NODE_REMOVED;
+        return m_context->ValuesBufferOf(m_nodeId, buffer);
     }
 
     UINT32 NodeBase::GetErrorLengthImpl()
@@ -466,13 +475,70 @@ namespace ShaderLab::Api
     {
         if (!info) return E_POINTER;
         if (index >= m_fields.size()) return E_INVALIDARG;
-        const auto& field = m_fields[index];
-        const UINT32 components = Graph::AnalysisFieldComponentCount(field.type);
-        info->type = static_cast<EFFECTGRAPH_FIELD_TYPE>(field.type);
-        info->componentCount = components;
-        info->elementCount = Graph::AnalysisFieldIsArray(field.type)
-            ? static_cast<UINT32>(field.arrayData.size() / (std::max)(components, 1u)) : 1;
+        FieldInfoOf(Graph::AnalysisLayoutOf(m_fields), index, *info);
         return S_OK;
+    }
+
+    void FieldInfoOf(const std::vector<Graph::AnalysisFieldDescriptor>& layout, size_t index, EFFECTGRAPH_FIELD_INFO& info)
+    {
+        const auto& field = layout[index];
+        info.type = static_cast<EFFECTGRAPH_FIELD_TYPE>(field.type);
+        info.componentCount = Graph::AnalysisFieldComponentCount(field.type);
+        info.elementCount = Graph::AnalysisFieldIsArray(field.type) ? field.arrayLength : 1;
+        UINT32 start = 0;
+        for (size_t i = 0; i < index; ++i) start += layout[i].pixelCount();
+        info.bufferElement = start;
+    }
+
+    ValuesBuffer::ValuesBuffer(Context* context, uint32_t nodeId, std::vector<Graph::AnalysisFieldDescriptor> layout,
+                               winrt::com_ptr<ID3D11Buffer> buffer, winrt::com_ptr<ID3D11ShaderResourceView> view)
+        : m_nodeId(nodeId), m_layout(std::move(layout)), m_buffer(std::move(buffer)), m_view(std::move(view))
+    {
+        m_context.copy_from(context);
+        m_epoch = context->Epoch();
+    }
+
+    STDMETHODIMP_(UINT32) ValuesBuffer::GetFieldIndex(PCWSTR name)
+    {
+        if (!name) return EFFECTGRAPH_INVALID_INDEX;
+        for (size_t i = 0; i < m_layout.size(); ++i)
+            if (m_layout[i].name == name) return static_cast<UINT32>(i);
+        return EFFECTGRAPH_INVALID_INDEX;
+    }
+
+    STDMETHODIMP ValuesBuffer::GetFieldInfo(UINT32 index, EFFECTGRAPH_FIELD_INFO* info)
+    {
+        if (!info) return E_POINTER;
+        if (index >= m_layout.size()) return E_INVALIDARG;
+        FieldInfoOf(m_layout, index, *info);
+        return S_OK;
+    }
+
+    STDMETHODIMP_(void) ValuesBuffer::GetBuffer(ID3D11Buffer** buffer)
+    {
+        if (buffer) m_buffer.copy_to(buffer);
+    }
+
+    STDMETHODIMP_(void) ValuesBuffer::GetView(ID3D11ShaderResourceView** view)
+    {
+        if (view) m_view.copy_to(view);
+    }
+
+    STDMETHODIMP ValuesBuffer::ReadValues(IEffectGraphValues** values)
+    {
+        if (!values) return E_POINTER;
+        *values = nullptr;
+        std::vector<Graph::AnalysisFieldValue> fields;
+        if (HRESULT hr = m_context->ReadValuesBuffer(m_buffer.get(), m_layout, fields); FAILED(hr)) return hr;
+        winrt::make<Values>(std::move(fields)).as<IEffectGraphValues>().copy_to(values);
+        return S_OK;
+    }
+
+    STDMETHODIMP ValuesBuffer::SetFloats(UINT32 index, const float* values, UINT32 valueCount)
+    {
+        if (!values && valueCount) return E_INVALIDARG;
+        if (index >= m_layout.size()) return E_INVALIDARG;
+        return m_context->WriteValues(m_nodeId, m_epoch, index, values, valueCount);
     }
 
     STDMETHODIMP Values::GetFloats(UINT32 index, float* values, UINT32 valueCount)

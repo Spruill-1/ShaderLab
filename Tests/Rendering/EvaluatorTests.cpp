@@ -9,6 +9,8 @@
 #include "../../Effects/ShaderLabEffects.h"
 #include "../../Graph/GraphModel.h"
 #include "../../Rendering/DisplayProfile.h"
+#include "../../Rendering/MathExpression.h"
+#include "../../Support/ExprTkEvaluator.h"
 #include "../../Rendering/WorkingSpaceSync.h"
 #include "Graph/GraphEdits.h"
 
@@ -233,5 +235,25 @@ namespace ShaderLab::Tests
              nullptr, &data, &bytes)) && data == includes[2].text.data() && bytes == includes[2].text.size());
         TEST("ShaderIncludes_HandlerRefusesOthers",
              FAILED(handler->Open(D3D_INCLUDE_LOCAL, "missing.hlsli", nullptr, &data, &bytes)));
+    }
+
+    // The engine has no expression language of its own: the runner registered
+    // ExprTk, and without a registration every expression fails with a reason.
+    SL_TEST_CASE(TestMathExpressionHook, Tag::Fast)
+    {
+        printf("\n=== Numeric Expression evaluator hook ===\n");
+        const wchar_t* names[] = { L"A", L"B" };
+        const float values[] = { 3.0f, 4.0f };
+        float result = 0.0f;
+        std::wstring error;
+        TEST("MathHook_Registered", Rendering::EvaluateMathExpression(L"sqrt(A*A + B*B)", names, values, 2, result, &error) &&
+             result == 5.0f);
+
+        Rendering::SetMathExpressionEvaluator(nullptr);
+        result = 1.0f;
+        error.clear();
+        const bool evaluated = Rendering::EvaluateMathExpression(L"A + B", names, values, 2, result, &error);
+        Rendering::SetMathExpressionEvaluator(&Support::EvaluateWithExprTk);
+        TEST("MathHook_UnsetFails", !evaluated && result == 0.0f && !error.empty());
     }
 }

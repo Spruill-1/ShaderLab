@@ -1,0 +1,33 @@
+EffectGraph is licensed under the MIT No Attribution License (MIT-0), below.
+It covers the engine and everything built only from it:
+
+  - the engine library: Graph/, Rendering/, Effects/, Engine/, pch_engine.*,
+    Version.h (ShaderLabEngine.vcxproj)
+  - the built-in effects: BuiltInEffects/ (BuiltInEffects.vcxproj)
+  - EffectGraph.dll: EffectGraphDll/ (EffectGraph.vcxproj)
+  - the effect compiler: EffectGraphCompile/ (EffectGraphCompile.vcxproj)
+  - the MSBuild integration: build/EffectGraph.targets,
+    build/EffectGraphBuiltIns.targets
+  - the language bindings and packages: bindings/, packaging/
+
+Everything else in this repository, the ShaderLab application, its headless
+host, MCP broker, tests and Support/ library included, is under the MIT
+License in LICENSE. EffectGraph contains no third-party source code; the
+binaries compile in C++/WinRT headers (MIT, Microsoft Corporation).
+
+MIT No Attribution
+
+Copyright 2026 David Spruill
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

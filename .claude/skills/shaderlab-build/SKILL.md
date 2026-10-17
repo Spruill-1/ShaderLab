@@ -68,7 +68,7 @@ First build after a fresh clone: `nuget restore ShaderLab.slnx -SolutionDirector
 (packages.config style, not PackageReference). Submodules `exprtk` and `miniz` must be
 present — `git submodule update --init --recursive`.
 
-The GUI locks `ShaderLab.exe` / `ShaderLabEngine.dll` in the layout and a lingering
+The GUI locks `ShaderLab.exe` in the layout and a lingering
 hub locks the broker copy. Kill them before rebuilding:
 
 ```pwsh

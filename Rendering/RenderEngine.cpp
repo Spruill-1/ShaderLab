@@ -1,6 +1,6 @@
 #include "pch.h"
 #include "RenderEngine.h"
-#include "DeviceStack.h"
+#include "Rendering/DeviceStack.h"
 
 #include <microsoft.ui.xaml.media.dxinterop.h>
 
@@ -14,13 +14,23 @@ namespace ShaderLab::Rendering
         HWND hwnd,
         winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel const& panel,
         const PipelineFormat& format,
-        DevicePreference devicePref)
+        ID2D1Device6* d2dDevice,
+        ID2D1DeviceContext5* renderContext)
     {
+        if (!m_d3dDevice || !d2dDevice || !renderContext)
+            throw winrt::hresult_error(E_NOT_VALID_STATE, L"RenderEngine::Initialize needs CreateDevice and a D2D device");
         m_hwnd = hwnd;
         m_panel = panel;
         m_format = format;
 
-        CreateDeviceResources(devicePref);
+        m_d2dDevice.copy_from(d2dDevice);
+        m_renderD2dContext.copy_from(renderContext);
+        // The back buffer's own context, apart from the render worker's:
+        // target, transform and DPI are per context.
+        winrt::com_ptr<ID2D1DeviceContext> context;
+        winrt::check_hresult(m_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, context.put()));
+        m_d2dDeviceContext = context.as<ID2D1DeviceContext5>();
+
         CreateSwapChain(panel);
         ConfigureSwapChainColorSpace();
         CreateRenderTarget();
@@ -56,7 +66,6 @@ namespace ShaderLab::Rendering
         m_d2dDeviceContext = nullptr;
         m_renderD2dContext = nullptr;
         m_d2dDevice = nullptr;
-        m_d2dFactory = nullptr;
         m_gpuTimer.Shutdown();
         m_d3dContext = nullptr;
         m_d3dDevice = nullptr;
@@ -68,7 +77,7 @@ namespace ShaderLab::Rendering
     // Device creation
     // -----------------------------------------------------------------------
 
-    void RenderEngine::CreateDeviceResources(DevicePreference devicePref)
+    void RenderEngine::CreateDevice(DevicePreference devicePref)
     {
         DeviceStackOptions options;
         options.adapterLuid = m_preferredAdapterLuid;
@@ -84,21 +93,14 @@ namespace ShaderLab::Rendering
         if (const HRESULT hr = CreateDeviceStack(options, stack, &failedStep); FAILED(hr))
             throw winrt::hresult_error(hr, winrt::hstring(L"Creating the GPU device failed at " + failedStep));
 
+        // The stack's D2D device is not kept: D2D comes from the
+        // EffectGraph context, which builds its own on this device.
         m_dxgiFactory = stack.dxgiFactory;
         m_d3dDevice   = stack.d3dDevice;
         m_d3dContext  = stack.d3dContext;
-        m_d2dFactory  = stack.d2dFactory;
-        m_d2dDevice   = stack.d2dDevice;
         m_adapterName = stack.adapterName;
         m_isWarp      = stack.isWarp;
         m_gpuTimer.Initialize(m_d3dDevice.get());
-
-        // Two contexts on the one device: the UI thread's, and the render
-        // worker's. Target, transform and DPI are per context, so the worker's
-        // BeginDraw/EndDraw cannot be disturbed by UI-thread draws (capture,
-        // pixel inspector).
-        winrt::check_hresult(stack.CreateDeviceContext(m_d2dDeviceContext));
-        winrt::check_hresult(stack.CreateDeviceContext(m_renderD2dContext));
     }
 
     // -----------------------------------------------------------------------
@@ -415,36 +417,5 @@ namespace ShaderLab::Rendering
         }
 
         return result;
-    }
-
-    // -----------------------------------------------------------------------
-    // Reinitialize on a different adapter
-    // -----------------------------------------------------------------------
-
-    void RenderEngine::Reinitialize(DevicePreference devicePref, LUID adapterLuid)
-    {
-        m_preferredAdapterLuid = adapterLuid;
-
-        // Save state that Shutdown clears.
-        auto savedPanel = m_panel;
-        auto savedHwnd = m_hwnd;
-        auto savedFormat = m_format;
-        auto savedWidth = m_width;
-        auto savedHeight = m_height;
-
-        Shutdown();
-
-        m_panel = savedPanel;
-        m_hwnd = savedHwnd;
-        m_format = savedFormat;
-
-        // Recreate on the new adapter.
-        CreateDeviceResources(devicePref);
-        CreateSwapChain(m_panel);
-        ConfigureSwapChainColorSpace();
-        CreateRenderTarget();
-
-        if (savedWidth > 0 && savedHeight > 0)
-            Resize(savedWidth, savedHeight);
     }
 }

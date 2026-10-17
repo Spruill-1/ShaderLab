@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "SourceTextureUtil.h"
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.h>
@@ -14,7 +13,7 @@ namespace ShaderLab::Effects
     // fallback when FP16 capture is unavailable) decoded from sRGB. No
     // method throws; a failure returns false or CaptureResult::Failed with
     // LastError() set.
-    class SHADERLAB_API WindowsGraphicsCaptureSourceProvider
+    class WindowsGraphicsCaptureSourceProvider
     {
     public:
         WindowsGraphicsCaptureSourceProvider() = default;

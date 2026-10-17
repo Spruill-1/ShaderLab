@@ -58,4 +58,9 @@ namespace ShaderLab::Rendering
     void GraphEvaluator::ClearCpuAnalysisInterest() { m_core->ClearCpuAnalysisInterest(); }
     void GraphEvaluator::RequestFreshCpuReadback(uint32_t nodeId) { m_core->RequestFreshCpuReadback(nodeId); }
     uint32_t GraphEvaluator::AppliedGpuBits(uint32_t nodeId) const { return m_core->AppliedGpuBits(nodeId); }
+    winrt::com_ptr<ID3D11ShaderResourceView> GraphEvaluator::AnalysisBuffer(uint32_t nodeId) const { return m_core->AnalysisBuffer(nodeId); }
+    HRESULT GraphEvaluator::WriteAnalysis(uint32_t nodeId, uint32_t firstElement, const float* float4s, uint32_t elementCount)
+    {
+        return m_core->WriteAnalysis(nodeId, firstElement, float4s, elementCount);
+    }
 }

@@ -658,7 +658,7 @@ float TargetLuma(TargetXf t, float3 scRGB)
 #endif
 )HLSL";
 
-    SHADERLAB_API const std::string& GetColorMathHLSL()
+    const std::string& GetColorMathHLSL()
     {
         return s_colorMathHLSL;
     }

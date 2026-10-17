@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "CustomEffectBase.h"
 
 namespace ShaderLab::Effects

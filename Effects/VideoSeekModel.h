@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 
 #include <map>
 
@@ -23,7 +22,7 @@ namespace ShaderLab::Effects
     // Threading: the cost averages are atomics, read from any thread. The
     // keyframe map is not locked here: the provider calls the keyframe
     // members with its state mutex held.
-    class SHADERLAB_API VideoSeekModel
+    class VideoSeekModel
     {
     public:
         // Forget everything; `frameRate` sets the threshold until costs are measured.

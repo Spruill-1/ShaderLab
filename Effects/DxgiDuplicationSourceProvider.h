@@ -1,12 +1,11 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "SourceTextureUtil.h"
 
 namespace ShaderLab::Effects
 {
-    struct SHADERLAB_API DxgiOutputInfo
+    struct DxgiOutputInfo
     {
         uint32_t adapterIndex{ 0 };
         uint32_t outputIndex{ 0 };
@@ -17,7 +16,7 @@ namespace ShaderLab::Effects
 
     // Captures one DXGI output with Desktop Duplication. CurrentBitmap() is
     // linear scRGB: the FP16 duplication as is, an 8-bit one decoded from sRGB.
-    class SHADERLAB_API DxgiDuplicationSourceProvider
+    class DxgiDuplicationSourceProvider
     {
     public:
         DxgiDuplicationSourceProvider() = default;

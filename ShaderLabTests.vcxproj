@@ -82,12 +82,12 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
     <ClCompile>
-      <PreprocessorDefinitions>WIN32;_CONSOLE;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;WIN32;_CONSOLE;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
-      <PreprocessorDefinitions>WIN32;_CONSOLE;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;WIN32;_CONSOLE;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -95,7 +95,6 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="EngineExport.h" />
     <ClInclude Include="pch_engine.h" />
     <ClInclude Include="Tests\TestCommon.h" />
     <ClInclude Include="Tests\TestSupport.h" />
@@ -137,6 +136,9 @@
     <ClCompile Include="ShaderLabMcpBroker\Shim.cpp" />
     <ClCompile Include="Tests\Persistence\PackageTests.cpp" />
     <ClCompile Include="Tests\Api\EffectGraphApiTests.cpp" />
+    <ClCompile Include="Tests\Api\EffectGraphPluginTests.cpp" />
+    <ClCompile Include="Tests\Api\EffectGraphDllTests.cpp" />
+    <ClCompile Include="Tests\Effects\BuiltInEffectTests.cpp" />
     <ClCompile Include="Tests\Effects\EffectBlobTests.cpp" />
     <ClCompile Include="Tests\Rendering\ComputeTests.cpp" />
     <ClCompile Include="Tests\Rendering\EvaluatorTests.cpp" />
@@ -150,16 +152,40 @@
     <ClCompile Include="Tests\Video\VideoSourceTests.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <!-- Built first for TestEffectGraphDll, which loads it; not linked. -->
+    <ProjectReference Include="EffectGraph.vcxproj">
+      <Project>{61D99F51-6BAE-4AC0-A59B-40B84A8C71DF}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+    <!-- Built first and copied to Effects\, where the tests load it. -->
+    <ProjectReference Include="TestEffectPlugin.vcxproj">
+      <Project>{9B2E4F17-3C6A-4D85-B1E2-7A0C5D9F6E48}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+    <ProjectReference Include="BuiltInEffects.vcxproj">
+      <Project>{463424C5-37AA-4129-ABAB-1CD7F3BF2215}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>true</LinkLibraryDependencies>
+    </ProjectReference>
     <ProjectReference Include="ShaderLabEngine.vcxproj">
       <Project>{A7A1E0F1-665C-4D06-9AC7-6D6B6A0D0F01}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <LinkLibraryDependencies>true</LinkLibraryDependencies>
     </ProjectReference>
+    <ProjectReference Include="ShaderLabSupport.vcxproj">
+      <Project>{3C5E8A21-7B4D-4F6A-9E12-5D8C0B7A4E63}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>true</LinkLibraryDependencies>
+    </ProjectReference>
   </ItemGroup>
-  <Target Name="CopyEngineRuntime" AfterTargets="Build">
-    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll')" />
-  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="build\EffectGraphBuiltIns.targets" />
+  <Target Name="CopyTestEffectPlugin" AfterTargets="Build">
+    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\TestEffectPlugin\TestEffectPlugin.dll"
+          DestinationFolder="$(OutDir)Effects" SkipUnchangedFiles="true" />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
     <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets')" />
     <Import Project="packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets" Condition="Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets')" />

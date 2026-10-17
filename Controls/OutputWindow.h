@@ -1,7 +1,7 @@
 #pragma once
 
 #include "pch.h"
-#include "../Rendering/PipelineFormat.h"
+#include "Rendering/PipelineFormat.h"
 #include "OutputSinkRenderState.h"
 
 namespace ShaderLab::Controls

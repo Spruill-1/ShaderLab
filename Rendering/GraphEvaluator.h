@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Graph/GraphModel.h"
 #include "EvaluatorOptions.h"
 
@@ -35,7 +34,7 @@ namespace ShaderLab::Rendering
     // The class holds only a pointer to its implementation
     // (Rendering/Evaluator/), so the exported layout does not change when
     // the evaluator's internals do.
-    class SHADERLAB_API GraphEvaluator
+    class GraphEvaluator
     {
     public:
         GraphEvaluator();
@@ -71,10 +70,8 @@ namespace ShaderLab::Rendering
         {
             Normal,
             // Re-applies properties and bindings only: queues no compute
-            // dispatch and opens no readback draw session (a node that would
-            // read back stays dirty for the next frame), and leaves variant
-            // and async-readback polling to the next Normal pass. Safe inside
-            // a host's BeginDraw; FrameExecutor uses it for the sweep after
+            // dispatch, and leaves variant and async-readback polling to the
+            // next Normal pass. FrameExecutor uses it for the sweep after
             // ProcessDeferredCompute.
             Frozen,
         };
@@ -85,7 +82,9 @@ namespace ShaderLab::Rendering
                              EvalMode mode = EvalMode::Normal);
 
         // Run deferred D3D11 compute dispatches for statistics nodes.
-        // Call AFTER Evaluate (and double-eval) when all D2D effects are initialized.
+        // Call AFTER Evaluate (and double-eval) when all D2D effects are
+        // initialized, outside any draw session on `dc`: an input the shader
+        // cannot read in place is rendered in a session of its own.
         // Returns true if any compute dispatches ran (analysis output changed).
         bool ProcessDeferredCompute(Graph::GraphModel& graph, ID2D1DeviceContext5* dc);
         // Compute dispatches Evaluate queued that ProcessDeferredCompute has
@@ -167,6 +166,14 @@ namespace ShaderLab::Rendering
         // gpuBindable parameter, 1 = structured buffer, 2 = analysis texture,
         // 0 = cbuffer. 0 for a node with no GPU-served binding.
         uint32_t AppliedGpuBits(uint32_t nodeId) const;
+
+        // A D3D11 compute node's analysis results on the GPU, as the
+        // StructuredBuffer<float4> its last dispatch wrote; null for any
+        // other node or before its first dispatch.
+        winrt::com_ptr<ID3D11ShaderResourceView> AnalysisBuffer(uint32_t nodeId) const;
+        // Overwrites elements of that buffer until the node next dispatches,
+        // refreshing the copy pixel-shader consumers read.
+        HRESULT WriteAnalysis(uint32_t nodeId, uint32_t firstElement, const float* float4s, uint32_t elementCount);
 
     private:
         std::unique_ptr<Evaluator::EvaluatorCore> m_core;

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../../EngineExport.h"
 #include "../../Graph/EffectNode.h"
 #include "../GpuBindingPlan.h"
 
@@ -27,14 +26,14 @@ namespace ShaderLab::Rendering::Evaluator
     };
 
     // Reflects `bytecode`; empty when reflection fails.
-    SHADERLAB_API ReflectedComputeCb ReflectComputeConstants(const std::vector<uint8_t>& bytecode);
+    ReflectedComputeCb ReflectComputeConstants(const std::vector<uint8_t>& bytecode);
 
     // Bytes the runner places after its own Width/Height (the first 8 bytes of
     // the cbuffer). Each variable takes the property of the same name, typed
     // to its HLSL slot; `_SLIdx_<param>` takes the field index the binding
     // plan serves that parameter from. Empty when the cbuffer holds nothing
     // past Width/Height.
-    SHADERLAB_API std::vector<BYTE> PackComputeConstants(
+    std::vector<BYTE> PackComputeConstants(
         const ReflectedComputeCb& cb,
         const std::map<std::wstring, Graph::PropertyValue>& properties,
         const GpuBindingPlan& plan);
@@ -42,7 +41,7 @@ namespace ShaderLab::Rendering::Evaluator
     // An image output size the properties state outright: OutputWidth +
     // OutputHeight (both at least 1), else the definition's square size
     // parameter (at least 64). 0 x 0 when neither is set.
-    SHADERLAB_API D2D1_SIZE_U ComputeOutputSizeFromProperties(
+    D2D1_SIZE_U ComputeOutputSizeFromProperties(
         const Graph::CustomEffectDefinition& def,
         const std::map<std::wstring, Graph::PropertyValue>& properties);
 
@@ -50,7 +49,7 @@ namespace ShaderLab::Rendering::Evaluator
     // for a PerOutputPixel shader; nullopt keeps the bridge's (1,1,1). The
     // group size comes from the shader's [numthreads] when reflection has
     // it, else from the definition.
-    SHADERLAB_API std::optional<std::array<UINT32, 3>> PerPixelDispatchGroups(
+    std::optional<std::array<UINT32, 3>> PerPixelDispatchGroups(
         const Graph::CustomEffectDefinition& def, const ReflectedComputeCb& reflected,
         UINT32 width, UINT32 height);
 }

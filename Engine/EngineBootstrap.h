@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 
 // Process-wide engine services a host starts and stops: the custom D2D
 // effect classes and the shader bytecode cache.
@@ -9,7 +8,7 @@ namespace ShaderLab::Engine
 {
     // Registers the engine's custom D2D effect classes. Returns the first
     // failure; every class is still attempted.
-    SHADERLAB_API HRESULT RegisterEngineD2DEffects(ID2D1Factory1* factory);
+    HRESULT RegisterEngineD2DEffects(ID2D1Factory1* factory);
 
     // Configures the on-disk bytecode cache. An empty `rootPath` disables
     // persistence (tests, ad-hoc headless runs); otherwise the directory is
@@ -17,7 +16,7 @@ namespace ShaderLab::Engine
     // (default 90 days) are reaped as a job on the cache's worker queue.
     // 0 skips the reap. The engine picks no default root: the host owns the
     // path policy (the GUI uses %LOCALAPPDATA%\ShaderLab\bytecode).
-    SHADERLAB_API void ConfigureBytecodeCache(
+    void ConfigureBytecodeCache(
         std::wstring rootPath,
         uint64_t staleThresholdSec = 90ull * 24 * 60 * 60);
 
@@ -25,5 +24,5 @@ namespace ShaderLab::Engine
     // and cache maintenance, and joins the bytecode cache's workers. Hosts
     // call it once, after their last render, before the engine DLL unloads.
     // Idempotent; compiles requested afterwards run inline on the caller.
-    SHADERLAB_API void ShutdownEngineServices();
+    void ShutdownEngineServices();
 }

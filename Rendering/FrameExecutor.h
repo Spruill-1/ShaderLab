@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Graph/GraphModel.h"
 
 namespace ShaderLab::Rendering
@@ -33,7 +32,7 @@ namespace ShaderLab::Rendering
 
     struct FrameRequest
     {
-        // Bound for the draw session and for `draw`; may be null.
+        // Bound for `draw`; may be null.
         ID2D1Image* target{ nullptr };
         bool markAllDirty{ false };
         FrameDemand demand{ FrameDemand::All };
@@ -45,13 +44,20 @@ namespace ShaderLab::Rendering
         // Brackets the Evaluate, DeferredCompute and Draw spans when set. The
         // host owns BeginFrame/EndFrame and the Frame span.
         GpuTimer* timer{ nullptr };
-        // Runs inside the draw session after compute, with `target` bound.
+        // Runs after compute in a draw session of its own, with `target`
+        // bound. With no draw the frame opens no session for it.
         std::function<void(ID2D1DeviceContext5*)> draw;
     };
 
     struct FrameResult
     {
+        // The draw's EndDraw; S_OK when the frame drew nothing. A compute
+        // input that failed to render fails its node instead.
         HRESULT endDraw{ S_OK };
+        // The device's removed reason after the frame, when it was removed
+        // (DXGI_ERROR_DEVICE_REMOVED, ...); S_OK otherwise. Set by
+        // IEffectGraphContextInternal::RunFrame.
+        HRESULT deviceRemoved{ S_OK };
         // Evaluate passes, the frozen post-dispatch sweep included.
         uint32_t passes{ 0 };
         // ProcessDeferredCompute ran a non-empty queue.
@@ -62,24 +68,17 @@ namespace ShaderLab::Rendering
         std::chrono::steady_clock::time_point start, evaluateEnd, computeEnd, drawEnd, end;
     };
 
-    // Runs one frame of a graph through the evaluator in the only order that
-    // works:
-    //
-    //   1. Outside any draw session: dirty propagation, demand, then Evaluate
-    //      (twice when new effects need it). The D2D Histogram and custom
-    //      analysis readbacks open their OWN BeginDraw, and nesting that in a
-    //      host's session fails with D2DERR_WRONG_STATE (0x88990001).
-    //   2. Inside one BeginDraw/EndDraw: ProcessDeferredCompute, which calls
-    //      dc->DrawImage to pre-render compute inputs and silently does nothing
-    //      outside a session (compute then reads black, with no error).
-    //   3. Still inside: a frozen Evaluate when anything needed is still dirty,
-    //      to re-apply the D2D nodes downstream of this frame's dispatches.
-    //      Frozen, so it queues no compute and opens no readback session; a
-    //      Histogram it touches reads on the next frame.
-    //   4. Still inside: the host's draw callback, then EndDraw.
-    //
-    // The context's target and transform are restored on return.
-    class SHADERLAB_API FrameExecutor
+    // Runs one frame of a graph through the evaluator: dirty propagation,
+    // demand, Evaluate (twice when new effects need it), the deferred compute
+    // dispatches, a frozen Evaluate when anything needed is still dirty (to
+    // re-apply the D2D nodes downstream of this frame's dispatches without
+    // queueing compute again), then the host's draw. No step runs inside
+    // another's draw session: each opens one only for its own drawing (an
+    // analysis readback, a compute input the shader cannot read in place, the
+    // draw), so a graph of compute on texture inputs opens none. Call it with
+    // no session open on `dc`. The context's target and transform are
+    // restored on return.
+    class FrameExecutor
     {
     public:
         static FrameResult Run(Graph::GraphModel& graph, GraphEvaluator& evaluator,

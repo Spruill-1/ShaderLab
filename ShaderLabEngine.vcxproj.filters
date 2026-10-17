@@ -10,12 +10,6 @@
     <Filter Include="Engine\Api">
       <UniqueIdentifier>{D0020199-8F9D-4D16-A15D-499BDC6BB782}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Engine\Mcp">
-      <UniqueIdentifier>{1AE58A52-8D93-532E-8693-94BB8237FBF7}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Engine\Mcp\Routes">
-      <UniqueIdentifier>{374BAEA8-7B08-516F-B721-6900040908D1}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Graph">
       <UniqueIdentifier>{18B0C1C9-6B45-5B72-A098-18D7B0BC7D54}</UniqueIdentifier>
     </Filter>
@@ -25,54 +19,19 @@
     <Filter Include="Rendering\Evaluator">
       <UniqueIdentifier>{7DBCFB61-E0FA-5185-8571-482D554B80ED}</UniqueIdentifier>
     </Filter>
-    <Filter Include="third_party">
-      <UniqueIdentifier>{BCA243FA-747D-52CF-BC13-A5CE99C126D6}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="third_party\miniz">
-      <UniqueIdentifier>{F83B071B-81AD-5B7D-A338-4C3360E492BB}</UniqueIdentifier>
-    </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="EngineExport.h" />
-    <ClInclude Include="Version.h" />
     <ClInclude Include="pch_engine.h" />
-    <ClInclude Include="Engine\Mcp\McpRouter.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpTypes.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpArgs.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpSerialize.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpJsonRpc.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpToolCatalog.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpFrame.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpCrypto.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpPeerIdentity.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpChannel.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpSessionClient.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
     <ClInclude Include="Engine\Api\EffectGraph.h">
       <Filter>Engine\Api</Filter>
     </ClInclude>
     <ClInclude Include="Engine\Api\EffectGraphInternal.h">
+      <Filter>Engine\Api</Filter>
+    </ClInclude>
+    <ClInclude Include="Engine\Api\EffectGraphPlugin.h">
+      <Filter>Engine\Api</Filter>
+    </ClInclude>
+    <ClInclude Include="Engine\Api\EffectGraphVersion.h">
       <Filter>Engine\Api</Filter>
     </ClInclude>
     <ClInclude Include="Engine\Api\EffectGraphImpl.h">
@@ -84,19 +43,10 @@
     <ClInclude Include="Engine\Utf8.h">
       <Filter>Engine</Filter>
     </ClInclude>
-    <ClInclude Include="Engine\Mcp\EngineMcpRoutes.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\McpJsonWriter.h">
-      <Filter>Engine\Mcp</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\Routes\RouteSupport.h">
-      <Filter>Engine\Mcp\Routes</Filter>
-    </ClInclude>
-    <ClInclude Include="Engine\Mcp\Routes\GraphPatch.h">
-      <Filter>Engine\Mcp\Routes</Filter>
-    </ClInclude>
     <ClInclude Include="Graph\EffectEdge.h">
+      <Filter>Graph</Filter>
+    </ClInclude>
+    <ClInclude Include="Graph\VideoSourceStatus.h">
       <Filter>Graph</Filter>
     </ClInclude>
     <ClInclude Include="Graph\GraphModel.h">
@@ -117,19 +67,10 @@
     <ClInclude Include="Graph\ParameterModel.h">
       <Filter>Graph</Filter>
     </ClInclude>
-    <ClInclude Include="Graph\ParameterVisibility.h">
-      <Filter>Graph</Filter>
-    </ClInclude>
     <ClInclude Include="Graph\ValueFormat.h">
       <Filter>Graph</Filter>
     </ClInclude>
-    <ClInclude Include="Graph\GraphLayout.h">
-      <Filter>Graph</Filter>
-    </ClInclude>
     <ClInclude Include="Graph\GraphEdits.h">
-      <Filter>Graph</Filter>
-    </ClInclude>
-    <ClInclude Include="Graph\GraphUiSnapshot.h">
       <Filter>Graph</Filter>
     </ClInclude>
     <ClInclude Include="Graph\EffectNode.h">
@@ -153,13 +94,7 @@
     <ClInclude Include="Rendering\DisplayProfile.h">
       <Filter>Rendering</Filter>
     </ClInclude>
-    <ClInclude Include="Rendering\EffectGraphFile.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
     <ClInclude Include="Rendering\GraphEvaluator.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\FfmpegProcess.h">
       <Filter>Rendering</Filter>
     </ClInclude>
     <ClInclude Include="Rendering\D2DHelpers.h">
@@ -213,15 +148,6 @@
     <ClInclude Include="Rendering\PipelineFormat.h">
       <Filter>Rendering</Filter>
     </ClInclude>
-    <ClInclude Include="Rendering\FramePacer.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\PreviewRenderStats.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\RenderThreadDispatcher.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
     <ClInclude Include="Rendering\CaptureNode.h">
       <Filter>Rendering</Filter>
     </ClInclude>
@@ -246,12 +172,6 @@
     <ClInclude Include="Rendering\PixelTrace.h">
       <Filter>Rendering</Filter>
     </ClInclude>
-    <ClInclude Include="Rendering\PreviewViewState.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="Rendering\VideoExport.h">
-      <Filter>Rendering</Filter>
-    </ClInclude>
     <ClInclude Include="Effects\Performance.h">
       <Filter>Effects</Filter>
     </ClInclude>
@@ -274,6 +194,12 @@
       <Filter>Effects</Filter>
     </ClInclude>
     <ClInclude Include="Effects\CustomPixelShaderEffect.h">
+      <Filter>Effects</Filter>
+    </ClInclude>
+    <ClInclude Include="Effects\BuiltInEffects.h">
+      <Filter>Effects</Filter>
+    </ClInclude>
+    <ClInclude Include="Effects\GamutLutGeometry.h">
       <Filter>Effects</Filter>
     </ClInclude>
     <ClInclude Include="Effects\EffectBlob.h">
@@ -333,7 +259,6 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch_engine.cpp" />
-    <ClCompile Include="EngineExport.cpp" />
     <ClCompile Include="Graph\GraphModel.cpp">
       <Filter>Graph</Filter>
     </ClCompile>
@@ -352,19 +277,10 @@
     <ClCompile Include="Graph\ParameterModel.cpp">
       <Filter>Graph</Filter>
     </ClCompile>
-    <ClCompile Include="Graph\ParameterVisibility.cpp">
-      <Filter>Graph</Filter>
-    </ClCompile>
     <ClCompile Include="Graph\ValueFormat.cpp">
       <Filter>Graph</Filter>
     </ClCompile>
-    <ClCompile Include="Graph\GraphLayout.cpp">
-      <Filter>Graph</Filter>
-    </ClCompile>
     <ClCompile Include="Graph\GraphEdits.cpp">
-      <Filter>Graph</Filter>
-    </ClCompile>
-    <ClCompile Include="Graph\GraphUiSnapshot.cpp">
       <Filter>Graph</Filter>
     </ClCompile>
     <ClCompile Include="Rendering\D3D11ComputeRunner.cpp">
@@ -374,9 +290,6 @@
       <Filter>Rendering</Filter>
     </ClCompile>
     <ClCompile Include="Rendering\GraphEvaluator.cpp">
-      <Filter>Rendering</Filter>
-    </ClCompile>
-    <ClCompile Include="Rendering\FfmpegProcess.cpp">
       <Filter>Rendering</Filter>
     </ClCompile>
     <ClCompile Include="Rendering\Evaluator\AnalysisReadback.cpp">
@@ -442,15 +355,6 @@
     <ClCompile Include="Rendering\PixelTrace.cpp">
       <Filter>Rendering</Filter>
     </ClCompile>
-    <ClCompile Include="Rendering\PreviewViewState.cpp">
-      <Filter>Rendering</Filter>
-    </ClCompile>
-    <ClCompile Include="Rendering\VideoExport.cpp">
-      <Filter>Rendering</Filter>
-    </ClCompile>
-    <ClCompile Include="Rendering\EffectGraphFile.cpp">
-      <Filter>Rendering</Filter>
-    </ClCompile>
     <ClCompile Include="Rendering\MathExpression.cpp">
       <Filter>Rendering</Filter>
     </ClCompile>
@@ -479,6 +383,12 @@
       <Filter>Effects</Filter>
     </ClCompile>
     <ClCompile Include="Effects\CustomPixelShaderEffect.cpp">
+      <Filter>Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Effects\BuiltInEffectHooks.cpp">
+      <Filter>Effects</Filter>
+    </ClCompile>
+    <ClCompile Include="Effects\BuiltInEffects.cpp">
       <Filter>Effects</Filter>
     </ClCompile>
     <ClCompile Include="Effects\EffectBlob.cpp">
@@ -535,13 +445,10 @@
     <ClCompile Include="Effects\VideoSourceProvider.cpp">
       <Filter>Effects</Filter>
     </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpRouter.cpp">
-      <Filter>Engine\Mcp</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpSerialize.cpp">
-      <Filter>Engine\Mcp</Filter>
-    </ClCompile>
     <ClCompile Include="Engine\Api\EffectGraphContext.cpp">
+      <Filter>Engine\Api</Filter>
+    </ClCompile>
+    <ClCompile Include="Engine\Api\EffectGraphPlugin.cpp">
       <Filter>Engine\Api</Filter>
     </ClCompile>
     <ClCompile Include="Engine\Api\EffectGraphNode.cpp">
@@ -549,69 +456,6 @@
     </ClCompile>
     <ClCompile Include="Engine\EngineBootstrap.cpp">
       <Filter>Engine</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\EngineMcpRoutes.cpp">
-      <Filter>Engine\Mcp</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\Routes\RouteSupport.cpp">
-      <Filter>Engine\Mcp\Routes</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\Routes\CatalogRoutes.cpp">
-      <Filter>Engine\Mcp\Routes</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\Routes\GraphRoutes.cpp">
-      <Filter>Engine\Mcp\Routes</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\Routes\GraphPatch.cpp">
-      <Filter>Engine\Mcp\Routes</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\Routes\PropertyRoutes.cpp">
-      <Filter>Engine\Mcp\Routes</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\Routes\EffectRoutes.cpp">
-      <Filter>Engine\Mcp\Routes</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\Routes\ReadbackRoutes.cpp">
-      <Filter>Engine\Mcp\Routes</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\Routes\FileRoutes.cpp">
-      <Filter>Engine\Mcp\Routes</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\Routes\DisplayRoutes.cpp">
-      <Filter>Engine\Mcp\Routes</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\Routes\VideoRoutes.cpp">
-      <Filter>Engine\Mcp\Routes</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpJsonRpc.cpp">
-      <Filter>Engine\Mcp</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpToolCatalog.cpp">
-      <Filter>Engine\Mcp</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpFrame.cpp">
-      <Filter>Engine\Mcp</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpCrypto.cpp">
-      <Filter>Engine\Mcp</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpPeerIdentity.cpp">
-      <Filter>Engine\Mcp</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpChannel.cpp">
-      <Filter>Engine\Mcp</Filter>
-    </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpSessionClient.cpp">
-      <Filter>Engine\Mcp</Filter>
-    </ClCompile>
-    <ClCompile Include="third_party\miniz\miniz.c">
-      <Filter>third_party\miniz</Filter>
-    </ClCompile>
-    <ClCompile Include="third_party\miniz\miniz_tdef.c">
-      <Filter>third_party\miniz</Filter>
-    </ClCompile>
-    <ClCompile Include="third_party\miniz\miniz_tinfl.c">
-      <Filter>third_party\miniz</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 
 #include <optional>
 #include <span>
@@ -19,15 +18,15 @@ namespace ShaderLab::Effects
 
     // shaderlab_params.hlsli, shaderlab_colormath.hlsli and
     // shaderlab_gamut.hlsli, in that order. Valid for the process lifetime.
-    SHADERLAB_API std::span<const EmbeddedInclude> EmbeddedIncludes();
+    std::span<const EmbeddedInclude> EmbeddedIncludes();
 
     // The text of the embedded header called `name`, matched exactly (no
     // path), or nullopt.
-    SHADERLAB_API std::optional<std::string_view> FindEmbeddedInclude(std::string_view name);
+    std::optional<std::string_view> FindEmbeddedInclude(std::string_view name);
 
     // Include handler serving EmbeddedIncludes and nothing else: shaders
     // compile from in-memory strings, so there is no directory to search.
     // Every D3DCompile of effect HLSL passes it, so all compile paths resolve
     // the same names. Never null; do not release.
-    SHADERLAB_API ID3DInclude* ShaderLabIncludeHandler();
+    ID3DInclude* ShaderLabIncludeHandler();
 }

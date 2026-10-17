@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pch_engine.h"
-#include "../EngineExport.h"
 #include "../Graph/GraphModel.h"
 
 // The value of one pixel at a node and at every node upstream of it, for the
@@ -17,7 +16,7 @@ namespace ShaderLab::Rendering
         float luminanceNits{ 0 };                       // Rec.709 Y x 80
     };
 
-    SHADERLAB_API TracedPixel DescribePixel(float r, float g, float b, float a);
+    TracedPixel DescribePixel(float r, float g, float b, float a);
 
     struct PixelTraceNode
     {
@@ -44,6 +43,6 @@ namespace ShaderLab::Rendering
     // D2D effect chain shares, from nodeId's output and recursively from
     // each node feeding it through image edges. A node reached by several
     // paths is read once. Render thread, outside a draw session.
-    SHADERLAB_API PixelTraceResult TracePixel(const Graph::GraphModel& graph, uint32_t nodeId,
+    PixelTraceResult TracePixel(const Graph::GraphModel& graph, uint32_t nodeId,
                                               int32_t x, int32_t y, ID2D1DeviceContext* dc);
 }

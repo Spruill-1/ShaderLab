@@ -4,7 +4,7 @@
 #include "pch.h"
 #include "MainWindow.xaml.h"
 
-#include "Rendering/EffectGraphFile.h"
+#include "Support/EffectGraphFile.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/BytecodeCache.h"
 #include "Version.h"
@@ -78,11 +78,11 @@ namespace winrt::ShaderLab::implementation
         try
         {
             // Copy the graph on the render thread, its single writer.
-            std::vector<::ShaderLab::Rendering::EffectGraphFile::MediaEntry> media;
-            const std::wstring jsonText = ::ShaderLab::Rendering::EffectGraphFile::SerializeForSave(
-                m_renderDispatcher.DispatchSync([this] { return m_graph; }), m_embedMedia, media);
+            std::vector<::ShaderLab::Support::EffectGraphFile::MediaEntry> media;
+            const std::wstring jsonText = ::ShaderLab::Support::EffectGraphFile::SerializeForSave(
+                m_renderDispatcher.DispatchSync([this] { return Model(); }), m_embedMedia, media);
 
-            const bool ok = ::ShaderLab::Rendering::EffectGraphFile::Save(
+            const bool ok = ::ShaderLab::Support::EffectGraphFile::Save(
                 m_currentFilePath, jsonText, media);
             if (ok)
             {
@@ -159,13 +159,13 @@ namespace winrt::ShaderLab::implementation
         // Build media entries + rewritten JSON from a copy of the graph
         // taken on the render thread, then drive a single synchronous save
         // with a progress callback that updates the dialog in-place.
-        std::vector<::ShaderLab::Rendering::EffectGraphFile::MediaEntry> media;
+        std::vector<::ShaderLab::Support::EffectGraphFile::MediaEntry> media;
         std::wstring jsonText;
         bool serialized = false;
         try
         {
-            jsonText = ::ShaderLab::Rendering::EffectGraphFile::SerializeForSave(
-                m_renderDispatcher.DispatchSync([this] { return m_graph; }), m_embedMedia, media);
+            jsonText = ::ShaderLab::Support::EffectGraphFile::SerializeForSave(
+                m_renderDispatcher.DispatchSync([this] { return Model(); }), m_embedMedia, media);
             serialized = true;
         }
         catch (...)
@@ -205,11 +205,11 @@ namespace winrt::ShaderLab::implementation
         // ProgressBar never repaints.
         std::wstring path = m_currentFilePath;
         bool ok = false;
-        ::ShaderLab::Rendering::EffectGraphFile::SaveStats stats;
+        ::ShaderLab::Support::EffectGraphFile::SaveStats stats;
         co_await winrt::resume_background();
         try
         {
-            ok = ::ShaderLab::Rendering::EffectGraphFile::Save(
+            ok = ::ShaderLab::Support::EffectGraphFile::Save(
                 path, jsonText, media, progressCb, &stats);
         }
         catch (...)
@@ -296,7 +296,7 @@ namespace winrt::ShaderLab::implementation
         const auto sourcePaths = m_renderDispatcher.DispatchSync([this]
         {
             std::vector<std::wstring> paths;
-            for (const auto& node : m_graph.Nodes())
+            for (const auto& node : Model().Nodes())
             {
                 if (node.type == ::ShaderLab::Graph::NodeType::Source &&
                     node.mediaPath.has_value() && !node.mediaPath->empty() &&
@@ -394,7 +394,7 @@ namespace winrt::ShaderLab::implementation
         dialog.Content(sp);
 
         auto dispatcher = this->DispatcherQueue();
-        std::optional<::ShaderLab::Rendering::EffectGraphFile::LoadResult> loadResult;
+        std::optional<::ShaderLab::Support::EffectGraphFile::LoadResult> loadResult;
         std::wstring loadError;
 
         // Show the progress dialog, yield once for layout, then run
@@ -423,7 +423,7 @@ namespace winrt::ShaderLab::implementation
         co_await winrt::resume_background();
         try
         {
-            auto r = ::ShaderLab::Rendering::EffectGraphFile::Load(pathStr, tempRoot, progressCb);
+            auto r = ::ShaderLab::Support::EffectGraphFile::Load(pathStr, tempRoot, progressCb);
             if (r.has_value()) loadResult = std::move(r);
             else loadError = L"Could not read graph from .effectgraph";
         }
@@ -450,15 +450,14 @@ namespace winrt::ShaderLab::implementation
                 // Rewrite media:// tokens on source nodes to the
                 // extracted temp paths so the live graph can render
                 // them through the existing image / video pipeline.
-                ::ShaderLab::Rendering::EffectGraphFile::ResolveMediaTokens(loaded, loadResult->mediaMap);
+                ::ShaderLab::Support::EffectGraphFile::ResolveMediaTokens(loaded, loadResult->mediaMap);
 
                 // On the render thread: we're on the UI thread here, and the
                 // worker is the graph's single writer -- releasing its caches
                 // or replacing the graph under a live Evaluate is a data race
                 // (the same one that crashed the GPU-bindings toggle).
                 m_renderDispatcher.DispatchSync([this, &loaded] {
-                    m_graphEvaluator.ReleaseCache(m_graph);
-                    m_graph = std::move(loaded);
+                    m_context->ReplaceGraph(std::move(loaded));
                 });
                 m_currentFilePath = pathStr;
                 m_unsavedChanges = false;
@@ -536,7 +535,7 @@ namespace winrt::ShaderLab::implementation
     {
         if (m_heartbeatTimer) return;
         m_heartbeatTimer = DispatcherQueue().CreateTimer();
-        m_heartbeatTimer.Interval(std::chrono::seconds(::ShaderLab::Rendering::cMediaHeartbeatIntervalSec));
+        m_heartbeatTimer.Interval(std::chrono::seconds(::ShaderLab::Support::cMediaHeartbeatIntervalSec));
         m_heartbeatTimer.Tick([this](auto&&, auto&&) { TouchHeartbeats(); });
         m_heartbeatTimer.Start();
     }
@@ -545,7 +544,7 @@ namespace winrt::ShaderLab::implementation
     {
         // One tiny write per loaded graph per interval.
         for (const auto& dir : m_extractedMediaDirs)
-            ::ShaderLab::Rendering::TouchMediaHeartbeat(dir);
+            ::ShaderLab::Support::TouchMediaHeartbeat(dir);
     }
 
     winrt::fire_and_forget MainWindow::ReapStaleMediaDirsAsync()
@@ -553,7 +552,7 @@ namespace winrt::ShaderLab::implementation
         auto strong = get_strong();
 
         // Folders from an instance that did not shut down cleanly: offer to delete them.
-        const auto stale = ::ShaderLab::Rendering::FindStaleMediaDirs(::ShaderLab::Rendering::TempDirectory());
+        const auto stale = ::ShaderLab::Support::FindStaleMediaDirs(::ShaderLab::Support::TempDirectory());
         if (stale.empty()) co_return;
 
         namespace XC = winrt::Microsoft::UI::Xaml::Controls;
@@ -578,7 +577,7 @@ namespace winrt::ShaderLab::implementation
         if (result != XC::ContentDialogResult::Primary) co_return;
 
         co_await winrt::resume_background();
-        ::ShaderLab::Rendering::ReapMediaDirs(stale);
+        ::ShaderLab::Support::ReapMediaDirs(stale);
     }
 
     // ---- Status-bar broom ------------------------------------------------
@@ -602,8 +601,8 @@ namespace winrt::ShaderLab::implementation
         co_await winrt::resume_background();
 
         // ---- Reap graph-temp media dirs --------------------------------
-        const auto mediaReap = ::ShaderLab::Rendering::ReapMediaDirs(::ShaderLab::Rendering::FindStaleMediaDirs(
-            ::ShaderLab::Rendering::TempDirectory(), ::ShaderLab::Rendering::cStaleMediaDirSec, /*countBytes*/ true));
+        const auto mediaReap = ::ShaderLab::Support::ReapMediaDirs(::ShaderLab::Support::FindStaleMediaDirs(
+            ::ShaderLab::Support::TempDirectory(), ::ShaderLab::Support::cStaleMediaDirSec, /*countBytes*/ true));
         const size_t graphDirsDeleted = mediaReap.deleted;
         const uint64_t graphBytesFreed = mediaReap.bytesFreed;
 
@@ -681,7 +680,7 @@ namespace winrt::ShaderLab::implementation
         auto resetGraph = [this]
         {
             m_nodeGraphController.RebuildLayout();
-            m_graph.MarkAllDirty();
+            Model().MarkAllDirty();
         };
         // The graph is written on the render thread. The adapter switch calls
         // this with the worker stopped, when there is no render thread to use.

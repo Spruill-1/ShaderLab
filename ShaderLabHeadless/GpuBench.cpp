@@ -1,7 +1,7 @@
 #include "pch_engine.h"
 #include "GpuBench.h"
 #include "HeadlessEngine.h"
-#include "../Graph/GraphEdits.h"
+#include "Graph/GraphEdits.h"
 
 #include <algorithm>
 #include <chrono>

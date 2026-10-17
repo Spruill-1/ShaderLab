@@ -20,7 +20,7 @@ Reference for "how does ShaderLab work under the hood".
 - [Compute Shader Analysis Pipeline](architecture/compute-analysis-pipeline.md) — D2D compute conventions, CPU readback, analysis output schema.
 - [D2D / D3D11 Hybrid Compute System](architecture/d2d-d3d11-hybrid-compute.md) — `CustomComputeBridgeEffect`, `D3D11ComputeRunner`, GPU-binding routing, COM class hierarchy.
 - [EffectGraph API](architecture/effectgraph-api.md) — the engine as a COM library for any D3D11 program: `IEffectGraphContext`, `IEffectGraphNode`, texture inputs, `Realize` / `RealizeTo`.
-- [Engine / Host Split](architecture/engine-host-split.md) — `ShaderLabEngine.dll` ABI, `IEngineCommandSink`, host event hooks.
+- [Engine / Host Split](architecture/engine-host-split.md) — the static engine library, `IEngineCommandSink`, host event hooks, the retired engine ABI history.
 
 ## Effects
 
@@ -53,6 +53,7 @@ Reference for the effect catalog and per-effect mechanics.
 
 - [Build Instructions](development/build.md) — prerequisites, configurations, dependency map.
 - [Project Structure](development/project-structure.md) — full file tree with per-file descriptions.
+- [EffectGraph Packages](development/packaging.md) — the `EffectGraph.Native` and C# `EffectGraph` NuGet packages, how they are built, and their C# test.
 - [MCP Migration: HTTP → stdio](development/mcp-stdio-migration.md) — **complete** (all 9 steps; decision #71, engine ABI 3). The implementation plan and rationale for replacing the embedded HTTP MCP server with stdio + a broker relay, kept as the reference for how the transport works.
 
 ## History
