@@ -2,7 +2,8 @@ Third-party software in ShaderLab
 
 ShaderLab's programs (ShaderLab.exe, ShaderLabHeadless.exe, ShaderLabTests.exe)
 build in the code below through the Support library (ShaderLabSupport.vcxproj).
-EffectGraph (LICENSE-EffectGraph) contains none of it.
+EffectGraph (https://github.com/Spruill-1/EffectGraph, MIT-0), the engine
+ShaderLab links, contains none of it.
 
 ================================================================================
 ExprTk (C++ Mathematical Expression Toolkit Library)

@@ -488,8 +488,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_G
             for (const auto& n : graph.Nodes())
             {
                 const Graph::SourceKind kind = Graph::ClassifySource(n);
-                if (Graph::IsLiveCapture(kind))
-                    warnings.push_back(std::format(L"node {} is a live capture source; it is not time-stepped", n.id));
+                if (Graph::IsLiveSource(kind))
+                    warnings.push_back(std::format(L"node {} is a live source; it is not time-stepped", n.id));
                 else if (kind == Graph::SourceKind::Video ||
                          (kind == Graph::SourceKind::Image && Effects::SourceNodeFactory::IsVideoFile(*n.mediaPath)))
                     warnings.push_back(std::format(L"node {} is a video file; video sources are not time-stepped by export yet", n.id));

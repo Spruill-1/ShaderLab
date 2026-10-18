@@ -8,6 +8,7 @@
 #include "Graph/GraphEdits.h"
 #include "Effects/EffectUpgrade.h"
 #include "Effects/NodeCatalog.h"
+#include "Sources/CaptureSources.h"
 #include "Rendering/GraphEvaluator.h"
 
 // Graph structure: reading the graph, adding, duplicating and removing nodes,
@@ -131,8 +132,7 @@ namespace ShaderLab::Mcp::Routes
                     auto name = ReadStringArg(args, L"effectName", argError);
                     Effects::NodeCreateArgs createArgs;
                     createArgs.filePath     = ReadStringArg(args, L"filePath", argError).value_or(L"");
-                    createArgs.adapterIndex = ReadUintArg(args, L"adapterIndex", argError).value_or(0);
-                    createArgs.outputIndex  = ReadUintArg(args, L"outputIndex", argError).value_or(0);
+                    ReadUintArgs(args, createArgs, argError);
                     if (!argError.empty())
                         return Error(400, argError);
                     if (!name)
@@ -144,14 +144,15 @@ namespace ShaderLab::Mcp::Routes
                         if (!created.node)
                             return Error(400, WideToUtf8(created.error));
                         const std::wstring nodeName = created.node->name;
+                        const bool duplication = Sources::IsDesktopDuplication(*created.node);
                         const uint32_t id = AddCreatedNode(ctx, created);   // starts dirty
                         sink.OnNodeAdded(id);
 
                         JsonWriter json;
                         json.BeginObject().Key("nodeId").Int(id);
-                        if (created.desktopDuplication)
-                            json.Key("adapterIndex").Int(createArgs.adapterIndex)
-                                .Key("outputIndex").Int(createArgs.outputIndex)
+                        if (duplication)
+                            json.Key("adapterIndex").Int(createArgs.uints[L"adapterIndex"])
+                                .Key("outputIndex").Int(createArgs.uints[L"outputIndex"])
                                 .Key("name").String(nodeName);
                         return Json(200, json.EndObject().Take());
                     });

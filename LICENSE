@@ -1,9 +1,9 @@
 ShaderLab is licensed under the MIT License, below.
 
-The EffectGraph engine in this repository is also available under the more
-permissive MIT No Attribution License (MIT-0): see LICENSE-EffectGraph for
-which parts that covers. Third-party code that ShaderLab builds in is listed,
-with its own license, in THIRD-PARTY-NOTICES.txt.
+ShaderLab is built on EffectGraph (https://github.com/Spruill-1/EffectGraph),
+which is under the MIT No Attribution License (MIT-0) in its own repository.
+Third-party code that ShaderLab builds in is listed, with its own license, in
+THIRD-PARTY-NOTICES.txt.
 
 MIT License
 

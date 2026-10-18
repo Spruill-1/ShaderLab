@@ -64,7 +64,7 @@
     <IntDir>$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabMcpBroker\obj\</IntDir>
   </PropertyGroup>
   <!--
-    Deliberately NOT referencing / linking ShaderLabEngine: the hub must
+    Deliberately NOT referencing / linking EffectGraph's engine: the hub must
     start in milliseconds and never touches a GPU. The Step 4 MCP modules
     it needs (frame codec, crypto, peer identity) are compiled directly
     into this exe.
@@ -102,7 +102,6 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="pch_engine.h" />
     <ClInclude Include="Mcp\McpFrame.h" />
     <ClInclude Include="Mcp\McpCrypto.h" />
     <ClInclude Include="Mcp\McpPeerIdentity.h" />

@@ -1,8 +1,8 @@
 #include "pch_engine.h"
 #include "../TestSupport.h"
 
-#include "../../Graph/GraphModel.h"
-#include "../../Rendering/GraphEvaluator.h"
+#include "Graph/GraphModel.h"
+#include "Rendering/GraphEvaluator.h"
 #include "../../Mcp/McpArgs.h"
 #include "../../Mcp/McpJsonWriter.h"
 #include "../../Mcp/McpJsonRpc.h"

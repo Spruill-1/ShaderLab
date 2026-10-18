@@ -271,7 +271,7 @@ namespace ShaderLab::Controls
         // Only file images: a live capture owns its bitmap and has no path.
         const auto kind = Graph::ClassifySource(node);
         if (node.type != Graph::NodeType::Source || node.effectClsid.has_value() ||
-            kind == Graph::SourceKind::Video || Graph::IsLiveCapture(kind))
+            kind == Graph::SourceKind::Video || Graph::IsLiveSource(kind))
             return;
 
         children.Append(SectionHeader(L"Image Path", { 0, 4, 0, 2 }));

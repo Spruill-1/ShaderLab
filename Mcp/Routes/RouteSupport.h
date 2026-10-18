@@ -12,6 +12,7 @@
 #include "Graph/GraphModel.h"
 #include "../McpArgs.h"
 #include "../McpJsonWriter.h"
+#include "Effects/NodeCatalog.h"
 
 #include <optional>
 #include <string>
@@ -20,11 +21,6 @@ namespace ShaderLab
 {
     class McpRouter;
 }
-namespace ShaderLab::Effects
-{
-    struct NodeCreateResult;
-}
-
 namespace ShaderLab::Mcp::Routes
 {
     namespace WDJ = winrt::Windows::Data::Json;
@@ -36,6 +32,15 @@ namespace ShaderLab::Mcp::Routes
     // Renders a frame in which nodeId is evaluated; a no-op for a host
     // without a renderer.
     void RenderFrameFor(EngineContext& ctx, uint32_t nodeId);
+
+    // The named arguments ShaderLab's node makers read into `createArgs`:
+    // adapterIndex and outputIndex for Desktop Duplication.
+    inline void ReadUintArgs(const WDJ::JsonObject& args, Effects::NodeCreateArgs& createArgs, std::string& error)
+    {
+        for (const wchar_t* key : { L"adapterIndex", L"outputIndex" })
+            if (auto value = ReadUintArg(args, key, error))
+                createArgs.uints[key] = *value;
+    }
 
     // Adds a node CreateNodeByName made and, when it is a Source that needs
     // it, prepares it on the host's device. Returns the new id.

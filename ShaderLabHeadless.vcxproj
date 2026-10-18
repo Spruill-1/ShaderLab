@@ -95,7 +95,6 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="pch_engine.h" />
     <ClInclude Include="ShaderLabHeadless\HeadlessArgs.h" />
     <ClInclude Include="ShaderLabHeadless\HeadlessEngine.h" />
     <ClInclude Include="ShaderLabHeadless\ImageOutput.h" />

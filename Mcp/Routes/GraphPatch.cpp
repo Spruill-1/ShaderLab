@@ -62,8 +62,7 @@ namespace ShaderLab::Mcp::Routes
             node.effect = *effect;
             std::string argError;
             node.args.filePath     = ReadStringArg(entry, L"filePath", argError).value_or(L"");
-            node.args.adapterIndex = ReadUintArg(entry, L"adapterIndex", argError).value_or(0);
-            node.args.outputIndex  = ReadUintArg(entry, L"outputIndex", argError).value_or(0);
+            ReadUintArgs(entry, node.args, argError);
             if (entry.HasKey(L"ref") && entry.GetNamedValue(L"ref").ValueType() == WDJ::JsonValueType::String)
                 node.ref = std::wstring(entry.GetNamedString(L"ref"));
             if (entry.HasKey(L"properties") &&

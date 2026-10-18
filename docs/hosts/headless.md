@@ -112,7 +112,7 @@ Three flags pin it:
 | Flag | Effect |
 |---|---|
 | `--display-profile NAME` | Replace the live profile with a fully-determined preset: `srgb-sdr`, `srgb-270`, `p3-600`, `p3-1000`, `bt2020-1000`, `bt2020-4000`, `adobergb`. An unknown name is a usage error (exit 1) — never a silent fallback to the live display, which would defeat the flag. |
-| `--effects-dir DIR` | Register user effects from every `*.json` saved graph and every effect plugin `*.dll` in `DIR` (repeatable). Headless never reads the GUI's `%LOCALAPPDATA%\ShaderLab\effects` folder by itself. Loaded effects are listed as `User effect:` and `Effect plugin:` lines and failures as `[ShaderLab] user effect not loaded:` and `[ShaderLab] effect plugin not loaded:` lines, all on stderr. See [User Effects](../effects/user-effects.md). |
+| `--effects-dir DIR` | Register user effects from every `*.json` saved graph and every effect plugin `*.dll` in `DIR` (repeatable). Headless never reads the GUI's `%LOCALAPPDATA%\ShaderLab\effects` folder by itself. Loaded effects are listed as `User effect:` and `Effect plugin:` lines and failures as `[ShaderLab] user effect not loaded:` and `[ShaderLab] effect plugin not loaded:` lines, all on stderr. See [User Effects](https://github.com/Spruill-1/EffectGraph/blob/main/docs/effects/user-effects.md). |
 | `--display-sdr-white N` | Override SDR white level (nits) on top of that preset, or on top of the live profile when no preset is named. |
 | `--display-peak-nits N` | Override peak luminance (nits), same layering. Also lowers `MaxFullFrameNits` if it would otherwise exceed the new peak. |
 
@@ -145,7 +145,7 @@ context (`SetDisplayProfile`), whose frame does the refresh.
 ## Built on the EffectGraph API
 
 `HeadlessEngine` is a host of the public engine API
-([`effectgraph-api.md`](../architecture/effectgraph-api.md)): it creates the
+([`effectgraph-api.md`](https://github.com/Spruill-1/EffectGraph/blob/main/docs/architecture/effectgraph-api.md)): it creates the
 D3D11 device for `--adapter`, then an `IEffectGraphContextInternal` on it with
 `EffectGraphCreateContext`, which owns the graph, evaluator, source factory and
 Direct2D context and registers the engine's effects. Every frame is the

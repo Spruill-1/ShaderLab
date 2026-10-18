@@ -11,7 +11,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "../Effects/Performance.h"
+#include "Effects/Performance.h"
 
 namespace ShaderLab::Tests
 {

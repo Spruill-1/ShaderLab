@@ -20,7 +20,7 @@ ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, 
 
 - Clone with `--recurse-submodules` (or run `git submodule update --init --recursive`). `exprtk` and `miniz` are git submodules under `third_party/`, pinned to explicit commits; `third_party/miniz_export.h` is an in-tree shim, not part of the submodule. See [build.md](../docs/development/build.md).
 - Open `ShaderLab.slnx` in Visual Studio 2022 17.8+ (VS 2026 / v18 also supported)
-- NuGet packages restore automatically (packages.config style, not PackageReference)
+- The engine comes from EffectGraph's packages (`EffectGraph.Engine`, `EffectGraph.Native`). They come from nuget.org: `nuget restore ShaderLab.slnx -SolutionDirectory .` (packages.config style, not PackageReference). `/p:EffectGraphSourceDir=..\EffectGraph\` builds against the checkout's source instead. See [build.md](../docs/development/build.md#effectgraph-packages).
 - Configurations: **Debug | x64** and **Debug | ARM64** (plus Release for both).
   CI builds x64 on `windows-latest` and ARM64 natively on `windows-11-arm`.
 - No wrapper build scripts exist; use MSBuild via VS or
@@ -36,7 +36,7 @@ ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, 
 
 ## Architecture
 
-The codebase is split between a host-agnostic engine library (`ShaderLabEngine.lib`, linked statically into every program; `EffectGraph.dll` wraps it for outside programs), a WinUI 3 app (`ShaderLab.exe`), a console host (`ShaderLabHeadless.exe`), and a test runner (`ShaderLabTests.exe`). The split is documented in detail in README's *Engine / Host Split* section.
+The host-agnostic engine is [EffectGraph](https://github.com/Spruill-1/EffectGraph), its own repository (decision #231). ShaderLab consumes it as the `EffectGraph.Engine` NuGet package (`EffectGraphEngine.lib`, linked statically into every program; decision #232) and adds a support library (`ShaderLabSupport.lib`), a WinUI 3 app (`ShaderLab.exe`), a console host (`ShaderLabHeadless.exe`), the MCP broker (`ShaderLabMcpBroker.exe`) and a test runner (`ShaderLabTests.exe`). The split is documented in [engine-host-split.md](../docs/architecture/engine-host-split.md). Engine sources (`Graph/`, `Rendering/`, `Effects/`, `Engine/` below, apart from ShaderLab's host pieces) are edited in the EffectGraph repository.
 
 ```
 ShaderLab.exe (WinUI 3 host)
@@ -47,7 +47,7 @@ ShaderLab.exe (WinUI 3 host)
   │                               PixelTracePanelController, PropertiesPanelController, ...
   └── EffectDesignerWindow      — Modal for creating/editing custom pixel/compute shader effects
 
-ShaderLabEngine.lib (host-agnostic, static)
+EffectGraphEngine.lib (EffectGraph repository, via the EffectGraph.Engine package)
   ├── Graph/                    — GraphModel, EffectNode, EffectEdge, NodeType, PropertyValue
   ├── Rendering/
   │   ├── GraphEvaluator        — Facade over Evaluator/ (topological walk, per-node NodeRuntime, ProcessDeferredCompute)
@@ -61,16 +61,23 @@ ShaderLabEngine.lib (host-agnostic, static)
   │   └── MathExpression        — Numeric Expression hook; ShaderLab registers ExprTk (Support/)
   ├── Effects/
   │   ├── ShaderLabEffects      — effect registry + the 8 built-ins with no shader; shader built-ins come from generated headers
-  │   ├── BuiltInEffects        — every built-in's name/id, class ids, the C++ hooks three carry (BuiltInEffectHooks.cpp)
+  │   ├── BuiltInEffects        — every built-in's name/id, class ids, the C++ hooks three carry (BuiltInEffectHooks.cpp); edited in BuiltInEffects/BuiltInEffectTable.cpp
   │   ├── ColorMath.cpp         — Shared HLSL color math library (BT.709/BT.2020/P3, PQ/HLG, ICtCp)
   │   ├── EffectRegistry        — 40+ wrapped D2D effects across 9 categories
   │   ├── ShaderCompiler        — D3DCompile + D3DReflect + ID3DInclude resolver for shaderlab_params.hlsli and shaderlab_colormath.hlsli
   │   ├── ShaderLabParamsHlsl   — Engine-embedded macro library for GPU-binding-aware parameters
   │   ├── IEngineComputeOutput  — COM interface for upstream effects exposing GPU-resident analysis
   │   ├── CustomPixelShaderEffect / CustomComputeShaderEffect — Custom-effect base classes
-  │   ├── SourceNodeFactory     — Image / video / Flood / DXGI Desktop Duplication / Windows Graphics Capture
-  │   └── DxgiDuplicationSourceProvider, WindowsGraphicsCaptureSourceProvider, VideoSourceProvider (+ VideoFrameReader / VideoSeekModel / VideoFrameConverter)
-  └── Mcp/  (ShaderLabSupport.lib, not the engine)
+  │   ├── SourceNodeFactory     — Image / video / Flood, and live sources a host registers (LiveSource.h)
+  │   └── VideoSourceProvider (+ VideoFrameReader / VideoSeekModel / VideoFrameConverter)
+  └── Engine/Api/               — EffectGraph's public COM API (IEffectGraphContext / IEffectGraphNode)
+
+ShaderLabSupport.lib (ShaderLab only, static)
+  ├── Graph/, Rendering/        — host pieces: GraphUiSnapshot, GraphLayout, ParameterVisibility, PreviewViewState,
+  │                               FramePacer, RenderThreadDispatcher, VideoExport, FfmpegProcess
+  ├── Sources/                  — DXGI Desktop Duplication + Windows Graphics Capture, registered as live source kinds
+  ├── Support/                  — ExprTk (Numeric Expression), .effectgraph files (miniz), PackageRoutes, EffectPlugins discovery
+  └── Mcp/
       ├── McpRouter             — route registry (longest-prefix, query split, HasRoute); HTTP listener deleted in stdio-mig. Step 9 — the broker is the only transport
       ├── McpTypes              — transport-neutral Mcp::Response (+ noReply) + shared JsonEscape/WideToUtf8
       ├── McpJsonRpc            — engine-side JSON-RPC dispatcher (initialize / tools / resources / ping)
@@ -176,7 +183,7 @@ When creating new D2D effects (the core purpose of this tool):
 2. Register with `ID2D1Factory1::RegisterEffectFromString()` using XML schema + `D2D1_VALUE_TYPE_BINDING` macros
 3. Keep only `InputCount` as a D2D-exposed property; manage shader bytecode and cbuffers host-side
 4. Use `ShaderCompiler` for `D3DCompile` (ps_5_0 / cs_5_0) + `D3DReflect` for cbuffer discovery
-5. Register effects in `Engine::RegisterEngineD2DEffects()` (`Engine/EngineBootstrap.h`), which every EffectGraph context calls on its own D2D factory (the app, headless and each test case run on one)
+5. Register effects in `Engine::RegisterEngineD2DEffects()` (EffectGraph's `Engine/EngineBootstrap.h`), which every EffectGraph context calls on its own D2D factory (the app, headless and each test case run on one)
 6. Follow `CustomPixelShaderEffect` / `CustomComputeShaderEffect` as templates
 
 ## Looking at HDR Output (an AI agent cannot, directly)
@@ -210,7 +217,7 @@ golden-image comparison, and round-tripping back in as an Image source.
 Active development centers on **tone-mapping and color-correction effects authored as graph nodes** — not a built-in tone-mapping pass. The render pipeline is intentionally pass-through (scRGB FP16 in, scRGB FP16 out); users compose tone mappers and color correction from graph effects, validate them with empirical fidelity tooling, and iterate.
 
 - **Pipeline is scRGB FP16 linear light** (1.0 = 80 nits SDR white). No fixed built-in tone-mapping pass — DWM/ACM handles final display conversion.
-- **The ICtCp suite** in `BuiltInEffects/BuiltInEffectTable.cpp` (Tone Map / Inverse Tone Map / Saturation / Highlight Desaturation / Round-Trip Validator / Gamut Map / Boundary) is the preferred path for tone-mapping work. Math lives in `GetColorMathHLSL()` (PQ/HLG transfer functions, BT.709/2020/P3 matrices, anchored Reinhard / Möbius, scRGB↔ICtCp).
+- **The ICtCp suite** in EffectGraph's `BuiltInEffects/BuiltInEffectTable.cpp` (Tone Map / Inverse Tone Map / Saturation / Highlight Desaturation / Round-Trip Validator / Gamut Map / Boundary) is the preferred path for tone-mapping work. Math lives in `GetColorMathHLSL()` (PQ/HLG transfer functions, BT.709/2020/P3 matrices, anchored Reinhard / Möbius, scRGB↔ICtCp).
 - **Empirical fidelity loop**: `Delta E Comparator` (Heatmap or Grayscale dE mode) + `Luminance Statistics` (D3D11 compute reduction) + `Working Space` node (mirrors active display profile) lets you measure CIEDE2000 mean/p95/max color difference *while sweeping a parameter*, on the GPU, every frame. This is the canonical way to evaluate any new tone-mapping or color-correction work.
 - **Working Space node** is the single path for tracking the active display profile. Effects expose first-class `RedPrimary` / `GreenPrimary` / `BluePrimary` / `WhitePoint` (Float2) and peak/SDR-white nit parameters; bind them from `working_space.*` outputs to follow Display Settings or simulated profiles automatically.
 - **D2D's built-in `CLSID_D2D1HdrToneMap`** applies a fixed BT.2408-style mid-tone lift independent of `InputMaxLuminance` (decision log #52). Useful as a reference, not a building block — its lift is opinionated and fixed.
@@ -222,18 +229,18 @@ Active development centers on **tone-mapping and color-correction effects author
 - **Display monitoring**: Event-driven — `DisplayInformation` bound to the main window (`IDisplayInformationStaticsInterop::GetForWindow`) raises `AdvancedColorInfoChanged` for HDR toggles, the SDR-brightness slider, and monitor moves; one `AdvancedColorInfo` snapshot feeds all of `DisplayCapabilities`. Requires Win11 22H2 (10.0.22621 min OS). Headless snapshots the primary monitor via `GetForMonitor` (no events).
 - **Graph serialization**: `Windows.Data.Json` (zero extra dependencies). GUID fields use `StringFromGUID2`/`CLSIDFromString`.
 - **Effect registry**: Singleton with 40+ built-in D2D effects across 9 categories. Case-insensitive name lookup.
-- **ShaderLab effects library**: 38 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map + Scale), Source / Generator, Composition (Split Comparison, Side by Side), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use; bytecode cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` (decision #58 catalog → see [builtin-catalog.md](../docs/effects/builtin-catalog.md) for the full per-effect type table).
+- **ShaderLab effects library**: 38 built-in effects, in EffectGraph (`Effects/ShaderLabEffects.h/.cpp`, sources in `BuiltInEffects/BuiltInEffectTable.cpp`), across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map + Scale), Source / Generator, Composition (Split Comparison, Side by Side), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use; bytecode cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` (decision #58 catalog → see [builtin-catalog.md](https://github.com/Spruill-1/EffectGraph/blob/main/docs/effects/builtin-catalog.md) for the full per-effect type table).
 - **MCP server**: JSON-RPC 2.0 (protocol 2025-06-18, batching rejected) over **stdio via the broker** — the embedded HTTP listener was deleted in stdio-migration Step 9 (decision #71, superseding #31/#58; engine ABI **3**). The router, dispatcher, 47-tool catalog and the 28 engine routes (`Mcp/Routes/`, one file per concern) live in `Mcp/`, in ShaderLabSupport.lib rather than the engine (handlers take `(path, query, body)`); the GUI's 20 own routes are in `MainWindow.McpAppRoutes.cpp` and `Controls/PerfMcpRoutes`, registered through `Controls::McpRouteTable` as UI, render or any-thread routes. Every body goes through `McpJsonWriter.h`; errors are `{error, code}`, a bad argument is a 400 before anything changes, and a later fault is a 500 with its message. Each host registers as a hub **session** (`McpSessionClient`, GUID-identified); a client's shim (`ShaderLabMcpBroker --stdio`, unpackaged, distributed to `%LOCALAPPDATA%\ShaderLab\bin\`) activates the packaged hub and pins a session with `use_session`. Both hosts register the same engine-side route set through `IEngineCommandSink`: pure mutation closures dispatched via `sink.Dispatch`, with 8 event hooks (`OnNodeAdded`, `OnNodeRemoved`, `OnNodeChanged`, `OnGraphCleared`, `OnGraphLoaded`, `OnGraphStructureChanged`, `OnCustomEffectRecompiled`, `OnDisplayProfileChanged`) the GUI overrides to keep its UI in sync. CI drives `RunTests.ps1` through a shim against a headless `--mcp-session`.
-- **Versioning**: three numbers, read them at their source rather than quoting them here (decision #229). `Version.h` is ShaderLab's version (window title, MCP server info, headless banner). `Engine/Api/EffectGraphVersion.h` is EffectGraph's (the packages, saved graphs). `Graph::cGraphFormatVersion` (`Graph/GraphModel.h`) is the saved-graph format; a graph in a newer format is refused on load. The engine is a static library linked into each program, so there is no engine ABI version to keep in step (decision #219).
+- **Versioning**: three numbers, read them at their source rather than quoting them here (decision #229). `Version.h` is ShaderLab's version (window title, MCP server info, headless banner). `Engine/Api/EffectGraphVersion.h` (in EffectGraph) is EffectGraph's (the packages, saved graphs); ShaderLab pins the package version in `build/EffectGraphPackage.props`. `Graph::cGraphFormatVersion` (`Graph/GraphModel.h`) is the saved-graph format; a graph in a newer format is refused on load. The engine is a static library linked into each program, so there is no engine ABI version to keep in step (decision #219).
 - **Refresh-rate-driven render loop on the worker thread**: the render worker `std::jthread` runs the graph evaluate at the active monitor's refresh rate (clamped to 60–240 Hz). Dirty-gated: skips evaluate when no nodes changed, no output window is open, and `m_forceRender` is false. The UI thread runs a `DispatcherQueueTimer` at the same rate, but its body is just "drain dispatcher + blit offscreen + Present1" — sub-ms cost. The interval is re-applied on every display change so dragging the window across monitors picks up the new rate.
 - **Evaluation runs with no draw session open on its device context** (decision #221): `Evaluate` and `ProcessDeferredCompute` open a session only for their own drawing (an analysis readback, a compute input that cannot be read in place) and close it, so wrapping either in a `BeginDraw` nests and fails. `FrameExecutor::Run` opens a session only for the host's draw; the GUI, headless and the tests all render through it.
 - **Ctrl+Enter** compiles shader from the editor TextBox.
 
 ## Adding New Files
 
-1. Create `.h` and `.cpp` in the appropriate directory (`Graph/`, `Rendering/`, `Effects/`, `Controls/`)
-2. Add both to `ShaderLab.vcxproj` under the correct `<ClInclude>` / `<ClCompile>` `<ItemGroup>`
-3. Add to `ShaderLab.vcxproj.filters` for VS Solution Explorer organization
+1. Create `.h` and `.cpp` in the appropriate directory (`Controls/`, `Mcp/`, `Support/`, or ShaderLab's host pieces in `Graph/` / `Rendering/`). Engine code (`Effects/`, the evaluator, the graph model) belongs in the EffectGraph repository.
+2. Add both to the owning project (`ShaderLab.vcxproj` or `ShaderLabSupport.vcxproj`) under the correct `<ClInclude>` / `<ClCompile>` `<ItemGroup>`
+3. Add to its `.vcxproj.filters` for VS Solution Explorer organization
 4. Use the matching `ShaderLab::SubNamespace` namespace
 5. `#include "pch.h"` as the first line in every `.cpp` file
 
@@ -258,9 +265,9 @@ These are critical lessons learned during development. Any AI agent generating o
 
 ## ShaderLab Effects Library
 
-The built-in effects library lives in `Effects/ShaderLabEffects.h/.cpp`:
+The built-in effects library is EffectGraph's ([repository](https://github.com/Spruill-1/EffectGraph), [catalog](https://github.com/Spruill-1/EffectGraph/blob/main/docs/effects/builtin-catalog.md)); ShaderLab gets it through the `EffectGraph.Engine` package:
 
-- **Embedded HLSL**: Each effect's shader code is stored as a `const char*` string constant. No external `.hlsl` files.
+- **Embedded HLSL**: Each effect's shader is edited in EffectGraph's `BuiltInEffects/BuiltInEffectTable.cpp` and compiled into a header per effect, which the package ships. No external `.hlsl` files.
 - **Shared color math**: A common HLSL library (BT.709/BT.2020/P3 color matrices, PQ/HLG transfer functions, CIE XYZ↔xy conversions, luminance calculations) that shaders pull in with `#include "shaderlab_colormath.hlsli"`. Optional: a shader may paste the functions it needs instead, which pins it to that math.
 - **Auto-compile**: Effects are compiled via `ShaderCompiler` at first use (when added to graph). Compiled bytecode is cached.
 - **Categories** (38 effects total):

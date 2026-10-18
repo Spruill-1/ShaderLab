@@ -5,7 +5,7 @@
 //   --stdio  The MCP server an MCP client launches; it forwards to the
 //            session use_session pinned, through the hub (Shim.h).
 //
-// It does not link ShaderLabEngine.dll: the hub must start in milliseconds
+// It does not link EffectGraph's engine: the hub must start in milliseconds
 // and never touches a GPU. The transport modules it needs (McpFrame,
 // McpCrypto, McpChannel, McpPeerIdentity, and McpTypes' JsonEscape) are
 // compiled into this exe.

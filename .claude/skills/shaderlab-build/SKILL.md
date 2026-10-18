@@ -9,6 +9,11 @@ Windows only. **x64 and ARM64** both build; outputs land in
 `<Platform>\<Config>\<Project>\`. Needs VS 2022 17.8+ (2026 / v18 works), the Windows
 App SDK 1.8 workload, Windows SDK 10.0.26100+, and `nuget.exe` on PATH.
 
+The engine is [EffectGraph](https://github.com/Spruill-1/EffectGraph), a separate
+repository; ShaderLab builds on its `EffectGraph.Engine` and `EffectGraph.Native`
+packages (version pinned in `build\EffectGraphPackage.props`). Engine changes and
+engine tests are made there, not here.
+
 Resolve MSBuild rather than hardcoding a path — edition and version differ per machine:
 
 ```pwsh
@@ -54,9 +59,7 @@ the packaged app and is much slower.
 ```pwsh
 $plat = 'x64'   # or 'ARM64'
 
-# Tests only. The usual inner loop: EffectGraphTests for the engine,
-# ShaderLabTests for MCP, the hosts and ShaderLab's own pieces.
-& $msb EffectGraphTests.vcxproj  /p:Configuration=Debug /p:Platform=$plat /m /v:m /nologo
+# Tests only. The usual inner loop.
 & $msb ShaderLabTests.vcxproj    /p:Configuration=Debug /p:Platform=$plat /m /v:m /nologo
 
 # Headless host (engine + console host, no WinUI).
@@ -66,9 +69,20 @@ $plat = 'x64'   # or 'ARM64'
 & $msb ShaderLab.slnx            /p:Configuration=Debug /p:Platform=$plat /m /v:m /nologo
 ```
 
-First build after a fresh clone: `nuget restore ShaderLab.slnx -SolutionDirectory .`
-(packages.config style, not PackageReference). Submodules `exprtk` and `miniz` must be
-present — `git submodule update --init --recursive`.
+First build after a fresh clone: restore (packages.config style, not
+PackageReference). EffectGraph's packages come from nuget.org with the rest:
+
+```pwsh
+nuget restore ShaderLab.slnx -SolutionDirectory .
+```
+
+A build without the restored package stops with that restore command. Submodules
+`exprtk` and `miniz` must be present — `git submodule update --init --recursive`.
+
+To change the engine and ShaderLab together, build against the checkout instead of
+the package: add `/p:EffectGraphSourceDir=..\EffectGraph\` (trailing backslash) to
+any command above. `build\EffectGraphEngine.targets` then references EffectGraph's
+`EffectGraphEngine.vcxproj` and generates the built-in effect headers from it.
 
 The GUI locks `ShaderLab.exe` in the layout and a lingering
 hub locks the broker copy. Kill them before rebuilding:
@@ -80,19 +94,17 @@ Get-Process ShaderLab, ShaderLabMcpBroker -ErrorAction SilentlyContinue | Stop-P
 ## Tests
 
 ```pwsh
-& ".\$plat\Debug\EffectGraphTests\EffectGraphTests.exe" --adapter warp
 & ".\$plat\Debug\ShaderLabTests\ShaderLabTests.exe" --adapter warp
 ```
 
 Each ends with `ALL <n> TESTS PASSED`; exit code is the failure count. `--adapter warp`
 uses the software rasterizer — no GPU dependency, and what CI runs.
-`EffectGraphTests` covers the engine: graph model, evaluator, bindings, bytecode
-cache, effects, sources, video sources, the public and plugin APIs, GPU-binding
-matrices and the HLSL math bench. `ShaderLabTests` covers what ShaderLab adds:
-MCP router + JSON-RPC contracts, broker frame codec / crypto / peer identity, the
-headless and shim argument handling, `.effectgraph` files, Numeric Expression
-evaluation (ExprTk), `GraphUiSnapshot`, layout, the frame pacer and dispatcher,
-video export and the real-time playback harnesses.
+`ShaderLabTests` covers what ShaderLab adds to the engine: MCP router + JSON-RPC
+contracts, broker frame codec / crypto / peer identity, the headless and shim
+argument handling, effect plugin discovery (`TestEffectPlugin`), `.effectgraph`
+files, Numeric Expression evaluation (ExprTk), `GraphUiSnapshot`, layout, the frame
+pacer and dispatcher, video export and the real-time playback harnesses. The
+engine's own tests (`EffectGraphTests`) are in the EffectGraph repository.
 
 Cases register themselves (`SL_TEST_CASE` in `Tests/TestCommon.h`), so a subset is a
 flag away: `--tag fast` (no device), `--tag video`, `--tag mcp`, `--tag math`,

@@ -64,7 +64,6 @@
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(ProjectDir)Engine\Api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <WarningLevel>Level4</WarningLevel>
       <ConformanceMode>true</ConformanceMode>
@@ -91,26 +90,17 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="Engine\Api\EffectGraph.h" />
-    <ClInclude Include="Engine\Api\EffectGraphPlugin.h" />
-  </ItemGroup>
-  <ItemGroup>
     <ClCompile Include="Tests\TestPlugin\TestEffectPlugin.cpp" />
   </ItemGroup>
   <ItemGroup>
     <EffectGraphEffect Include="Tests\TestPlugin\TestPluginGain.json" />
   </ItemGroup>
-  <!-- Build order only: the effect is compiled with EffectGraphCompile. Nothing
-       of the engine is linked. -->
-  <ItemGroup>
-    <ProjectReference Include="EffectGraphCompile.vcxproj">
-      <Project>{05BD6911-0AEA-4FD9-AAF6-95E061D5494E}</Project>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-      <LinkLibraryDependencies>false</LinkLibraryDependencies>
-    </ProjectReference>
-  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <Import Project="build\EffectGraph.targets" />
+  <!-- EffectGraph.Native's headers and EffectGraphCompile build the effect; the
+       plugin calls nothing in EffectGraph.lib, so nothing of it is linked. -->
+  <Import Project="build\EffectGraphPackage.props" />
+  <Import Project="$(EffectGraphPackagesDir)EffectGraph.Native.$(EffectGraphPackageVersion)\build\native\EffectGraph.Native.targets"
+          Condition="Exists('$(EffectGraphPackagesDir)EffectGraph.Native.$(EffectGraphPackageVersion)\build\native\EffectGraph.Native.targets')" />
   <ImportGroup Label="ExtensionTargets">
     <Import Project="packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets" Condition="Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets')" />
   </ImportGroup>
@@ -119,6 +109,7 @@
       <ErrorText>This project references NuGet package(s) that are missing on this computer. Use NuGet Package Restore to download them. For more information, see http://go.microsoft.com/fwlink/?LinkID=322105. The missing file is {0}.</ErrorText>
     </PropertyGroup>
     <Error Condition="!Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props'))" />
+    <Error Condition="!Exists('$(EffectGraphPackagesDir)EffectGraph.Native.$(EffectGraphPackageVersion)\build\native\EffectGraph.Native.targets')" Text="$([System.String]::Format('$(ErrorText)', 'EffectGraph.Native $(EffectGraphPackageVersion)'))" />
     <Error Condition="!Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets'))" />
   </Target>
 </Project>

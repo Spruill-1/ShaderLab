@@ -35,11 +35,19 @@ $msb = "$vs\MSBuild\Current\Bin\MSBuild.exe"           # x64 host
 # On an ARM64 HOST, use the arm64-native binary instead -- see the trap below:
 # $msb = "$vs\MSBuild\Current\Bin\arm64\MSBuild.exe"
 
-& $msb EffectGraphTests.vcxproj /p:Configuration=Debug /p:Platform=x64 /m /v:m /nologo
+nuget restore ShaderLab.slnx -SolutionDirectory .   # includes EffectGraph's packages
 & $msb ShaderLabTests.vcxproj /p:Configuration=Debug /p:Platform=x64 /m /v:m /nologo
-& '.\x64\Debug\EffectGraphTests\EffectGraphTests.exe' --adapter warp  # ends "ALL <n> TESTS PASSED"
-& '.\x64\Debug\ShaderLabTests\ShaderLabTests.exe' --adapter warp
+& '.\x64\Debug\ShaderLabTests\ShaderLabTests.exe' --adapter warp  # ends "ALL <n> TESTS PASSED"
 ```
+
+> **The engine is EffectGraph, a separate repository**
+> ([Spruill-1/EffectGraph](https://github.com/Spruill-1/EffectGraph)), consumed as the
+> `EffectGraph.Engine` package (static library + internal headers) and
+> `EffectGraph.Native` (the test plugin's compiler), pinned in
+> `build/EffectGraphPackage.props` and `packages.config`, restored from nuget.org.
+> To change the engine and ShaderLab together, build with
+> `/p:EffectGraphSourceDir=..\EffectGraph\`, which references its engine project
+> instead. An engine change belongs in EffectGraph, with its own tests.
 
 > **Trap — building ARM64 *on* an ARM64 host needs the arm64 MSBuild.**
 > `MSBuild\Current\Bin\MSBuild.exe` is 32-bit and reports
@@ -60,7 +68,7 @@ Fastest inner loops, cheapest first:
 
 | Loop | Command |
 |---|---|
-| Pure math / shader-bench | build + run `EffectGraphTests.exe --adapter warp` (no GPU, no UI) |
+| Pure math / shader-bench | build + run `ShaderLabTests.exe --adapter warp` (no GPU, no UI); the engine's own math is in EffectGraph's `EffectGraphTests` |
 | Headless render / pixel probe | `ARM64\Debug\ShaderLabHeadless\ShaderLabHeadless.exe --graph Tests\fixtures\test_cli_basic.json --node <id> --output out.png --adapter warp` |
 | Batch parameter sweep | same exe with `--script <in.json> --script-output <out.json>` |
 | Full app + MCP | see the **shaderlab-run** skill — packaged deploy has real gotchas |
@@ -100,7 +108,7 @@ dispatched closure (it runs on the render thread). Full contract:
 
 The full list — and it is worth reading before writing any D2D effect — is in
 [`.github/copilot-instructions.md`](.github/copilot-instructions.md) §*D2D Custom
-Effect Gotchas* and [`docs/architecture/d2d-d3d11-hybrid-compute.md`](docs/architecture/d2d-d3d11-hybrid-compute.md).
+Effect Gotchas* and [`docs/architecture/d2d-d3d11-hybrid-compute.md`](https://github.com/Spruill-1/EffectGraph/blob/main/docs/architecture/d2d-d3d11-hybrid-compute.md).
 The ones that bite most often:
 
 - **Evaluation runs with no draw session open on its device context.**
@@ -198,46 +206,39 @@ golden-image comparison, and feeding back in as an Image source.
 
 ## Layout
 
-Projects around one host-agnostic engine library:
+Programs around EffectGraph's engine, which comes from the `EffectGraph.Engine` package
+(above):
 
-- `ShaderLabEngine.lib` — a static library every program links: `Graph/` (the model), `Rendering/`
-  (evaluator, `D3D11ComputeRunner`, `DisplayMonitor`, ICC, capture), `Effects/`
-  (effect registry, compiler, sources; the built-in shader effects are generated
-  headers, below),
-  `Engine/Api/` (EffectGraph, the public COM API for other D3D11 programs: see
-  [`docs/architecture/effectgraph-api.md`](docs/architecture/effectgraph-api.md)).
-  Nothing is exported from it; there is no engine ABI to keep in step.
-- `ShaderLabSupport.lib` — ShaderLab's programs only, never EffectGraph: `Mcp/` (router,
+- **EffectGraph** (its own repository, MIT-0) — the graph model, evaluator, effect
+  registry and compiler, sources, display code, the built-in effects and the public
+  COM API ([EffectGraph API](https://github.com/Spruill-1/EffectGraph/blob/main/docs/architecture/effectgraph-api.md)).
+  Every ShaderLab program links its static library, `EffectGraphEngine.lib`, through
+  `build/EffectGraphEngine.targets`. ShaderLab code includes its headers from the
+  include root (`"Graph/GraphModel.h"`, `"pch_engine.h"`), never by `../` paths.
+- `ShaderLabSupport.lib` — what ShaderLab adds around the engine: `Mcp/` (router,
   JSON-RPC, tool catalog, the engine routes, broker crypto), ExprTk behind the
   engine's Numeric Expression hook, `.effectgraph` files (miniz), the
-  `/graph/load-file` / `save-file` routes, and host pieces that sit in the engine's
-  folders (`GraphUiSnapshot`, `GraphLayout`, `RenderThreadDispatcher`, `FramePacer`,
-  `PreviewViewState`, `VideoExport`; the full list is `scripts/ShaderLabOwnedFiles.txt`).
-  Engine code must not include them: `scripts/Check-EngineBoundary.ps1` (CI) fails if it does.
-  ShaderLab code includes engine headers from the root (`"Graph/GraphModel.h"`), never by
-  `../` paths, so it builds the same against this tree or the `EffectGraph.Engine` package
-  (`build/EffectGraphEngine.targets`; `scripts/Test-SplitBuild.ps1` rehearses that). Hosts call `Support::RegisterShaderLabSupport()`
-  at startup. It keeps third-party code out of EffectGraph, which is MIT-0
-  (`LICENSE-EffectGraph`); ShaderLab is MIT.
-- `EffectGraph.dll` — the engine for other programs: exports only the EffectGraph C
-  API (7 functions, including plugin loading) and COM interfaces, with the public header and built-in effect
-  headers in its `include\` folder. ShaderLab's own programs do not use it.
+  `/graph/load-file` / `save-file` routes, effect plugin discovery, the screen
+  and window capture Sources (`Sources/`, registered as EffectGraph live source
+  kinds), and the host pieces in `Graph/` and `Rendering/` (`GraphUiSnapshot`,
+  `GraphLayout`, `RenderThreadDispatcher`, `FramePacer`, `PreviewViewState`,
+  `VideoExport`).
+  Hosts call `Support::RegisterShaderLabSupport()` at startup. ShaderLab is MIT;
+  its third-party code (ExprTk, miniz) is here, never in EffectGraph.
 - `ShaderLab.exe` — WinUI 3 packaged app: XAML, `Controls/` controllers,
   `RenderEngine`, the render worker, app-side MCP routes.
 - `ShaderLabHeadless.exe` — console host, no WinUI. PNG render, FP32 readback,
   script batch, MCP session.
 - `ShaderLabMcpBroker.exe` — MCP transport. `--hub` is a blind relay (sealed bodies);
   `--stdio` is the client shim. Does **not** link the engine.
-- `EffectGraphTests.exe` / `ShaderLabTests.exe` — the engine's tests and ShaderLab's,
-  one runner (`Tests/TestRunner.cpp`), no WinUI, WARP-capable. An engine test must not
-  use ShaderLab code (the boundary check covers `Tests/` too); a case that needs
-  MCP, the support library or a host piece goes in a ShaderLab test file.
-- `EffectGraphCompile.exe` — builds an effect blob from an Effect Designer `.json` at a
-  consuming project's build (`build/EffectGraph.targets` runs it), and with `--builtins`
-  writes a header per built-in shader effect from `BuiltInEffects.lib`
-  (`BuiltInEffects/BuiltInEffectTable.cpp`, where built-ins are edited). The app,
-  headless and tests include `EffectGraphBuiltIns.h` through
-  `build/EffectGraphBuiltIns.targets`; the engine DLL holds no built-in HLSL.
+- `ShaderLabTests.exe` — ShaderLab's tests (MCP, hosts, support library, host pieces,
+  playback harnesses), no WinUI, WARP-capable. Its runner (`Tests/TestRunner.cpp`) is a
+  copy of EffectGraph's; `SL_TEST_SETUP` in `Tests/ShaderLabTestSetup.cpp` registers
+  the support library. `TestEffectPlugin.dll` is built against `EffectGraph.Native`
+  for the plugin discovery test.
+- Built-in effects are EffectGraph's: each is a generated header in the
+  `EffectGraph.Engine` package, and the programs include `EffectGraphBuiltIns.h` to
+  register them all.
 
 Pipeline is **always scRGB FP16 linear light** (1.0 = 80 nits), no format switching,
 no built-in tone-mapping pass — tone mappers are composed as graph effects (the ICtCp

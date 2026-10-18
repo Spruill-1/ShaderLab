@@ -19,12 +19,14 @@
 #include "Effects/EffectUpgrade.h"
 #include "Engine/Utf8.h"
 #include "Effects/ShaderLabEffects.h"
-#include "Effects/DxgiDuplicationSourceProvider.h"
+#include "Sources/CaptureSources.h"
+#include "Sources/DxgiDuplicationSourceProvider.h"
 #include "Effects/Performance.h"
 #include "Rendering/HostRenderSettings.h"
 #include "Engine/EngineBootstrap.h"
 #include "Version.h"
 #include <microsoft.ui.xaml.media.dxinterop.h>
+#include <winrt/Windows.Graphics.Capture.h>
 #include <shlobj.h>
 #include <KnownFolders.h>
 #include <DispatcherQueue.h>
@@ -1247,7 +1249,7 @@ namespace winrt::ShaderLab::implementation
 
                     auto dxgiCaptureGroup = MUX::MenuFlyoutSubItem();
                     dxgiCaptureGroup.Text(L"DXGI DuplicateOutput");
-                    auto outputs = ::ShaderLab::Effects::DxgiDuplicationSourceProvider::EnumerateOutputs();
+                    auto outputs = ::ShaderLab::Sources::DxgiDuplicationSourceProvider::EnumerateOutputs();
                     for (const auto& output : outputs)
                     {
                         auto item = MUX::MenuFlyoutItem();
@@ -1257,7 +1259,7 @@ namespace winrt::ShaderLab::implementation
                         item.Text(winrt::hstring(text));
                         item.Click([this, output, text](auto&&, auto&&)
                         {
-                            auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateDxgiDuplicateOutputSourceNode(
+                            auto node = ::ShaderLab::Sources::CreateDesktopDuplicationNode(
                                 output.adapterIndex,
                                 output.outputIndex,
                                 L"DXGI " + text);
@@ -1430,13 +1432,13 @@ namespace winrt::ShaderLab::implementation
         std::wstring name = item.DisplayName().empty()
             ? L"Windows Graphics Capture"
             : std::wstring(item.DisplayName().c_str());
-        auto node = ::ShaderLab::Effects::SourceNodeFactory::CreateWindowsGraphicsCaptureSourceNode(name);
+        auto node = ::ShaderLab::Sources::CreateGraphicsCaptureNode(name);
         auto nodeId = m_nodeGraphController.AddNode(std::move(node), { 0.0f, 0.0f });
-        // The factory belongs to the render thread; registering replaces a
-        // provider the worker may be ticking.
+        // The factory belongs to the render thread; a new target replaces a
+        // source the worker may be ticking.
         m_renderDispatcher.DispatchSync([this, nodeId, item]
         {
-            Sources().RegisterGraphicsCaptureItem(nodeId, item);
+            Sources().SetLiveSourceTarget(nodeId, item);
             ::ShaderLab::Graph::ResetNodeOutput(Model(), nodeId);
         });
 

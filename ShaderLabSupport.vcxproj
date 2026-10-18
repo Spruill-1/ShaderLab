@@ -101,6 +101,9 @@
     <ClInclude Include="Support\EffectGraphFile.h" />
     <ClInclude Include="Support\PackageRoutes.h" />
     <ClInclude Include="Support\EffectPlugins.h" />
+    <ClInclude Include="Sources\CaptureSources.h" />
+    <ClInclude Include="Sources\DxgiDuplicationSourceProvider.h" />
+    <ClInclude Include="Sources\WindowsGraphicsCaptureSourceProvider.h" />
     <ClInclude Include="Graph\ParameterVisibility.h" />
     <ClInclude Include="Graph\GraphLayout.h" />
     <ClInclude Include="Graph\GraphUiSnapshot.h" />
@@ -135,6 +138,9 @@
     <ClCompile Include="Support\EffectGraphFile.cpp" />
     <ClCompile Include="Support\PackageRoutes.cpp" />
     <ClCompile Include="Support\EffectPlugins.cpp" />
+    <ClCompile Include="Sources\CaptureSources.cpp" />
+    <ClCompile Include="Sources\DxgiDuplicationSourceProvider.cpp" />
+    <ClCompile Include="Sources\WindowsGraphicsCaptureSourceProvider.cpp" />
     <ClCompile Include="Graph\ParameterVisibility.cpp" />
     <ClCompile Include="Graph\GraphLayout.cpp" />
     <ClCompile Include="Graph\GraphUiSnapshot.cpp" />

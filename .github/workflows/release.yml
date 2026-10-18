@@ -1,157 +1,221 @@
 name: Release
 
+# Pushing a tag v<major>.<minor>.<patch> runs CI, builds the MSIX for x64 and
+# ARM64 with that version, signs it with Azure Artifact Signing, and publishes a
+# GitHub release. Signing waits in the 'release' environment for approval.
+#
+# Signing is on when the repository variable MSIX_PUBLISHER is set (the
+# certificate's subject, which the package's Publisher must equal). It also
+# needs AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_SUBSCRIPTION_ID,
+# SIGNING_ENDPOINT, SIGNING_ACCOUNT and SIGNING_PROFILE; no secret is stored,
+# azure/login trades the job's OIDC token for an Entra token. Without
+# MSIX_PUBLISHER the release is unsigned, for Developer Mode installs
+# (docs/development/releasing.md).
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    tags: ['v*.*.*']
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version tag (e.g. v1.1.0). Leave empty when triggered by tag push.'
-        required: false
 
 permissions:
-  contents: write
+  contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Actions are pinned to commits; the comment names the release.
 jobs:
-  build:
-    name: Build (${{ matrix.platform }})
-    runs-on: windows-latest
+  ci:
+    uses: ./.github/workflows/ci.yml
 
+  build:
+    name: Build MSIX (${{ matrix.platform }})
+    needs: ci
+    runs-on: windows-2025
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: x64
-            msbuild_platform: x64
-          - platform: arm64
-            msbuild_platform: ARM64
-
-    env:
-      Solution_Path: ShaderLab.slnx
-      Configuration: Release
-      Platform: ${{ matrix.msbuild_platform }}
-
+        platform: [x64, ARM64]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
-      - name: Resolve version
-        id: ver
+      - name: Stamp version and publisher
         shell: pwsh
+        env:
+          MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
         run: |
-          $tag = if ($env:GITHUB_REF -like 'refs/tags/*') {
-            $env:GITHUB_REF -replace '^refs/tags/',''
-          } elseif ('${{ github.event.inputs.version }}') {
-            '${{ github.event.inputs.version }}'
-          } else { 'v0.0.0-dev' }
-          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Release tag: $tag"
+          $ref = '${{ github.ref_name }}'
+          $version = if ($ref -match '^v(\d+)\.(\d+)\.(\d+)$') { "$($Matches[1]).$($Matches[2]).$($Matches[3]).0" } else { '0.0.0.0' }
+          # Unsigned packages carry the OID that lets Add-AppxPackage -AllowUnsigned
+          # take them; a signed one carries the certificate's subject.
+          $publisher = if ($env:MSIX_PUBLISHER) { $env:MSIX_PUBLISHER }
+                       else { 'CN=ShaderLab, OID.2.25.311729368913984317654407730594956997722=1' }
+          [xml]$manifest = Get-Content Package.appxmanifest -Raw
+          $manifest.Package.Identity.Version = $version
+          $manifest.Package.Identity.Publisher = $publisher
+          $manifest.Save((Resolve-Path Package.appxmanifest))
+          Write-Host "Version $version, Publisher $publisher"
 
       - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
 
       - name: Setup NuGet
-        uses: NuGet/setup-nuget@v2
+        uses: NuGet/setup-nuget@fd55a6f3b34392fa83fde1454582407d8c714123 # v4.0
 
       - name: NuGet restore
-        run: nuget restore "${{ env.Solution_Path }}" -SolutionDirectory .
+        run: nuget restore ShaderLab.slnx -SolutionDirectory .
 
-      - name: Inject unsigned-namespace OID into manifest
+      # ARM64 is cross-compiled; the native-arm64 CI job guards the ARM64-host build.
+      - name: Build
         shell: pwsh
         run: |
-          # Add-AppxPackage -AllowUnsigned only accepts packages whose
-          # Publisher contains this magic OID. We don't keep it in the
-          # checked-in manifest because Windows refuses to register
-          # *signed* packages with the OID, breaking local F5 deploy.
-          $manifest = 'Package.appxmanifest'
-          (Get-Content $manifest -Raw) `
-            -replace 'Publisher="CN=ShaderLab"', 'Publisher="CN=ShaderLab, OID.2.25.311729368913984317654407730594956997722=1"' `
-            | Set-Content $manifest -NoNewline
-          Select-String -Path $manifest -Pattern 'Publisher='
-
-      - name: Build loose-file MSIX layout
-        shell: pwsh
-        run: |
-          msbuild "${{ env.Solution_Path }}" `
-            /p:Configuration=${{ env.Configuration }} `
-            /p:Platform=${{ env.Platform }} `
+          msbuild ShaderLab.vcxproj `
+            /p:Configuration=Release `
+            /p:Platform=${{ matrix.platform }} `
             /p:AppxBundle=Never `
             /p:AppxPackageSigningEnabled=false `
             /p:GenerateAppxPackageOnBuild=true `
             /p:UapAppxPackageBuildMode=SideloadOnly `
+            /p:AppxPackageDir=$env:GITHUB_WORKSPACE\out\ `
             /m /nologo /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Collect release artifacts
-        id: collect
+      # The sideload folder: ShaderLab_<version>_<arch>.msix and Dependencies\.
+      - name: Collect the package folder
         shell: pwsh
         run: |
-          $stage = Join-Path $env:GITHUB_WORKSPACE 'release-stage'
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $msix = Get-ChildItem out -Recurse -Filter 'ShaderLab_*.msix' -File |
+                  Where-Object { $_.FullName -notmatch '\\Dependencies\\' }
+          if (@($msix).Count -ne 1) { Get-ChildItem out -Recurse | ForEach-Object FullName; throw "Expected one ShaderLab msix, found $(@($msix).Count)" }
+          # The hub's exe is a hand-added payload; without it MCP fails only at runtime.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($msix.FullName)
+          $hasBroker = $zip.Entries.FullName -contains 'ShaderLabMcpBroker.exe'
+          $zip.Dispose()
+          if (-not $hasBroker) { throw "$($msix.Name) has no ShaderLabMcpBroker.exe" }
+          New-Item -ItemType Directory -Force stage | Out-Null
+          Copy-Item -Recurse "$($msix.Directory.FullName)\*" stage
+          Copy-Item scripts/Install.ps1 stage
+          Get-ChildItem stage -Recurse -File | ForEach-Object { $_.FullName.Substring($PWD.Path.Length + 1) }
 
-          # Find the VS-produced sideload bundle dir (contains the ShaderLab .msix
-          # plus a Dependencies\ subfolder). The matching .msix is the one named
-          # "ShaderLab*" sitting at the top level of its bundle dir — NOT one of
-          # the dependency packages that live under Dependencies\<arch>\.
-          $platform = '${{ matrix.platform }}'
-          $msbuildPlatform = '${{ matrix.msbuild_platform }}'
-          $candidates = Get-ChildItem -Recurse -Path AppPackages -Filter 'ShaderLab*.msix' -File `
-            | Where-Object { $_.Directory.Parent.Name -ne 'Dependencies' -and $_.Directory.Parent.Parent.Name -ne 'Dependencies' } `
-            | Where-Object { $_.FullName -match "_${msbuildPlatform}[_\\.]" -or $_.Directory.Name -match "_${msbuildPlatform}_" }
-          $msix = $candidates | Sort-Object FullName | Select-Object -First 1
-          if (-not $msix) {
-            Write-Host "Contents of AppPackages:" -ForegroundColor Yellow
-            Get-ChildItem -Recurse -Path AppPackages | Select-Object FullName | Format-Table -AutoSize
-            throw "No ShaderLab*.msix file found under AppPackages for $msbuildPlatform."
-          }
-          $bundleDir = $msix.Directory.FullName
-          Write-Host "Using bundle: $bundleDir"
-
-          $version = '${{ steps.ver.outputs.tag }}' -replace '^v',''
-          $zip = Join-Path $stage "ShaderLab-$version-$platform.zip"
-
-          # Copy install script alongside the msix, then zip the whole bundle.
-          Copy-Item -Force scripts/Install.ps1 (Join-Path $bundleDir 'Install.ps1')
-          Compress-Archive -Path "$bundleDir\*" -DestinationPath $zip -Force
-
-          Get-ChildItem $stage | ForEach-Object { Write-Host "Staged: $($_.Name)" }
-          "stage=$stage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ShaderLab-${{ steps.ver.outputs.tag }}-${{ matrix.platform }}
-          path: ${{ steps.collect.outputs.stage }}
-          retention-days: 90
+          name: unsigned-${{ matrix.platform }}
+          path: stage
+          if-no-files-found: error
+
+  sign:
+    name: Sign (Azure Artifact Signing)
+    needs: build
+    if: vars.MSIX_PUBLISHER != ''
+    runs-on: windows-2025
+    # Required reviewers on this environment are the approval gate, and the
+    # Entra app's federated credential trusts only this environment.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: unsigned-*
+          path: pkg
+
+      # Only ShaderLab's own package: Dependencies\ holds Microsoft's, already signed.
+      - name: List the packages to sign
+        id: files
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem pkg -Recurse -Filter 'ShaderLab_*.msix' -File |
+                   Where-Object { $_.FullName -notmatch '\\Dependencies\\' } | ForEach-Object FullName
+          if (@($files).Count -ne 2) { throw "Expected two ShaderLab msix files, found $(@($files).Count)" }
+          "list<<EOF`n$($files -join "`n")`nEOF" | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.SIGNING_PROFILE }}
+          files: ${{ steps.files.outputs.list }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-azure-cli-credential: false
+
+      - name: Verify
+        shell: pwsh
+        run: |
+          foreach ($file in Get-ChildItem pkg -Recurse -Filter 'ShaderLab_*.msix' -File | Where-Object { $_.FullName -notmatch '\\Dependencies\\' }) {
+            $sig = Get-AuthenticodeSignature $file.FullName
+            Write-Host "$($file.Name): $($sig.Status) $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "$($file.Name) is not validly signed: $($sig.StatusMessage)" }
+            if ($sig.SignerCertificate.Subject -ne '${{ vars.MSIX_PUBLISHER }}') {
+              throw "Signer '$($sig.SignerCertificate.Subject)' differs from MSIX_PUBLISHER; the package will not install."
+            }
+          }
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed
+          path: pkg
+          if-no-files-found: error
 
   release:
-    name: Publish GitHub Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-
+    name: GitHub release
+    needs: [build, sign]
+    # Signed when signing is configured, unsigned otherwise; only from a tag.
+    if: >-
+      always() && startsWith(github.ref, 'refs/tags/') &&
+      needs.build.result == 'success' &&
+      (needs.sign.result == 'success' || (needs.sign.result == 'skipped' && vars.MSIX_PUBLISHER == ''))
+    runs-on: windows-2025
+    permissions:
+      contents: write
     steps:
-      - name: Resolve version
-        id: ver
-        shell: bash
-        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+      - name: Download signed
+        if: needs.sign.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: artifacts
-          pattern: ShaderLab-${{ steps.ver.outputs.tag }}-*
-          merge-multiple: true
+          name: signed
+          path: pkg
 
-      - name: List artifacts
-        run: ls -R artifacts
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Download unsigned
+        if: needs.sign.result != 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          name: ShaderLab ${{ steps.ver.outputs.tag }}
+          pattern: unsigned-*
+          path: pkg
+
+      - name: Zip each platform
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}' -replace '^v', ''
+          New-Item -ItemType Directory -Force dist | Out-Null
+          foreach ($dir in Get-ChildItem pkg -Directory) {
+            $platform = ($dir.Name -replace '^unsigned-', '').ToLowerInvariant()
+            Compress-Archive -Path "$($dir.FullName)\*" -DestinationPath "dist\ShaderLab-$version-$platform.zip"
+          }
+          Get-ChildItem dist | ForEach-Object Name
+
+      - name: Publish
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ShaderLab ${{ github.ref_name }}
           generate_release_notes: true
-          files: artifacts/*.zip
+          files: dist/*.zip

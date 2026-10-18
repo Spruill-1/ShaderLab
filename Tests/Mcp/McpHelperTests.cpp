@@ -130,6 +130,18 @@ namespace ShaderLab::Tests
             auto applyPlay = router.RouteRequest(L"POST", L"/graph/apply",
                 R"({"nodes":[{"effect":"Clock","properties":{"isPlaying":"banana"}}]})");
             TEST("Apply_BadIsPlayingRefusedLikeSetProperty", applyPlay.statusCode == 400);
+
+            // Desktop Duplication is ShaderLab's node maker; its indices reach
+            // it from both routes, as strings too (Claude Code sends untyped
+            // arguments as strings).
+            auto noOutput = router.RouteRequest(L"POST", L"/graph/add-node",
+                R"({"effectName":"Desktop Duplication","adapterIndex":"97","outputIndex":3})");
+            TEST("AddNode_DuplicationArgsReachMaker", noOutput.statusCode == 400 &&
+                 noOutput.body.find("No DXGI output 97:3") != std::string::npos);
+            auto applyNoOutput = router.RouteRequest(L"POST", L"/graph/apply",
+                R"({"nodes":[{"ref":"d","effect":"Desktop Duplication","adapterIndex":"97"}]})");
+            TEST("Apply_DuplicationArgsReachMaker", applyNoOutput.statusCode == 400 &&
+                 applyNoOutput.body.find("No DXGI output 97:0") != std::string::npos);
         }
     }
 }

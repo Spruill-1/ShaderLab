@@ -6,7 +6,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="pch_engine.h" />
     <ClInclude Include="ShaderLabHeadless\HeadlessArgs.h">
       <Filter>ShaderLabHeadless</Filter>
     </ClInclude>

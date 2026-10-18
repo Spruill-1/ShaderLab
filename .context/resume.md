@@ -15,7 +15,7 @@ edits and made this the most drift-prone file in the repo — it once claimed en
 | Engine ABI | `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` |
 | What changed, when, and why | [`CHANGELOG.md`](../CHANGELOG.md) |
 | Architectural decisions + rationale | [`docs/history/decision-log.md`](../docs/history/decision-log.md) |
-| Effect catalog | [`docs/effects/builtin-catalog.md`](../docs/effects/builtin-catalog.md) (a test pins the count) |
+| Effect catalog | [`docs/effects/builtin-catalog.md`](https://github.com/Spruill-1/EffectGraph/blob/main/docs/effects/builtin-catalog.md) (a test pins the count) |
 | MCP tools / routes | [`docs/hosts/mcp-server.md`](../docs/hosts/mcp-server.md) |
 | Test totals | run the suite — it prints them |
 | Agent working rules | [`CLAUDE.md`](../CLAUDE.md), [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) |
@@ -100,7 +100,7 @@ Two locks with a strict order (`m_graphMutex` → `m_visualsMutex`); never hold
 ### Effect categories
 Grouped by `category` + optional `subcategory`, which drives the Add Node flyout.
 Members change; the structure doesn't — full table in
-[builtin-catalog.md](../docs/effects/builtin-catalog.md).
+[builtin-catalog.md](https://github.com/Spruill-1/EffectGraph/blob/main/docs/effects/builtin-catalog.md).
 
 - **Analysis → Highlights** — false-colour / heatmap views of where the energy is.
 - **Analysis → Scopes** — CIE histogram and chromaticity plot.
@@ -114,7 +114,8 @@ Members change; the structure doesn't — full table in
   Not architecturally special (decision #63): agents use `/graph/add-node` + `/analysis/<id>`.
 - **Source / Generators** — synthetic patterns and gamut sources.
 - **Live capture sources** — DXGI Desktop Duplication (per-output) and Windows Graphics
-  Capture; ticked per frame by `SourceNodeFactory::TickAndUploadLiveCaptures`.
+  Capture, ShaderLab's (`Sources/`), registered with EffectGraph as live source kinds;
+  ticked per frame by `SourceNodeFactory::TickLiveSources`.
 - **Data / Parameter nodes** (no shader, evaluator-handled) — Float / Integer / Toggle /
   Gamut, Clock, Numeric Expression (ExprTk), Random, and **Working Space**.
 

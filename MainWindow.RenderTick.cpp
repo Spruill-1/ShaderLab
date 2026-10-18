@@ -260,7 +260,7 @@ namespace winrt::ShaderLab::implementation
                 if (auto* dc5 = static_cast<ID2D1DeviceContext5*>(m_renderEngine.RenderD2DContext()))
                 {
                     auto nodes = Model().MutableNodes();
-                    if (Sources().TickAndUploadLiveCaptures(nodes, dc5))
+                    if (Sources().TickLiveSources(nodes, dc5))
                         m_forceRender = true;
                 }
 

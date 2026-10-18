@@ -30,7 +30,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="pch_engine.h" />
     <ClInclude Include="Tests\TestCommon.h">
       <Filter>Tests</Filter>
     </ClInclude>
@@ -65,6 +64,9 @@
       <Filter>Tests\Hosts</Filter>
     </ClCompile>
     <ClCompile Include="Tests\Hosts\EffectPluginDiscoveryTests.cpp">
+      <Filter>Tests\Hosts</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Hosts\CaptureSourceTests.cpp">
       <Filter>Tests\Hosts</Filter>
     </ClCompile>
     <ClCompile Include="Tests\Hosts\HeadlessArgsTests.cpp">

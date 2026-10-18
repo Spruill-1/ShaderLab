@@ -1,9 +1,9 @@
 #include "pch_engine.h"
 #include "../TestSupport.h"
 
-#include "../../Graph/GraphModel.h"
+#include "Graph/GraphModel.h"
 #include "../../Graph/GraphLayout.h"
-#include "../../Graph/ValueFormat.h"
+#include "Graph/ValueFormat.h"
 #include "Graph/GraphEdits.h"
 
 #include <cstdio>

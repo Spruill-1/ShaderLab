@@ -95,7 +95,6 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="pch_engine.h" />
     <ClInclude Include="Tests\TestCommon.h" />
     <ClInclude Include="Tests\TestSupport.h" />
     <ClInclude Include="Tests\ShaderTestBench.h" />
@@ -112,6 +111,7 @@
     <ClCompile Include="Tests\Graph\GraphUiTests.cpp" />
     <ClCompile Include="Tests\Hosts\BrokerShimTests.cpp" />
     <ClCompile Include="Tests\Hosts\EffectPluginDiscoveryTests.cpp" />
+    <ClCompile Include="Tests\Hosts\CaptureSourceTests.cpp" />
     <ClCompile Include="Tests\Hosts\HeadlessArgsTests.cpp" />
     <ClCompile Include="Tests\Mcp\McpEffectGraphTests.cpp" />
     <ClCompile Include="Tests\Mcp\McpHelperTests.cpp" />

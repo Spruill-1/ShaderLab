@@ -4,6 +4,9 @@
     <Filter Include="Support">
       <UniqueIdentifier>{6E2B9C41-3A7D-4E58-B1F0-8C2D5A9E7B13}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Sources">
+      <UniqueIdentifier>{4F7C2E19-8B3A-4D61-9E05-2A6B1C8D3F47}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Graph">
       <UniqueIdentifier>{18B0C1C9-6B45-5B72-A098-18D7B0BC7D54}</UniqueIdentifier>
     </Filter>
@@ -29,6 +32,9 @@
     <ClInclude Include="Support\EffectGraphFile.h"><Filter>Support</Filter></ClInclude>
     <ClInclude Include="Support\PackageRoutes.h"><Filter>Support</Filter></ClInclude>
     <ClInclude Include="Support\EffectPlugins.h"><Filter>Support</Filter></ClInclude>
+    <ClInclude Include="Sources\CaptureSources.h"><Filter>Sources</Filter></ClInclude>
+    <ClInclude Include="Sources\DxgiDuplicationSourceProvider.h"><Filter>Sources</Filter></ClInclude>
+    <ClInclude Include="Sources\WindowsGraphicsCaptureSourceProvider.h"><Filter>Sources</Filter></ClInclude>
     <ClInclude Include="Graph\ParameterVisibility.h"><Filter>Graph</Filter></ClInclude>
     <ClInclude Include="Graph\GraphLayout.h"><Filter>Graph</Filter></ClInclude>
     <ClInclude Include="Graph\GraphUiSnapshot.h"><Filter>Graph</Filter></ClInclude>
@@ -61,6 +67,9 @@
     <ClCompile Include="Support\EffectGraphFile.cpp"><Filter>Support</Filter></ClCompile>
     <ClCompile Include="Support\PackageRoutes.cpp"><Filter>Support</Filter></ClCompile>
     <ClCompile Include="Support\EffectPlugins.cpp"><Filter>Support</Filter></ClCompile>
+    <ClCompile Include="Sources\CaptureSources.cpp"><Filter>Sources</Filter></ClCompile>
+    <ClCompile Include="Sources\DxgiDuplicationSourceProvider.cpp"><Filter>Sources</Filter></ClCompile>
+    <ClCompile Include="Sources\WindowsGraphicsCaptureSourceProvider.cpp"><Filter>Sources</Filter></ClCompile>
     <ClCompile Include="Graph\ParameterVisibility.cpp"><Filter>Graph</Filter></ClCompile>
     <ClCompile Include="Graph\GraphLayout.cpp"><Filter>Graph</Filter></ClCompile>
     <ClCompile Include="Graph\GraphUiSnapshot.cpp"><Filter>Graph</Filter></ClCompile>

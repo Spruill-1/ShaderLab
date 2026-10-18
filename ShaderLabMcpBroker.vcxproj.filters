@@ -9,7 +9,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="pch_engine.h" />
     <ClInclude Include="Mcp\McpFrame.h">
       <Filter>Mcp</Filter>
     </ClInclude>

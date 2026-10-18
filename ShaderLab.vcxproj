@@ -355,8 +355,6 @@
     <None Include="packages.config" />
     <None Include=".gitmodules" />
     <None Include="scripts\Install.ps1" />
-    <None Include="scripts\Check-EngineBoundary.ps1" />
-    <None Include="scripts\ShaderLabOwnedFiles.txt" />
     <None Include="ShaderLab.vcxproj.filters" />
   </ItemGroup>
   <PropertyGroup Condition="'$(DisableHasPackageAndPublishMenuAddedByProject)'!='true' and '$(EnableMsixTooling)'=='true'">

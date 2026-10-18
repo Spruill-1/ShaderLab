@@ -1,6 +1,6 @@
-# Runs the HLSL math cases of EffectGraphTests.exe and ShaderLabTests.exe
-# (--tag math) on WARP, so it works without a GPU; -Tag '' runs both whole
-# suites. Builds a runner first when it is missing. Exits with the failure
+# Runs the HLSL math cases of ShaderLabTests.exe (--tag math) on WARP, so it
+# works without a GPU; -Tag '' runs the whole suite (EffectGraph's own math
+# tests are in its repository). Builds a runner first when it is missing. Exits with the failure
 # count, so non-zero means a suite is red.
 
 param(
@@ -16,7 +16,7 @@ $Repo = Split-Path -Parent $PSScriptRoot
 Push-Location $Repo
 try {
     $failures = 0
-    foreach ($runner in 'EffectGraphTests', 'ShaderLabTests') {
+    foreach ($runner in 'ShaderLabTests') {
         $exe = Join-Path $Repo "$Platform\$Configuration\$runner\$runner.exe"
         if (-not (Test-Path $exe)) {
             Write-Host "$runner not built; building now..."
