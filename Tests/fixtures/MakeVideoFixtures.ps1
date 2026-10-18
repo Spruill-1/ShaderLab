@@ -4,11 +4,14 @@
 
 .DESCRIPTION
   The clips are generated rather than checked in (binary media in git is
-  permanent history weight). ShaderLabTests reports the test as [SKIP] when
-  they are absent, so CI -- which has no ffmpeg -- is unaffected.
+  permanent history weight). ShaderLabTests counts a skip for each test that
+  needs an absent clip (a failure under --require-fixtures), so CI -- which
+  has no ffmpeg -- is unaffected.
 
   The exception is the video_index_* clips (under 100 KB each), which are
-  checked in; this script regenerates them.
+  checked in; this script regenerates them. Tests\fixtures\manifest.json
+  lists every fixture and pins each checked-in clip's SHA-256, which this
+  script prints: after regenerating one on purpose, copy its hash there.
 
   The two seek clips are 1 s at 30 fps with a SINGLE keyframe, which is the point:
   seeking to frame 17 must decode forward from frame 0, exercising the
@@ -85,4 +88,5 @@ foreach ($clip in @(@{ Size = '320x180'; Rate = 60 }, @{ Size = '320x180'; Rate 
     if ($LASTEXITCODE) { throw "ffmpeg failed ($name)" }
 }
 
-Get-ChildItem $out -Filter 'video_*.mp4' | Select-Object Name, Length
+Get-ChildItem $out -Filter 'video_*.mp4' |
+    Select-Object Name, Length, @{ Name = 'SHA256'; Expression = { (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } }

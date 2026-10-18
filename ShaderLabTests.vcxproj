@@ -77,17 +77,17 @@
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>d3d11.lib;d2d1.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;windowscodecs.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;dwrite.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;d2d1.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;windowscodecs.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
     <ClCompile>
-      <PreprocessorDefinitions>WIN32;_CONSOLE;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;WIN32;_CONSOLE;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
-      <PreprocessorDefinitions>WIN32;_CONSOLE;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;WIN32;_CONSOLE;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -95,35 +95,56 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="EngineExport.h" />
-    <ClInclude Include="pch_engine.h" />
     <ClInclude Include="Tests\TestCommon.h" />
+    <ClInclude Include="Tests\TestSupport.h" />
     <ClInclude Include="Tests\ShaderTestBench.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="pch_engine.cpp">
+    <ClCompile Include="pch_host.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Tests\TestRunner.cpp" />
-    <ClCompile Include="Tests\VideoPlaybackTests.cpp" />
+    <ClCompile Include="Tests\TestSupport.cpp" />
     <ClCompile Include="Tests\ShaderTestBench.cpp" />
-    <ClCompile Include="Tests\Math\TransferFunctionTests.cpp" />
-    <ClCompile Include="Tests\Math\ColorMatrixTests.cpp" />
-    <ClCompile Include="Tests\Math\MobiusReinhardTests.cpp" />
-    <ClCompile Include="Tests\Math\DeltaETests.cpp" />
-    <ClCompile Include="Tests\Math\GamutTests.cpp" />
+    <ClCompile Include="Tests\ShaderLabTestSetup.cpp" />
+    <ClCompile Include="Tests\Graph\GraphLayoutTests.cpp" />
+    <ClCompile Include="Tests\Graph\GraphUiTests.cpp" />
+    <ClCompile Include="Tests\Hosts\BrokerShimTests.cpp" />
+    <ClCompile Include="Tests\Hosts\EffectPluginDiscoveryTests.cpp" />
+    <ClCompile Include="Tests\Hosts\CaptureSourceTests.cpp" />
+    <ClCompile Include="Tests\Hosts\HeadlessArgsTests.cpp" />
+    <ClCompile Include="Tests\Mcp\McpEffectGraphTests.cpp" />
+    <ClCompile Include="Tests\Mcp\McpHelperTests.cpp" />
+    <ClCompile Include="Tests\Mcp\McpRouteTests.cpp" />
+    <ClCompile Include="Tests\Mcp\McpRouterTests.cpp" />
+    <ClCompile Include="Tests\Mcp\McpTransportTests.cpp" />
+    <ClCompile Include="Tests\Persistence\PackageTests.cpp" />
+    <ClCompile Include="Tests\Rendering\ExpressionTests.cpp" />
+    <ClCompile Include="Tests\Rendering\HostLoopTests.cpp" />
+    <ClCompile Include="Tests\Video\VideoExportTests.cpp" />
+    <ClCompile Include="Tests\Video\VideoPlaybackTests.cpp" />
+    <ClCompile Include="ShaderLabHeadless\HeadlessArgs.cpp" />
+    <ClCompile Include="ShaderLabMcpBroker\BrokerPipeIo.cpp" />
+    <ClCompile Include="ShaderLabMcpBroker\Shim.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="ShaderLabEngine.vcxproj">
-      <Project>{A7A1E0F1-665C-4D06-9AC7-6D6B6A0D0F01}</Project>
+    <ProjectReference Include="TestEffectPlugin.vcxproj">
+      <Project>{9B2E4F17-3C6A-4D85-B1E2-7A0C5D9F6E48}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+    <ProjectReference Include="ShaderLabSupport.vcxproj">
+      <Project>{3C5E8A21-7B4D-4F6A-9E12-5D8C0B7A4E63}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <LinkLibraryDependencies>true</LinkLibraryDependencies>
     </ProjectReference>
   </ItemGroup>
-  <Target Name="CopyEngineRuntime" AfterTargets="Build">
-    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll')" />
-  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="build\EffectGraphEngine.targets" />
+  <Target Name="CopyTestEffectPlugin" AfterTargets="Build">
+    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\TestEffectPlugin\TestEffectPlugin.dll"
+          DestinationFolder="$(OutDir)Effects" SkipUnchangedFiles="true" />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
     <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets')" />
     <Import Project="packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets" Condition="Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets')" />

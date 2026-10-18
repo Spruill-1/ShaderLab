@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Mcp">
+      <UniqueIdentifier>{1C729112-C2FE-5DB5-8847-A17E18C238BF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ShaderLabMcpBroker">
+      <UniqueIdentifier>{90C632DB-9E3B-5A74-B232-149D78A9D04D}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Mcp\McpFrame.h">
+      <Filter>Mcp</Filter>
+    </ClInclude>
+    <ClInclude Include="Mcp\McpCrypto.h">
+      <Filter>Mcp</Filter>
+    </ClInclude>
+    <ClInclude Include="Mcp\McpPeerIdentity.h">
+      <Filter>Mcp</Filter>
+    </ClInclude>
+    <ClInclude Include="Mcp\McpChannel.h">
+      <Filter>Mcp</Filter>
+    </ClInclude>
+    <ClInclude Include="Mcp\McpTypes.h">
+      <Filter>Mcp</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderLabMcpBroker\BrokerPipeIo.h">
+      <Filter>ShaderLabMcpBroker</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderLabMcpBroker\Hub.h">
+      <Filter>ShaderLabMcpBroker</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderLabMcpBroker\Shim.h">
+      <Filter>ShaderLabMcpBroker</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch_host.cpp" />
+    <ClCompile Include="Mcp\McpFrame.cpp">
+      <Filter>Mcp</Filter>
+    </ClCompile>
+    <ClCompile Include="Mcp\McpCrypto.cpp">
+      <Filter>Mcp</Filter>
+    </ClCompile>
+    <ClCompile Include="Mcp\McpPeerIdentity.cpp">
+      <Filter>Mcp</Filter>
+    </ClCompile>
+    <ClCompile Include="Mcp\McpChannel.cpp">
+      <Filter>Mcp</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabMcpBroker\Main.cpp">
+      <Filter>ShaderLabMcpBroker</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabMcpBroker\BrokerPipeIo.cpp">
+      <Filter>ShaderLabMcpBroker</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabMcpBroker\Hub.cpp">
+      <Filter>ShaderLabMcpBroker</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabMcpBroker\Shim.cpp">
+      <Filter>ShaderLabMcpBroker</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>

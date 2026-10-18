@@ -1,10 +1,14 @@
 #include "pch_engine.h"
 #include "VideoExport.h"
-#include "GraphEvaluator.h"
-#include "../Graph/EffectGraph.h"
-#include "../Effects/ShaderCompiler.h"
-#include "../Effects/ShaderLabEffects.h"
-#include "../Effects/SourceNodeFactory.h"
+#include "Rendering/GraphEvaluator.h"
+#include "Rendering/FrameExecutor.h"
+#include "FfmpegProcess.h"
+#include "Graph/ClockModel.h"
+#include "Graph/GraphModel.h"
+#include "Graph/SourceKind.h"
+#include "Effects/ShaderCompiler.h"
+#include "Effects/ShaderLabEffects.h"
+#include "Effects/SourceNodeFactory.h"
 
 #include <algorithm>
 #include <chrono>
@@ -16,9 +20,11 @@
 
 namespace ShaderLab::Rendering
 {
-    using Graph::EffectGraph;
+    using Graph::GraphModel;
     using Graph::EffectNode;
     using Graph::NodeType;
+    using Graph::LongestClockDuration;
+    using Graph::SetClocksToTime;
 
     namespace
     {
@@ -46,14 +52,6 @@ namespace ShaderLab::Rendering
             return false;
         }
 
-        std::wstring Quote(const std::wstring& s)
-        {
-            if (s.find_first_of(L" \t\"") == std::wstring::npos) return s;
-            std::wstring out = L"\"";
-            for (wchar_t c : s) { if (c == L'"') out += L'\\'; out += c; }
-            return out + L"\"";
-        }
-
         std::wstring FormatFps(double fps)
         {
             // Integral rates stay integral ("60"); NTSC-style rates are
@@ -63,136 +61,6 @@ namespace ShaderLab::Rendering
             if (std::abs(fps - ntsc / 1.001) < 1e-6) return std::format(L"{}000/1001", static_cast<long long>(ntsc));
             return std::format(L"{:.6f}", fps);
         }
-
-        // ---- ffmpeg child process -----------------------------------------
-        //
-        // stdin carries raw frames; stdout+stderr share one pipe that a
-        // reader thread drains CONTINUOUSLY. Leaving it undrained deadlocks
-        // the export: ffmpeg blocks writing its log, stops reading stdin, and
-        // our frame write blocks forever.
-        class FfmpegProcess
-        {
-        public:
-            ~FfmpegProcess() { Abort(); }
-
-            bool Start(const std::wstring& exe, const std::wstring& args, bool withStdin, std::wstring& error)
-            {
-                SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
-                HANDLE outRead = nullptr, outWrite = nullptr, inRead = nullptr;
-                if (!CreatePipe(&outRead, &outWrite, &sa, 0))
-                {
-                    error = L"CreatePipe(stdout) failed";
-                    return false;
-                }
-                SetHandleInformation(outRead, HANDLE_FLAG_INHERIT, 0);
-                if (withStdin)
-                {
-                    if (!CreatePipe(&inRead, &m_stdinWrite, &sa, 1 << 20))
-                    {
-                        CloseHandle(outRead); CloseHandle(outWrite);
-                        error = L"CreatePipe(stdin) failed";
-                        return false;
-                    }
-                    SetHandleInformation(m_stdinWrite, HANDLE_FLAG_INHERIT, 0);
-                }
-                STARTUPINFOW si{ sizeof(si) };
-                si.dwFlags = STARTF_USESTDHANDLES;
-                si.hStdInput = withStdin ? inRead : GetStdHandle(STD_INPUT_HANDLE);
-                si.hStdOutput = outWrite;
-                si.hStdError = outWrite;
-                PROCESS_INFORMATION pi{};
-                std::wstring cmd = Quote(exe) + L" " + args;
-                const BOOL ok = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
-                    CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-                // The child owns its ends now; ours must close or EOF never arrives.
-                CloseHandle(outWrite);
-                if (inRead) CloseHandle(inRead);
-                if (!ok)
-                {
-                    const DWORD e = GetLastError();
-                    CloseHandle(outRead);
-                    if (m_stdinWrite) { CloseHandle(m_stdinWrite); m_stdinWrite = nullptr; }
-                    error = std::format(L"could not start ffmpeg ({}): Win32 error {}", exe, e);
-                    return false;
-                }
-                CloseHandle(pi.hThread);
-                m_process = pi.hProcess;
-                m_outRead = outRead;
-                m_reader = std::thread([this] {
-                    char buf[4096];
-                    DWORD n = 0;
-                    while (ReadFile(m_outRead, buf, sizeof(buf), &n, nullptr) && n > 0)
-                    {
-                        std::scoped_lock lock(m_logMutex);
-                        m_log.append(buf, n);
-                        if (m_log.size() > 256 * 1024) m_log.erase(0, m_log.size() - 128 * 1024);
-                    }
-                });
-                return true;
-            }
-
-            bool Write(const void* data, size_t size)
-            {
-                const auto* p = static_cast<const uint8_t*>(data);
-                while (size > 0)
-                {
-                    DWORD chunk = static_cast<DWORD>((std::min)(size, size_t(1) << 24));
-                    DWORD written = 0;
-                    if (!WriteFile(m_stdinWrite, p, chunk, &written, nullptr) || written == 0)
-                        return false;   // broken pipe: ffmpeg exited; the log says why
-                    p += written;
-                    size -= written;
-                }
-                return true;
-            }
-
-            // Close stdin (end of stream) and wait for exit. Returns the exit
-            // code, or -1 on timeout (the process is then terminated).
-            int Finish(DWORD timeoutMs)
-            {
-                if (m_stdinWrite) { CloseHandle(m_stdinWrite); m_stdinWrite = nullptr; }
-                int code = -1;
-                if (m_process)
-                {
-                    if (WaitForSingleObject(m_process, timeoutMs) == WAIT_OBJECT_0)
-                    {
-                        DWORD c = 0;
-                        GetExitCodeProcess(m_process, &c);
-                        code = static_cast<int>(c);
-                    }
-                    else
-                    {
-                        TerminateProcess(m_process, 1);
-                        WaitForSingleObject(m_process, 5000);
-                    }
-                    CloseHandle(m_process);
-                    m_process = nullptr;
-                }
-                if (m_reader.joinable()) m_reader.join();
-                if (m_outRead) { CloseHandle(m_outRead); m_outRead = nullptr; }
-                return code;
-            }
-
-            void Abort()
-            {
-                if (m_process) TerminateProcess(m_process, 1);
-                Finish(5000);
-            }
-
-            std::string Log()
-            {
-                std::scoped_lock lock(m_logMutex);
-                return m_log;
-            }
-
-        private:
-            HANDLE m_process{ nullptr };
-            HANDLE m_stdinWrite{ nullptr };
-            HANDLE m_outRead{ nullptr };
-            std::thread m_reader;
-            std::mutex m_logMutex;
-            std::string m_log;
-        };
 
         std::string Tail(const std::string& s, size_t n)
         {
@@ -531,72 +399,118 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_G
 
         // ---- per-frame evaluation -------------------------------------------
 
-        // The shape every host uses (MainWindow::RenderFrameToOffscreen,
-        // headless runEval): Evaluate OUTSIDE a draw session, then inside one
-        // ProcessDeferredCompute and a frozen sweep for whatever it dirtied.
-        // The node's output is then drawn 1:1 into `target` (SOURCE_COPY,
-        // nearest, no transform) from `srcRect` in image space.
-        bool RenderFrame(EffectGraph& graph, GraphEvaluator& evaluator, ID2D1DeviceContext5* dc,
+        // One FrameExecutor frame with every node dirty and the export node as
+        // the demand root. The node's output is drawn 1:1 into `target`
+        // (SOURCE_COPY, nearest, no transform) from `srcRect` in image space.
+        // `settle` allows the second Evaluate pass new effects need; later
+        // frames reuse the settled effects and skip it.
+        bool RenderFrame(GraphModel& graph, GraphEvaluator& evaluator, ID2D1DeviceContext5* dc,
                          uint32_t nodeId, ID2D1Bitmap1* target, const D2D1_RECT_F* srcRect,
-                         bool twoPass, D2D1_RECT_F* boundsOut, std::wstring& error)
+                         bool settle, D2D1_RECT_F* boundsOut, std::wstring& error)
         {
-            graph.MarkAllDirty();
-            dc->SetTarget(nullptr);
-            evaluator.Evaluate(graph, dc);
-            if (twoPass) evaluator.Evaluate(graph, dc);   // new custom effects need two passes
-
-            dc->SetTarget(target);
-            dc->BeginDraw();
-            evaluator.ProcessDeferredCompute(graph, dc);
-            if (graph.HasDirtyNodes())
+            ID2D1Image* image = nullptr;
+            FrameRequest request;
+            request.target = target;
+            request.markAllDirty = true;
+            request.demand = FrameDemand::Roots;
+            request.roots = { nodeId };
+            request.secondPass = settle ? SecondPass::IfDirty : SecondPass::Never;
+            request.draw = [&](ID2D1DeviceContext5* ctx)
             {
-                evaluator.SetDeferredComputeFrozen(true);
-                evaluator.Evaluate(graph, dc);
-                evaluator.SetDeferredComputeFrozen(false);
-            }
-            auto* node = graph.FindNode(nodeId);
-            ID2D1Image* image = node ? node->cachedOutput : nullptr;
-            if (image)
-            {
-                if (boundsOut) dc->GetImageLocalBounds(image, boundsOut);
-                if (srcRect)
-                {
-                    // ProcessDeferredCompute retargets the context for its
-                    // pre-renders; draw into OUR target explicitly.
-                    dc->SetTarget(target);
-                    dc->SetTransform(D2D1::Matrix3x2F::Identity());
-                    dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-                    const D2D1_POINT_2F origin = D2D1::Point2F(0.0f, 0.0f);
-                    dc->DrawImage(image, &origin, srcRect,
-                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_COPY);
-                }
-            }
-            const HRESULT hr = dc->EndDraw();
-            dc->SetTarget(nullptr);
+                const auto* node = graph.FindNode(nodeId);
+                image = node ? node->cachedOutput : nullptr;
+                if (!image) return;
+                if (boundsOut) ctx->GetImageLocalBounds(image, boundsOut);
+                if (!srcRect) return;
+                ctx->SetTransform(D2D1::Matrix3x2F::Identity());
+                ctx->Clear(D2D1::ColorF(0, 0, 0, 0));
+                const D2D1_POINT_2F origin = D2D1::Point2F(0.0f, 0.0f);
+                ctx->DrawImage(image, &origin, srcRect,
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_COPY);
+            };
+            const FrameResult frame = FrameExecutor::Run(graph, evaluator, dc, request);
             if (!image)
             {
+                const auto* node = graph.FindNode(nodeId);
                 error = node && !node->runtimeError.empty()
                     ? std::format(L"node {} produced no image: {}", nodeId, node->runtimeError)
                     : std::format(L"node {} produced no image output", nodeId);
                 return false;
             }
-            if (FAILED(hr))
+            if (FAILED(frame.endDraw))
             {
-                error = std::format(L"EndDraw failed 0x{:08X}", static_cast<uint32_t>(hr));
+                error = std::format(L"EndDraw failed 0x{:08X}", static_cast<uint32_t>(frame.endDraw));
                 return false;
             }
             return true;
         }
 
-        const EffectNode* FindWorkingSpace(const EffectGraph& graph)
+        const EffectNode* FindWorkingSpace(const GraphModel& graph)
         {
             for (const auto& n : graph.Nodes())
-                if (n.customEffect.has_value() && n.customEffect->shaderLabEffectId == L"Working Space")
+                if (n.customEffect.has_value() && n.customEffect->nodeKind == Graph::NodeKind::WorkingSpace)
                     return &n;
             return nullptr;
         }
 
-        struct Mastering { float rx, ry, gx, gy, bx, by, wx, wy, maxNits, minNits; };
+        // ---- export steps ---------------------------------------------------
+
+        // Empty when this ffmpeg lists `encoder`, else why not.
+        std::wstring ProbeEncoder(const std::wstring& ffmpeg, const std::wstring& encoder)
+        {
+            FfmpegProcess probe;
+            std::wstring error;
+            if (!probe.Start(ffmpeg, L"-hide_banner -encoders", false, error)) return error;
+            probe.Finish(30000);
+            const std::string needle = " " + winrt::to_string(encoder) + " ";
+            if (probe.Log().find(needle) == std::string::npos)
+                return std::format(L"this ffmpeg ({}) has no {} encoder. Use a build that includes it "
+                                   L"(e.g. the Gyan 'full' or 'essentials' builds).", ffmpeg, encoder);
+            return {};
+        }
+
+        // Fills r.fps / start / duration / frames; empty error when valid.
+        std::wstring ComputeTimeline(const VideoExportRequest& req, const GraphModel& graph, VideoExportResult& r)
+        {
+            r.fps = req.fps;
+            r.start = req.start;
+            r.duration = req.duration.value_or(LongestClockDuration(graph));
+            if (!(r.duration > 0.0))
+                return L"the graph has no Clock with a non-zero Speed; pass a duration";
+            r.frames = static_cast<uint32_t>((std::max)(1.0, std::round(r.duration * r.fps)));
+            if (r.frames > 100000) return L"more than 100000 frames requested";
+            return {};
+        }
+
+        // Sources the fixed timeline does not step.
+        void AddSourceWarnings(const GraphModel& graph, std::vector<std::wstring>& warnings)
+        {
+            for (const auto& n : graph.Nodes())
+            {
+                const Graph::SourceKind kind = Graph::ClassifySource(n);
+                if (Graph::IsLiveSource(kind))
+                    warnings.push_back(std::format(L"node {} is a live source; it is not time-stepped", n.id));
+                else if (kind == Graph::SourceKind::Video ||
+                         (kind == Graph::SourceKind::Image && Effects::SourceNodeFactory::IsVideoFile(*n.mediaPath)))
+                    warnings.push_back(std::format(L"node {} is a video file; video sources are not time-stepped by export yet", n.id));
+            }
+        }
+
+        // The mastering display the request asks for; empty error when found.
+        std::wstring ReadMastering(const VideoExportRequest& req, const GraphModel& graph, MasteringDisplay& md)
+        {
+            md = DefaultMasteringDisplay();
+            if (req.mastering != MasteringMode::WorkingSpace)
+                return {};
+            const EffectNode* ws = FindWorkingSpace(graph);
+            if (!ws) return L"mastering=working-space needs a Working Space node in the graph";
+            const bool okp = GetF2(*ws, L"RedPrimary", md.rx, md.ry) && GetF2(*ws, L"GreenPrimary", md.gx, md.gy) &&
+                             GetF2(*ws, L"BluePrimary", md.bx, md.by) && GetF2(*ws, L"WhitePoint", md.wx, md.wy);
+            md.maxNits = GetF(*ws, L"PeakNits", 0.0f);
+            md.minNits = GetF(*ws, L"MinNits", 0.0f);
+            if (!okp || md.maxNits <= 0.0f) return L"the Working Space node has no primaries / peak luminance yet";
+            return {};
+        }
     }
 
     // ---- public ---------------------------------------------------------------
@@ -628,63 +542,117 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_G
         return {};
     }
 
-    uint32_t SetClocksToTime(EffectGraph& graph, double seconds)
+    bool ParseVideoOptions(const std::wstring& format, const std::wstring& codec, const std::wstring& mastering,
+                           VideoExportRequest& request, std::wstring& error)
     {
-        uint32_t n = 0;
-        for (auto& node : const_cast<std::vector<EffectNode>&>(graph.Nodes()))
-        {
-            if (!node.isClock) continue;
-            const float start = GetF(node, L"StartTime", 0.0f);
-            const float stop  = GetF(node, L"StopTime", 10.0f);
-            const float speed = GetF(node, L"Speed", 1.0f);
-            const bool  loop  = GetF(node, L"Loop", 1.0f) > 0.5f;
-            double duration = static_cast<double>(stop) - start;
-            if (duration <= 0.0) duration = 1.0;   // the tick's own rule
-            double t = seconds * speed;
-            if (loop)
-            {
-                t = std::fmod(t, duration);
-                if (t < 0.0) t += duration;
-            }
-            else
-            {
-                t = std::clamp(t, 0.0, duration);
-            }
-            node.clockTime = t;
-            node.clockTickBucket = -1;
-            node.dirty = true;
-            ++n;
-        }
-        return n;
+        if (format == L"hdr10" || format.empty()) request.format = VideoFormat::Hdr10;
+        else if (format == L"sdr") request.format = VideoFormat::Sdr;
+        else { error = L"format must be hdr10 or sdr (got '" + format + L"')"; return false; }
+        if (codec.empty()) request.codec = VideoCodec::Default;
+        else if (codec == L"hevc" || codec == L"h265") request.codec = VideoCodec::Hevc;
+        else if (codec == L"av1") request.codec = VideoCodec::Av1;
+        else if (codec == L"h264" || codec == L"avc") request.codec = VideoCodec::H264;
+        else { error = L"codec must be hevc, av1 or h264 (got '" + codec + L"')"; return false; }
+        if (mastering == L"p3-1000" || mastering.empty()) request.mastering = MasteringMode::P3D65_1000;
+        else if (mastering == L"working-space") request.mastering = MasteringMode::WorkingSpace;
+        else if (mastering == L"none") request.mastering = MasteringMode::None;
+        else { error = L"mastering must be p3-1000, working-space or none (got '" + mastering + L"')"; return false; }
+        return true;
     }
 
-    double LongestClockDuration(const EffectGraph& graph)
+    VideoCodec ResolveVideoCodec(const VideoExportRequest& req, std::wstring& error)
     {
-        double longest = 0.0;
-        for (const auto& node : graph.Nodes())
+        const bool hdr = req.format == VideoFormat::Hdr10;
+        VideoCodec codec = req.codec;
+        if (codec == VideoCodec::Default) codec = hdr ? VideoCodec::Hevc : VideoCodec::H264;
+        if (hdr && codec == VideoCodec::H264)
+            error = L"HDR10 needs HEVC or AV1 (H.264 has no 10-bit profile players accept for HDR10)";
+        else if (req.lossless && codec == VideoCodec::Av1)
+            error = L"--lossless is not supported with AV1 (SVT-AV1 has no lossless mode); use HEVC";
+        return codec;
+    }
+
+    const wchar_t* EncoderName(VideoCodec codec)
+    {
+        switch (codec)
         {
-            if (!node.isClock) continue;
-            const float speed = GetF(node, L"Speed", 1.0f);
-            if (std::abs(speed) < 1e-6f) continue;
-            double duration = static_cast<double>(GetF(node, L"StopTime", 10.0f)) - GetF(node, L"StartTime", 0.0f);
-            if (duration <= 0.0) duration = 1.0;
-            longest = (std::max)(longest, duration / std::abs(speed));
+        case VideoCodec::Hevc: return L"libx265";
+        case VideoCodec::Av1:  return L"libsvtav1";
+        default:               return L"libx264";
         }
-        return longest;
+    }
+
+    std::wstring BuildFfmpegArgs(const VideoExportRequest& req, const FfmpegEncodeSettings& settings)
+    {
+        const bool hdr = req.format == VideoFormat::Hdr10;
+        const std::wstring prim = hdr ? L"bt2020" : L"bt709";
+        const std::wstring trc  = hdr ? L"smpte2084" : L"bt709";
+        const std::wstring mtx  = hdr ? L"bt2020nc" : L"bt709";
+        const std::wstring colourTags = std::format(
+            L"-color_range tv -color_primaries {} -color_trc {} -colorspace {} -chroma_sample_location left",
+            prim, trc, mtx);
+        std::wstring args = std::format(
+            L"-hide_banner -loglevel warning -y -f rawvideo -pix_fmt {} -video_size {}x{} -framerate {} {} -i - -an ",
+            hdr ? L"p010le" : L"nv12", settings.width, settings.height, FormatFps(req.fps), colourTags);
+
+        const std::wstring outPix = hdr ? L"yuv420p10le" : L"yuv420p";
+        std::wstring ext = std::filesystem::path(req.outputPath).extension().wstring();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+        const bool isMp4 = (ext == L".mp4" || ext == L".mov" || ext == L".m4v");
+        const MasteringDisplay* md = settings.mastering ? &*settings.mastering : nullptr;
+
+        if (settings.codec == VideoCodec::Hevc)
+        {
+            const int crf = req.crf >= 0 ? req.crf : (hdr ? 18 : 20);
+            std::wstring xp = std::format(
+                L"log-level=error:repeat-headers=1:colorprim={}:transfer={}:colormatrix={}:range=limited:chromaloc=0",
+                prim, trc, mtx);
+            if (md)
+            {
+                auto u = [](float v, float scale) { return static_cast<long long>(std::llround(v * scale)); };
+                xp += std::format(L":hdr10=1:master-display=G({},{})B({},{})R({},{})WP({},{})L({},{}):max-cll={},{}",
+                    u(md->gx, 50000), u(md->gy, 50000), u(md->bx, 50000), u(md->by, 50000),
+                    u(md->rx, 50000), u(md->ry, 50000), u(md->wx, 50000), u(md->wy, 50000),
+                    u(md->maxNits, 10000), u(md->minNits, 10000), settings.maxCll, settings.maxFall);
+            }
+            if (req.lossless) xp += L":lossless=1";
+            args += std::format(L"-c:v libx265 -preset {} {}-pix_fmt {} -x265-params {} ",
+                req.preset.empty() ? L"medium" : req.preset,
+                req.lossless ? L"" : std::format(L"-crf {} ", crf), outPix, xp);
+            if (isMp4) args += L"-tag:v hvc1 ";
+        }
+        else if (settings.codec == VideoCodec::Av1)
+        {
+            const int crf = req.crf >= 0 ? req.crf : 30;
+            std::wstring sp;
+            if (md)
+                sp = std::format(L"-svtav1-params mastering-display=G({:.4f},{:.4f})B({:.4f},{:.4f})R({:.4f},{:.4f})WP({:.4f},{:.4f})L({:.4f},{:.4f}):content-light={},{} ",
+                    md->gx, md->gy, md->bx, md->by, md->rx, md->ry, md->wx, md->wy, md->maxNits, md->minNits,
+                    settings.maxCll, settings.maxFall);
+            args += std::format(L"-c:v libsvtav1 -preset {} -crf {} -pix_fmt {} {}",
+                req.preset.empty() ? L"6" : req.preset, crf, outPix, sp);
+        }
+        else
+        {
+            const int crf = req.crf >= 0 ? req.crf : 18;
+            args += std::format(L"-c:v libx264 -preset {} {}-pix_fmt {} -x264-params chromaloc=0 ",
+                req.preset.empty() ? L"medium" : req.preset,
+                req.lossless ? L"-qp 0 " : std::format(L"-crf {} ", crf), outPix);
+        }
+        args += colourTags + L" ";
+        if (isMp4) args += L"-movflags +faststart ";
+        args += QuoteCommandArgument(req.outputPath);
+        return args;
     }
 
     VideoExportResult ExportVideo(
         const VideoExportRequest& req,
-        EffectGraph& graph,
+        GraphModel& graph,
         GraphEvaluator& evaluator,
-        Effects::SourceNodeFactory& sourceFactory,
-        DisplayMonitor* displayMonitor,
         ID2D1DeviceContext* dcBase,
         ID3D11Device* device,
         ID3D11DeviceContext* immediate)
     {
-        (void)sourceFactory;
-        (void)displayMonitor;
         VideoExportResult r;
         const auto t0 = std::chrono::steady_clock::now();
         auto fail = [&](std::wstring msg) -> VideoExportResult& {
@@ -705,47 +673,20 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_G
             return fail(L"fps must be in (0, 480]");
 
         // ---- ffmpeg + encoder ----------------------------------------------
-        std::wstring ffErr;
-        r.ffmpegPath = FindFfmpeg(req.ffmpegPath, ffErr);
-        if (r.ffmpegPath.empty()) return fail(ffErr);
-
+        std::wstring err;
+        r.ffmpegPath = FindFfmpeg(req.ffmpegPath, err);
+        if (r.ffmpegPath.empty()) return fail(err);
         const bool hdr = req.format == VideoFormat::Hdr10;
-        VideoCodec codec = req.codec;
-        if (codec == VideoCodec::Default) codec = hdr ? VideoCodec::Hevc : VideoCodec::H264;
-        if (hdr && codec == VideoCodec::H264)
-            return fail(L"HDR10 needs HEVC or AV1 (H.264 has no 10-bit profile players accept for HDR10)");
-        if (req.lossless && codec == VideoCodec::Av1)
-            return fail(L"--lossless is not supported with AV1 (SVT-AV1 has no lossless mode); use HEVC");
-        r.encoder = codec == VideoCodec::Hevc ? L"libx265" : codec == VideoCodec::Av1 ? L"libsvtav1" : L"libx264";
-        {
-            FfmpegProcess probe;
-            std::wstring perr;
-            if (!probe.Start(r.ffmpegPath, L"-hide_banner -encoders", false, perr)) return fail(perr);
-            probe.Finish(30000);
-            const std::string list = probe.Log();
-            const std::string needle = " " + winrt::to_string(r.encoder) + " ";
-            if (list.find(needle) == std::string::npos)
-                return fail(std::format(L"this ffmpeg ({}) has no {} encoder. Use a build that includes it "
-                                        L"(e.g. the Gyan 'full' or 'essentials' builds).", r.ffmpegPath, r.encoder));
-        }
+        const VideoCodec codec = ResolveVideoCodec(req, err);
+        if (!err.empty()) return fail(err);
+        r.encoder = EncoderName(codec);
+        if (auto probeError = ProbeEncoder(r.ffmpegPath, r.encoder); !probeError.empty())
+            return fail(probeError);
 
         // ---- timeline ------------------------------------------------------
-        r.fps = req.fps;
-        r.start = req.start;
-        r.duration = req.duration.value_or(LongestClockDuration(graph));
-        if (!(r.duration > 0.0))
-            return fail(L"the graph has no Clock with a non-zero Speed; pass a duration");
-        r.frames = static_cast<uint32_t>((std::max)(1.0, std::round(r.duration * r.fps)));
-        if (r.frames > 100000) return fail(L"more than 100000 frames requested");
-
-        for (const auto& n : graph.Nodes())
-        {
-            if (n.type != NodeType::Source) continue;
-            if (n.properties.count(L"IsDxgiDuplicateOutput") || n.properties.count(L"IsWindowsGraphicsCapture"))
-                r.warnings.push_back(std::format(L"node {} is a live capture source; it is not time-stepped", n.id));
-            else if (n.shaderPath && Effects::SourceNodeFactory::IsVideoFile(*n.shaderPath))
-                r.warnings.push_back(std::format(L"node {} is a video file; video sources are not time-stepped by export yet", n.id));
-        }
+        if (auto timelineError = ComputeTimeline(req, graph, r); !timelineError.empty())
+            return fail(timelineError);
+        AddSourceWarnings(graph, r.warnings);
 
         float oldDpiX = 96.0f, oldDpiY = 96.0f;
         dc->GetDpi(&oldDpiX, &oldDpiY);
@@ -753,7 +694,6 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_G
         struct DpiRestore { ID2D1DeviceContext5* dc; float x, y; ~DpiRestore() { dc->SetDpi(x, y); } } dpiRestore{ dc.get(), oldDpiX, oldDpiY };
 
         // ---- prime: settle new effects, measure the output rect ----------
-        std::wstring err;
         D2D1_RECT_F bounds{};
         {
             winrt::com_ptr<ID2D1Bitmap1> scratch;
@@ -815,18 +755,11 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_G
         };
 
         // ---- HDR10 static metadata ----------------------------------------
-        Mastering md{ 0.680f, 0.320f, 0.265f, 0.690f, 0.150f, 0.060f, 0.3127f, 0.3290f, 1000.0f, 0.005f };
         const bool wantMetadata = hdr && req.mastering != MasteringMode::None;
-        if (wantMetadata && req.mastering == MasteringMode::WorkingSpace)
-        {
-            const EffectNode* ws = FindWorkingSpace(graph);
-            if (!ws) return fail(L"mastering=working-space needs a Working Space node in the graph");
-            bool okp = GetF2(*ws, L"RedPrimary", md.rx, md.ry) && GetF2(*ws, L"GreenPrimary", md.gx, md.gy) &&
-                       GetF2(*ws, L"BluePrimary", md.bx, md.by) && GetF2(*ws, L"WhitePoint", md.wx, md.wy);
-            md.maxNits = GetF(*ws, L"PeakNits", 0.0f);
-            md.minNits = GetF(*ws, L"MinNits", 0.0f);
-            if (!okp || md.maxNits <= 0.0f) return fail(L"the Working Space node has no primaries / peak luminance yet");
-        }
+        MasteringDisplay md = DefaultMasteringDisplay();
+        if (wantMetadata)
+            if (auto masteringError = ReadMastering(req, graph, md); !masteringError.empty())
+                return fail(masteringError);
 
         double measuredCll = 0.0, measuredFall = 0.0;
         const bool haveOverride = req.maxCll.has_value() && req.maxFall.has_value();
@@ -842,66 +775,16 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_G
                 measuredFall = (std::max)(measuredFall, st.meanNits);
             }
         }
-        const uint32_t cll  = haveOverride ? *req.maxCll  : static_cast<uint32_t>(std::ceil(measuredCll));
-        const uint32_t fall = haveOverride ? *req.maxFall : static_cast<uint32_t>(std::ceil(measuredFall));
 
-        // ---- ffmpeg command -------------------------------------------------
-        const std::wstring prim = hdr ? L"bt2020" : L"bt709";
-        const std::wstring trc  = hdr ? L"smpte2084" : L"bt709";
-        const std::wstring mtx  = hdr ? L"bt2020nc" : L"bt709";
-        const std::wstring colourTags = std::format(
-            L"-color_range tv -color_primaries {} -color_trc {} -colorspace {} -chroma_sample_location left",
-            prim, trc, mtx);
-        std::wstring args = std::format(
-            L"-hide_banner -loglevel warning -y -f rawvideo -pix_fmt {} -video_size {}x{} -framerate {} {} -i - -an ",
-            hdr ? L"p010le" : L"nv12", r.width, r.height, FormatFps(r.fps), colourTags);
-
-        const std::wstring outPix = hdr ? L"yuv420p10le" : L"yuv420p";
-        std::wstring ext = std::filesystem::path(req.outputPath).extension().wstring();
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
-        const bool isMp4 = (ext == L".mp4" || ext == L".mov" || ext == L".m4v");
-
-        if (codec == VideoCodec::Hevc)
-        {
-            const int crf = req.crf >= 0 ? req.crf : (hdr ? 18 : 20);
-            std::wstring xp = std::format(
-                L"log-level=error:repeat-headers=1:colorprim={}:transfer={}:colormatrix={}:range=limited:chromaloc=0",
-                prim, trc, mtx);
-            if (wantMetadata)
-            {
-                auto u = [](float v, float scale) { return static_cast<long long>(std::llround(v * scale)); };
-                xp += std::format(L":hdr10=1:master-display=G({},{})B({},{})R({},{})WP({},{})L({},{}):max-cll={},{}",
-                    u(md.gx, 50000), u(md.gy, 50000), u(md.bx, 50000), u(md.by, 50000),
-                    u(md.rx, 50000), u(md.ry, 50000), u(md.wx, 50000), u(md.wy, 50000),
-                    u(md.maxNits, 10000), u(md.minNits, 10000), cll, fall);
-            }
-            if (req.lossless) xp += L":lossless=1";
-            args += std::format(L"-c:v libx265 -preset {} {}-pix_fmt {} -x265-params {} ",
-                req.preset.empty() ? L"medium" : req.preset,
-                req.lossless ? L"" : std::format(L"-crf {} ", crf), outPix, xp);
-            if (isMp4) args += L"-tag:v hvc1 ";
-        }
-        else if (codec == VideoCodec::Av1)
-        {
-            const int crf = req.crf >= 0 ? req.crf : 30;
-            std::wstring sp;
-            if (wantMetadata)
-                sp = std::format(L"-svtav1-params mastering-display=G({:.4f},{:.4f})B({:.4f},{:.4f})R({:.4f},{:.4f})WP({:.4f},{:.4f})L({:.4f},{:.4f}):content-light={},{} ",
-                    md.gx, md.gy, md.bx, md.by, md.rx, md.ry, md.wx, md.wy, md.maxNits, md.minNits, cll, fall);
-            args += std::format(L"-c:v libsvtav1 -preset {} -crf {} -pix_fmt {} {}",
-                req.preset.empty() ? L"6" : req.preset, crf, outPix, sp);
-        }
-        else
-        {
-            const int crf = req.crf >= 0 ? req.crf : 18;
-            args += std::format(L"-c:v libx264 -preset {} {}-pix_fmt {} -x264-params chromaloc=0 ",
-                req.preset.empty() ? L"medium" : req.preset,
-                req.lossless ? L"-qp 0 " : std::format(L"-crf {} ", crf), outPix);
-        }
-        args += colourTags + L" ";
-        if (isMp4) args += L"-movflags +faststart ";
-        args += Quote(req.outputPath);
-        r.commandLine = Quote(r.ffmpegPath) + L" " + args;
+        FfmpegEncodeSettings settings;
+        settings.codec = codec;
+        settings.width = r.width;
+        settings.height = r.height;
+        if (wantMetadata) settings.mastering = md;
+        settings.maxCll  = haveOverride ? *req.maxCll  : static_cast<uint32_t>(std::ceil(measuredCll));
+        settings.maxFall = haveOverride ? *req.maxFall : static_cast<uint32_t>(std::ceil(measuredFall));
+        const std::wstring args = BuildFfmpegArgs(req, settings);
+        r.commandLine = QuoteCommandArgument(r.ffmpegPath) + L" " + args;
 
         // ---- pass 2: render, convert, encode -------------------------------
         FfmpegProcess ff;

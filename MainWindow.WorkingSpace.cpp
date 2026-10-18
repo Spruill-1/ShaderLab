@@ -1,8 +1,5 @@
-// MainWindow partial (Phase 4 split): display-profile selection and the
-// per-frame Working Space node sync. All methods are members of
-// `winrt::ShaderLab::implementation::MainWindow` and share state via
-// MainWindow.xaml.h. Extracted from MainWindow.xaml.cpp lines 1102-1370
-// at commit c177770 (Phase 3 + earlier health phases).
+// MainWindow partial: display-profile selection and the per-frame Working
+// Space node sync.
 
 #include "pch.h"
 #include "MainWindow.xaml.h"
@@ -12,6 +9,21 @@
 
 namespace winrt::ShaderLab::implementation
 {
+    namespace
+    {
+        // Display-profile selector item tags: a preset's index into
+        // m_displayPresets, or one of these.
+        constexpr int32_t cProfileTagCurrent = -1;
+        constexpr int32_t cProfileTagLoad    = -2;
+        constexpr int32_t cProfileTagIcc     = -3;
+        constexpr int32_t cProfileTagNone    = -4;   // an item without a tag
+
+        int32_t ProfileTag(winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem const& item)
+        {
+            return winrt::unbox_value_or<int32_t>(item.Tag(), cProfileTagNone);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Display profile selection
     // -----------------------------------------------------------------------
@@ -25,7 +37,7 @@ namespace winrt::ShaderLab::implementation
         // "Current Monitor" item.
         auto currentItem = winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem();
         currentItem.Content(winrt::box_value(L"Current Monitor"));
-        currentItem.Tag(winrt::box_value(L"current"));
+        currentItem.Tag(winrt::box_value(cProfileTagCurrent));
         selector.Items().Append(currentItem);
 
         // Preset items.
@@ -34,14 +46,14 @@ namespace winrt::ShaderLab::implementation
         {
             auto item = winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem();
             item.Content(winrt::box_value(winrt::hstring(m_displayPresets[i].profileName)));
-            item.Tag(winrt::box_value(L"preset:" + std::to_wstring(i)));
+            item.Tag(winrt::box_value(static_cast<int32_t>(i)));
             selector.Items().Append(item);
         }
 
         // "Load ICC Profile..." action item.
         auto loadItem = winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem();
         loadItem.Content(winrt::box_value(L"Load ICC Profile\u2026"));
-        loadItem.Tag(winrt::box_value(L"load"));
+        loadItem.Tag(winrt::box_value(cProfileTagLoad));
         selector.Items().Append(loadItem);
 
         selector.SelectedIndex(0);
@@ -51,10 +63,9 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::ApplyDisplayProfile(const ::ShaderLab::Rendering::DisplayProfile& profile)
     {
-        // Fires the display-change callback synchronously, which sets
-        // m_displayCapsDirty + m_forceRender; the render worker (the only
-        // graph writer) MarkAllDirty()s and re-syncs Working Space nodes
-        // on its next tick. Only the status bar needs a direct poke.
+        // The render worker (the only graph writer) re-syncs Working Space
+        // nodes from the active profile on its next tick; only the status
+        // bar needs a direct poke.
         m_displayMonitor.SetSimulatedProfile(profile);
         UpdateStatusBar();
     }
@@ -67,10 +78,8 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::UpdateWorkingSpaceNodes()
     {
-        // Engine-side helper does the actual work; we just propagate the
-        // m_forceRender side effect when something changed so the render
-        // tick picks up the dirty Working Space nodes next frame.
-        if (::ShaderLab::Rendering::UpdateWorkingSpaceNodes(m_graph, m_displayMonitor))
+        // A changed node forces a frame so its consumers re-render.
+        if (::ShaderLab::Rendering::UpdateWorkingSpaceNodes(Model(), m_displayMonitor.ActiveProfile()))
             m_forceRender = true;
     }
 
@@ -84,25 +93,21 @@ namespace winrt::ShaderLab::implementation
         auto selected = selector.SelectedItem();
         if (!selected) return;
 
-        auto item = selected.as<winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem>();
-        auto tag = winrt::unbox_value<winrt::hstring>(item.Tag());
-
-        if (tag == L"current")
+        const int32_t tag = ProfileTag(selected.as<winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem>());
+        if (tag == cProfileTagCurrent)
         {
             RevertToLiveDisplay();
             m_committedProfileIndex = selector.SelectedIndex();
         }
-        else if (tag.size() > 7 && tag.c_str()[0] == L'p') // "preset:N"
+        else if (tag >= 0)
         {
-            auto indexStr = std::wstring(tag.c_str() + 7);
-            size_t presetIdx = static_cast<size_t>(std::stoul(indexStr));
-            if (presetIdx < m_displayPresets.size())
+            if (static_cast<size_t>(tag) < m_displayPresets.size())
             {
-                ApplyDisplayProfile(m_displayPresets[presetIdx]);
+                ApplyDisplayProfile(m_displayPresets[static_cast<size_t>(tag)]);
                 m_committedProfileIndex = selector.SelectedIndex();
             }
         }
-        else if (tag == L"icc")
+        else if (tag == cProfileTagIcc)
         {
             if (m_loadedIccProfile.has_value())
             {
@@ -110,7 +115,7 @@ namespace winrt::ShaderLab::implementation
                 m_committedProfileIndex = selector.SelectedIndex();
             }
         }
-        else if (tag == L"load")
+        else if (tag == cProfileTagLoad)
         {
             LoadIccProfileAsync();
         }
@@ -162,8 +167,7 @@ namespace winrt::ShaderLab::implementation
         if (loadIdx > 0)
         {
             auto prevItem = selector.Items().GetAt(loadIdx - 1).as<winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem>();
-            auto prevTag = winrt::unbox_value<winrt::hstring>(prevItem.Tag());
-            if (prevTag == L"icc")
+            if (ProfileTag(prevItem) == cProfileTagIcc)
             {
                 selector.Items().RemoveAt(loadIdx - 1);
                 loadIdx--;
@@ -173,7 +177,7 @@ namespace winrt::ShaderLab::implementation
         // Insert the new ICC item before the "Load..." sentinel.
         auto iccItem = winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem();
         iccItem.Content(winrt::box_value(winrt::hstring(profile.profileName)));
-        iccItem.Tag(winrt::box_value(L"icc"));
+        iccItem.Tag(winrt::box_value(cProfileTagIcc));
         selector.Items().InsertAt(loadIdx, iccItem);
 
         // Select the newly inserted item.

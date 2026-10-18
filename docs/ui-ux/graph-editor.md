@@ -7,7 +7,11 @@
 
 ## Removing edges (Alt+click)
 
-- **Alt + Left-click** on any edge — image edge or orange data-binding edge — removes it. Hit-testing is done by sampling the cubic bezier with a small distance tolerance (`Controls/NodeGraphController.cpp::HitTestEdge`). The same path also handles right-click delete in the canvas context menu.
+- **Alt + Left-click** on any edge — image edge or orange data-binding edge — removes it. Hit-testing is done by sampling the cubic bezier with a small distance tolerance (`Controls/NodeGraphController.cpp::HitTestEdge`). Paint and hit-testing share one definition of a data edge (`ForEachDataEdge`) and of its curve (`EdgeCurve`). Removing a data edge calls `GraphModel::UnbindPropertySource`. The same path also handles right-click delete in the canvas context menu.
+
+## Inline sliders and play
+
+- A parameter node's slider maps the pointer to 0..1 and calls `Graph::SetParameterNormalized` (range from the node's `Min` / `Max` properties, else the declared `Value` range, snapped to its step); a Clock's slider calls `Graph::SeekClock`. The play button calls `Graph::SetClockPlaying`, which rewinds a finished non-looping clock, as MCP's `isPlaying` does.
 
 ## Copy / Paste
 

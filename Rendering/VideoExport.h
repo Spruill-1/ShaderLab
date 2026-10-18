@@ -4,9 +4,9 @@
 //
 // The graph is stepped on a FIXED timeline -- frame n renders with every Clock
 // at start + n / fps -- so a frame that takes 200 ms to render is exactly as
-// correct as one that takes 2 ms. Wall time plays no part. Each frame runs the
-// full evaluation shape every host uses (Evaluate outside the draw session,
-// ProcessDeferredCompute + the frozen sweep inside it) with every node dirty.
+// correct as one that takes 2 ms. Wall time plays no part. Each frame sets the
+// clocks with Graph::SetClocksToTime and runs one FrameExecutor frame with every
+// node dirty.
 //
 // Colour conversion is ours, on the GPU, not ffmpeg's: the node's scRGB FP16
 // output becomes limited-range 4:2:0 -- p010le (HDR10: BT.2020 primaries, PQ in
@@ -21,9 +21,9 @@
 // metadata costs a first render-only pass. Rendering is deterministic, and the
 // second pass re-measures and reports any disagreement.
 //
-// Host-agnostic; headless exposes it as --video and the /render/video route.
+// Host-agnostic. Headless exposes it as --video and registers the
+// /render/video route (Mcp::RegisterVideoExportRoute); the GUI does not.
 
-#include "../EngineExport.h"
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -33,13 +33,11 @@ struct ID2D1DeviceContext;
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 
-namespace ShaderLab::Graph { class EffectGraph; }
-namespace ShaderLab::Effects { class SourceNodeFactory; }
+namespace ShaderLab::Graph { class GraphModel; }
 
 namespace ShaderLab::Rendering
 {
     class GraphEvaluator;
-    class DisplayMonitor;
 
     enum class VideoFormat { Hdr10, Sdr };
     // Default: HEVC for both formats' 10/8-bit variants except SDR, which
@@ -95,28 +93,59 @@ namespace ShaderLab::Rendering
 
     // Resolve ffmpeg: an explicit path must exist; otherwise search PATH.
     // Returns empty and fills `error` with instructions when neither works.
-    SHADERLAB_API std::wstring FindFfmpeg(const std::wstring& explicitPath, std::wstring& error);
-
-    // Set every Clock node to the given export-timeline time (seconds),
-    // applying the node's own Speed / Loop / Start / Stop exactly as the live
-    // tick would after that much playback. Returns the number of clocks set.
-    SHADERLAB_API uint32_t SetClocksToTime(Graph::EffectGraph& graph, double seconds);
-
-    // The span one pass of the longest Clock takes at its Speed, in seconds;
-    // 0 when the graph has no Clock with a non-zero speed.
-    SHADERLAB_API double LongestClockDuration(const Graph::EffectGraph& graph);
+    std::wstring FindFfmpeg(const std::wstring& explicitPath, std::wstring& error);
 
     // The conversion math as HLSL functions (VideoEncodeHdr10 / VideoEncodeSdr
     // / VideoChromaHdr10 / VideoChromaSdr), without the kernel -- exposed so
     // the shader test bench can check them against reference values.
-    SHADERLAB_API const std::string& VideoConvertHelpersHLSL();
+    const std::string& VideoConvertHelpersHLSL();
 
-    SHADERLAB_API VideoExportResult ExportVideo(
+    // Sets request.format, codec and mastering from their --video / MCP
+    // spellings (hdr10|sdr, hevc|h265|av1|h264|avc, p3-1000|working-space|none;
+    // empty picks the default). False, with `error` naming the valid values,
+    // for anything else.
+    bool ParseVideoOptions(const std::wstring& format, const std::wstring& codec,
+                                         const std::wstring& mastering, VideoExportRequest& request,
+                                         std::wstring& error);
+
+    // The codec an export encodes with: Default is HEVC for HDR10 and H.264
+    // for SDR. `error` says why the request's combination is refused.
+    VideoCodec ResolveVideoCodec(const VideoExportRequest& request, std::wstring& error);
+    // ffmpeg's encoder for a codec: libx265, libsvtav1 or libx264.
+    const wchar_t* EncoderName(VideoCodec codec);
+
+    // An HDR10 mastering display: CIE xy primaries and white point, and its
+    // luminance range in nits.
+    struct MasteringDisplay
+    {
+        float rx, ry, gx, gy, bx, by, wx, wy, maxNits, minNits;
+    };
+    // P3-D65 at 1000 / 0.005 nits (MasteringMode::P3D65_1000).
+    constexpr MasteringDisplay DefaultMasteringDisplay()
+    {
+        return { 0.680f, 0.320f, 0.265f, 0.690f, 0.150f, 0.060f, 0.3127f, 0.3290f, 1000.0f, 0.005f };
+    }
+
+    // What the encode needs beyond the request.
+    struct FfmpegEncodeSettings
+    {
+        VideoCodec codec{ VideoCodec::Hevc };   // resolved (ResolveVideoCodec)
+        uint32_t width{ 0 };
+        uint32_t height{ 0 };
+        std::optional<MasteringDisplay> mastering;   // unset: no static metadata
+        uint32_t maxCll{ 0 };
+        uint32_t maxFall{ 0 };
+    };
+
+    // ffmpeg's arguments, without the executable, for encoding raw p010le /
+    // nv12 frames from stdin into request.outputPath.
+    std::wstring BuildFfmpegArgs(const VideoExportRequest& request,
+                                               const FfmpegEncodeSettings& settings);
+
+    VideoExportResult ExportVideo(
         const VideoExportRequest& request,
-        Graph::EffectGraph& graph,
+        Graph::GraphModel& graph,
         GraphEvaluator& evaluator,
-        Effects::SourceNodeFactory& sourceFactory,
-        DisplayMonitor* displayMonitor,
         ID2D1DeviceContext* dc,
         ID3D11Device* device,
         ID3D11DeviceContext* immediateContext);

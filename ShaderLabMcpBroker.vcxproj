@@ -64,11 +64,10 @@
     <IntDir>$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabMcpBroker\obj\</IntDir>
   </PropertyGroup>
   <!--
-    Deliberately NOT referencing / linking ShaderLabEngine: the hub must
+    Deliberately NOT referencing / linking EffectGraph's engine: the hub must
     start in milliseconds and never touches a GPU. The Step 4 MCP modules
     it needs (frame codec, crypto, peer identity) are compiled directly
-    into this exe; SHADERLAB_ENGINE_EXPORTS keeps their SHADERLAB_API
-    annotations as (harmless) exports instead of unresolved dllimports.
+    into this exe.
   -->
   <ItemDefinitionGroup>
     <ClCompile>
@@ -79,7 +78,7 @@
       <WarningLevel>Level4</WarningLevel>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <PreprocessorDefinitions>SHADERLAB_ENGINE_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <DisableSpecificWarnings>4251;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <AdditionalOptions>%(AdditionalOptions) /bigobj /utf-8</AdditionalOptions>
     </ClCompile>
@@ -103,25 +102,33 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="EngineExport.h" />
-    <ClInclude Include="pch_engine.h" />
-    <ClInclude Include="Engine\Mcp\McpFrame.h" />
-    <ClInclude Include="Engine\Mcp\McpCrypto.h" />
-    <ClInclude Include="Engine\Mcp\McpPeerIdentity.h" />
-    <ClInclude Include="Engine\Mcp\McpChannel.h" />
-    <ClInclude Include="Engine\Mcp\McpTypes.h" />
+    <ClInclude Include="Mcp\McpFrame.h" />
+    <ClInclude Include="Mcp\McpCrypto.h" />
+    <ClInclude Include="Mcp\McpPeerIdentity.h" />
+    <ClInclude Include="Mcp\McpChannel.h" />
+    <ClInclude Include="Mcp\McpTypes.h" />
+    <ClInclude Include="ShaderLabMcpBroker\BrokerPipeIo.h" />
+    <ClInclude Include="ShaderLabMcpBroker\Hub.h" />
+    <ClInclude Include="ShaderLabMcpBroker\Shim.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="pch_engine.cpp">
+    <ClCompile Include="pch_host.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="Engine\Mcp\McpFrame.cpp" />
-    <ClCompile Include="Engine\Mcp\McpCrypto.cpp" />
-    <ClCompile Include="Engine\Mcp\McpPeerIdentity.cpp" />
-    <ClCompile Include="Engine\Mcp\McpChannel.cpp" />
+    <ClCompile Include="Mcp\McpFrame.cpp" />
+    <ClCompile Include="Mcp\McpCrypto.cpp" />
+    <ClCompile Include="Mcp\McpPeerIdentity.cpp" />
+    <ClCompile Include="Mcp\McpChannel.cpp" />
     <ClCompile Include="ShaderLabMcpBroker\Main.cpp" />
+    <ClCompile Include="ShaderLabMcpBroker\BrokerPipeIo.cpp" />
+    <ClCompile Include="ShaderLabMcpBroker\Hub.cpp" />
+    <ClCompile Include="ShaderLabMcpBroker\Shim.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <PropertyGroup>
+    <EffectGraphEngineHeadersOnly>true</EffectGraphEngineHeadersOnly>
+  </PropertyGroup>
+  <Import Project="build\EffectGraphEngine.targets" />
   <ImportGroup Label="ExtensionTargets">
     <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets')" />
     <Import Project="packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets" Condition="Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets')" />

@@ -4,27 +4,27 @@
 
 A WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging Direct2D shader effects with full HDR and wide color gamut support.
 
+Its engine — the effect graph, evaluator and built-in effects — is [EffectGraph](https://github.com/Spruill-1/EffectGraph), a separate repository that ShaderLab consumes as NuGet packages.
+
 ---
 
 ## Installing a Release Build
 
-Release builds ship as **unsigned MSIX packages** — no signing certificate needed, but Developer Mode must be on.
+Download the zip for your machine from the GitHub Releases page
+(`ShaderLab-<version>-x64.zip` for AMD64 / Intel, `ShaderLab-<version>-arm64.zip`
+for ARM64), extract it, and run `Install.ps1`. It installs the Microsoft
+packages ShaderLab depends on (VCLibs, Windows App Runtime) for your
+architecture, then ShaderLab. ShaderLab requires **Windows 11 22H2 (build 22621)
+or later**: the display pipeline uses WinRT `AdvancedColorInfo` through desktop
+interop, which first shipped there.
 
-1. Enable Developer Mode: *Settings → Privacy & security → For developers → Developer Mode*.
-2. Download the architecture-matched zip from the GitHub Releases page:
-   - `ShaderLab-<version>-x64.zip` for AMD64 / Intel
-   - `ShaderLab-<version>-arm64.zip` for ARM64 (Snapdragon X / Surface Pro)
-3. Extract and run `Install.ps1` **from an elevated PowerShell** (see the limitation below):
-   ```pwsh
-   .\Install.ps1
-   ```
-4. Launch ShaderLab from the Start menu.
-
-`Install.ps1` calls `Add-AppxPackage -AllowUnsigned`, which installs unsigned MSIX packages on systems with Developer Mode enabled. ShaderLab requires **Windows 11 22H2 (build 22621) or later** — the display pipeline uses WinRT `AdvancedColorInfo` via desktop interop, which first shipped there. The script installs the bundled dependency packages (Microsoft VCLibs, Windows App Runtime) for the host architecture first, then ShaderLab itself.
-
-> ⚠️ **Known limitation — admin is required (unsigned + full-trust).** ShaderLab is a full-trust packaged app: its main app and the background MCP **Hub** both declare `Windows.FullTrustApplication` (executable activations). Per [Microsoft's unsigned-package rules](https://learn.microsoft.com/windows/msix/package/unsigned-package), an unsigned package containing executable content can only be installed **for all users, which requires elevation** — a per-user, non-elevated `Add-AppxPackage -AllowUnsigned` fails with `0x80073D2B` ("an unsigned package cannot include Executable activations"). Run `Install.ps1` from an **elevated** PowerShell. A **signed** release would install per-user with no admin; signing the release with a real code-signing certificate is the cleaner long-term fix (tracked as a release-process gap).
-
-The release manifest carries the special OID `2.25.311729368913984317654407730594956997722=1` (Windows' "unsigned namespace") that allows `-AllowUnsigned`. The OID is injected by the release workflow only — the in-repo manifest stays plain `CN=ShaderLab` so signed F5 deploys keep working locally.
+A **signed** release installs per user, with no Developer Mode and no
+elevation. An **unsigned** one (a release made before signing was set up, or a
+fork's) needs Developer Mode (*Settings → Privacy & security → For developers*)
+and an elevated PowerShell: an unsigned full-trust package installs only for all
+users (`0x80073D2B` otherwise). `Install.ps1` reads the package's signature and
+takes the right path. How releases are built and signed:
+[releasing](docs/development/releasing.md).
 
 ---
 
@@ -38,11 +38,17 @@ git clone --recurse-submodules https://github.com/<owner>/ShaderLab.git
 
 On an existing clone: `git submodule update --init --recursive`.
 
-Then open `ShaderLab.slnx` and F5 (Debug | x64, startup project = `ShaderLab`) to deploy and launch the packaged app. NuGet restores automatically, and MSBuild auto-runs **`scripts/EnsureDevCert.ps1`** on first build to generate a self-signed `CN=ShaderLab` cert and import it into `TrustedPeople` for F5 deploy — the project ships without a code-signing certificate.
+The engine comes from EffectGraph's packages (`EffectGraph.Engine`, `EffectGraph.Native`) on nuget.org. Restore:
+
+```pwsh
+nuget restore ShaderLab.slnx -SolutionDirectory .
+```
+
+Then open `ShaderLab.slnx` and F5 (Debug | x64, startup project = `ShaderLab`) to deploy and launch the packaged app. MSBuild auto-runs **`scripts/EnsureDevCert.ps1`** on first build to generate a self-signed `CN=ShaderLab` cert and import it into `TrustedPeople` for F5 deploy — the project ships without a code-signing certificate.
 
 If the submodules are missing, the build stops with an actionable error rather than a cascade of missing-header failures.
 
-See [docs/development/build.md](docs/development/build.md) for full prerequisites, configurations, and the dependency map.
+See [docs/development/build.md](docs/development/build.md) for full prerequisites, configurations, building against an EffectGraph checkout, and the dependency map.
 
 ---
 
@@ -52,12 +58,13 @@ The deep technical reference lives under [docs/](docs/README.md), organized by a
 
 | Area | Highlights |
 |---|---|
-| [Architecture](docs/README.md#architecture) | System overview, threading model (UI thread + render worker), pipeline format, effect graph model, D2D/D3D11 hybrid compute, engine/host split |
-| [Effects](docs/README.md#effects) | Built-in catalog, Effect Designer, parameter / numeric / property-binding mechanics, working space |
+| [Architecture](docs/README.md#architecture) | System overview, threading model (UI thread + render worker), engine/host split |
+| [Effects](docs/README.md#effects) | Effect Designer, Numeric Expression node |
 | [UI / UX](docs/README.md#ui--ux) | Graph editor, multi-output windows, animation, conditional parameter visibility |
 | [Hosts](docs/README.md#hosts) | ShaderLabHeadless console host, MCP server for AI agent integration |
 | [Development](docs/README.md#development) | Build instructions, project structure |
 | [History](docs/README.md#history) | Decision log (architectural choices with rationale) |
+| [EffectGraph](docs/README.md#effectgraph-engine--in-its-own-repository) | The engine's docs, in its repository: pipeline format, graph model, evaluation, hybrid compute, built-in catalog, bindings |
 
 [`CHANGELOG.md`](CHANGELOG.md) tracks every release. The [decision log](docs/history/decision-log.md) tracks architectural choices independently of release boundaries.
 
@@ -74,7 +81,7 @@ Core capabilities:
 - **Analysis viewers** (Luminance / Channel / Chromaticity Statistics, CIE Histogram + Plot, Gamut Coverage, Luminance Heatmap, etc.) — all share the same compute-bridge architecture and route their outputs as SRVs to downstream consumers when possible.
 - **Tone-mapping suite** (D2D `HDR Tone Map`, ICtCp Tone Map, ICtCp Inverse Tone Map, ICtCp Gamut Map, etc.) operating in scRGB FP16 with PQ / HLG / sRGB transfer functions.
 - **HDR / WCG aware** — event-driven display tracking (WinRT `AdvancedColorInfoChanged`: HDR toggles, the Windows SDR-brightness slider, monitor moves), ICC profile parsing, monitor primaries piped into Custom-gamut analysis effects via the Working Space node.
-- **MCP integration** (stdio, via a broker: shim → hub → per-window sessions) + **headless host** for AI-agent and CI use; the MCP route layer lives in `ShaderLabEngine.dll` so headless and GUI hosts share the route implementations.
+- **MCP integration** (stdio, via a broker: shim → hub → per-window sessions) + **headless host** for AI-agent and CI use; the MCP route layer lives in ShaderLab's support library so headless and GUI hosts share the route implementations.
 
 Build: Visual Studio 2022 17.8+, Windows 10 SDK 10.0.26100+, C++/WinRT only (no C#). Runtime: Windows 11 22H2 (10.0.22621)+.
 
@@ -82,4 +89,4 @@ Build: Visual Studio 2022 17.8+, Windows 10 SDK 10.0.26100+, C++/WinRT only (no 
 
 ## License & Contact
 
-See [LICENSE](LICENSE) for the project license and the GitHub repository for issues / PRs.
+ShaderLab is MIT ([LICENSE](LICENSE)). The EffectGraph engine and its packages are MIT-0 ([its LICENSE](https://github.com/Spruill-1/EffectGraph/blob/main/LICENSE)). Third-party code in ShaderLab's programs: [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt). Issues and PRs on the GitHub repository.

@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "OutputWindow.h"
+#include "Rendering/ImageCapture.h"
 
 #include <microsoft.ui.xaml.media.dxinterop.h>
 #include <winrt/Microsoft.UI.Windowing.h>
@@ -21,15 +22,12 @@ namespace ShaderLab::Controls
         const Rendering::PipelineFormat& format)
     {
         m_d3dDevice = d3dDevice;
-        m_dc = dc;
+        m_saveDc.copy_from(dc);
         m_dxgiFactory = dxgiFactory;
         m_nodeId = nodeId;
         m_format = format;
 
-        // P7: create the cross-thread sink. Render worker pushes-ref via
-        // MainWindow::m_outputSinks; UI thread mutates view state under
-        // m_sink->viewMutex. The shared_ptr keeps it alive across thread
-        // boundaries even if the UI thread closes the window mid-render.
+        // Shared with the render worker through MainWindow::m_outputSinks.
         m_sink = std::make_shared<OutputSinkRenderState>();
         m_sink->nodeId = nodeId;
 
@@ -148,12 +146,8 @@ namespace ShaderLab::Controls
                 }
             });
 
-            // Double-click to fit.
-            m_panel.DoubleTapped([this](auto&&, auto&&)
-            {
-                m_needsFit = true;
-                m_autoFit = true;
-            });
+            // Double-click turns auto-fit back on.
+            m_panel.DoubleTapped([this](auto&&, auto&&) { m_autoFit = true; });
 
             // Wait for panel Loaded before creating DXGI resources.
             m_panel.Loaded([this](auto&&, auto&&)
@@ -167,19 +161,6 @@ namespace ShaderLab::Controls
                     if (m_width > 0 && m_height > 0)
                     {
                         CreateSwapChain();
-                    }
-
-                    // P7: push initial size into the sink so the worker can
-                    // create offscreen buffers immediately. Without this the
-                    // worker waits one UI tick for SyncSinkFromUi to push
-                    // the size and the first frame would render as black.
-                    if (m_sink)
-                    {
-                        std::scoped_lock lock(m_sink->viewMutex);
-                        m_sink->requestedW = m_width;
-                        m_sink->requestedH = m_height;
-                        m_sink->compositionScale =
-                            static_cast<float>(m_panel.CompositionScaleX());
                     }
 
                     m_sizeChangedToken = m_panel.SizeChanged(
@@ -206,11 +187,8 @@ namespace ShaderLab::Controls
     void OutputWindow::Close()
     {
         m_isOpen = false;
-        // P7: signal to the render worker that this sink is gone. Worker
-        // checks `closed` under viewMutex before rendering and skips. UI
-        // side keeps the shared_ptr alive long enough that any in-flight
-        // render-thread iteration can finish accessing the buffers without
-        // a use-after-free.
+        // The worker skips a closed sink; one it is drawing stays alive
+        // through its own reference.
         if (m_sink)
         {
             std::scoped_lock lock(m_sink->viewMutex);
@@ -319,11 +297,8 @@ namespace ShaderLab::Controls
     // A SwapChainPanel composes its swap chain in DIPs. The buffer here is
     // sized in PHYSICAL pixels (ActualSize * CompositionScale) so the image is
     // sharp -- which means that without the inverse matrix the panel magnifies
-    // it by the display scale, anchored at the top-left. At 150% that showed
-    // the top-left two thirds of a correctly fitted image (measured: a 34 px
-    // letterbox landing at 50 px, the bottom pushed under the status bar).
-    // Invisible at 100% scaling. MainWindow::UpdateGraphPanelScale does the
-    // same for the node-graph panel.
+    // it by the display scale, anchored at the top-left (invisible at 100%).
+    // MainWindow::UpdateGraphPanelScale does the same for the node-graph panel.
     void OutputWindow::ApplyInverseCompositionScale()
     {
         if (!m_swapChain || !m_panel) return;
@@ -365,8 +340,14 @@ namespace ShaderLab::Controls
 
     winrt::fire_and_forget OutputWindow::SaveImageAsync()
     {
-        if (!m_dc || !m_lastImage || !m_window)
+        if (!m_saveDc || !m_lastImage || !m_window)
             co_return;
+
+        // The picker suspends this coroutine: hold the image and context, and
+        // check the window still exists before touching members again.
+        const auto dcHold = m_saveDc;
+        winrt::com_ptr<ID2D1Image> imageHold = m_lastImage;
+        std::weak_ptr<bool> alive = m_alive;
 
         // Get HWND for the file picker.
         HWND hwnd{ nullptr };
@@ -388,106 +369,37 @@ namespace ShaderLab::Controls
         picker.FileTypeChoices().Insert(L"PNG Image (SDR)", winrt::single_threaded_vector<winrt::hstring>({ L".png" }));
 
         auto file = co_await picker.PickSaveFileAsync();
-        if (!file) co_return;
+        if (!file || alive.expired()) co_return;
 
-        auto* dc = m_dc;
-        auto* image = m_lastImage;
-        if (!dc || !image) co_return;
+        auto* dc = dcHold.get();
+        auto* image = imageHold.get();
 
         try
         {
-            float oldDpiX, oldDpiY;
-            dc->GetDpi(&oldDpiX, &oldDpiY);
-            dc->SetDpi(96.0f, 96.0f);
-            dc->SetTransform(D2D1::Matrix3x2F::Identity());
-
-            D2D1_RECT_F bounds{};
-            dc->GetImageLocalBounds(image, &bounds);
-            uint32_t w = static_cast<uint32_t>(bounds.right - bounds.left);
-            uint32_t h = static_cast<uint32_t>(bounds.bottom - bounds.top);
-            dc->SetDpi(oldDpiX, oldDpiY);
-            if (w == 0 || h == 0) co_return;
-
-            auto fileExt = std::wstring(file.FileType().c_str());
-            bool isJxr = (fileExt == L".jxr" || fileExt == L".wdp");
-
+            const std::wstring fileExt(file.FileType());
+            const bool isJxr = (fileExt == L".jxr" || fileExt == L".wdp");
             // PNG uses the _SRGB variant: encode the linear scene on
             // write (plain UNORM wrote linear bytes -> dark in viewers).
             // JXR stays FP16 linear scRGB.
-            DXGI_FORMAT renderFormat = isJxr
+            const DXGI_FORMAT renderFormat = isJxr
                 ? DXGI_FORMAT_R16G16B16A16_FLOAT
                 : DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 
-            winrt::com_ptr<ID2D1Bitmap1> renderBitmap;
-            D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_TARGET,
-                D2D1::PixelFormat(renderFormat, D2D1_ALPHA_MODE_PREMULTIPLIED));
-            dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bmpProps, renderBitmap.put());
+            D2D1_RECT_F bounds{};
+            winrt::check_hresult(Rendering::GetImageBounds96Dpi(dc, image, bounds));
+            const uint32_t w = static_cast<uint32_t>((std::max)(0.0f, bounds.right - bounds.left));
+            const uint32_t h = static_cast<uint32_t>((std::max)(0.0f, bounds.bottom - bounds.top));
+            if (w == 0 || h == 0) co_return;
 
-            winrt::com_ptr<ID2D1Image> oldTarget;
-            dc->GetTarget(oldTarget.put());
-            dc->SetTarget(renderBitmap.get());
-            dc->BeginDraw();
-            dc->Clear(D2D1::ColorF(0, 0, 0, 1.0f));
-            dc->SetTransform(D2D1::Matrix3x2F::Identity());
-            dc->DrawImage(image);
-            dc->EndDraw();
-            dc->SetTarget(oldTarget.get());
-
-            winrt::com_ptr<IWICImagingFactory> wicFactory;
-            winrt::check_hresult(CoCreateInstance(
-                CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                IID_PPV_ARGS(wicFactory.put())));
-
-            auto filePath = std::wstring(file.Path().c_str());
-            GUID containerFormat = isJxr ? GUID_ContainerFormatWmp : GUID_ContainerFormatPng;
-
-            winrt::com_ptr<IWICStream> stream;
-            winrt::check_hresult(wicFactory->CreateStream(stream.put()));
-            winrt::check_hresult(stream->InitializeFromFilename(filePath.c_str(), GENERIC_WRITE));
-
-            winrt::com_ptr<IWICBitmapEncoder> encoder;
-            winrt::check_hresult(wicFactory->CreateEncoder(containerFormat, nullptr, encoder.put()));
-            winrt::check_hresult(encoder->Initialize(stream.get(), WICBitmapEncoderNoCache));
-
-            winrt::com_ptr<IWICBitmapFrameEncode> frame;
-            winrt::com_ptr<IPropertyBag2> encoderOptions;
-            winrt::check_hresult(encoder->CreateNewFrame(frame.put(), encoderOptions.put()));
-
-            if (isJxr && encoderOptions)
-            {
-                PROPBAG2 option{};
-                option.pstrName = const_cast<LPOLESTR>(L"Lossless");
-                VARIANT val{};
-                val.vt = VT_BOOL;
-                val.boolVal = VARIANT_TRUE;
-                encoderOptions->Write(1, &option, &val);
-            }
-
-            winrt::check_hresult(frame->Initialize(encoderOptions.get()));
-            winrt::check_hresult(frame->SetSize(w, h));
-
-            WICPixelFormatGUID pixelFormat = isJxr
-                ? GUID_WICPixelFormat64bppRGBAHalf
-                : GUID_WICPixelFormat32bppBGRA;
-            winrt::check_hresult(frame->SetPixelFormat(&pixelFormat));
-
-            winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
-            D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                D2D1::PixelFormat(renderFormat, D2D1_ALPHA_MODE_PREMULTIPLIED));
-            dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, cpuProps, cpuBitmap.put());
-            D2D1_POINT_2U destPoint = { 0, 0 };
-            D2D1_RECT_U srcRect = { 0, 0, w, h };
-            cpuBitmap->CopyFromBitmap(&destPoint, renderBitmap.get(), &srcRect);
-
-            D2D1_MAPPED_RECT mapped{};
-            winrt::check_hresult(cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped));
-            winrt::check_hresult(frame->WritePixels(h, mapped.pitch, mapped.pitch * h, mapped.bits));
-            cpuBitmap->Unmap();
-
-            winrt::check_hresult(frame->Commit());
-            winrt::check_hresult(encoder->Commit());
+            Rendering::PixelBuffer pixels;
+            winrt::check_hresult(Rendering::RenderToPixels(dc, w, h, renderFormat, D2D1::ColorF(0, 0, 0, 1.0f),
+                [&](ID2D1DeviceContext* target)
+                {
+                    target->SetTransform(D2D1::Matrix3x2F::Translation(-bounds.left, -bounds.top));
+                    target->DrawImage(image);
+                },
+                pixels));
+            winrt::check_hresult(Rendering::EncodeToFile(pixels, std::wstring(file.Path())));
 
             if (m_fpsText)
                 m_fpsText.Text(L"Saved: " + file.Name());
@@ -511,30 +423,8 @@ namespace ShaderLab::Controls
     }
 
     // -----------------------------------------------------------------------
-    // P7: cross-thread output rendering
+    // Presenting the worker's frames
     // -----------------------------------------------------------------------
-
-    void OutputWindow::SyncSinkFromUi()
-    {
-        // UI thread. Push the current view state into the sink so the render
-        // thread sees a coherent snapshot when it draws into this window's
-        // offscreen pair. Called once per UI tick before BlitAndPresent.
-        if (!m_sink) return;
-        std::scoped_lock lock(m_sink->viewMutex);
-        m_sink->requestedW = m_width;
-        m_sink->requestedH = m_height;
-        m_sink->compositionScale = m_panel
-            ? static_cast<float>(m_panel.CompositionScaleX())
-            : 1.0f;
-        m_sink->panX       = m_panX;
-        m_sink->panY       = m_panY;
-        m_sink->zoom       = m_zoom;
-        m_sink->autoFit    = m_autoFit;
-        m_sink->needsFit   = m_needsFit;
-        // m_needsFit is one-shot: clear it on UI side after publishing so
-        // the render thread only fits once per request.
-        m_needsFit         = false;
-    }
 
     void OutputWindow::BlitAndPresent(ID2D1DeviceContext5* uiDc)
     {
@@ -544,13 +434,8 @@ namespace ShaderLab::Controls
         // transform, then Present1.
         if (!m_isOpen || !m_swapChain || !uiDc || !m_sink) return;
 
-        // Refresh m_width/m_height from the current panel state. The
-        // SizeChanged handler is hooked at the END of the panel's Loaded
-        // callback, so layout passes that happen between window activation
-        // and handler attachment are missed -- the swap chain stays at the
-        // initial Loaded-time size forever, even though the panel actually
-        // sits at a different layout size. Rechecking here every tick is
-        // cheap and lets us catch any missed resize.
+        // Re-read the panel size: SizeChanged is hooked only at the end of
+        // the panel's Loaded handler, so layout passes before that are missed.
         if (m_panel)
         {
             try
@@ -565,7 +450,6 @@ namespace ShaderLab::Controls
                     m_width = w;
                     m_height = h;
                     m_needsResize = true;
-                    m_needsFit = true;
                 }
             }
             catch (...)
@@ -576,18 +460,10 @@ namespace ShaderLab::Controls
             }
         }
 
-        // Handle pending swap-chain resize before consuming a frame.
-        //
-        // ResizeBuffers fails while ANY reference to a back buffer is alive
-        // (a D2D bitmap wrapping it, a context whose target it is). Until this
-        // was fixed a leftover wrapper from the pre-P7 Present path pinned
-        // buffer 0, so every resize failed -- and because the flag was
-        // cleared BEFORE the call, the failure was consumed: the swap chain
-        // stayed at its creation size for the life of the window while the
-        // fit math used the new panel size, clipping the image and stretching
-        // an undersized buffer. The per-blit wrapper below is released (and
-        // the target cleared) before we return, so nothing pins it now; a
-        // failure stays pending and is logged instead of being swallowed.
+        // Resize before consuming a frame. ResizeBuffers fails while anything
+        // references a back buffer, so the per-blit wrapper below is released
+        // (and the target cleared) before returning; a failed resize stays
+        // pending and is retried.
         if (m_needsResize)
         {
             if (m_width > 0 && m_height > 0)
@@ -612,44 +488,36 @@ namespace ShaderLab::Controls
             ApplyInverseCompositionScale();
         }
 
-        const int32_t idx = m_sink->publishedIdx.load(std::memory_order_acquire);
-        if (idx < 0 || idx > 1) return;
+        // One load: the buffer set, index and version belong together.
+        const auto frame = m_sink->published.load(std::memory_order_acquire);
+        if (!frame || !frame->buffers) return;
 
-        // Lazy rebuild of UI-side source wrappers when bufferGen changes
-        // (size change). Wrappers must be created on the UI D2D context.
-        const uint64_t bufGen = m_sink->bufferGen.load(std::memory_order_acquire);
-        if (bufGen != m_sink->uiObservedGen ||
-            !m_sink->uiSources[0] || !m_sink->uiSources[1])
+        // Source bitmaps on the UI context, rebuilt when the worker
+        // reallocates (a resize); the frame's shared_ptr keeps its buffer set
+        // alive however far the worker has moved on.
+        if (frame->buffers != m_sink->uiBuffers)
         {
-            const auto& fmt = m_format;
-            D2D1_BITMAP_PROPERTIES1 sp = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_NONE,
-                D2D1::PixelFormat(fmt.dxgiFormat, D2D1_ALPHA_MODE_PREMULTIPLIED),
-                96.0f, 96.0f);
+            const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE,
+                D2D1::PixelFormat(m_format.dxgiFormat, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
             for (uint32_t i = 0; i < 2; ++i)
             {
                 m_sink->uiSources[i] = nullptr;
-                if (!m_sink->textures[i]) continue;
                 winrt::com_ptr<IDXGISurface> surface;
-                if (SUCCEEDED(m_sink->textures[i]->QueryInterface(
-                        IID_PPV_ARGS(surface.put()))))
-                {
-                    uiDc->CreateBitmapFromDxgiSurface(
-                            surface.get(), sp, m_sink->uiSources[i].put());
-                }
+                if (frame->buffers->textures[i] &&
+                    SUCCEEDED(frame->buffers->textures[i]->QueryInterface(IID_PPV_ARGS(surface.put()))))
+                    uiDc->CreateBitmapFromDxgiSurface(surface.get(), props, m_sink->uiSources[i].put());
             }
-            m_sink->uiObservedGen = bufGen;
-            // First frame after resize / first paint -- recompute fit so
-            // the image is centered in the new panel size.
+            m_sink->uiBuffers = frame->buffers;
+            // A new size: fit it to the panel.
             m_needsFit = true;
         }
 
-        auto* sourceBitmap = m_sink->uiSources[idx].get();
+        auto* sourceBitmap = m_sink->uiSources[frame->index].get();
         if (!sourceBitmap) return;
 
         // Nothing new to show? A fit still pending counts as new (it changes
         // the view below), as does any resize, DPI or pan/zoom change.
-        const uint64_t version = m_sink->publishedVersion.load(std::memory_order_acquire);
+        const uint64_t version = frame->version;
         const PresentedView view{ m_width, m_height,
             m_panel ? static_cast<float>(m_panel.CompositionScaleX()) : 1.0f,
             m_zoom, m_panX, m_panY };
@@ -658,12 +526,8 @@ namespace ShaderLab::Controls
         if (version == m_lastBlittedVersion && view == m_lastPresentedView && !m_needsFit)
             return;
 
-        // Cache for SaveImageAsync. The source bitmap wraps the worker's
-        // offscreen texture; the wrapper lifetime is governed by uiSources
-        // (rebuilt on bufferGen change). Storing a raw pointer here is safe
-        // for the duration of this BlitAndPresent and the subsequent UI
-        // tick where Save is most likely to fire.
-        m_lastImage = sourceBitmap;
+        // Saved by SaveImageAsync, which holds its own reference.
+        m_lastImage.copy_from(sourceBitmap);
 
         winrt::com_ptr<IDXGISurface> backBuffer;
         HRESULT hr = m_swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.put()));

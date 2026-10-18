@@ -1,12 +1,10 @@
-// MainWindow partial (Phase 4 split): graph save/load + embedded-media
-// archive + heartbeat / stale-temp-dir reaper. All methods are members
-// of `winrt::ShaderLab::implementation::MainWindow`. Extracted from
-// MainWindow.xaml.cpp at commit c177770 (Phase 3 + earlier health phases).
+// MainWindow partial: graph save/load, the embedded-media archive, and the
+// heartbeat and stale-temp-dir reaper.
 
 #include "pch.h"
 #include "MainWindow.xaml.h"
 
-#include "Rendering/EffectGraphFile.h"
+#include "Support/EffectGraphFile.h"
 #include "Effects/ShaderLabEffects.h"
 #include "Effects/BytecodeCache.h"
 #include "Version.h"
@@ -80,11 +78,11 @@ namespace winrt::ShaderLab::implementation
         try
         {
             // Copy the graph on the render thread, its single writer.
-            std::vector<::ShaderLab::Rendering::EffectGraphFile::MediaEntry> media;
-            const std::wstring jsonText = ::ShaderLab::Rendering::EffectGraphFile::SerializeForSave(
-                m_renderDispatcher.DispatchSync([this] { return m_graph; }), m_embedMedia, media);
+            std::vector<::ShaderLab::Support::EffectGraphFile::MediaEntry> media;
+            const std::wstring jsonText = ::ShaderLab::Support::EffectGraphFile::SerializeForSave(
+                m_renderDispatcher.DispatchSync([this] { return Model(); }), m_embedMedia, media);
 
-            const bool ok = ::ShaderLab::Rendering::EffectGraphFile::Save(
+            const bool ok = ::ShaderLab::Support::EffectGraphFile::Save(
                 m_currentFilePath, jsonText, media);
             if (ok)
             {
@@ -154,20 +152,20 @@ namespace winrt::ShaderLab::implementation
         // UI thread via DispatcherQueue so the bar actually animates
         // while miniz is compressing media.
         winrt::apartment_context ui_thread;
-        auto showOp = m_compileProgress.ShowDialogAsync(dialog);
+        auto showOp = m_dialogs.ShowAsync(dialog);
         co_await winrt::resume_after(std::chrono::milliseconds(16));
         co_await ui_thread;
 
         // Build media entries + rewritten JSON from a copy of the graph
         // taken on the render thread, then drive a single synchronous save
         // with a progress callback that updates the dialog in-place.
-        std::vector<::ShaderLab::Rendering::EffectGraphFile::MediaEntry> media;
+        std::vector<::ShaderLab::Support::EffectGraphFile::MediaEntry> media;
         std::wstring jsonText;
         bool serialized = false;
         try
         {
-            jsonText = ::ShaderLab::Rendering::EffectGraphFile::SerializeForSave(
-                m_renderDispatcher.DispatchSync([this] { return m_graph; }), m_embedMedia, media);
+            jsonText = ::ShaderLab::Support::EffectGraphFile::SerializeForSave(
+                m_renderDispatcher.DispatchSync([this] { return Model(); }), m_embedMedia, media);
             serialized = true;
         }
         catch (...)
@@ -176,7 +174,7 @@ namespace winrt::ShaderLab::implementation
         }
         if (!serialized)
         {
-            m_compileProgress.HideDialog(dialog);
+            m_dialogs.Hide(dialog);
             co_await showOp;
             PipelineFormatText().Text(L"Error: Failed to save graph");
             co_return;
@@ -207,11 +205,11 @@ namespace winrt::ShaderLab::implementation
         // ProgressBar never repaints.
         std::wstring path = m_currentFilePath;
         bool ok = false;
-        ::ShaderLab::Rendering::EffectGraphFile::SaveStats stats;
+        ::ShaderLab::Support::EffectGraphFile::SaveStats stats;
         co_await winrt::resume_background();
         try
         {
-            ok = ::ShaderLab::Rendering::EffectGraphFile::Save(
+            ok = ::ShaderLab::Support::EffectGraphFile::Save(
                 path, jsonText, media, progressCb, &stats);
         }
         catch (...)
@@ -220,7 +218,7 @@ namespace winrt::ShaderLab::implementation
         }
         co_await ui_thread;
 
-        m_compileProgress.HideDialog(dialog);
+        m_dialogs.Hide(dialog);
         co_await showOp;
 
         if (ok)
@@ -298,12 +296,12 @@ namespace winrt::ShaderLab::implementation
         const auto sourcePaths = m_renderDispatcher.DispatchSync([this]
         {
             std::vector<std::wstring> paths;
-            for (const auto& node : m_graph.Nodes())
+            for (const auto& node : Model().Nodes())
             {
                 if (node.type == ::ShaderLab::Graph::NodeType::Source &&
-                    node.shaderPath.has_value() && !node.shaderPath->empty() &&
-                    !node.shaderPath->starts_with(L"media://"))
-                    paths.push_back(*node.shaderPath);
+                    node.mediaPath.has_value() && !node.mediaPath->empty() &&
+                    !node.mediaPath->starts_with(L"media://"))
+                    paths.push_back(*node.mediaPath);
             }
             return paths;
         });
@@ -344,7 +342,7 @@ namespace winrt::ShaderLab::implementation
             dialog.PrimaryButtonText(L"Save");
             dialog.CloseButtonText(L"Cancel");
             dialog.DefaultButton(XC::ContentDialogButton::Primary);
-            auto result = co_await m_compileProgress.ShowDialogAsync(dialog);
+            auto result = co_await m_dialogs.ShowAsync(dialog);
             if (result != XC::ContentDialogResult::Primary)
             {
                 m_currentFilePath.clear();
@@ -396,14 +394,14 @@ namespace winrt::ShaderLab::implementation
         dialog.Content(sp);
 
         auto dispatcher = this->DispatcherQueue();
-        std::optional<::ShaderLab::Rendering::EffectGraphFile::LoadResult> loadResult;
+        std::optional<::ShaderLab::Support::EffectGraphFile::LoadResult> loadResult;
         std::wstring loadError;
 
         // Show the progress dialog, yield once for layout, then run
         // the load on a background thread so miniz inflate doesn't
         // freeze the UI on big media archives.
         winrt::apartment_context ui_thread;
-        auto showOp = m_compileProgress.ShowDialogAsync(dialog);
+        auto showOp = m_dialogs.ShowAsync(dialog);
         co_await winrt::resume_after(std::chrono::milliseconds(16));
         co_await ui_thread;
 
@@ -425,7 +423,7 @@ namespace winrt::ShaderLab::implementation
         co_await winrt::resume_background();
         try
         {
-            auto r = ::ShaderLab::Rendering::EffectGraphFile::Load(pathStr, tempRoot, progressCb);
+            auto r = ::ShaderLab::Support::EffectGraphFile::Load(pathStr, tempRoot, progressCb);
             if (r.has_value()) loadResult = std::move(r);
             else loadError = L"Could not read graph from .effectgraph";
         }
@@ -433,7 +431,7 @@ namespace winrt::ShaderLab::implementation
         catch (...)                       { loadError = L"Unknown load failure"; }
         co_await ui_thread;
 
-        m_compileProgress.HideDialog(dialog);
+        m_dialogs.Hide(dialog);
         co_await showOp;
 
         if (!loadResult.has_value())
@@ -446,21 +444,20 @@ namespace winrt::ShaderLab::implementation
         {
             try
             {
-                auto loaded = ::ShaderLab::Graph::EffectGraph::FromJson(
+                auto loaded = ::ShaderLab::Graph::GraphModel::FromJson(
                     winrt::hstring(loadResult->graphJson));
 
                 // Rewrite media:// tokens on source nodes to the
                 // extracted temp paths so the live graph can render
                 // them through the existing image / video pipeline.
-                ::ShaderLab::Rendering::EffectGraphFile::ResolveMediaTokens(loaded, loadResult->mediaMap);
+                ::ShaderLab::Support::EffectGraphFile::ResolveMediaTokens(loaded, loadResult->mediaMap);
 
                 // On the render thread: we're on the UI thread here, and the
                 // worker is the graph's single writer -- releasing its caches
                 // or replacing the graph under a live Evaluate is a data race
                 // (the same one that crashed the GPU-bindings toggle).
                 m_renderDispatcher.DispatchSync([this, &loaded] {
-                    m_graphEvaluator.ReleaseCache(m_graph);
-                    m_graph = std::move(loaded);
+                    m_context->ReplaceGraph(std::move(loaded));
                 });
                 m_currentFilePath = pathStr;
                 m_unsavedChanges = false;
@@ -499,7 +496,7 @@ namespace winrt::ShaderLab::implementation
             edialog.Title(winrt::box_value(L"Cannot Open Graph"));
             edialog.Content(winrt::box_value(winrt::hstring(versionError)));
             edialog.CloseButtonText(L"OK");
-            co_await m_compileProgress.ShowDialogAsync(edialog);
+            co_await m_dialogs.ShowAsync(edialog);
         }
     }
 
@@ -517,7 +514,7 @@ namespace winrt::ShaderLab::implementation
         dialog.SecondaryButtonText(L"Discard");
         dialog.CloseButtonText(L"Cancel");
         dialog.DefaultButton(winrt::Microsoft::UI::Xaml::Controls::ContentDialogButton::Primary);
-        auto result = co_await m_compileProgress.ShowDialogAsync(dialog);
+        auto result = co_await m_dialogs.ShowAsync(dialog);
         switch (result)
         {
             case winrt::Microsoft::UI::Xaml::Controls::ContentDialogResult::Primary:   co_return 0; // Save
@@ -529,96 +526,33 @@ namespace winrt::ShaderLab::implementation
     // ---- Heartbeat / temp-dir reaper ----------------------------------------
     //
     // Every extracted .effectgraph media dir gets a .heartbeat file
-    // that we touch every HeartbeatIntervalSec. On startup we scan
+    // that we touch every cMediaHeartbeatIntervalSec. On startup we scan
     // %TEMP% for ShaderLab-* directories whose .heartbeat (or, if
-    // missing, mtime of the dir itself) is older than HeartbeatStaleSec
+    // missing, mtime of the dir itself) is older than cStaleMediaDirSec
     // -- those are crash leftovers and we offer to delete them.
 
     void MainWindow::StartHeartbeatTimer()
     {
         if (m_heartbeatTimer) return;
         m_heartbeatTimer = DispatcherQueue().CreateTimer();
-        m_heartbeatTimer.Interval(std::chrono::seconds(HeartbeatIntervalSec));
+        m_heartbeatTimer.Interval(std::chrono::seconds(::ShaderLab::Support::cMediaHeartbeatIntervalSec));
         m_heartbeatTimer.Tick([this](auto&&, auto&&) { TouchHeartbeats(); });
         m_heartbeatTimer.Start();
     }
 
     void MainWindow::TouchHeartbeats()
     {
-        // Write the current FILETIME into <dir>\.heartbeat. Cheap
-        // (one tiny file write per loaded graph, every minute) and
-        // resilient to clock skew because we only compare against
-        // FILETIMEs from the same machine.
-        FILETIME now{};
-        ::GetSystemTimeAsFileTime(&now);
-        for (const auto& d : m_extractedMediaDirs)
-        {
-            std::error_code ec;
-            if (!std::filesystem::exists(d, ec)) continue;
-            std::wstring path = d + L"\\.heartbeat";
-            HANDLE h = ::CreateFileW(path.c_str(),
-                GENERIC_WRITE, 0, nullptr,
-                CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
-            if (h == INVALID_HANDLE_VALUE) continue;
-            DWORD written = 0;
-            ::WriteFile(h, &now, sizeof(now), &written, nullptr);
-            ::CloseHandle(h);
-        }
+        // One tiny write per loaded graph per interval.
+        for (const auto& dir : m_extractedMediaDirs)
+            ::ShaderLab::Support::TouchMediaHeartbeat(dir);
     }
 
     winrt::fire_and_forget MainWindow::ReapStaleMediaDirsAsync()
     {
         auto strong = get_strong();
 
-        // Snapshot %TEMP% and look for ShaderLab-* directories that
-        // either have no .heartbeat or whose heartbeat is older than
-        // HeartbeatStaleSec. Anything matching is from a crashed
-        // instance (or a previous version that didn't write
-        // heartbeats); offer to delete the lot.
-        wchar_t tempBuf[MAX_PATH + 1]{};
-        DWORD len = ::GetTempPathW(MAX_PATH, tempBuf);
-        if (len == 0) co_return;
-        std::wstring tempRoot(tempBuf, len);
-
-        std::vector<std::wstring> stale;
-        FILETIME nowFt{};
-        ::GetSystemTimeAsFileTime(&nowFt);
-        const uint64_t now = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
-        const uint64_t staleTicks = static_cast<uint64_t>(HeartbeatStaleSec) * 10'000'000ULL;
-
-        std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(tempRoot, ec))
-        {
-            if (ec) break;
-            if (!entry.is_directory(ec)) continue;
-            const auto name = entry.path().filename().wstring();
-            if (!name.starts_with(L"ShaderLab-")) continue;
-
-            // Determine the dir's "last touched" time. Prefer the
-            // .heartbeat file's mtime; fall back to the directory's
-            // own mtime so directories from older builds (which
-            // didn't write heartbeats) still get reaped.
-            FILETIME ft{};
-            std::wstring beat = entry.path().wstring() + L"\\.heartbeat";
-            HANDLE h = ::CreateFileW(beat.c_str(),
-                GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_HIDDEN, nullptr);
-            if (h != INVALID_HANDLE_VALUE)
-            {
-                ::GetFileTime(h, nullptr, nullptr, &ft);
-                ::CloseHandle(h);
-            }
-            else
-            {
-                WIN32_FILE_ATTRIBUTE_DATA fad{};
-                if (::GetFileAttributesExW(entry.path().c_str(), GetFileExInfoStandard, &fad))
-                    ft = fad.ftLastWriteTime;
-            }
-            const uint64_t touched = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-            if (touched == 0 || (now > touched && (now - touched) > staleTicks))
-                stale.push_back(entry.path().wstring());
-        }
-
+        // Folders from an instance that did not shut down cleanly: offer to delete them.
+        const auto stale = ::ShaderLab::Support::FindStaleMediaDirs(::ShaderLab::Support::TempDirectory());
         if (stale.empty()) co_return;
 
         namespace XC = winrt::Microsoft::UI::Xaml::Controls;
@@ -639,16 +573,14 @@ namespace winrt::ShaderLab::implementation
         dialog.CloseButtonText(L"Keep");
         dialog.DefaultButton(XC::ContentDialogButton::Primary);
 
-        auto result = co_await m_compileProgress.ShowDialogAsync(dialog);
+        auto result = co_await m_dialogs.ShowAsync(dialog);
         if (result != XC::ContentDialogResult::Primary) co_return;
 
         co_await winrt::resume_background();
-        std::error_code rmEc;
-        for (const auto& d : stale)
-            std::filesystem::remove_all(d, rmEc);
+        ::ShaderLab::Support::ReapMediaDirs(stale);
     }
 
-    // ---- Status-bar broom (Phase 8 p8-status-bar-button) -------------------
+    // ---- Status-bar broom ------------------------------------------------
     //
     // Single-click runs both reapers (graph-temp media dirs + shader
     // bytecode cache) and reports freed bytes in ReaperStatusText.
@@ -669,73 +601,10 @@ namespace winrt::ShaderLab::implementation
         co_await winrt::resume_background();
 
         // ---- Reap graph-temp media dirs --------------------------------
-        size_t graphDirsDeleted = 0;
-        size_t graphBytesFreed  = 0;
-        {
-            wchar_t tempBuf[MAX_PATH + 1]{};
-            DWORD len = ::GetTempPathW(MAX_PATH, tempBuf);
-            if (len > 0)
-            {
-                std::wstring tempRoot(tempBuf, len);
-                FILETIME nowFt{};
-                ::GetSystemTimeAsFileTime(&nowFt);
-                const uint64_t now = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
-                const uint64_t staleTicks = static_cast<uint64_t>(HeartbeatStaleSec) * 10'000'000ULL;
-
-                std::error_code ec;
-                std::vector<std::pair<std::wstring, uint64_t>> victims;
-                for (const auto& entry : std::filesystem::directory_iterator(tempRoot, ec))
-                {
-                    if (ec) break;
-                    if (!entry.is_directory(ec)) continue;
-                    const auto name = entry.path().filename().wstring();
-                    if (!name.starts_with(L"ShaderLab-")) continue;
-
-                    FILETIME ft{};
-                    std::wstring beat = entry.path().wstring() + L"\\.heartbeat";
-                    HANDLE h = ::CreateFileW(beat.c_str(),
-                        GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_HIDDEN, nullptr);
-                    if (h != INVALID_HANDLE_VALUE)
-                    {
-                        ::GetFileTime(h, nullptr, nullptr, &ft);
-                        ::CloseHandle(h);
-                    }
-                    else
-                    {
-                        WIN32_FILE_ATTRIBUTE_DATA fad{};
-                        if (::GetFileAttributesExW(entry.path().c_str(), GetFileExInfoStandard, &fad))
-                            ft = fad.ftLastWriteTime;
-                    }
-                    const uint64_t touched = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-                    if (touched == 0 || (now > touched && (now - touched) > staleTicks))
-                    {
-                        // Sum the dir's contents for the freed-bytes display.
-                        uint64_t bytes = 0;
-                        for (auto it = std::filesystem::recursive_directory_iterator(entry.path(), ec);
-                             it != std::filesystem::recursive_directory_iterator(); ++it)
-                        {
-                            if (ec) { ec.clear(); continue; }
-                            if (it->is_regular_file(ec))
-                                bytes += static_cast<uint64_t>(it->file_size(ec));
-                        }
-                        victims.emplace_back(entry.path().wstring(), bytes);
-                    }
-                }
-
-                std::error_code rmEc;
-                for (const auto& [path, bytes] : victims)
-                {
-                    std::filesystem::remove_all(path, rmEc);
-                    if (!rmEc)
-                    {
-                        ++graphDirsDeleted;
-                        graphBytesFreed += bytes;
-                    }
-                    rmEc.clear();
-                }
-            }
-        }
+        const auto mediaReap = ::ShaderLab::Support::ReapMediaDirs(::ShaderLab::Support::FindStaleMediaDirs(
+            ::ShaderLab::Support::TempDirectory(), ::ShaderLab::Support::cStaleMediaDirSec, /*countBytes*/ true));
+        const size_t graphDirsDeleted = mediaReap.deleted;
+        const uint64_t graphBytesFreed = mediaReap.bytesFreed;
 
         // ---- Reap shader bytecode cache --------------------------------
         // Use a 7-day threshold for the broom (less aggressive than
@@ -798,28 +667,20 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::ResetAfterGraphLoad(bool reopenOutputWindows)
     {
-        m_previewNodeId = 0;
-        m_previewViews.clear();
-        m_traceActive = false;
-        m_lastTraceTopologyHash = 0;
-        m_traceRowCache.clear();
+        Preview().Reset();
+        m_tracePanel.Reset();
 
-        // Close all existing output windows.
+        // Close all existing output windows and drop their sinks.
         m_outputWindows.clear();
+        {
+            std::scoped_lock lock(m_outputSinksMutex);
+            m_outputSinks.clear();
+        }
 
-        // Restore isClock flag from ShaderLab effect descriptors BEFORE
-        // SetGraph triggers a layout pass. The flag isn't serialized in
-        // JSON (it's derived from the effect definition), so a freshly-
-        // deserialized Clock node has isClock=false. RebuildLayout reads
-        // node.isClock to decide whether to allocate space for the
-        // play/pause button + progress bar; if it runs first the visual
-        // ends up sized as a regular parameter node and the controls
-        // never appear until something else triggers another layout.
         auto resetGraph = [this]
         {
-            ::ShaderLab::Effects::ShaderLabEffects::RestoreRuntimeFlags(m_graph);
-            m_nodeGraphController.SetGraph(&m_graph);
-            m_graph.MarkAllDirty();
+            m_nodeGraphController.RebuildLayout();
+            Model().MarkAllDirty();
         };
         // The graph is written on the render thread. The adapter switch calls
         // this with the worker stopped, when there is no render thread to use.
@@ -834,27 +695,9 @@ namespace winrt::ShaderLab::implementation
         }
         PopulatePreviewNodeSelector();
 
-        // Reset trace UI.
-        PixelTracePanel().Children().Clear();
-        TracePositionText().Text(L"Click preview to trace a pixel");
-
-        // Defer FitPreviewToView until after the first evaluation
-        // produces valid cachedOutput (image bounds aren't available yet).
-        m_needsFitPreview = true;
         UpdateStatusBar();
-
-        // Reopen output windows for all Output nodes in the loaded graph.
         if (reopenOutputWindows)
-        {
-            if (const auto snapshot = CurrentGraphSnapshot())
-            {
-                for (const auto& node : snapshot->nodes)
-                {
-                    if (node.type != ::ShaderLab::Graph::NodeType::Output) continue;
-                    try { OpenOutputWindow(node.id); } catch (...) {}
-                }
-            }
-        }
+            ReopenOutputWindows();
     }
 
 }

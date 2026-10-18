@@ -1,12 +1,12 @@
 <#
 .SYNOPSIS
-    Installs ShaderLab from an unsigned MSIX package. Requires Developer Mode.
+    Installs ShaderLab from its MSIX package and the dependencies beside it.
 
 .DESCRIPTION
-    Calls Add-AppxPackage with -AllowUnsigned, which lets Windows install an
-    unsigned MSIX when Developer Mode is on. ShaderLab's manifest declares a
-    minimum OS of Windows 11 22H2 (10.0.22621); older builds are rejected at
-    install time. No code-signing certificate is required.
+    A signed release installs as is. An unsigned build installs with
+    Add-AppxPackage -AllowUnsigned, which needs Developer Mode. ShaderLab's
+    manifest declares a minimum OS of Windows 11 22H2 (10.0.22621); older
+    builds are rejected at install time.
 
 .PARAMETER MsixPath
     Path to the .msix file. If omitted, looks for the first .msix next to this script.
@@ -17,15 +17,6 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-
-# Verify Developer Mode is enabled.
-$devKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
-$devMode = (Get-ItemProperty -Path $devKey -Name AllowDevelopmentWithoutDevLicense -ErrorAction SilentlyContinue).AllowDevelopmentWithoutDevLicense
-if ($devMode -ne 1) {
-    Write-Host 'ERROR: Windows Developer Mode is not enabled.' -ForegroundColor Red
-    Write-Host 'Enable it: Settings -> Privacy & security -> For developers -> Developer Mode.'
-    exit 1
-}
 
 if (-not $MsixPath) {
     # Pick the ShaderLab package, not Microsoft.* dependency .msix files that
@@ -44,6 +35,18 @@ if (-not $MsixPath) {
 if (-not $MsixPath -or -not (Test-Path $MsixPath)) {
     Write-Host "ERROR: No .msix file found. Pass -MsixPath '<path-to-msix>'." -ForegroundColor Red
     exit 1
+}
+
+# An unsigned package needs Developer Mode.
+$signed = (Get-AuthenticodeSignature $MsixPath).Status -eq 'Valid'
+if (-not $signed) {
+    $devKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
+    $devMode = (Get-ItemProperty -Path $devKey -Name AllowDevelopmentWithoutDevLicense -ErrorAction SilentlyContinue).AllowDevelopmentWithoutDevLicense
+    if ($devMode -ne 1) {
+        Write-Host 'ERROR: this package is unsigned, and Windows Developer Mode is not enabled.' -ForegroundColor Red
+        Write-Host 'Enable it: Settings -> Privacy & security -> For developers -> Developer Mode.'
+        exit 1
+    }
 }
 
 Write-Host "Installing $MsixPath ..." -ForegroundColor Cyan
@@ -82,11 +85,14 @@ if (Test-Path $depsDir) {
     }
 }
 
-# Install the main package. -AllowUnsigned needs Developer Mode.
-Add-AppxPackage -Path $MsixPath -AllowUnsigned -ForceApplicationShutdown
+if ($signed) {
+    Add-AppxPackage -Path $MsixPath -ForceApplicationShutdown
+} else {
+    Add-AppxPackage -Path $MsixPath -AllowUnsigned -ForceApplicationShutdown
+}
 Write-Host 'Installed. Launch ShaderLab from the Start menu.' -ForegroundColor Green
 
-# ---- MCP client config (stdio-migration Step 8) -------------------------
+# ---- MCP client config -------------------------------------------------
 # ShaderLab copies its MCP shim to %LOCALAPPDATA%\ShaderLab\bin\ on first
 # launch, and exposes each window as an MCP session via the broker hub. Print
 # a ready-to-paste stdio client config: the shim path is stable + unpackaged

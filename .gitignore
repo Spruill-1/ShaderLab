@@ -123,3 +123,9 @@ Tests/fixtures/*.mp4
 # The frame-index clips are small (< 100 KB) and checked in so the playback
 # harness runs without ffmpeg.
 !Tests/fixtures/video_index_*.mp4
+
+# EffectGraph packages (packaging/Pack.ps1) and the C# bindings build
+/packaging/out/
+/packaging/obj/
+/bindings/csharp/**/bin/
+/bindings/csharp/**/obj/

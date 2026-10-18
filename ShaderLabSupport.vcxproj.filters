@@ -1,0 +1,104 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Support">
+      <UniqueIdentifier>{6E2B9C41-3A7D-4E58-B1F0-8C2D5A9E7B13}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Sources">
+      <UniqueIdentifier>{4F7C2E19-8B3A-4D61-9E05-2A6B1C8D3F47}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Graph">
+      <UniqueIdentifier>{18B0C1C9-6B45-5B72-A098-18D7B0BC7D54}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Rendering">
+      <UniqueIdentifier>{1B1CB936-8741-5247-9EE2-98E5ED1DCF70}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Mcp">
+      <UniqueIdentifier>{1AE58A52-8D93-532E-8693-94BB8237FBF7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Mcp\Routes">
+      <UniqueIdentifier>{374BAEA8-7B08-516F-B721-6900040908D1}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="third_party">
+      <UniqueIdentifier>{BCA243FA-747D-52CF-BC13-A5CE99C126D6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="third_party\miniz">
+      <UniqueIdentifier>{F83B071B-81AD-5B7D-A338-4C3360E492BB}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Support\ShaderLabSupport.h"><Filter>Support</Filter></ClInclude>
+    <ClInclude Include="Support\ExprTkEvaluator.h"><Filter>Support</Filter></ClInclude>
+    <ClInclude Include="Support\EffectGraphFile.h"><Filter>Support</Filter></ClInclude>
+    <ClInclude Include="Support\PackageRoutes.h"><Filter>Support</Filter></ClInclude>
+    <ClInclude Include="Support\EffectPlugins.h"><Filter>Support</Filter></ClInclude>
+    <ClInclude Include="Sources\CaptureSources.h"><Filter>Sources</Filter></ClInclude>
+    <ClInclude Include="Sources\DxgiDuplicationSourceProvider.h"><Filter>Sources</Filter></ClInclude>
+    <ClInclude Include="Sources\WindowsGraphicsCaptureSourceProvider.h"><Filter>Sources</Filter></ClInclude>
+    <ClInclude Include="Graph\ParameterVisibility.h"><Filter>Graph</Filter></ClInclude>
+    <ClInclude Include="Graph\GraphLayout.h"><Filter>Graph</Filter></ClInclude>
+    <ClInclude Include="Graph\GraphUiSnapshot.h"><Filter>Graph</Filter></ClInclude>
+    <ClInclude Include="Rendering\FfmpegProcess.h"><Filter>Rendering</Filter></ClInclude>
+    <ClInclude Include="Rendering\FramePacer.h"><Filter>Rendering</Filter></ClInclude>
+    <ClInclude Include="Rendering\PreviewRenderStats.h"><Filter>Rendering</Filter></ClInclude>
+    <ClInclude Include="Rendering\RenderThreadDispatcher.h"><Filter>Rendering</Filter></ClInclude>
+    <ClInclude Include="Rendering\PreviewViewState.h"><Filter>Rendering</Filter></ClInclude>
+    <ClInclude Include="Rendering\VideoExport.h"><Filter>Rendering</Filter></ClInclude>
+    <ClInclude Include="Mcp\EngineMcpRoutes.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpArgs.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpChannel.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpCrypto.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpFrame.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpJsonRpc.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpJsonWriter.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpPeerIdentity.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpRouter.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpSerialize.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpSessionClient.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpTimeouts.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpToolCatalog.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\McpTypes.h"><Filter>Mcp</Filter></ClInclude>
+    <ClInclude Include="Mcp\Routes\GraphPatch.h"><Filter>Mcp\Routes</Filter></ClInclude>
+    <ClInclude Include="Mcp\Routes\RouteSupport.h"><Filter>Mcp\Routes</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch_host.cpp" />
+    <ClCompile Include="Support\ShaderLabSupport.cpp"><Filter>Support</Filter></ClCompile>
+    <ClCompile Include="Support\EffectGraphFile.cpp"><Filter>Support</Filter></ClCompile>
+    <ClCompile Include="Support\PackageRoutes.cpp"><Filter>Support</Filter></ClCompile>
+    <ClCompile Include="Support\EffectPlugins.cpp"><Filter>Support</Filter></ClCompile>
+    <ClCompile Include="Sources\CaptureSources.cpp"><Filter>Sources</Filter></ClCompile>
+    <ClCompile Include="Sources\DxgiDuplicationSourceProvider.cpp"><Filter>Sources</Filter></ClCompile>
+    <ClCompile Include="Sources\WindowsGraphicsCaptureSourceProvider.cpp"><Filter>Sources</Filter></ClCompile>
+    <ClCompile Include="Graph\ParameterVisibility.cpp"><Filter>Graph</Filter></ClCompile>
+    <ClCompile Include="Graph\GraphLayout.cpp"><Filter>Graph</Filter></ClCompile>
+    <ClCompile Include="Graph\GraphUiSnapshot.cpp"><Filter>Graph</Filter></ClCompile>
+    <ClCompile Include="Rendering\FfmpegProcess.cpp"><Filter>Rendering</Filter></ClCompile>
+    <ClCompile Include="Rendering\PreviewViewState.cpp"><Filter>Rendering</Filter></ClCompile>
+    <ClCompile Include="Rendering\VideoExport.cpp"><Filter>Rendering</Filter></ClCompile>
+    <ClCompile Include="Mcp\EngineMcpRoutes.cpp"><Filter>Mcp</Filter></ClCompile>
+    <ClCompile Include="Mcp\McpChannel.cpp"><Filter>Mcp</Filter></ClCompile>
+    <ClCompile Include="Mcp\McpCrypto.cpp"><Filter>Mcp</Filter></ClCompile>
+    <ClCompile Include="Mcp\McpFrame.cpp"><Filter>Mcp</Filter></ClCompile>
+    <ClCompile Include="Mcp\McpJsonRpc.cpp"><Filter>Mcp</Filter></ClCompile>
+    <ClCompile Include="Mcp\McpPeerIdentity.cpp"><Filter>Mcp</Filter></ClCompile>
+    <ClCompile Include="Mcp\McpRouter.cpp"><Filter>Mcp</Filter></ClCompile>
+    <ClCompile Include="Mcp\McpSerialize.cpp"><Filter>Mcp</Filter></ClCompile>
+    <ClCompile Include="Mcp\McpSessionClient.cpp"><Filter>Mcp</Filter></ClCompile>
+    <ClCompile Include="Mcp\McpToolCatalog.cpp"><Filter>Mcp</Filter></ClCompile>
+    <ClCompile Include="Mcp\Routes\CatalogRoutes.cpp"><Filter>Mcp\Routes</Filter></ClCompile>
+    <ClCompile Include="Mcp\Routes\DisplayRoutes.cpp"><Filter>Mcp\Routes</Filter></ClCompile>
+    <ClCompile Include="Mcp\Routes\EffectRoutes.cpp"><Filter>Mcp\Routes</Filter></ClCompile>
+    <ClCompile Include="Mcp\Routes\FileRoutes.cpp"><Filter>Mcp\Routes</Filter></ClCompile>
+    <ClCompile Include="Mcp\Routes\GraphPatch.cpp"><Filter>Mcp\Routes</Filter></ClCompile>
+    <ClCompile Include="Mcp\Routes\GraphRoutes.cpp"><Filter>Mcp\Routes</Filter></ClCompile>
+    <ClCompile Include="Mcp\Routes\PropertyRoutes.cpp"><Filter>Mcp\Routes</Filter></ClCompile>
+    <ClCompile Include="Mcp\Routes\ReadbackRoutes.cpp"><Filter>Mcp\Routes</Filter></ClCompile>
+    <ClCompile Include="Mcp\Routes\RouteSupport.cpp"><Filter>Mcp\Routes</Filter></ClCompile>
+    <ClCompile Include="Mcp\Routes\VideoRoutes.cpp"><Filter>Mcp\Routes</Filter></ClCompile>
+    <ClCompile Include="Support\ExprTkEvaluator.cpp"><Filter>Support</Filter></ClCompile>
+    <ClCompile Include="third_party\miniz\miniz.c"><Filter>third_party\miniz</Filter></ClCompile>
+    <ClCompile Include="third_party\miniz\miniz_tdef.c"><Filter>third_party\miniz</Filter></ClCompile>
+    <ClCompile Include="third_party\miniz\miniz_tinfl.c"><Filter>third_party\miniz</Filter></ClCompile>
+  </ItemGroup>
+</Project>

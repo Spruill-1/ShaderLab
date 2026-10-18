@@ -95,12 +95,12 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
     <ClCompile>
-      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
-      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -117,16 +117,27 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Controls\NodeGraphController.h" />
+    <ClInclude Include="Controls\NodeLayout.h" />
+    <ClInclude Include="Controls\NodeGraphRenderer.h" />
+    <ClInclude Include="Controls\GraphCanvasInputController.h" />
+    <ClInclude Include="Controls\PreviewController.h" />
+    <ClInclude Include="Controls\PixelTracePanelController.h" />
     <ClInclude Include="Controls\OutputWindow.h" />
     <ClInclude Include="Controls\OutputSinkRenderState.h" />
+    <ClInclude Include="Controls\OutputSinkRenderer.h" />
     <ClInclude Include="Controls\NodeLog.h" />
     <ClInclude Include="Controls\LogWindow.h" />
-    <ClInclude Include="Controls\PixelInspectorController.h" />
-    <ClInclude Include="Controls\PixelTraceController.h" />
     <ClInclude Include="Controls\CompileProgressController.h" />
-    <ClInclude Include="Controls\ShaderEditorController.h" />
+    <ClInclude Include="Controls\DialogCoordinator.h" />
+    <ClInclude Include="Controls\McpRouteTable.h" />
+    <ClInclude Include="Controls\PerfMcpRoutes.h" />
+    <ClInclude Include="Controls\PropertiesPanelController.h" />
+    <ClInclude Include="Controls\PropertyEditors.h" />
+    <ClInclude Include="Controls\CurveEditorDialog.h" />
+    <ClInclude Include="Controls\McpStatusIndicator.h" />
     <ClInclude Include="Effects\CustomComputeShaderEffect.h" />
     <ClInclude Include="Effects\CustomPixelShaderEffect.h" />
+    <ClInclude Include="Effects\CustomEffectBase.h" />
     <ClInclude Include="Effects\DxgiDuplicationSourceProvider.h" />
     <ClInclude Include="Effects\EffectRegistry.h" />
     <ClInclude Include="Effects\PropertyMetadata.h" />
@@ -134,11 +145,22 @@
     <ClInclude Include="Effects\ShaderCompiler.h" />
     <ClInclude Include="Effects\ShaderLabEffects.h" />
     <ClInclude Include="Effects\VideoSourceProvider.h" />
+    <ClInclude Include="Effects\VideoFrameConverter.h" />
+    <ClInclude Include="Effects\VideoFrameReader.h" />
+    <ClInclude Include="Effects\VideoSeekModel.h" />
+    <ClInclude Include="Effects\SourceTextureUtil.h" />
     <ClInclude Include="Effects\WindowsGraphicsCaptureSourceProvider.h" />
     <ClInclude Include="Version.h" />
     <ClInclude Include="Effects\SourceNodeFactory.h" />
     <ClInclude Include="Graph\EffectEdge.h" />
-    <ClInclude Include="Graph\EffectGraph.h" />
+    <ClInclude Include="Graph\GraphModel.h" />
+    <ClInclude Include="Graph\ClockModel.h" />
+    <ClInclude Include="Graph\NodeContracts.h" />
+    <ClInclude Include="Graph\SourceKind.h" />
+    <ClInclude Include="Graph\ParameterVisibility.h" />
+    <ClInclude Include="Graph\ValueFormat.h" />
+    <ClInclude Include="Graph\GraphEdits.h" />
+    <ClInclude Include="Effects\EffectUpgrade.h" />
     <ClInclude Include="Graph\EffectNode.h" />
     <ClInclude Include="Graph\NodeType.h" />
     <ClInclude Include="Graph\PropertyValue.h" />
@@ -156,11 +178,14 @@
     <ClInclude Include="Rendering\DisplayMonitor.h" />
     <ClInclude Include="Rendering\DisplayProfile.h" />
     <ClInclude Include="Rendering\GraphEvaluator.h" />
+    <ClInclude Include="Rendering\FrameExecutor.h" />
+    <ClInclude Include="Rendering\SourceRuntime.h" />
     <ClInclude Include="Rendering\D3D11ComputeRunner.h" />
     <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
     <ClInclude Include="Rendering\RenderEngine.h" />
-    <ClInclude Include="Rendering\FalseColorOverlay.h" />
+    <ClInclude Include="Rendering\HostRenderSettings.h" />
+    <ClInclude Include="Rendering\FrameTimings.h" />
   </ItemGroup>
   <ItemGroup>
     <ApplicationDefinition Include="App.xaml" />
@@ -169,12 +194,22 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Controls\NodeGraphController.cpp" />
+    <ClCompile Include="Controls\NodeLayout.cpp" />
+    <ClCompile Include="Controls\NodeGraphRenderer.cpp" />
+    <ClCompile Include="Controls\GraphCanvasInputController.cpp" />
+    <ClCompile Include="Controls\PreviewController.cpp" />
+    <ClCompile Include="Controls\PixelTracePanelController.cpp" />
     <ClCompile Include="Controls\OutputWindow.cpp" />
+    <ClCompile Include="Controls\OutputSinkRenderer.cpp" />
     <ClCompile Include="Controls\LogWindow.cpp" />
-    <ClCompile Include="Controls\PixelInspectorController.cpp" />
-    <ClCompile Include="Controls\PixelTraceController.cpp" />
     <ClCompile Include="Controls\CompileProgressController.cpp" />
-    <ClCompile Include="Controls\ShaderEditorController.cpp" />
+    <ClCompile Include="Controls\DialogCoordinator.cpp" />
+    <ClCompile Include="Controls\McpRouteTable.cpp" />
+    <ClCompile Include="Controls\PerfMcpRoutes.cpp" />
+    <ClCompile Include="Controls\PropertiesPanelController.cpp" />
+    <ClCompile Include="Controls\PropertyEditors.cpp" />
+    <ClCompile Include="Controls\CurveEditorDialog.cpp" />
+    <ClCompile Include="Controls\McpStatusIndicator.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
@@ -194,11 +229,18 @@
       <DependentUpon>MainWindow.xaml</DependentUpon>
     </ClCompile>
     <ClCompile Include="MainWindow.McpRoutes.cpp" />
+    <ClCompile Include="MainWindow.McpAppRoutes.cpp">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="MainWindow.McpSession.cpp">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </ClCompile>
     <ClCompile Include="EffectDesignerWindow.xaml.cpp">
       <DependentUpon>EffectDesignerWindow.xaml</DependentUpon>
     </ClCompile>
     <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
     <ClCompile Include="Rendering\RenderEngine.cpp" />
+    <ClCompile Include="Rendering\HostRenderSettings.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Midl Include="MainWindow.idl">
@@ -286,8 +328,8 @@
     <ProjectCapability Include="Msix" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="ShaderLabEngine.vcxproj">
-      <Project>{A7A1E0F1-665C-4D06-9AC7-6D6B6A0D0F01}</Project>
+    <ProjectReference Include="ShaderLabSupport.vcxproj">
+      <Project>{3C5E8A21-7B4D-4F6A-9E12-5D8C0B7A4E63}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <LinkLibraryDependencies>true</LinkLibraryDependencies>
     </ProjectReference>
@@ -304,6 +346,12 @@
     <None Include=".github\workflows\ci.yml" />
     <None Include=".github\workflows\release.yml" />
     <None Include=".gitignore" />
+    <None Include="LICENSE">
+      <DeploymentContent>true</DeploymentContent>
+    </None>
+    <None Include="THIRD-PARTY-NOTICES.txt">
+      <DeploymentContent>true</DeploymentContent>
+    </None>
     <None Include="packages.config" />
     <None Include=".gitmodules" />
     <None Include="scripts\Install.ps1" />
@@ -313,6 +361,7 @@
     <HasPackageAndPublishMenu>true</HasPackageAndPublishMenu>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="build\EffectGraphEngine.targets" />
   <ImportGroup Label="ExtensionTargets">
     <Import Project="packages\Microsoft.Web.WebView2.1.0.3179.45\build\native\Microsoft.Web.WebView2.targets" Condition="Exists('packages\Microsoft.Web.WebView2.1.0.3179.45\build\native\Microsoft.Web.WebView2.targets')" />
     <Import Project="packages\Microsoft.Windows.SDK.BuildTools.MSIX.1.7.20250829.1\build\Microsoft.Windows.SDK.BuildTools.MSIX.targets" Condition="Exists('packages\Microsoft.Windows.SDK.BuildTools.MSIX.1.7.20250829.1\build\Microsoft.Windows.SDK.BuildTools.MSIX.targets')" />
@@ -331,23 +380,7 @@
     <Import Project="packages\Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\Microsoft.Windows.ImplementationLibrary.targets" Condition="Exists('packages\Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\Microsoft.Windows.ImplementationLibrary.targets')" />
   </ImportGroup>
   <!--
-    Copy ShaderLabEngine.dll into the app output and include it in the MSIX package payload.
-    The project reference uses ReferenceOutputAssembly=false (to link only the .lib), so the
-    .dll is not picked up automatically. It must be added to AppxPackagePayload BEFORE
-    _ComputeAppxPackagePayload runs, otherwise the deployed package will be missing the dll
-    and the launched app will fail with "ShaderLabEngine.dll was not found".
-  -->
-  <Target Name="CopyEngineRuntime" AfterTargets="Link" BeforeTargets="_ComputeAppxPackagePayload;AfterBuild" Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll')">
-    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
-    <Copy SourceFiles="$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.pdb" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)$(Platform)\$(Configuration)\ShaderLabEngine\ShaderLabEngine.pdb')" />
-    <ItemGroup>
-      <AppxPackagePayload Include="$(OutDir)ShaderLabEngine.dll">
-        <TargetPath>ShaderLabEngine.dll</TargetPath>
-      </AppxPackagePayload>
-    </ItemGroup>
-  </Target>
-  <!--
-    Broker payload (stdio-migration Step 5). Mirrors CopyEngineRuntime:
+    Broker payload (stdio-migration Step 5). Like any hand-added payload, it
     must run BeforeTargets="_ComputeAppxPackagePayload" or the package
     builds clean with the Hub application's exe silently missing and
     activation fails at runtime.

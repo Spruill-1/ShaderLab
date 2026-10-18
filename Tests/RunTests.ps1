@@ -1,8 +1,7 @@
 <#
 .SYNOPSIS
     ShaderLab MCP integration suite. Drives a ShaderLab session end-to-end
-    through the broker (shim -> hub -> session), the ONLY transport since the
-    HTTP listener was removed in stdio-migration Step 9.
+    through the broker (shim -> hub -> session), its only transport.
 
 .DESCRIPTION
     Starts a shim (ShaderLabMcpBroker --stdio), pins the first registered
@@ -41,8 +40,6 @@ $script:TestResults = @()
 $script:Notifications = @()
 $script:TestDir = $PSScriptRoot
 $script:RepoRoot = Split-Path $script:TestDir -Parent
-$script:FixturesDir = Join-Path $script:TestDir "fixtures"
-$script:OutputDir = Join-Path $script:TestDir "output"
 
 # ============================================================================
 # Shim transport
@@ -89,14 +86,12 @@ function Stop-Shim {
 
 # One JSON-RPC round-trip over the shim's stdio.
 #
-# Correlates on "id" and skips server -> client notifications. It used to read
-# exactly one line per request and treat position as correlation -- but the
-# shim advertises tools.listChanged in initialize and emits
+# Correlates on "id" and skips server -> client notifications. The shim
+# advertises tools.listChanged in initialize and emits
 # notifications/tools/list_changed right after the use_session reply, once the
-# pinned session's catalog is spliced in. That single unsolicited line shifted
-# every later read by one and cascaded into ~18 bogus failures whose messages
-# were simply the PREVIOUS call's response ("Unknown tool: image_stats" landing
-# on a test that never asked for it). Correlate, never count.
+# pinned session's catalog is spliced in, so reading one line per request
+# would pair every later call with the previous call's response. Correlate,
+# never count.
 #
 # A mismatched id is raised rather than tolerated: it means the stream has
 # desynced, and every later read would be silently wrong.
@@ -373,6 +368,26 @@ RunTest "Error.BadShaderCompile" {
     }
 }
 
+RunTest "Error.BadBoolRejected" {
+    # A word that is not a boolean is an error, not a silent false.
+    $id = AddNode "Clock"
+    try { SetProperty $id "isPlaying" "banana"; return $false } catch { return $true }
+}
+
+RunTest "Graph.ApplyCreatesCustomShader" {
+    # graph_apply resolves effect names as graph_add_node does.
+    $r = McpCall "graph_apply" @{ nodes = @(@{ ref = "fx"; effect = "Custom Pixel Shader" }) }
+    $node = GetNode $r.refToId.fx
+    return $null -ne $node.customEffect
+}
+
+RunTest "Route.GraphOverviewNodeTypes" {
+    # One node-type vocabulary: graph_overview says BuiltInEffect, as graph_get_node does.
+    AddNode "Gaussian Blur" | Out-Null
+    $o = McpCall "graph_overview"
+    return $o.nodes[0].type -eq "BuiltInEffect"
+}
+
 # ============================================================================
 # Tests: Effect Evaluation
 # ============================================================================
@@ -536,7 +551,7 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET
 }
 
 # ============================================================================
-# Tests: Promoted routes (stdio-migration Step 1)
+# Tests: routed tools
 # ============================================================================
 
 RunTest "Route.RenameNode" -RequiresGui {
@@ -581,9 +596,8 @@ RunTest "Route.ImageStatsRemoved" {
 }
 
 RunTest "Route.CatalogRoundTrip" {
-    # Live round-trip over every advertised tool (stdio-migration Step 3's
-    # replacement for a HasRoute-based coverage test, which prefix semantics
-    # make impossible). Every tool must return a well-formed tool-result
+    # Live round-trip over every advertised tool (route prefix semantics make a
+    # static HasRoute coverage check impossible). Every tool must return a well-formed tool-result
     # envelope -- content[] + boolean isError -- never a hang, transport
     # error, or malformed frame. Mutating tools get validation-failing args
     # so nothing is disturbed; readback tools get a scratch node.
@@ -610,7 +624,10 @@ RunTest "Route.CatalogRoundTrip" {
     $canned = @{
         graph_add_node        = @{ effectName = 'Gaussian Blur' }
         graph_remove_node     = @{ nodeId = 999999 }
-        graph_rename_node     = @{ nodeId = 999999; name = 'x' }
+        graph_duplicate_nodes = @{ nodeIds = @(999999) }
+        graph_upgrade_nodes   = @{ nodeId = 999999 }
+        graph_expression_input = @{ nodeId = 999999; action = 'add' }
+        graph_rename_node    = @{ nodeId = 999999; name = 'x' }
         graph_connect         = @{ srcId = 999999; srcPin = 0; dstId = 999998; dstPin = 0 }
         graph_disconnect      = @{ srcId = 999999; srcPin = 0; dstId = 999998; dstPin = 0 }
         graph_set_property    = @{ nodeId = 999999; key = 'x'; value = 1 }
@@ -658,27 +675,25 @@ RunTest "Route.CatalogRoundTrip" {
 }
 
 # ============================================================================
-# Tests: CLI Mode
+# Tests: saved graph JSON
 # ============================================================================
 
 RunTest "CLI.BasicEvaluation" {
-    # Create a simple test graph fixture.
-    $fixture = Join-Path $script:FixturesDir "test_cli_basic.json"
-    # Build graph via MCP, save to file.
+    # graph_save_json returns a graph that writes out as a file. It goes under
+    # %TEMP%, never over the tracked Tests\fixtures\test_cli_basic.json.
     $src = AddNode "Gamut Source"
     SetProperty $src "OutputSize" 64.0
     $json = McpCall "graph_save_json"
-    $jsonStr = $json | ConvertTo-Json -Depth 10
-    [System.IO.File]::WriteAllText($fixture, $jsonStr, [System.Text.Encoding]::UTF8)
-
-    $outDir = Join-Path $script:OutputDir "cli_basic"
-    if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force }
-    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-
-    # Run CLI mode (in a separate process — the current app is running GUI mode).
-    # The CLI mode requires a separate invocation.
-    # For now, just verify the fixture was created.
-    return (Test-Path $fixture)
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) "ShaderLabRunTests-$PID"
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $saved = Join-Path $dir "test_cli_basic.json"
+    try {
+        [System.IO.File]::WriteAllText($saved, ($json | ConvertTo-Json -Depth 10), [System.Text.Encoding]::UTF8)
+        return ((Test-Path $saved) -and (Get-Item $saved).Length -gt 0)
+    }
+    finally {
+        Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # ============================================================================

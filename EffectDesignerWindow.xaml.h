@@ -56,7 +56,6 @@ namespace winrt::ShaderLab::implementation
         ::ShaderLab::Graph::CustomEffectDefinition BuildDefinition();
 
         // Generate HLSL scaffold from the current definition.
-        std::wstring GenerateHlsl(const ::ShaderLab::Graph::CustomEffectDefinition& def);
 
         // Compile the current HLSL and update status.
         bool CompileHlsl(::ShaderLab::Graph::CustomEffectDefinition& def);

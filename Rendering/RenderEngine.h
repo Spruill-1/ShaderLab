@@ -1,9 +1,9 @@
 #pragma once
 
 #include "pch.h"
-#include "PipelineFormat.h"
-#include "GpuTimer.h"
-#include "DisplayInfo.h"
+#include "Rendering/PipelineFormat.h"
+#include "Rendering/GpuTimer.h"
+#include "Rendering/DisplayInfo.h"
 
 namespace ShaderLab::Rendering
 {
@@ -25,18 +25,15 @@ namespace ShaderLab::Rendering
         bool isWarp{};
     };
 
-    // Core rendering engine: owns D3D11 device, D2D1 device context, and the
-    // DXGI swap chain bound to a WinUI 3 SwapChainPanel.
+    // The GUI's device and preview swap chain: the D3D11 device on the chosen
+    // adapter, the GPU timer, and the swap chain bound to a SwapChainPanel.
+    // D2D is not its own: Initialize takes the D2D device and render context
+    // of the EffectGraph context built on D3DDevice(), so images the graph
+    // renders can be drawn into the swap chain.
     //
-    // Lifecycle:
-    //   1. Construct
-    //   2. Initialize(hwnd, swapChainPanel) — creates device stack + swap chain
-    //   3. Resize(w, h) — called on SizeChanged
-    //   4. BeginDraw / EndDraw / Present — per-frame rendering
-    //   5. SetPipelineFormat — switch format, recreates swap chain
-    //
-    // The engine does NOT own the graph evaluator — that lives at a higher level
-    // and calls BeginDraw/EndDraw to render into the D2D device context.
+    // Lifecycle: CreateDevice, then the host creates or moves its context
+    // onto D3DDevice(), then Initialize; Resize on SizeChanged; Shutdown
+    // before the next CreateDevice.
     class RenderEngine
     {
     public:
@@ -46,11 +43,17 @@ namespace ShaderLab::Rendering
         RenderEngine(const RenderEngine&) = delete;
         RenderEngine& operator=(const RenderEngine&) = delete;
 
-        // Create D3D11 device, D2D factory/device/context, swap chain on the panel.
+        // Creates the D3D11 device on the preferred adapter. Throws on failure.
+        void CreateDevice(DevicePreference devicePref);
+
+        // Creates the swap chain on the panel and a back-buffer context on
+        // d2dDevice, which must be on D3DDevice(). renderContext is the render
+        // worker's. Throws on failure.
         void Initialize(HWND hwnd,
                         winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel const& panel,
-                        const PipelineFormat& format = FormatScRgbFP16,
-                        DevicePreference devicePref = DevicePreference::Default);
+                        const PipelineFormat& format,
+                        ID2D1Device6* d2dDevice,
+                        ID2D1DeviceContext5* renderContext);
 
         // Release all GPU resources.
         void Shutdown();
@@ -64,9 +67,6 @@ namespace ShaderLab::Rendering
         // with the panel's CompositionScaleX/Y (UI thread) whenever it
         // changes; the engine re-applies it after every ResizeBuffers.
         void SetCompositionScale(float scaleX, float scaleY);
-
-        // Switch the entire pipeline to a new format (recreates swap chain + RT).
-        void SetPipelineFormat(const PipelineFormat& format);
 
         // --- Per-frame rendering ---
 
@@ -93,19 +93,13 @@ namespace ShaderLab::Rendering
         GpuTimer&               Timer()                  { return m_gpuTimer; }
         const GpuTimer&         Timer()            const { return m_gpuTimer; }
         ID3D11DeviceContext4*   D3DContext()       const { return m_d3dContext.get(); }
-        ID2D1Factory7*          D2DFactory()       const { return m_d2dFactory.get(); }
         ID2D1Device6*           D2DDevice()        const { return m_d2dDevice.get(); }
-        // Default D2D context. Lives on whichever thread last touched it
-        // historically (UI thread). After P7, this is the UI-thread context
-        // for capture / pixel-inspector / source-prep paths that still run
-        // on UI. The render worker uses RenderD2DContext() instead.
+        // UI-thread D2D context: the swap-chain target and the preview blit.
+        // The render worker uses RenderD2DContext() instead.
         ID2D1DeviceContext5*    D2DDeviceContext()  const { return m_d2dDeviceContext.get(); }
-        // Dedicated D2D context for the render-worker thread. Created from
-        // the same multi-threaded D2D device as D2DDeviceContext, so
-        // resources interop, but state (target/transform/dpi) is
-        // independent. This gives the worker its own BeginDraw/EndDraw
-        // session so concurrent UI-thread BeginDraw on the default context
-        // can't put the device into error state mid-draw.
+        // The render worker's D2D context: the EffectGraph context's own, on
+        // the same D2D device as D2DDeviceContext, so resources interop while
+        // target, transform and DPI stay independent.
         ID2D1DeviceContext5*    RenderD2DContext()  const { return m_renderD2dContext.get(); }
         IDXGISwapChain3*        SwapChain()        const { return m_swapChain.get(); }
         IDXGIFactory7*          DXGIFactory()      const { return m_dxgiFactory.get(); }
@@ -118,16 +112,12 @@ namespace ShaderLab::Rendering
         const std::wstring&     AdapterName()      const { return m_adapterName; }
         bool                    IsWarp()           const { return m_isWarp; }
         void SetPreferredAdapterLuid(LUID luid) { m_preferredAdapterLuid = luid; }
+        LUID PreferredAdapterLuid() const { return m_preferredAdapterLuid; }
 
         // Enumerate available DXGI adapters.
         static std::vector<AdapterInfo> EnumerateAdapters();
 
-        // Reinitialize on a different adapter. Tears down all GPU resources
-        // and recreates the device stack on the specified adapter.
-        // Caller must release all device-dependent resources before calling.
-        void Reinitialize(DevicePreference devicePref, LUID adapterLuid = {});
-
-        // ---- Offscreen render target (Phase 7 render-thread split) -------
+        // ---- Offscreen render target -------------------------------------
         //
         // Render thread renders into a pair of double-buffered D2D bitmaps
         // (each backed by its own D3D11 texture); UI thread blits the
@@ -154,7 +144,6 @@ namespace ShaderLab::Rendering
         void ReleaseOffscreenTargets();
 
     private:
-        void CreateDeviceResources(DevicePreference devicePref);
         void CreateSwapChain(winrt::Microsoft::UI::Xaml::Controls::SwapChainPanel const& panel);
         void ConfigureSwapChainColorSpace();
         void CreateRenderTarget();
@@ -165,10 +154,9 @@ namespace ShaderLab::Rendering
         GpuTimer                                m_gpuTimer;
         winrt::com_ptr<ID3D11Device5>           m_d3dDevice;
         winrt::com_ptr<ID3D11DeviceContext4>     m_d3dContext;
-        winrt::com_ptr<ID2D1Factory7>           m_d2dFactory;
         winrt::com_ptr<ID2D1Device6>            m_d2dDevice;
         winrt::com_ptr<ID2D1DeviceContext5>      m_d2dDeviceContext;
-        winrt::com_ptr<ID2D1DeviceContext5>      m_renderD2dContext; // P7: dedicated render-thread context
+        winrt::com_ptr<ID2D1DeviceContext5>      m_renderD2dContext; // render-worker context
 
         // Swap chain
         winrt::com_ptr<IDXGISwapChain3>         m_swapChain;
@@ -177,7 +165,7 @@ namespace ShaderLab::Rendering
         void ApplyCompositionScaleMatrix();
         winrt::com_ptr<ID2D1Bitmap1>            m_renderTarget;
 
-        // Offscreen target pair (Phase 7). Render thread renders into one,
+        // Offscreen target pair. Render thread renders into one,
         // UI thread blits the other into m_swapChain. Index swap is managed
         // by MainWindow (atomic publish protocol).
         winrt::com_ptr<ID3D11Texture2D>         m_offscreenTexture[2];

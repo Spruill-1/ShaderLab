@@ -1,355 +1,209 @@
 #pragma once
 
 #include "pch.h"
-#include "../Graph/EffectGraph.h"
+#include "NodeLayout.h"
+#include "NodeGraphRenderer.h"
+#include "Graph/GraphModel.h"
 #include "../Graph/GraphUiSnapshot.h"
-#include "../Effects/EffectRegistry.h"
 #include "../Rendering/RenderThreadDispatcher.h"
 
 namespace ShaderLab::Controls
 {
-    // Visual representation of a node for hit-testing and rendering.
-    struct NodeVisual
-    {
-        uint32_t nodeId{ 0 };
-        D2D1_RECT_F bounds{};           // Bounding rectangle on the canvas
-        float headerHeight{ 28.0f };    // Height of the title bar
-        float pinSpacing{ 20.0f };      // Vertical spacing between pins
-
-        // Image pin positions (center of the pin circle).
-        std::vector<D2D1_POINT_2F> inputPinPositions;
-        std::vector<D2D1_POINT_2F> outputPinPositions;
-
-        // Data pin positions and names (for property bindings).
-        std::vector<D2D1_POINT_2F> dataInputPinPositions;
-        std::vector<D2D1_POINT_2F> dataOutputPinPositions;
-        std::vector<std::wstring>  dataInputPinNames;    // "PropName (type)"
-        std::vector<std::wstring>  dataOutputPinNames;   // field names (for binding lookup)
-        std::vector<std::wstring>  dataInputPinLabels;   // "PropName (type)" for display
-        std::vector<std::wstring>  dataOutputPinLabels;  // "FieldName (type)" for display
-
-        // Parameter node inline control.
-        bool isParameterNode{ false };
-        bool isClockNode{ false };
-        D2D1_RECT_F sliderRect{};       // Slider track rect (for hit-test)
-        D2D1_RECT_F playButtonRect{};   // Play/pause button rect (clock nodes)
-    };
-
-    // Describes a pending connection drag operation.
-    struct ConnectionDrag
-    {
-        bool     active{ false };
-        uint32_t sourceNodeId{ 0 };
-        uint32_t sourcePin{ 0 };
-        bool     fromOutput{ true };    // true = dragging from an output pin
-        bool     isDataPin{ false };    // true = data pin (property binding)
-        D2D1_POINT_2F currentPos{};     // Current mouse/pointer position
-    };
-
-    // Selection state.
-    struct SelectionState
-    {
-        std::unordered_set<uint32_t> selectedNodeIds;
-        bool isDragging{ false };
-        D2D1_POINT_2F dragStart{};
-        D2D1_POINT_2F dragOffset{};     // Accumulated offset during drag
-    };
-
-    // Node graph editor controller — manages the visual layout, interaction,
-    // and rendering of an EffectGraph as a canvas-based node editor.
+    // The node-graph editor: laid-out node visuals, selection, node / slider
+    // / connection drags, hit-testing and the graph edits they make. Painting
+    // is NodeGraphRenderer's; pointer routing is GraphCanvasInputController's.
     //
-    // Responsibilities:
-    //   - Layout nodes on a 2D canvas with positions from EffectNode::position
-    //   - Hit-test nodes, pins, and edges for pointer interaction
-    //   - Manage node selection, multi-select, and drag-move
-    //   - Handle connection creation/deletion via pin drag
-    //   - Provide D2D rendering commands for node/edge visualization
-    //   - Auto-layout for newly added nodes
+    // ---- THREADING RULE: how this controller touches graph data ----
     //
-    // The controller does NOT own the EffectGraph or the D2D device context.
-    // The host (MainWindow) provides these and calls Render() each frame.
+    //  1. READS on the UI thread -> the published GraphUiSnapshot only. The
+    //     render worker mutates the live graph continuously, so a direct read
+    //     races it (an access violation inside std::map, not a compile error).
+    //     Hold the snapshot for the whole read.
+    //
+    //  2. WRITES -> on the render thread, through the dispatcher. Every
+    //     command below dispatches its own write and relays out inside the
+    //     same closure.
+    //
+    //  3. LAYOUT (RebuildLayout / AutoLayout) reads the live graph, so it runs
+    //     on the render thread, or while the worker is stopped (startup, an
+    //     adapter switch). Other threads call RequestRelayout /
+    //     RequestAutoLayout, which dispatch.
     class NodeGraphController
     {
     public:
-        NodeGraphController() = default;
+        using SnapshotProvider = std::function<std::shared_ptr<const Graph::GraphUiSnapshot>()>;
 
-        // Bind to an effect graph. Must be called before any interaction.
-        void SetGraph(Graph::EffectGraph* graph);
+        // Must precede every other call.
+        void Attach(Graph::GraphModel& graph, Rendering::RenderThreadDispatcher& dispatcher,
+                    SnapshotProvider snapshots);
 
-        // Bind the render-thread dispatcher. All graph-mutating calls
-        // (Connect/Disconnect/AddNode/RemoveNode/BindProperty etc.) route
-        // through this so they execute on whichever thread owns rendering.
-        // Until the worker thread spawns (Phase 7), the dispatcher runs in
-        // synchronous mode and closures execute inline -- equivalent to
-        // calling m_graph->X() directly. Setting nullptr falls back to the
-        // direct-call path (e.g. tests that don't have a dispatcher).
-        void SetDispatcher(::ShaderLab::Rendering::RenderThreadDispatcher* d) { m_dispatcher = d; }
-
-        // ---- THREADING RULE: how this controller may touch graph data ----
-        //
-        // Three access paths exist. Picking the wrong one is a data race that
-        // shows up as an access violation deep inside std::map, not as a
-        // compile error -- so read this before adding any new graph access.
-        //
-        //  1. READS on the UI thread  -> ALWAYS via Snapshot().
-        //     The render worker mutates the live EffectGraph continuously
-        //     (clock properties every tick, plus every MCP closure). Reading
-        //     m_graph directly from the UI thread races those writes: a paint
-        //     landing mid-mutation walks a std::map being rebalanced, or a node
-        //     graph_clear just destroyed. Snapshot() returns an immutable
-        //     per-frame value copy published by the render thread, so it is
-        //     always safe and at most one frame stale -- fine for display and
-        //     hit-testing. Hold the returned shared_ptr for the whole read.
-        //
-        //  2. WRITES (from any thread) -> ALWAYS through m_dispatcher.
-        //     See SetDispatcher above. Never mutate m_graph directly from a
-        //     pointer/interaction handler.
-        //
-        //  3. Layout computation (RebuildLayout/AutoLayout/ComputeNodeVisual)
-        //     -> live m_graph, but ONLY on the render thread. These must see
-        //     post-mutation state immediately (a snapshot would be a frame
-        //     stale and a just-added node would be missing), so they read the
-        //     live graph and callers are responsible for being on the render
-        //     thread -- UI-side callers go through
-        //     MainWindow::RunLayoutOnRenderThread or m_dispatcher.
-        //
-        // Supplies the latest published GraphUiSnapshot (MainWindow owns it).
-        // May return nullptr before the first frame is published, in which case
-        // read paths fall back to the live graph -- safe only because the render
-        // worker has not spawned yet at that point.
-        void SetSnapshotProvider(
-            std::function<std::shared_ptr<const Graph::GraphUiSnapshot>()> p)
-        {
-            m_snapshotProvider = std::move(p);
-        }
+        // Args: srcNodeId, srcPin, dstNodeId, dstPin, isDataBinding.
+        using ConnectionCallback = std::function<void(uint32_t, uint32_t, uint32_t, uint32_t, bool)>;
+        void SetConnectionCallback(ConnectionCallback cb) { m_connectionCallback = std::move(cb); }
 
         // ---- Layout ----
 
-        // Rebuild visual layout from the current graph state.
+        // Recomputes every node's visual from the live graph. Layout thread only.
         void RebuildLayout();
-
-        // Auto-arrange nodes left-to-right by topological depth,
-        // minimizing edge crossings. Called when nodes/edges change.
+        // Moves every node to its ComputeAutoLayout place, then relays out.
+        // Layout thread only; a graph with a cycle keeps its positions.
         void AutoLayout();
+        // The same from any other thread: run on the render thread and wait.
+        void RequestRelayout();
+        void RequestAutoLayout();
 
-        // Set canvas pan offset (scrolling).
+        // ---- View ----
+
         void SetPanOffset(float x, float y);
         D2D1_POINT_2F PanOffset() const { return m_panOffset; }
-
-        // Set canvas zoom level (1.0 = 100%).
-        void SetZoom(float zoom);
+        void SetZoom(float zoom);   // clamped to [0.1, 5]
         float Zoom() const { return m_zoom; }
-
-        // Inform the controller of the current visible viewport size in pixels.
-        // Used to place auto-positioned new nodes in the user's current view.
+        D2D1_POINT_2F ScreenToCanvas(D2D1_POINT_2F screenPoint) const;
+        // Used to place auto-positioned new nodes in the current view (DIPs).
         void SetViewportSize(float w, float h) { m_viewportW = w; m_viewportH = h; }
-
-        // Annotate each node on the canvas with its GPU cost and the reason
-        // that figure reads the way it does. Purely a display switch -- the
-        // measurement itself is the GPU timer's, and is taken whether or not
-        // anything is shown. Read on the UI thread only.
-        void SetShowNodeGpuStats(bool on)
-        {
-            if (m_showNodeGpuStats == on) return;
-            m_showNodeGpuStats = on;
-            m_needsRedraw = true;
-        }
+        // Annotates each node with its GPU cost. UI thread only.
+        void SetShowNodeGpuStats(bool on);
         bool ShowNodeGpuStats() const { return m_showNodeGpuStats; }
-
-        // Returns the axis-aligned bounding box of all node visuals in canvas
-        // (pre-pan/zoom) space. Returns {0,0,0,0} when no nodes are laid out.
-        // Caller is responsible for calling RebuildLayout() first if the graph
-        // may have changed since the last layout.
+        // Bounding box of every node visual in canvas space; {0,0,0,0} when empty.
         D2D1_RECT_F ContentBounds() const;
 
-        // ---- Interaction ----
+        // ---- Hit tests (UI thread, canvas space) ----
 
-        // Hit-test a canvas point. Returns the node ID under the point, or 0.
         uint32_t HitTestNode(D2D1_POINT_2F canvasPoint) const;
-
-        // Hit-test for a pin. Returns true and fills nodeId/pinIndex/isOutput/isDataPin.
-        bool HitTestPin(D2D1_POINT_2F canvasPoint,
-                        uint32_t& nodeId, uint32_t& pinIndex, bool& isOutput,
-                        bool& isDataPin) const;
-
-        // Hit-test for inline slider on parameter nodes. Returns node ID or 0.
+        std::optional<PinRef> HitTestPin(D2D1_POINT_2F canvasPoint) const;
         uint32_t HitTestSlider(D2D1_POINT_2F canvasPoint) const;
-
-        // Hit-test for play/pause button on clock nodes. Returns node ID or 0.
         uint32_t HitTestPlayButton(D2D1_POINT_2F canvasPoint) const;
+        bool IsParameterNode(uint32_t nodeId) const;
 
-        // Result of HitTestEdge.
         struct EdgeHit
         {
             bool found{ false };
             bool isDataBinding{ false };
-            // Image edge fields (when !isDataBinding).
             uint32_t sourceNodeId{ 0 };
-            uint32_t sourcePin{ 0 };
+            uint32_t sourcePin{ 0 };        // image edges
             uint32_t destNodeId{ 0 };
-            uint32_t destPin{ 0 };
-            // Data binding fields (when isDataBinding).
-            std::wstring destPropertyName;
-            std::wstring sourceFieldName;  // for unique-source disambiguation
+            uint32_t destPin{ 0 };          // image edges
+            std::wstring destPropertyName;  // data bindings
+            std::wstring sourceFieldName;   // data bindings
         };
-
-        // Hit-test for an edge (image or data binding) under the given canvas
-        // point. Returns the closest hit within tolerance, or {found=false}.
+        // The edge or binding curve closest to the point within tolerance.
         EdgeHit HitTestEdge(D2D1_POINT_2F canvasPoint, float tolerance = 6.0f) const;
 
-        // Remove the given edge from the graph. Returns true on success.
+        // ---- Commands (UI thread) ----
+
+        // Removes the edge, or the binding components that read that field.
         bool RemoveEdge(const EdgeHit& hit);
+        // Starts or pauses a clock; returns its new state, or nothing if it is gone.
+        std::optional<bool> TogglePlaying(uint32_t nodeId);
 
-        // Update slider value from canvas X position during drag.
-        // Returns true if value changed.
-        bool UpdateSliderDrag(uint32_t nodeId, D2D1_POINT_2F canvasPoint);
+        // A slider drag writes the latest position on the render thread
+        // without waiting; EndSliderDrag waits for the last write. Update
+        // returns true when the position moved.
+        void BeginSliderDrag(uint32_t nodeId, D2D1_POINT_2F canvasPoint);
+        bool UpdateSliderDrag(D2D1_POINT_2F canvasPoint);
+        void EndSliderDrag();
+        uint32_t SliderDragNodeId() const { return m_sliderDrag.nodeId; }
 
-        // Check if a node is a parameter node (no HLSL, data output only).
-        bool IsParameterNode(uint32_t nodeId) const;
-
-        // Begin dragging selected nodes.
+        // Moves the selection the same way: visuals at once, the graph's
+        // positions coalesced into one queued write.
         void BeginDragNodes(D2D1_POINT_2F startPoint);
         void UpdateDragNodes(D2D1_POINT_2F currentPoint);
         void EndDragNodes();
 
-        // Begin dragging a connection from a pin.
-        void BeginConnection(uint32_t nodeId, uint32_t pinIndex, bool fromOutput, bool isDataPin = false);
+        void BeginConnection(const PinRef& from);
         void UpdateConnection(D2D1_POINT_2F currentPoint);
+        // Connects output to input of the same pin type; true when it did.
         bool EndConnection(D2D1_POINT_2F dropPoint);
         void CancelConnection();
 
-        // ---- Selection ----
-
         void SelectNode(uint32_t nodeId, bool addToSelection = false);
-        void DeselectNode(uint32_t nodeId);
         void DeselectAll();
         void SelectAll();
-        const std::unordered_set<uint32_t>& SelectedNodes() const { return m_selection.selectedNodeIds; }
-
-        // Delete all selected nodes and their edges.
+        const std::unordered_set<uint32_t>& SelectedNodes() const { return m_selection; }
         void DeleteSelected();
 
-        // ---- Node operations ----
-
-        // Add a node at a canvas position (auto-positioned if pos is zero).
+        // Adds a node at a canvas position, or in the current view when the
+        // position is (0, 0). Returns its id.
         uint32_t AddNode(Graph::EffectNode node, D2D1_POINT_2F canvasPos);
 
-        // Add an output node if one doesn't exist.
-        uint32_t EnsureOutputNode();
+        // Adds a copy of each (original id, node) in the current view and
+        // reconnects the edges between the copies.
+        void PasteNodes(const std::vector<std::pair<uint32_t, Graph::EffectNode>>& nodes,
+                        std::span<const Graph::EffectEdge> edges);
 
-        // ---- Rendering ----
+        // ---- Paint (UI thread) ----
 
-        // Render the node graph to a D2D device context.
-        // The caller should set up the transform for pan/zoom.
-        void Render(ID2D1DeviceContext* dc, D2D1_SIZE_F viewportSize);
-
-        // ---- Constants ----
-
-        static constexpr float NodeWidth = 180.0f;
-        static constexpr float PinRadius = 6.0f;
-        static constexpr float NodeCornerRadius = 6.0f;
-
-        // Optional callback for logging connection events.
-        // Args: srcNodeId, srcPin, dstNodeId, dstPin, isDataBinding
-        using ConnectionCallback = std::function<void(uint32_t, uint32_t, uint32_t, uint32_t, bool)>;
-        void SetConnectionCallback(ConnectionCallback cb) { m_connectionCallback = std::move(cb); }
+        void Render(ID2D1DeviceContext* dc);
+        void ReleaseDeviceResources();
+        void SetNeedsRedraw() { m_needsRedraw.store(true); }
+        bool NeedsRedraw() const { return m_needsRedraw.load(); }
 
     private:
-        // Convert screen point to canvas point (accounting for pan/zoom).
-        D2D1_POINT_2F ScreenToCanvas(D2D1_POINT_2F screenPoint) const;
-        D2D1_POINT_2F CanvasToScreen(D2D1_POINT_2F canvasPoint) const;
-
-        // Compute the visual bounds for a node.
-        NodeVisual ComputeNodeVisual(const Graph::EffectNode& node) const;
-
-        // Rendering helpers.
-        void RenderEdges(ID2D1DeviceContext* dc);
-        void RenderNodes(ID2D1DeviceContext* dc);
-        void RenderConnectionDrag(ID2D1DeviceContext* dc);
-
-        // Color helpers for node types.
-        static D2D1_COLOR_F NodeColor(Graph::NodeType type);
-        static D2D1_COLOR_F NodeHeaderColor(Graph::NodeType type);
-
-        Graph::EffectGraph* m_graph{ nullptr };
-        ::ShaderLab::Rendering::RenderThreadDispatcher* m_dispatcher{ nullptr };
-        std::function<std::shared_ptr<const Graph::GraphUiSnapshot>()> m_snapshotProvider;
-
-        // UI-thread read accessor -- see the THREADING RULE above. Returns the
-        // latest published snapshot, or nullptr when none exists yet.
+        bool OnLayoutThread() const;
+        void CheckLayoutThread() const;
         std::shared_ptr<const Graph::GraphUiSnapshot> Snapshot() const
         {
             return m_snapshotProvider ? m_snapshotProvider() : nullptr;
         }
 
-        // Snapshot held for the duration of one Render() call. Acquired once so
-        // edges and nodes within a single paint always come from the same
-        // frame, and so pointers into it stay valid for the whole paint.
-        std::shared_ptr<const Graph::GraphUiSnapshot> m_paintSnapshot;
+        // Applies the queued drag writes. Render thread.
+        void FlushDragWrites();
+        // Queues one FlushDragWrites unless one is already queued.
+        void ScheduleDragFlush();
 
-        // Guards m_visuals. Separate from the graph: m_visuals is written from
-        // BOTH threads -- RebuildLayout runs on the render thread (from the
-        // engine-sink event hooks) while AddNode/DeleteSelected/UpdateDragNodes
-        // write it on the UI thread after dispatching their graph mutation --
-        // and it is read by every paint and hit-test on the UI thread.
-        //
-        // Kept deliberately fine-grained. The obvious alternative, reusing
-        // MainWindow::m_graphMutex, couples the canvas to the render worker's
-        // whole tick (~50ms on a heavy graph) and stalls painting.
-        //
-        // LOCK ORDER RULE: never hold this across a RenderThreadDispatcher
-        // DispatchSync. The render thread takes m_graphMutex then (via
-        // RebuildLayout) this one; a UI thread holding this while waiting on the
-        // render thread inverts that order and deadlocks. Always dispatch the
-        // graph write FIRST, release, then take this to update visuals.
-        // For the same reason no lock-holder may call RebuildLayout, which
-        // acquires it itself (std::shared_mutex is not recursive).
-        mutable std::shared_mutex m_visualsMutex;
+        Graph::GraphModel* m_graph{ nullptr };
+        Rendering::RenderThreadDispatcher* m_dispatcher{ nullptr };
+        SnapshotProvider m_snapshotProvider;
         ConnectionCallback m_connectionCallback;
 
-        // Cached visual layout.
+        // Guards m_visuals, which RebuildLayout writes on the render thread
+        // while the UI paints and hit-tests from it.
+        //
+        // Never hold this across a DispatchSync (a dispatched closure that
+        // relayouts takes it on the render thread, so waiting on that closure
+        // while holding this deadlocks), never read
+        // m_visuals inside a dispatched closure, and copy values out rather
+        // than keep references across a dispatch. RebuildLayout takes it
+        // itself, so no holder may call it.
+        mutable std::shared_mutex m_visualsMutex;
         std::unordered_map<uint32_t, NodeVisual> m_visuals;
 
-        // Interaction state.
-        SelectionState m_selection;
+        // UI-thread state.
+        std::unordered_set<uint32_t> m_selection;
+        bool m_draggingNodes{ false };
+        D2D1_POINT_2F m_dragStart{};
+        D2D1_POINT_2F m_dragOffset{};
+        struct SliderDrag
+        {
+            uint32_t nodeId{ 0 };
+            bool isClock{ false };
+            D2D1_RECT_F rect{};
+            double lastT{ -1.0 };
+        } m_sliderDrag;
         ConnectionDrag m_connectionDrag;
 
-        // Canvas transform.
+        // Drag writes waiting for the render thread; FlushDragWrites takes them.
+        struct DragWrites
+        {
+            std::mutex mutex;
+            bool queued{ false };
+            std::vector<uint32_t> moveIds;
+            float dx{ 0.0f };
+            float dy{ 0.0f };
+            uint32_t sliderNodeId{ 0 };
+            bool sliderIsClock{ false };
+            std::optional<double> sliderT;
+        } m_dragWrites;
+
         D2D1_POINT_2F m_panOffset{ 0.0f, 0.0f };
         float m_zoom{ 1.0f };
-
-        // Auto-layout position for new nodes.
-        float m_nextAutoX{ 50.0f };
-        float m_nextAutoY{ 50.0f };
-        int   m_autoStaggerCount{ 0 };
-
-        // Visible viewport size in pixels (set by host on init/resize).
+        int m_autoStaggerCount{ 0 };
         float m_viewportW{ 800.0f };
         float m_viewportH{ 600.0f };
+        std::atomic<bool> m_showNodeGpuStats{ false };
 
-        // Cached D2D resources (created on first Render call).
-        winrt::com_ptr<ID2D1SolidColorBrush> m_brushNode;
-        winrt::com_ptr<ID2D1SolidColorBrush> m_brushHeader;
-        winrt::com_ptr<ID2D1SolidColorBrush> m_brushEdge;
-        winrt::com_ptr<ID2D1SolidColorBrush> m_brushPin;
-        winrt::com_ptr<ID2D1SolidColorBrush> m_brushSelection;
-        winrt::com_ptr<ID2D1SolidColorBrush> m_brushText;
-        winrt::com_ptr<ID2D1SolidColorBrush> m_brushDataPin;     // Orange for data pins
-        winrt::com_ptr<ID2D1SolidColorBrush> m_brushDataEdge;    // Orange for data edges
-        winrt::com_ptr<ID2D1SolidColorBrush> m_brushGpuBadge;   // Retinted per GPU state
-        winrt::com_ptr<IDWriteTextFormat>     m_textFormat;
-        winrt::com_ptr<IDWriteTextFormat>     m_pinLabelFormat;   // Small text for pin labels
-        bool m_resourcesCreated{ false };
-        bool m_needsRedraw{ true }; // Set when graph topology/selection/layout changes
-        bool m_showNodeGpuStats{ false };
-
-        void EnsureResources(ID2D1DeviceContext* dc);
-
-    public:
-        void SetNeedsRedraw() { m_needsRedraw = true; }
-
-        // Release cached D2D resources (call after GPU device change).
-        void ReleaseDeviceResources();
-        bool NeedsRedraw() const { return m_needsRedraw; }
+        NodeGraphRenderer m_renderer;
+        // Set from the render thread too (layout rebuilds, compute results).
+        std::atomic<bool> m_needsRedraw{ true };
     };
 }

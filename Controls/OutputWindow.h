@@ -1,7 +1,7 @@
 #pragma once
 
 #include "pch.h"
-#include "../Rendering/PipelineFormat.h"
+#include "Rendering/PipelineFormat.h"
 #include "OutputSinkRenderState.h"
 
 namespace ShaderLab::Controls
@@ -25,22 +25,12 @@ namespace ShaderLab::Controls
             const std::wstring& nodeName,
             const Rendering::PipelineFormat& format);
 
-        // P7: push current UI-thread view state (window size, pan/zoom,
-        // autoFit, needsFit) into the shared sink under its viewMutex so
-        // the render thread can read a coherent snapshot. Called once per
-        // UI tick before BlitAndPresent.
-        void SyncSinkFromUi();
-
-        // P7: blit the latest published offscreen buffer (created on render
-        // thread, see RenderOutputSink in MainWindow.RenderTick.cpp) into
-        // this window's swap chain back buffer, then Present1. UI thread
-        // only. Lazily rebuilds the UI-side D2D bitmap source wrappers if
-        // the render thread bumped bufferGen since last blit.
+        // Blits the worker's latest frame (Controls/OutputSinkRenderer) into
+        // this window's swap chain, fitted or at the user's pan / zoom, and
+        // presents. UI thread only; does nothing when nothing changed.
         void BlitAndPresent(ID2D1DeviceContext5* uiDc);
 
-        // P7 sink accessor. Lifetime is shared_ptr so the render thread can
-        // hold a reference for the duration of one frame even if the UI
-        // thread closes the window mid-render.
+        // What the render worker draws into; it holds its own reference.
         std::shared_ptr<OutputSinkRenderState> Sink() const { return m_sink; }
 
         void Close();
@@ -70,7 +60,9 @@ namespace ShaderLab::Controls
         // Shared (non-owning).
         ID3D11Device5* m_d3dDevice{ nullptr };
         IDXGIFactory7* m_dxgiFactory{ nullptr };
-        ID2D1DeviceContext5* m_dc{ nullptr };
+        // The engine's default context, which SaveImageAsync reads back with;
+        // blits use the UI context passed to BlitAndPresent.
+        winrt::com_ptr<ID2D1DeviceContext5> m_saveDc;
 
         // Owned per-window resources.
         winrt::Microsoft::UI::Xaml::Window m_window{ nullptr };
@@ -80,12 +72,13 @@ namespace ShaderLab::Controls
         float m_appliedScaleX{ 0.0f };   // scale the inverse matrix was built for
         float m_appliedScaleY{ 0.0f };
 
-        // P7 cross-thread state. Created in Create(), shared with the
-        // render worker via MainWindow::m_outputSinks.
         std::shared_ptr<OutputSinkRenderState> m_sink;
 
-        // Last rendered image (non-owning, for save).
-        ID2D1Image* m_lastImage{ nullptr };
+        // The last blitted frame, for Save.
+        winrt::com_ptr<ID2D1Image> m_lastImage;
+
+        // Expires with the window; SaveImageAsync checks it after resuming.
+        std::shared_ptr<bool> m_alive{ std::make_shared<bool>(true) };
         std::wstring m_nodeName;
 
         Rendering::PipelineFormat m_format{ Rendering::FormatScRgbFP16 };
@@ -128,10 +121,6 @@ namespace ShaderLab::Controls
         std::wstring m_lastStatusText;
         std::wstring m_lastTooltip;
         winrt::Microsoft::UI::Xaml::Controls::TextBlock m_tooltipBlock{ nullptr };
-
-        // FPS counter -- driven by main window via SetStatusText/SetStatusTooltip.
-        // No per-window state; every render tick presents to all output windows
-        // synchronously so the main window's FPS *is* this window's FPS.
 
         // Event tokens for cleanup.
         winrt::event_token m_sizeChangedToken{};

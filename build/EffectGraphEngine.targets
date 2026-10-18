@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Where ShaderLab's projects get EffectGraph's engine. Import after
+  Microsoft.Cpp.targets.
+
+  Package (the default): EffectGraph.Engine as packages.config restores it,
+  at the version in EffectGraphPackage.props; its targets add the headers, the
+  built-in effect headers and the library. Set EffectGraphEnginePackageDir to
+  use an extracted package from elsewhere.
+
+  Source: set EffectGraphSourceDir to an EffectGraph checkout (with a trailing
+  backslash) to build its engine project alongside ShaderLab and change both
+  at once, e.g. /p:EffectGraphSourceDir=..\EffectGraph\
+
+  A project that needs only the headers (a static library, the MCP broker) sets
+  EffectGraphEngineHeadersOnly to true before importing this.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildThisFileDirectory)EffectGraphPackage.props" />
+  <PropertyGroup>
+    <EffectGraphEngineFromSource Condition="'$(EffectGraphSourceDir)' != ''">true</EffectGraphEngineFromSource>
+    <EffectGraphEnginePackageDir Condition="'$(EffectGraphEnginePackageDir)' == ''">$(EffectGraphPackagesDir)EffectGraph.Engine.$(EffectGraphPackageVersion)\</EffectGraphEnginePackageDir>
+  </PropertyGroup>
+
+  <!-- Source: the engine project of an EffectGraph checkout. -->
+  <ItemGroup Condition="'$(EffectGraphEngineFromSource)' == 'true' and '$(EffectGraphEngineHeadersOnly)' != 'true'">
+    <ProjectReference Include="$(EffectGraphSourceDir)EffectGraphEngine.vcxproj">
+      <Project>{A7A1E0F1-665C-4D06-9AC7-6D6B6A0D0F01}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>true</LinkLibraryDependencies>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(EffectGraphEngineFromSource)' == 'true'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(EffectGraphSourceDir);$(EffectGraphSourceDir)Engine\Api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>EFFECTGRAPH_STATIC;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <Import Project="$(EffectGraphSourceDir)build\EffectGraphBuiltIns.targets"
+          Condition="'$(EffectGraphEngineFromSource)' == 'true' and '$(EffectGraphEngineHeadersOnly)' != 'true'" />
+
+  <!-- Package. -->
+  <Target Name="EffectGraphEnginePackageCheck" BeforeTargets="PrepareForBuild"
+          Condition="'$(EffectGraphEngineFromSource)' != 'true' and !Exists('$(EffectGraphEnginePackageDir)build\native\EffectGraph.Engine.targets')">
+    <Error Text="EffectGraph.Engine $(EffectGraphPackageVersion) is not at $(EffectGraphEnginePackageDir). Run: nuget restore ShaderLab.slnx -SolutionDirectory . (nuget.config names the feeds), or build against a checkout with /p:EffectGraphSourceDir=..\EffectGraph\" />
+  </Target>
+  <Import Project="$(EffectGraphEnginePackageDir)build\native\EffectGraph.Engine.targets"
+          Condition="'$(EffectGraphEngineFromSource)' != 'true' and Exists('$(EffectGraphEnginePackageDir)build\native\EffectGraph.Engine.targets')" />
+</Project>

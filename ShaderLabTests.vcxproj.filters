@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="ShaderLabHeadless">
+      <UniqueIdentifier>{2C9A88FF-8758-5578-B56B-C431007DD12A}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ShaderLabMcpBroker">
+      <UniqueIdentifier>{C63B9C70-C6C6-55DC-A3A6-6DB9CD92827D}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests">
+      <UniqueIdentifier>{D1908119-8916-5DF1-A4DF-DFFECEA92618}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Graph">
+      <UniqueIdentifier>{9A08887E-CD16-5026-8B78-A1DB182FD034}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Hosts">
+      <UniqueIdentifier>{01DEDDB2-FCC3-5BEF-B658-1C327F816602}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Mcp">
+      <UniqueIdentifier>{97A29F8C-64F9-526B-BE67-1D70511305CE}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Persistence">
+      <UniqueIdentifier>{A560B497-AC36-5A3F-A287-E8A2BFA0F55C}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Rendering">
+      <UniqueIdentifier>{5BCB61F1-FE19-5F61-9486-75AB72A75F4E}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests\Video">
+      <UniqueIdentifier>{7B45A540-B3DA-5894-8099-1B1DE2563DEE}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Tests\TestCommon.h">
+      <Filter>Tests</Filter>
+    </ClInclude>
+    <ClInclude Include="Tests\TestSupport.h">
+      <Filter>Tests</Filter>
+    </ClInclude>
+    <ClInclude Include="Tests\ShaderTestBench.h">
+      <Filter>Tests</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch_host.cpp" />
+    <ClCompile Include="Tests\TestRunner.cpp">
+      <Filter>Tests</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\TestSupport.cpp">
+      <Filter>Tests</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\ShaderTestBench.cpp">
+      <Filter>Tests</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\ShaderLabTestSetup.cpp">
+      <Filter>Tests</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Graph\GraphLayoutTests.cpp">
+      <Filter>Tests\Graph</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Graph\GraphUiTests.cpp">
+      <Filter>Tests\Graph</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Hosts\BrokerShimTests.cpp">
+      <Filter>Tests\Hosts</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Hosts\EffectPluginDiscoveryTests.cpp">
+      <Filter>Tests\Hosts</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Hosts\CaptureSourceTests.cpp">
+      <Filter>Tests\Hosts</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Hosts\HeadlessArgsTests.cpp">
+      <Filter>Tests\Hosts</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Mcp\McpEffectGraphTests.cpp">
+      <Filter>Tests\Mcp</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Mcp\McpHelperTests.cpp">
+      <Filter>Tests\Mcp</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Mcp\McpRouteTests.cpp">
+      <Filter>Tests\Mcp</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Mcp\McpRouterTests.cpp">
+      <Filter>Tests\Mcp</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Mcp\McpTransportTests.cpp">
+      <Filter>Tests\Mcp</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Persistence\PackageTests.cpp">
+      <Filter>Tests\Persistence</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Rendering\ExpressionTests.cpp">
+      <Filter>Tests\Rendering</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Rendering\HostLoopTests.cpp">
+      <Filter>Tests\Rendering</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Video\VideoExportTests.cpp">
+      <Filter>Tests\Video</Filter>
+    </ClCompile>
+    <ClCompile Include="Tests\Video\VideoPlaybackTests.cpp">
+      <Filter>Tests\Video</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabHeadless\HeadlessArgs.cpp">
+      <Filter>ShaderLabHeadless</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabMcpBroker\BrokerPipeIo.cpp">
+      <Filter>ShaderLabMcpBroker</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabMcpBroker\Shim.cpp">
+      <Filter>ShaderLabMcpBroker</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>

@@ -13,8 +13,8 @@ Prefer **headless** when the question is numeric — it skips all of this. See
 
 ## 0. Build first
 
-Use the **shaderlab-build** skill. The GUI locks `ShaderLab.exe` and
-`ShaderLabEngine.dll` in the layout, and a lingering `ShaderLabMcpBroker` hub locks
+Use the **shaderlab-build** skill. The GUI locks `ShaderLab.exe` in the layout,
+and a lingering `ShaderLabMcpBroker` hub locks
 the layout's broker copy — **kill both before rebuilding** or the copy step fails.
 
 ```pwsh
@@ -58,9 +58,10 @@ the session appears in `list_sessions`.
 
 ## 3. MCP
 
-MCP is enabled by `%LOCALAPPDATA%\ShaderLab\config.json` containing `{"mcp": true}`;
-alternatives are the `--mcp` arg or the toolbar toggle. On launch the GUI copies the
-shim to
+MCP is on by default: each window starts a session at launch. `"mcp": false` in
+`%LOCALAPPDATA%\ShaderLab\config.json` or `SHADERLAB_MCP=0` turns it off for every
+launch (config.json is read last, so its value wins over the environment), and the
+toolbar toggle turns it off per window. On launch the GUI copies the shim to
 `%LOCALAPPDATA%\ShaderLab\bin\ShaderLabMcpBroker.exe` and registers a session with the
 hub, which the shim activates on demand.
 

@@ -30,7 +30,7 @@ namespace ShaderLab::Controls
             1.0, winrt::Microsoft::UI::Xaml::GridUnitType::Star));
         rows.Append(contentRow);
 
-        // Toolbar with Clear and Copy buttons.
+        // Toolbar with a Clear button.
         auto toolbar = winrt::Microsoft::UI::Xaml::Controls::StackPanel();
         toolbar.Orientation(winrt::Microsoft::UI::Xaml::Controls::Orientation::Horizontal);
         toolbar.Padding({ 8, 4, 8, 4 });
@@ -41,9 +41,10 @@ namespace ShaderLab::Controls
         auto clearBtn = winrt::Microsoft::UI::Xaml::Controls::Button();
         clearBtn.Content(winrt::box_value(L"Clear"));
         clearBtn.Click([this](auto&&, auto&&) {
+            // m_lastSeq already marks the newest entry shown, so later
+            // entries keep appending after the clear.
             if (m_logView)
                 m_logView.Blocks().Clear();
-            m_lastSeq = UINT64_MAX; // skip all existing entries on next update
         });
         toolbar.Children().Append(clearBtn);
 

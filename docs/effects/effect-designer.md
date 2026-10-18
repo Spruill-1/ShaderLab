@@ -16,8 +16,8 @@ The engine serves three headers to every shader it compiles. None is required.
 
 | Header | Contents |
 |---|---|
-| `shaderlab_colormath.hlsli` | The shared color-math library (`Effects/ColorMath.cpp`): transfer functions, gamut matrices, ICtCp, dE ITP, the target-gamut helpers. |
-| `shaderlab_params.hlsli` | The parameter macros: `SHADERLAB_PARAM` / `SHADERLAB_GPU_BUFFER` / `SHADERLAB_LOAD_PARAM` for GPU-bindable parameters and `SHADERLAB_OPTION` / `SHADERLAB_OPTION_VALUE` for [option variants](option-variants.md). |
+| `shaderlab_colormath.hlsli` | The shared color-math library (`Effects/ColorMath.cpp`): transfer functions, gamut matrices, ICtCp, dE ITP, the CIE Lab metrics (`CieDeltaE76` / `CieDeltaE94` / `CieDeltaE2000`), the target-gamut helpers and `GamutPrimariesFor` (gamut id to primaries). |
+| `shaderlab_params.hlsli` | The parameter macros: `SHADERLAB_PARAM` / `SHADERLAB_GPU_BUFFER` / `SHADERLAB_LOAD_PARAM` for GPU-bindable parameters and `SHADERLAB_OPTION` / `SHADERLAB_OPTION_VALUE` for [option variants](https://github.com/Spruill-1/EffectGraph/blob/main/docs/effects/option-variants.md), and the multi-group reduction helpers the statistics shaders use (`ShaderLabTreeReduce`, `ShaderLabStoreHistogram`, `ShaderLabMergeHistograms`, `ShaderLabPercentileBin`; see [Statistics reductions](https://github.com/Spruill-1/EffectGraph/blob/main/docs/architecture/compute-analysis-pipeline.md#statistics-reductions)). |
 | `shaderlab_gamut.hlsli` | The target-gamut boundary search in ICtCp and the `ICtCp Gamut Boundary LUT` contract (`Effects/ShaderLabEffects.cpp`, `GetGamutHLSL()`). Includes `shaderlab_colormath.hlsli` itself. |
 
 **Generate Scaffold** emits both includes at the top of every shader type:
@@ -50,7 +50,7 @@ A reader that includes it compiles the same geometry and stamp logic as the
 generator, so the two cannot disagree about the table's layout.
 
 The target itself comes from the color math: `MakeTargetXf(gamut, R, G, B, W)`
-returns the `TargetXf` for a [target gamut id](builtin-catalog.md#target-gamut-ids)
+returns the `TargetXf` for a [target gamut id](https://github.com/Spruill-1/EffectGraph/blob/main/docs/effects/builtin-catalog.md#target-gamut-ids)
 (0 sRGB, 1 Display P3, 2 BT.2020, 3 Custom from `R`/`G`/`B`/`W`, 4 DCI-P3), and
 `ScRGBToTarget` / `TargetToScRGB` convert through it. The xy constants
 `GAMUT_709_*`, `GAMUT_P3_*`, `GAMUT_2020_*`, `D65_WHITE` and `DCI_WHITE` are there
@@ -64,7 +64,8 @@ the gamut header.
 
 The same names resolve in every compile path: the evaluator, the bytecode
 cache, graph and user-effect loading, the Effect Designer and MCP
-`effect_compile` (`ShaderLabIncludeHandler()` in `Effects/ShaderCompiler.h`).
+`effect_compile` (`ShaderLabIncludeHandler()` in `Effects/ShaderIncludes.h`,
+which also lists the headers: `EmbeddedIncludes`, `FindEmbeddedInclude`).
 Any other `#include` fails.
 
 ## Option Variants
@@ -73,7 +74,7 @@ An `enum` parameter row has a **Variant per option** checkbox. Ticked, the
 effect is compiled once per option with the value a compile-time constant, and
 every variant is built as soon as the effect is placed, so switching options
 never waits on a compile. The generated cbuffer declares the parameter with
-`SHADERLAB_OPTION`. See [Option Variants](option-variants.md).
+`SHADERLAB_OPTION`. See [Option Variants](https://github.com/Spruill-1/EffectGraph/blob/main/docs/effects/option-variants.md).
 
 ## D3D11 Compute Shader Workflow
 
@@ -113,7 +114,7 @@ void main(uint3 GTid : SV_GroupThreadID)
     }
 
     if (tid == 0)
-        Result[0] = gs_sum[0] / float(Width * Height);
+        Result[SL_FIELD_Mean] = gs_sum[0] / float(Width * Height);
 }
 ```
 
@@ -121,7 +122,8 @@ void main(uint3 GTid : SV_GroupThreadID)
 - No `_TileOffset` — single dispatch covers the full image
 - `Width`/`Height` auto-injected at cbuffer offset 0 (user params at offset 8)
 - Output is `RWStructuredBuffer<float4>` (not `RWTexture2D<float4>`)
-- Results map to typed analysis output fields (one `float4` per field)
+- Results map to typed analysis output fields (one `float4` per field). Every compile defines `SL_FIELD_<name>` as each field's `Result` index (here a field named `Mean`); characters outside `[A-Za-z0-9_]` become `_`
+- The dispatch shape, output size and injected values are derived from the definition the way a saved graph's are ([Node contracts](https://github.com/Spruill-1/EffectGraph/blob/main/docs/architecture/effect-graph-model.md#node-contracts)): a 32×32 group runs as one group
 - Supports atomics, full-image groupshared memory, and arbitrary reduction patterns
 
 ## Opening Built-in Effects

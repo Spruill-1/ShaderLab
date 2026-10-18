@@ -1,5 +1,7 @@
 # Architecture Overview
 
+The engine is [EffectGraph](https://github.com/Spruill-1/EffectGraph), a separate repository that ShaderLab consumes as the `EffectGraph.Engine` package (`EffectGraphEngine.lib`, linked statically into each program; decisions #231, #232). Everything else below is this repository.
+
 ```mermaid
 graph TB
     subgraph App["ShaderLab.exe (WinUI 3 app)"]
@@ -8,17 +10,22 @@ graph TB
         RE[RenderEngine<br/>SwapChainPanel binding]
     end
 
-    subgraph Engine["ShaderLabEngine.dll"]
+    subgraph Engine["EffectGraph (EffectGraph.Engine package)"]
         EG[Graph/*]
-        EV[GraphEvaluator / FalseColorOverlay]
+        EV[GraphEvaluator]
         FX[EffectRegistry / ShaderLabEffects / SourceNodeFactory]
-        IO[ImageLoader / VideoSourceProvider / ShaderCompiler]
+        IO[ImageLoader / VideoSourceProvider / capture providers / ShaderCompiler]
         MON[DisplayMonitor / ICC]
-        MCP[Engine/Mcp: McpRouter + EngineMcpRoutes]
+    end
+
+    subgraph Support["ShaderLabSupport.lib (static, ShaderLab only)"]
+        MCP[Mcp/: McpRouter + Routes/]
+        SUP[Support/: ExprTk, .effectgraph files, plugin discovery]
+        SRC[Sources/: desktop and window capture]
     end
 
     subgraph Tests["ShaderLabTests.exe"]
-        TR[TestRunner main + 51 HLSL math tests]
+        TR[TestRunner, self-registering cases<br/>Mcp / Hosts / persistence / expressions / host loop / UI snapshot + layout / video export + playback]
     end
 
     subgraph Headless["ShaderLabHeadless.exe"]

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="ShaderLabHeadless">
+      <UniqueIdentifier>{F3B30292-0FDE-54C3-BB15-5C3E9E64EED3}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="ShaderLabHeadless\HeadlessArgs.h">
+      <Filter>ShaderLabHeadless</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderLabHeadless\HeadlessEngine.h">
+      <Filter>ShaderLabHeadless</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderLabHeadless\ImageOutput.h">
+      <Filter>ShaderLabHeadless</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderLabHeadless\ScriptRunner.h">
+      <Filter>ShaderLabHeadless</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderLabHeadless\GpuBench.h">
+      <Filter>ShaderLabHeadless</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch_host.cpp" />
+    <ClCompile Include="ShaderLabHeadless\Main.cpp">
+      <Filter>ShaderLabHeadless</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabHeadless\HeadlessArgs.cpp">
+      <Filter>ShaderLabHeadless</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabHeadless\HeadlessEngine.cpp">
+      <Filter>ShaderLabHeadless</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabHeadless\ImageOutput.cpp">
+      <Filter>ShaderLabHeadless</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabHeadless\ScriptRunner.cpp">
+      <Filter>ShaderLabHeadless</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderLabHeadless\GpuBench.cpp">
+      <Filter>ShaderLabHeadless</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>
