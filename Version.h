@@ -9,10 +9,10 @@
 
 namespace ShaderLab
 {
-    constexpr uint32_t VersionMajor = 1;
-    constexpr uint32_t VersionMinor = 9;
+    constexpr uint32_t VersionMajor = 2;
+    constexpr uint32_t VersionMinor = 0;
     constexpr uint32_t VersionPatch = 0;
 
     // Human-readable version string.
-    constexpr const wchar_t* VersionString = L"1.9.0";
+    constexpr const wchar_t* VersionString = L"2.0.0";
 }
