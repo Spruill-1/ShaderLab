@@ -3,6 +3,12 @@
 All notable changes to ShaderLab will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+
+- **EffectGraph 1.0.1** ([its changelog](https://github.com/Spruill-1/EffectGraph/blob/main/CHANGELOG.md)). A pixel shader bound to an analysis value now reads it on the GPU from the first frame. Before, a graph that stayed unchanged after loading kept serving the binding through a blocking CPU readback until something dirtied its producer.
+
 ## [2.0.0] - 2026-10-19
 
 A major version: the engine is now EffectGraph's packages, so ShaderLab no longer ships `EffectGraph.dll`, `EffectGraphCompile` or the bindings; and signed releases carry the signing certificate's publisher, a new package family that installs beside a 1.x install rather than upgrading it. 1.9.0 was never released; its changes are here.
