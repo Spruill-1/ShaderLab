@@ -5,7 +5,7 @@
 -->
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
-    <EffectGraphPackageVersion>1.0.1</EffectGraphPackageVersion>
+    <EffectGraphPackageVersion>1.0.2</EffectGraphPackageVersion>
     <EffectGraphPackagesDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\packages\'))</EffectGraphPackagesDir>
   </PropertyGroup>
 </Project>

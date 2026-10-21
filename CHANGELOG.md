@@ -7,6 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **EffectGraph 1.0.2** ([its changelog](https://github.com/Spruill-1/EffectGraph/blob/main/CHANGELOG.md)). A pixel shader that reads analysis values on the GPU no longer costs their producers a blocking CPU readback on a graph's first frame. A CPU consumer bound to a producer whose values were on the GPU only now reads current values instead of the last ones that reached the CPU.
 - **EffectGraph 1.0.1** ([its changelog](https://github.com/Spruill-1/EffectGraph/blob/main/CHANGELOG.md)). A pixel shader bound to an analysis value now reads it on the GPU from the first frame. Before, a graph that stayed unchanged after loading kept serving the binding through a blocking CPU readback until something dirtied its producer.
 
 ## [2.0.0] - 2026-10-19
