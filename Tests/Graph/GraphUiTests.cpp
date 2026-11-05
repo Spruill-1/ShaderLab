@@ -86,7 +86,12 @@ namespace ShaderLab::Tests
         TEST("Snapshot lookup unknown id is null",    snap->FindNode(99999u) == nullptr);
         TEST("Snapshot strips cachedOutput",          snap->FindNode(srcId)->cachedOutput == nullptr);
         TEST("Snapshot preserves runtimeError",       snap->FindNode(srcId)->runtimeError == L"oops");
-        TEST("Snapshot preserves dirty flag",         snap->FindNode(srcId)->dirty);
+        // EffectGraph 1.1 keeps the dirty flag behind IsDirty(); 1.0.x has the field.
+        const auto isDirty = [](const auto& node) {
+            if constexpr (requires { node.IsDirty(); }) return node.IsDirty();
+            else return node.dirty;
+        };
+        TEST("Snapshot preserves dirty flag",         isDirty(*snap->FindNode(srcId)));
         TEST("Snapshot edge mirrors connection",
              snap->edges[0].sourceNodeId == srcId && snap->edges[0].destNodeId == dstId);
         TEST("Snapshot carries topological order",
